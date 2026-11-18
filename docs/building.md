@@ -11,7 +11,8 @@ Everything goes through one script, `build.ps1`, on Windows x64.
 | NASM | boot stages, entry stubs | on `PATH` |
 | Rust via rustup | kernel Rust, user crates, `dosimg` | the exact version is pinned in `rust-toolchain.toml` and installed on demand |
 | QEMU (with its edk2/OVMF firmware) | running and testing | `C:\Program Files\qemu` or `PATH`; `DOS_OVMF_DIR` overrides the firmware folder |
-| Visual Studio or Build Tools, C++ x64 workload | the Windows compatibility proof program (`compat/win`) | found with `vswhere`; `DOS_MSVC_BIN` overrides |
+| Visual Studio or Build Tools, C++ x64 workload | the Windows test programs of D-CMPL (`compat/win`) | found with `vswhere`; `DOS_MSVC_BIN` overrides |
+| Windows 10/11 SDK | W2, the static C runtime test program (headers, the static UCRT, `kernel32.lib`) | `Windows Kits\10` under Program Files (x86); `DOS_WINSDK` overrides |
 | MinGW gcc (optional) | host check of the loaders' C crypto | skipped with a note if missing |
 | 7-Zip (optional) | host check that a FAT32 volume written by D-OS reads correctly | skipped if missing |
 

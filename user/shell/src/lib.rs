@@ -47,6 +47,10 @@ const NOTICES_MAX: u32 = 40;
 const MAX_JOBS: usize = 16;
 /// What a tool may use (its share of the session's own quota).
 const TOOL_LIMITS: sys::Limits = sys::Limits { memory: 16 << 20, handles: 128, threads: 4 };
+/// What a foreign program may use, D-CMPL included (Windows threads have 1 MiB stacks).
+const FOREIGN_LIMITS: sys::Limits = sys::Limits { memory: 128 << 20, handles: 256, threads: 16 };
+/// The largest foreign program `run` reads.
+const MAX_FOREIGN: u64 = 64 << 20;
 
 /// A granted directory at a path (`/data`), with the rights the session has on it.
 pub struct Place {
@@ -367,6 +371,12 @@ impl Shell {
             sys::handle_close(mine);
             format!("{}: cannot start: {}", t.name, sys::status(e))
         })?;
+        self.add_job(&t.name, p, mine, line, background, filters);
+        Ok(())
+    }
+
+    /// A started job: its process and output channel, watched from now on.
+    fn add_job(&mut self, name: &str, p: Handle, mine: Handle, line: &str, background: bool, filters: Vec<Vec<String>>) {
         let id = self.next_job;
         self.next_job += 1;
         self.port.arm(mine, sys::READABLE | sys::PEER_CLOSED, u64::from(id) << 8 | KEY_JOB_OUT);
@@ -374,7 +384,7 @@ impl Shell {
         self.jobs.push(Job {
             id,
             line: String::from(line),
-            name: t.name.clone(),
+            name: String::from(name),
             proc: Owned::from_raw(p),
             out: Owned::from_raw(mine),
             records: Vec::new(),
@@ -390,6 +400,101 @@ impl Shell {
         } else {
             self.fg = Some(id);
         }
+    }
+
+    /// `run <file> [arguments]` for a program that is not a tool: a Windows (PE) or Linux (ELF)
+    /// program, told apart by its header, run by D-CMPL. It gets the current place (with the
+    /// session's rights there) as its working directory, an output channel and the wall clock;
+    /// nothing else of the session (no other place, no endpoint, no manager).
+    fn launch_foreign(&mut self, prog: &str, args: &[String], line: &str, background: bool, filters: Vec<Vec<String>>) -> Result<(), String> {
+        if self.jobs.len() >= MAX_JOBS {
+            return Err(format!("run: too many jobs ({}); end one first", MAX_JOBS));
+        }
+        let abs = normalize(&self.place, prog);
+        let (file, kind) = self.open("run", &abs, 0, fp::R_READ)?;
+        if kind != fp::KIND_FILE {
+            return Err(format!("run: {} is a directory", abs));
+        }
+        let size = file.stat().map_err(|e| format!("run: {}: {}", abs, fp::message(e)))?.size;
+        if size > MAX_FOREIGN {
+            return Err(format!("run: {} is larger than {} MiB", abs, MAX_FOREIGN >> 20));
+        }
+        let mut data = alloc::vec![0u8; size as usize];
+        let got = file.read(0, &mut data).map_err(|e| format!("run: {}: {}", abs, fp::message(e)))?;
+        data.truncate(got);
+        drop(file);
+        let personality = if data.starts_with(b"MZ") {
+            "win"
+        } else if data.starts_with(&[0x7F, b'E', b'L', b'F']) {
+            "linux"
+        } else {
+            return Err(format!("run: {} is not a program D-CMPL runs (a Windows .exe or a Linux ELF executable)", abs));
+        };
+        let Some(dcmpl) = libd::find_program(b"dcmpl.dx") else {
+            return Err(String::from("run: D-CMPL (dcmpl.dx) is not available to this session"));
+        };
+        let vmex = libd::startup_handle(sys::TAG_VMEX);
+        if vmex == 0 {
+            return Err(String::from("run: this session may not run foreign programs (no VMEX grant)"));
+        }
+        let leaf = split_parent(&abs).1.to_string();
+        // Every handle it gets (closed again if something fails before the spawn).
+        let mut hs: Vec<SpawnHandle> = Vec::new();
+        let close_all = |hs: &[SpawnHandle]| {
+            for h in hs {
+                sys::handle_close(h.handle);
+            }
+        };
+        let fail = |hs: &[SpawnHandle], e: i64| -> String {
+            close_all(hs);
+            format!("run: {}: {}", leaf, sys::status(e))
+        };
+        let image = sys::vmo_create(data.len().max(1) as u64).map_err(|e| fail(&hs, e))?;
+        hs.push(SpawnHandle { handle: image, rights: sys::RIGHTS_SAME, tag: tool::TAG_IMAGE, reserved: 0 });
+        let r = sys::vmo_write(image, 0, &data);
+        if r < 0 {
+            return Err(fail(&hs, r));
+        }
+        drop(data);
+        let x = sys::handle_duplicate(vmex, sys::RIGHTS_SAME).map_err(|e| fail(&hs, e))?;
+        hs.push(SpawnHandle { handle: x, rights: sys::RIGHTS_SAME, tag: sys::TAG_VMEX, reserved: 0 });
+        if let Ok(l) = sys::handle_duplicate(libd::startup_handle(sys::TAG_LOG), sys::RIGHTS_SAME) {
+            hs.push(SpawnHandle { handle: l, rights: sys::RIGHTS_SAME, tag: sys::TAG_LOG, reserved: 0 });
+        }
+        let now = libd::time::now();
+        if now.0 != 0
+            && let Ok(v) = sys::vmo_create(16)
+        {
+            let mut b = [0u8; 16];
+            b[..8].copy_from_slice(&now.0.to_le_bytes());
+            b[8..].copy_from_slice(&sys::clock_ns().to_le_bytes());
+            sys::vmo_write(v, 0, &b);
+            hs.push(SpawnHandle { handle: v, rights: sys::RIGHT_READ, tag: tool::TAG_TIME_BASE, reserved: 0 });
+        }
+        // The current place, with the session's rights there: its working directory.
+        if self.place != "/" {
+            let place = self.place.clone();
+            let rights = self.resolve(&place).map_or(fp::R_READ, |(pl, _)| pl.rights & (fp::R_READ | fp::R_WRITE));
+            let (dir, _) = self.open("run", &place, fp::O_DIRECTORY, rights).inspect_err(|_| close_all(&hs))?;
+            let mut ns = fp::NsBuilder::new();
+            ns.add(place.as_bytes(), dir);
+            let mut nh = [SpawnHandle::default(); 2];
+            let n = ns.finish(&mut nh).map_err(|e| fail(&hs, e))?;
+            hs.extend_from_slice(&nh[..n]);
+        }
+        let (mine, theirs) = sys::channel_pair().map_err(|e| fail(&hs, e))?;
+        hs.push(SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: tool::TAG_OUTPUT, reserved: 0 });
+        let mut argv = format!("{} {}", personality, leaf);
+        for a in args {
+            argv.push(' ');
+            argv.push_str(a);
+        }
+        let p = sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), dcmpl, leaf.as_bytes(), argv.as_bytes(), &hs, &FOREIGN_LIMITS).map_err(|e| {
+            sys::handle_close(mine);
+            format!("run: {}: cannot start: {}", leaf, sys::status(e))
+        })?;
+        println!("shell: run {} ({}, under D-CMPL) in {}", abs, if personality == "win" { "Windows" } else { "Linux" }, self.place);
+        self.add_job(&leaf, p, mine, line, background, filters);
         Ok(())
     }
 
@@ -523,10 +628,14 @@ impl Shell {
             return;
         }
         if name == "run" {
-            let Some(t) = args.first().and_then(|n| self.find_tool(n)).cloned() else {
-                return self.error(&format!("run: {}", args.first().map_or(String::from("run what? (run <tool> [arguments])"), |n| format!("no tool '{}'", n))));
+            let Some(first) = args.first() else {
+                return self.error("run: run what? (run <tool or program> [arguments])");
             };
-            if let Err(e) = self.launch(&t, &args[1..], shown, l.background, filters) {
+            let r = match self.find_tool(first).cloned() {
+                Some(t) => self.launch(&t, &args[1..], shown, l.background, filters),
+                None => self.launch_foreign(first, &args[1..], shown, l.background, filters),
+            };
+            if let Err(e) = r {
                 self.error(&e);
             }
             return;

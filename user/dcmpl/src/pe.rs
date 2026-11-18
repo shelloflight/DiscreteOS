@@ -11,8 +11,10 @@
 //! - at most 16 sections, aligned, in address order without overlap, inside the image, raw data
 //!   inside the file, never writable and executable (W^X);
 //! - the entry point inside an executable section;
-//! - data directories inside the image; TLS, delay-load imports and .NET images are refused
-//!   (not supported yet);
+//! - data directories inside the image; delay-load imports and .NET images are refused (not
+//!   supported yet); the exception table (`.pdata`) a whole number of 12-byte entries;
+//! - the TLS directory (read after relocation, `tls`): the template and the index slot inside the
+//!   image, at most 1 MiB of TLS data, at most 16 callbacks, each inside an executable section;
 //! - base relocations: blocks inside the directory, only DIR64 (and ABSOLUTE padding), every
 //!   target 8 bytes inside the image;
 //! - imports: at most 64 DLLs and 4096 functions per DLL, names NUL-terminated inside the image,
@@ -44,6 +46,7 @@ pub const SCN_MEM_READ: u32 = 0x4000_0000;
 pub const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
 const DIR_IMPORT: usize = 1;
+const DIR_EXCEPTION: usize = 3;
 const DIR_SECURITY: usize = 4; // a file offset, not an RVA
 const DIR_BASERELOC: usize = 5;
 const DIR_TLS: usize = 9;
@@ -172,6 +175,11 @@ pub struct Image {
     pub nsec: usize,
     pub import: Dir,
     pub reloc: Dir,
+    pub tls: Dir,
+    /// The function table (`RUNTIME_FUNCTION` entries) the SEH unwinder searches.
+    pub exception: Dir,
+    /// SizeOfStackReserve: the main thread's stack size and the default for new threads.
+    pub stack_reserve: u64,
     /// Not linked with relocations stripped: can be loaded away from its preferred base.
     pub relocatable: bool,
 }
@@ -227,6 +235,7 @@ pub fn parse(data: &[u8]) -> R<Image> {
     let size_of_image = rd32(data, opt + 56)?;
     let size_of_headers = rd32(data, opt + 60)?;
     let subsystem = rd16(data, opt + 68)?;
+    let stack_reserve = rd64(data, opt + 72)?;
     let ndirs = rd32(data, opt + 108)? as usize;
     if ndirs > 16 || 112 + 8 * ndirs > opt_size {
         return Err(PeError::Bad("bad data directory count"));
@@ -265,8 +274,11 @@ pub fn parse(data: &[u8]) -> R<Image> {
             }
         }
     }
-    if dirs[DIR_TLS].size != 0 {
-        return Err(PeError::Unsupported("TLS directory (__declspec(thread), TLS callbacks)"));
+    if dirs[DIR_TLS].size != 0 && dirs[DIR_TLS].size < 40 {
+        return Err(PeError::Bad("TLS directory too small"));
+    }
+    if dirs[DIR_EXCEPTION].size % 12 != 0 {
+        return Err(PeError::Bad("exception table not a whole number of entries"));
     }
     if dirs[DIR_DELAY_IMPORT].size != 0 {
         return Err(PeError::Unsupported("delay-load imports"));
@@ -286,6 +298,9 @@ pub fn parse(data: &[u8]) -> R<Image> {
         nsec,
         import: dirs[DIR_IMPORT],
         reloc: dirs[DIR_BASERELOC],
+        tls: dirs[DIR_TLS],
+        exception: dirs[DIR_EXCEPTION],
+        stack_reserve,
         relocatable: fchars & FILE_RELOCS_STRIPPED == 0, // an empty .reloc: nothing to fix up
     };
     let mut prev_end = align_up(size_of_headers, sect_align).ok_or(PeError::Bad("bad header size"))?;
@@ -447,6 +462,73 @@ impl Image {
             d += 20;
         }
         Ok(bound)
+    }
+}
+
+/// The TLS directory of a laid-out, relocated image loaded at `base` (RVAs inside the image).
+#[derive(Clone, Copy, Default)]
+pub struct Tls {
+    pub template_rva: u32,
+    pub template_len: u32,
+    pub zero_fill: u32,
+    pub index_rva: u32,
+    pub callbacks: [u32; MAX_TLS_CALLBACKS],
+    pub ncallbacks: usize,
+}
+
+pub const MAX_TLS: u32 = 1 << 20;
+pub const MAX_TLS_CALLBACKS: usize = 16;
+
+impl Image {
+    /// Read and check the TLS directory (after relocation: its fields are addresses).
+    pub fn tls(&self, img: &[u8], base: u64) -> R<Option<Tls>> {
+        if self.tls.size == 0 {
+            return Ok(None);
+        }
+        let size = u64::from(self.size_of_image);
+        let img = img.get(..size as usize).ok_or(PeError::Truncated)?;
+        let d = self.tls.rva as usize;
+        let rva = |va: u64| -> R<u32> {
+            let r = va.checked_sub(base).ok_or(PeError::Bad("TLS address outside the image"))?;
+            if r >= size { Err(PeError::Bad("TLS address outside the image")) } else { Ok(r as u32) }
+        };
+        let (start, end) = (rd64(img, d)?, rd64(img, d + 8)?);
+        let (index, cbs) = (rd64(img, d + 16)?, rd64(img, d + 24)?);
+        let zero_fill = rd32(img, d + 32)?;
+        let mut t = Tls { zero_fill, ..Tls::default() };
+        if end < start || end - start > u64::from(MAX_TLS) || zero_fill > MAX_TLS {
+            return Err(PeError::Unsupported("TLS data over 1 MiB"));
+        }
+        if end > start {
+            t.template_rva = rva(start)?;
+            t.template_len = (end - start) as u32;
+            if u64::from(t.template_rva) + u64::from(t.template_len) > size {
+                return Err(PeError::Bad("TLS template outside the image"));
+            }
+        }
+        t.index_rva = rva(index)?;
+        if u64::from(t.index_rva) + 4 > size {
+            return Err(PeError::Bad("TLS index outside the image"));
+        }
+        if cbs != 0 {
+            let at = rva(cbs)? as usize;
+            for i in 0..=MAX_TLS_CALLBACKS {
+                let cb = rd64(img, at + 8 * i)?;
+                if cb == 0 {
+                    break;
+                }
+                if i == MAX_TLS_CALLBACKS {
+                    return Err(PeError::Unsupported("more than 16 TLS callbacks"));
+                }
+                let r = rva(cb)?;
+                if !self.sections().iter().any(|s| s.executable() && r >= s.rva && u64::from(r) < u64::from(s.rva) + u64::from(s.mem)) {
+                    return Err(PeError::Bad("TLS callback not in an executable section"));
+                }
+                t.callbacks[i] = r;
+                t.ncallbacks = i + 1;
+            }
+        }
+        Ok(Some(t))
     }
 }
 

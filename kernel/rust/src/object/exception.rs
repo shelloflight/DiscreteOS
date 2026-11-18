@@ -66,6 +66,8 @@ impl Regs {
 pub enum Action {
     Resume,
     Kill(i32),
+    /// End only the stopped thread, with this exit code (ABI v10: a Linux `exit` of one thread).
+    ExitThread(i32),
 }
 
 /// Exception kinds (ABI).

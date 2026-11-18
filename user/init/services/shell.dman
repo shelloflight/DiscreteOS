@@ -1,7 +1,8 @@
 # The shell: one session on the terminal. Everything a session may do is listed here: every volume
 # (with the rights the storage service gives it: read-only on a normal boot), the log, the clock,
 # the service manager (services and power) and the tools. A tool it starts gets only the paths
-# typed, with the rights its own manifest declares.
+# typed, with the rights its own manifest declares. D-CMPL and the VMEX resource are for `run` of a
+# Windows or Linux program: it runs under D-CMPL with only the current place.
 name = "shell"
 image = "shell.dx"
 group = "system"
@@ -14,11 +15,13 @@ connect = ["terminal.session", "log.read", "clock.time"]
 namespace = ["*"]
 manager = ["services", "power"]
 tools = true
+programs = ["dcmpl.dx"]
+vmex = true
 
 [quota]
-memory = "32M"
+memory = "192M"
 handles = 512
-threads = 4
+threads = 32
 
 [restart]
 policy = "always"

@@ -13,7 +13,7 @@ silently.
 | Name | What | State |
 |---|---|---|
 | **D-KRNL** | the kernel (C + Rust + NASM) | working, hardened, tested |
-| **D-CMPL** | compatibility layer: Windows and Linux programs run unchanged | first proofs run |
+| **D-CMPL** | compatibility layer: Windows and Linux programs run unchanged | console programs run (W2, L2) |
 | **D-AWMI** | window manager and graphics | not started |
 | **D-PACK** | signed packages and system updates | not started |
 
@@ -66,7 +66,7 @@ installer yet); `init` gets a read-only VMO for each one ([services.md](services
 | `user/devmgr/`, `user/storaged/` | Rust | device manager + drivers, storage service |
 | `user/log/`, `user/clock/` | Rust | log service, clock service ([services.md](services.md)) |
 | `user/terminal/`, `user/shell/`, `user/tools/` | Rust | the terminal (screen, keyboard, line editing), the shell, the core tools ([shell.md](shell.md)) |
-| `user/dcmpl/`, `compat/` | Rust, C | D-CMPL and its Windows/Linux proof programs ([compat.md](compat.md)) |
+| `user/dcmpl/`, `compat/` | Rust, C, C++ | D-CMPL on libd and its Windows/Linux test programs ([compat.md](compat.md)) |
 | `user/utest/`, `user/fstest/`, `user/ltest/`, `user/ctest/`, `user/hello/` | C, Rust | ring-3 test programs |
 | `tools/dosimg/` | Rust | host tool: disk images, signing, fsck, attestation verifier |
 | `build.ps1` | PowerShell | build, run, debug, test ([building.md](building.md)) |

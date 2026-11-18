@@ -102,7 +102,10 @@ pub mod nr {
     // ABI v9: the terminal and the shell
     pub const DISPLAY_INFO: u64 = 67;
     pub const PROCESS_HANDLES: u64 = 68;
-    pub const COUNT: u64 = 69;
+    // ABI v10: D-CMPL's Linux server (mmap, clone)
+    pub const PROCESS_VMAR: u64 = 69;
+    pub const THREAD_CREATE_STOPPED: u64 = 70;
+    pub const COUNT: u64 = 71;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -421,6 +424,7 @@ const SPAWN_NEEDS_SUPERVISOR: u32 = SPAWN_FORWARD | SPAWN_START_EXCEPTION;
 /// exception_resume actions.
 const RESUME: u64 = 0;
 const KILL: u64 = 1;
+const EXIT_THREAD: u64 = 2;
 
 fn ok(v: u64) -> KResult<i64> {
     Ok(v as i64)
@@ -711,6 +715,7 @@ fn exception_resume(u: &UserThread, h: u64, action: u64, code: u64) -> KResult<i
     let a = match action {
         RESUME => Action::Resume,
         KILL => Action::Kill(code as i32),
+        EXIT_THREAD => Action::ExitThread(code as i32),
         _ => return Err(Status::InvalidArgs),
     };
     e.core.resolve(a)?;
@@ -964,6 +969,26 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
                 crate::object::default_rights(crate::object::ObjType::Thread),
             )?;
             Ok(i64::from(ht.0))
+        }
+        nr::THREAD_CREATE_STOPPED => {
+            // As thread_create, but the thread stops with a START exception before its first
+            // instruction: its supervisor sets every register (a Linux clone child).
+            let (target, _) = p.get_process(h(a[0]), Rights::MANAGE)?;
+            if p.is_dead() {
+                return Err(Status::BadState);
+            }
+            if target.exception_channel().is_none() {
+                return Err(Status::BadState); // nobody would start it
+            }
+            let t = super::thread::start(&target, a[1], a[2], a[3], 0, true)?;
+            p.add(Object::Thread(t), default_rights(ObjType::Thread)).map(|x| i64::from(x.0))
+        }
+        nr::PROCESS_VMAR => {
+            // The root region of a process: what a supervisor needs to map memory into it (a
+            // Linux mmap). MANAGE already allows reading and writing all of its memory.
+            let (target, _) = p.get_process(h(a[0]), Rights::MANAGE)?;
+            let v = target.root_vmar().clone();
+            p.add(Object::Vmar(v), default_rights(ObjType::Vmar)).map(|x| i64::from(x.0))
         }
         nr::THREAD_EXIT => return Ok(Next::ExitThread(a[0] as i32)),
         nr::THREAD_EXIT_CODE => p.thread_exit_code(h(a[0])).map(i64::from),

@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 9
+#define DOS_ABI_VERSION 10
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -114,6 +114,8 @@ enum {
     DOS_SYS_KLOG_READ, DOS_SYS_LOG_RECORD,
     /* ABI v9: the terminal and the shell */
     DOS_SYS_DISPLAY_INFO, DOS_SYS_PROCESS_HANDLES,
+    /* ABI v10: D-CMPL's Linux server (mmap, clone) */
+    DOS_SYS_PROCESS_VMAR, DOS_SYS_THREAD_CREATE_STOPPED,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -179,6 +181,7 @@ struct dos_regs {
 #define DOS_EXC_START   3     /* DOS_SPAWN_START_EXCEPTION: the first thread, before its first instruction */
 #define DOS_EXC_RESUME  0
 #define DOS_EXC_KILL    1     /* kill the process with the given exit code */
+#define DOS_EXC_EXIT_THREAD 2 /* ABI v10: end only the stopped thread, with the given exit code */
 
 /* In-process handler: RDI points at this, on the handler stack; resume with dos_exception_return. */
 struct dos_exception_record {
@@ -423,6 +426,13 @@ struct dos_handle_entry {
 };
 _Static_assert(sizeof(struct dos_handle_entry) == 48, "dos_handle_entry layout");
 static inline int64_t dos_process_handles(dos_handle_t proc, struct dos_handle_entry *buf, uint64_t cap) { return DOS_SC(DOS_SYS_PROCESS_HANDLES, proc, buf, cap, 0, 0, 0); }
+
+/* ABI v10, MANAGE on the process: its root VMAR (a supervisor maps memory into it). */
+static inline int64_t dos_process_vmar(dos_handle_t proc) { return DOS_SC(DOS_SYS_PROCESS_VMAR, proc, 0, 0, 0, 0, 0); }
+/* ABI v10, MANAGE on the process: like dos_thread_create, but the thread stops with a START
+ * exception before its first instruction (its supervisor sets every register). BAD_STATE if the
+ * process has no exception channel. */
+static inline int64_t dos_thread_create_stopped(dos_handle_t proc, uint64_t entry, uint64_t stack_top, uint64_t arg) { return DOS_SC(DOS_SYS_THREAD_CREATE_STOPPED, proc, entry, stack_top, arg, 0, 0); }
 
 /* ABI v8: the boot-time record (DOS_TAG_BOOT_TIME). */
 struct dos_boot_time {

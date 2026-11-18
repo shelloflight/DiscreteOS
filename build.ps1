@@ -89,8 +89,9 @@
       lockup       a CPU stuck with interrupts off is caught by the watchdog, with its NMI backtrace
       softlockup   a CPU that stops switching while work waits gets a soft-lockup warning
       soak         a few rounds of the randomized soak test (the soak target runs it for longer)
-      compat       D-CMPL proofs: W1 (MSVC-built PE) and L1 (static Linux ELF) run unchanged; an
-                   unsupported import / syscall fails cleanly; faults are reported; PE parser fuzzed
+      compat       D-CMPL: W1 and L1 (no runtime) and W2 (MSVC static CRT: heap, threads, TLS, SEH,
+                   C++ exceptions) and L2 (static Linux: clone threads, futex, mmap, signals) run
+                   unchanged; unsupported imports / syscalls fail cleanly; faults reported; PE fuzzing
       objects      kernel objects: rights enforcement, handle reuse after close, quotas, process kill,
                    out-of-memory paths proven by fault injection, multi-core handle-table stress
       ubsan        selftest built with UBSan (trap mode): the C kernel runs free of undefined behaviour
@@ -335,7 +336,11 @@ $TestCases = [ordered]@{
     smep        = @{ Define = 'SMEP';        Expect = @('KTEST smep: kernel calling user code', 'Page fault (#PF)', 'instruction fetch', 'kernel tried to execute user memory (SMEP)', $Halted); Forbid = @('KTEST smep: FAILED') }
     kdb         = @{ Define = $null;         Expect = @('kdb: threads', 'TID  NAME', 'reaper', 'kdb: cpus', 'CPU  ONLINE', 'PCR  8', 'kdb: measure: '); Forbid = @('KERNEL PANIC')
                      Serial = @('threads', 'cpus', 'measure'); SerialAfter = 'kdb: serial console ready' }
-    compat      = @{ Define = 'COMPAT';      Expect = @('utest: compat: start exception', 'Hello, world from Windows (W1)', 'W1: TEB at GS, PEB image base matches, kernel32 bound', 'BENCH compat: PE load of w1.exe', 'unsupported import USER32.dll!MessageBoxA', "user fault: process 'w1fault.exe'", 'Hello, world from Linux (L1)', 'L1: argv/auxv on the stack, TLS at FS, set_tid_address served', 'unsupported Linux syscall 63 (uname) -> ENOSYS', 'L1: uname -> ENOSYS, handled cleanly', 'l1: SIGSEGV', 'BENCH compat: forwarded Linux syscall round trip', 'dcmpl: pe fuzz:', 'utest: compat: PASSED', 'init: utest compat exited with code 0'); Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC'); Timeout = 120 }
+    compat      = @{ Define = 'COMPAT';      Expect = @('utest: compat: start exception', 'Hello, world from Windows (W1)', 'W1: TEB at GS, PEB image base matches, kernel32 bound', 'BENCH compat: PE load of w1.exe', 'unsupported import USER32.dll!MessageBoxA', "user fault: process 'w1fault.exe'", 'Hello, world from Linux (L1)', 'L1: argv/auxv on the stack, TLS at FS, set_tid_address served', 'unsupported Linux syscall 63 (uname) -> ENOSYS', 'L1: uname -> ENOSYS, handled cleanly', 'l1: SIGSEGV', 'BENCH compat: forwarded Linux syscall round trip',
+                                'Hello from Windows (W2): MSVC static CRT on D-CMPL', 'W2: threads  ok', 'W2: tls      ok', 'W2: seh      ok', 'W2: c++      ok', 'W2: 0 checks failed',
+                                "dcmpl: w2.exe: unhandled exception 0xc0000005", "user fault: process 'w2.exe'",
+                                'Hello from Linux (L2): threads, memory, files and signals on D-CMPL', 'L2: threads ok', 'L2: signals ok', 'L2: futex ok', 'L2: enosys ok', 'L2: 0 checks failed',
+                                'dcmpl: pe fuzz:', 'utest: compat: PASSED', 'init: utest compat exited with code 0'); Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC'); Timeout = 120 }
     drivers     = @{ Define = 'DRIVERS';     Devices = $true
                      Expect = @('IOMMU: DMA remapping on', 'devmgr: test: device ABI: config writes filtered, MSI-X table hidden', 'virtio-blk: 2048 sectors', 'DMA confined by the IOMMU',
                                 'devmgr: test: virtio-blk: 2048 sectors', 'write + read back OK', 'devmgr: test: interrupt delivery: virtio-blk', "user fault: process 'virtio-blk.ddrv'", 'devmgr: restarting virtio-blk.ddrv',
@@ -389,12 +394,16 @@ $TestCases = [ordered]@{
     # a session typed on the keyboard. Places, file tools with declared rights, filters over records,
     # a path outside the namespace refused, completion, the services, the log, then power off.
     shell       = @{ Define = 'SHELL';       Devices = $true; Timeout = 180; MustExit = $true; KeysAfter = 'shell: ready'
-                     Keys = (ConvertTo-QemuKeys @('places', 'go data', 'make notes', 'copy /boot/README.TXT notes', 'list notes | where size > 10 | pick name size',
+                     Keys = (ConvertTo-QemuKeys @('places', 'go data', 'make notes', 'run /esp/DOS/APPS/W2.EXE alpha beta notes', '@~20000', 'run /esp/DOS/APPS/L2 notes', '@~15000',
+                                                 'run /boot/README.TXT', 'copy /boot/README.TXT notes', 'list notes | where size > 10 | pick name size',
                                                  'show notes/README.TXT', 'move notes/README.TXT notes/readme.txt', 'copy notes/readme.txt /nowhere/x.txt', 'lst',
                                                  'help copy', 'tasks | where kind = service | where state = running | count', 'log | where source = shell | take 1',
                                                  'objects | where type = channel | count', 'delete notes/readme.txt notes', 'go /sy<tab>', 'time', 'power off'))
                      Expect = @('terminal: display 80x25 VGA text', 'shell: ready: 4 place(s): /boot (read-write), /data (read-write), /esp (read-write), /system (read-write); 6 tool(s)',
-                                'terminal| / > places', 'terminal|  place', 'terminal| data > make notes', 'terminal| v made /data/notes', 'terminal| v copied /data/notes/README.TXT (58 B)',
+                                'terminal| / > places', 'terminal|  place', 'terminal| data > make notes', 'terminal| v made /data/notes',
+                                'shell: run /esp/DOS/APPS/W2.EXE (Windows, under D-CMPL) in /data', 'terminal| W2: files    ok: 100 lines read back', 'terminal| W2: 0 checks failed',
+                                'shell: run /esp/DOS/APPS/L2 (Linux, under D-CMPL) in /data', 'terminal| L2: files ok: 100 lines read back', 'terminal| L2: 0 checks failed',
+                                'terminal| x run: /boot/README.TXT is not a program D-CMPL runs', 'terminal| v copied /data/notes/README.TXT (58 B)',
                                 'terminal|  README.TXT', 'terminal| D-OS boot volume (FAT32). Written by dosimg on the host.', 'terminal| v moved /data/notes/README.TXT to /data/notes/readme.txt',
                                 "terminal| x copy: /nowhere/x.txt is not in this session's namespace", "terminal| x unknown command 'lst' - did you mean 'list'?",
                                 'terminal|   usage: copy <from> <to>', 'terminal|  count', 'shell: ready: 4 place(s)', 'terminal| v deleted /data/notes/readme.txt', 'terminal| v deleted /data/notes',
@@ -684,6 +693,13 @@ function Invoke-Build([string]$OutDir = $Build, [string]$KernelTest = $null, [sw
     $helloSig = Join-Path $OutDir 'hello.dsig'
     Invoke-Native (Get-Dosimg) @('sign', $key.Seed, 'program', 'hello.dx', $hello, $helloSig)
     $extraFiles = @("DOS/APPS/HELLO.DX=$hello", "DOS/APPS/HELLO.DSIG=$helloSig")
+    if ($KernelTest -eq 'SHELL') {
+        # Foreign programs on the boot volume for `run` in the shell test (unsigned: D-CMPL runs
+        # them through VMEX, a measured decision).
+        $w2 = (@($programs) | Where-Object Name -eq 'w2.exe' | Select-Object -First 1).Path
+        $l2 = (@($programs) | Where-Object Name -eq 'l2' | Select-Object -First 1).Path
+        $extraFiles += @("DOS/APPS/W2.EXE=$w2", "DOS/APPS/L2=$l2")
+    }
     if ($KernelTest -eq 'SERVICES') {
         # Manifests on the boot volume for the service manager's test: one signed, one unsigned, one
         # whose content changed after it was signed.
@@ -934,9 +950,9 @@ function Invoke-RustUserBuild($Crate, [string]$OutDir, [string]$Lld, [scriptbloc
     return $out
 }
 
-# MSVC (cl, link, lib) for the Windows proof programs: $env:DOS_MSVC_BIN, else the newest VC tools of
-# the newest Visual Studio with the x64 compiler (vswhere). No developer prompt or Windows SDK is
-# needed: the programs include no headers, and import libraries are made from compat\win\*.def.
+# MSVC (cl, link, lib) for the Windows programs: $env:DOS_MSVC_BIN, else the newest VC tools of the
+# newest Visual Studio with the x64 compiler (vswhere). No developer prompt is needed. W1 includes no
+# headers (import libraries come from compat\win\*.def); W2 uses the C runtime and the Windows SDK.
 $script:MsvcBin = $null
 function Find-Msvc {
     if ($script:MsvcBin) { return $script:MsvcBin }
@@ -956,10 +972,31 @@ function Find-Msvc {
     return $dir
 }
 
+# The Windows SDK (headers, the static UCRT, kernel32.lib): $env:DOS_WINSDK (a Windows Kits\10
+# folder), else the installed one; its newest version with the x64 UCRT. Returns @{ Include; Lib }.
+$script:WinSdk = $null
+function Find-WindowsSdk {
+    if ($script:WinSdk) { return $script:WinSdk }
+    $roots = @($env:DOS_WINSDK, (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10')) | Where-Object { $_ -and (Test-Path (Join-Path $_ 'Lib')) }
+    foreach ($root in $roots) {
+        $v = Get-ChildItem (Join-Path $root 'Lib') -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'ucrt\x64\libucrt.lib') } |
+            Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } | Select-Object -Last 1
+        if ($v) {
+            $inc = Join-Path $root "Include\$($v.Name)"
+            $script:WinSdk = @{ Include = @((Join-Path $inc 'ucrt'), (Join-Path $inc 'um'), (Join-Path $inc 'shared'))
+                                Lib = @((Join-Path $v.FullName 'ucrt\x64'), (Join-Path $v.FullName 'um\x64')) }
+            return $script:WinSdk
+        }
+    }
+    throw 'Windows SDK not found (needed for W2, the static C runtime test): install the Windows 10/11 SDK, or set DOS_WINSDK.'
+}
+
 # D-CMPL proof programs, embedded next to the .dx programs as unchanged foreign binaries:
 #   W1: compat\win\w1.c built with MSVC without a CRT -> w1.exe; variants w1fault.exe (writes to
 #       NULL) and w1bad.exe (also imports USER32.dll!MessageBoxA). /Brepro: reproducible bytes.
 #   L1: compat\linux\l1.c built with clang for x86_64-linux, a static ET_EXEC at 0x400000 -> l1.
+#   W2: compat\win\w2.c + w2cxx.cpp with MSVC and the static C runtime (/MT, C++ exceptions) -> w2.exe.
+#   L2: compat\linux\l2.c like L1 (threads, memory, files, signals through raw syscalls) -> l2.
 function Invoke-CompatBuild([string]$OutDir, [string]$Clang, [string]$Lld, [scriptblock]$Log) {
     $src = Join-Path $Root 'compat'
     $out = Join-Path $OutDir 'compat'
@@ -991,6 +1028,37 @@ function Invoke-CompatBuild([string]$OutDir, [string]$Clang, [string]$Lld, [scri
     Invoke-Native $Lld @('-static', '-nostdlib', '-e', '_start', '--build-id=none', '-s', '-z', 'noexecstack',
         '-z', 'separate-loadable-segments', '-z', 'max-page-size=4096', '--image-base=0x400000', '-o', $l1, $l1o)
     $progs += [pscustomobject]@{ Name = 'l1'; Path = $l1 }
+
+    # W2: an ordinary console program with MSVC's static C runtime.
+    $sdk = Find-WindowsSdk
+    $vc = Split-Path (Split-Path (Split-Path $msvc -Parent) -Parent) -Parent    # ...\VC\Tools\MSVC\<version>
+    $saved = @($env:INCLUDE, $env:LIB)
+    $env:INCLUDE = (@(Join-Path $vc 'include') + $sdk.Include) -join ';'
+    $env:LIB = (@(Join-Path $vc 'lib\x64') + $sdk.Lib) -join ';'
+    try {
+        $w2 = Join-Path $out 'w2.exe'
+        $w2objs = @()
+        foreach ($f in @('w2.c', 'w2cxx.cpp')) {
+            $o = Join-Path $out ([IO.Path]::ChangeExtension($f, '.obj'))
+            & $Log "  CL    compat\win\$f [MSVC /MT]"
+            Invoke-Native $cl @('/nologo', '/c', '/MT', '/O2', '/EHsc', '/GS', '/W4', '/WX', '/Brepro', "/Fo$o", (Join-Path $src "win\$f"))
+            $w2objs += $o
+        }
+        Invoke-Native $link (@('/nologo', '/SUBSYSTEM:CONSOLE', '/MACHINE:X64', '/Brepro', '/DYNAMICBASE', '/HIGHENTROPYVA', '/NXCOMPAT',
+            '/MANIFEST:NO', '/DEBUG:NONE', "/OUT:$w2") + $w2objs)
+    } finally { $env:INCLUDE = $saved[0]; $env:LIB = $saved[1] }
+    $progs += [pscustomobject]@{ Name = 'w2.exe'; Path = $w2 }
+
+    # L2: a static Linux program with threads, memory, files and signals.
+    $l2o = Join-Path $out 'l2.o'
+    $l2 = Join-Path $out 'l2'
+    & $Log '  CC    compat\linux\l2.c -> l2 [x86_64-linux]'
+    Invoke-Native $Clang @('--target=x86_64-linux-gnu', '-std=c17', '-O2', '-g0', '-ffreestanding', '-fno-builtin', '-nostdinc',
+        '-fno-pic', '-fno-pie', '-fno-stack-protector', '-fno-asynchronous-unwind-tables', "-ffile-prefix-map=$Root\=",
+        '-Wall', '-Wextra', '-Werror', '-c', '-o', $l2o, (Join-Path $src 'linux\l2.c'))
+    Invoke-Native $Lld @('-static', '-nostdlib', '-e', '_start', '--build-id=none', '-s', '-z', 'noexecstack',
+        '-z', 'separate-loadable-segments', '-z', 'max-page-size=4096', '--image-base=0x400000', '-o', $l2, $l2o)
+    $progs += [pscustomobject]@{ Name = 'l2'; Path = $l2 }
     return $progs
 }
 

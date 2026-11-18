@@ -1,4 +1,4 @@
-# User ABI (version 9)
+# User ABI (version 10)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **9**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **10**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -31,6 +31,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 7 | service manager decisions in the measurement log (64); MANIFEST and MEASURE startup handles; `vmo_verify` accepts manifest signatures |
 | 8 | the log service (65-66): kernel log records name the writing process; KLOG and BOOT_TIME startup handles |
 | 9 | the terminal and the shell (67-68): the `display` device and `display_info`; `process_handles` |
+| 10 | D-CMPL's Linux server (69-70): `process_vmar`, `thread_create_stopped`; `exception_resume` can end one thread (`EXIT_THREAD`) |
 
 ## Calling convention (x86-64)
 
@@ -117,7 +118,7 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 40 | process_exception_channel | process | channel handle | MANAGE |
 | 41 | exception_get_regs | exception, `struct dos_regs *` | 0 | READ |
 | 42 | exception_set_regs | exception, `const struct dos_regs *` | 0 (validated) | WRITE |
-| 43 | exception_resume | exception, `RESUME` or `KILL`, code | 0 | MANAGE |
+| 43 | exception_resume | exception, `RESUME`, `KILL` (the process) or `EXIT_THREAD` (v10: only that thread), code | 0 | MANAGE |
 | 44 | thread_set_exception_handler | entry, stack top (0, 0 removes) | 0 | |
 | 45 | exception_return | `const struct dos_exception_record *` | does not return | |
 | 46 | thread_set_base | `FS` or `GS`, base | 0 | |
@@ -143,6 +144,8 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 66 | log_record | log, level (0 error .. 3 debug), text, len | len (`log_write` is level 2, info) | WRITE |
 | 67 | display_info | device, `struct dos_display_info *` | 0 (`WRONG_TYPE` unless it is the display) | INSPECT |
 | 68 | process_handles | process, `struct dos_handle_entry *`, cap | handles it holds (at most 256 entries copied: type, rights, koid, name; never handle values) | INSPECT |
+| 69 | process_vmar | process | its root VMAR handle | MANAGE |
+| 70 | thread_create_stopped | process, entry, stack top, arg | thread handle; it stops with a `START` exception before its first instruction (`BAD_STATE` without an exception channel) | MANAGE |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.

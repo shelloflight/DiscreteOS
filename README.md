@@ -14,7 +14,7 @@ measured**. Where standards cost nothing, D-OS uses them: ELF, UEFI, ACPI, GPT, 
 | Component | Role | State |
 |---|---|---|
 | **D-KRNL** | the kernel | working, hardened, extensively tested |
-| **D-CMPL** | compatibility layer for Windows and Linux programs | first programs run |
+| **D-CMPL** | compatibility layer for Windows and Linux programs | console programs run |
 | **D-AWMI** | window manager and graphics | planned |
 | **D-PACK** | signed packages and updates | planned |
 
@@ -39,13 +39,15 @@ is no GUI yet.
 - A terminal and a shell whose commands pass typed records (`list | where size > 1M | sort
   modified`); each tool gets only the paths typed, with the rights its manifest declares
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
-- An MSVC-built Windows program and a static Linux program run unchanged
+- Windows console programs built with MSVC's static C runtime (threads, TLS, SEH, C++
+  exceptions, files) and static Linux programs (threads, `mmap`, files, signals, `futex`) run
+  unchanged, started from the shell with `run` and given only the current directory
 - 81 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
   stress, reproducible builds
 
 ## Quick start
 
-Windows x64 with LLVM, NASM, Rust (rustup), QEMU and the Visual Studio C++ tools
+Windows x64 with LLVM, NASM, Rust (rustup), QEMU, the Visual Studio C++ tools and the Windows SDK
 ([full setup](docs/building.md)):
 
 ```powershell

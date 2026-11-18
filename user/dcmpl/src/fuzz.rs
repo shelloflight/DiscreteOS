@@ -1,12 +1,15 @@
 //! PE parser fuzzing (like the kernel's ELF fuzzer, kernel/rust/src/user/tests.rs): every
 //! embedded `.exe` is mutated `rounds` times (bit flips, random bytes, boundary values, 64-bit
 //! words, truncation) and run through everything the loader does before mapping: parse, layout,
-//! relocation (to a random base) and import binding. Accepted images must keep the parser's
+//! relocation (to a random base), import binding and the TLS directory. Accepted images must keep the parser's
 //! invariants. A missed check shows up as a panic (an out-of-bounds index), which fails the test.
 
+use alloc::vec::Vec;
+
+use libd::println;
+
 use crate::pe::{self, Image};
-use crate::sys::{self, Mapping};
-use crate::{println, programs, read_program, root_vmar, text};
+use crate::{programs, read_image, text};
 
 const STAGE: u64 = 1 << 20; // images with a larger SizeOfImage are parsed, not laid out
 
@@ -45,32 +48,27 @@ fn sane(img: &Image, file_len: usize) -> bool {
 
 fn dummy_resolve(dll: &[u8], func: &[u8]) -> Option<u64> {
     // Real resolver for KERNEL32.dll, anything else accepted too so binding is fully exercised.
-    crate::win::resolve(dll, func).or(Some(0x1000 + func.len() as u64))
+    crate::win::k32::resolve(dll, func).or(Some(0x1000 + func.len() as u64))
 }
 
 pub fn run(rounds: u64) -> i32 {
     let rounds = rounds.max(1);
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ sys::rdtsc());
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ libd::sys::clock_ns());
     let (mut images, mut failures) = (0u64, 0u64);
     let (mut accepted, mut laid_out) = (0u64, 0u64);
-    let Ok(mut stage) = Mapping::new(root_vmar(), STAGE) else {
-        println!("dcmpl: pe fuzz: FAIL: no memory");
-        return 1;
-    };
-    let Ok(mut work) = Mapping::new(root_vmar(), 256 * 1024) else {
-        println!("dcmpl: pe fuzz: FAIL: no memory");
-        return 1;
-    };
+    let mut stage: Vec<u8> = alloc::vec![0; STAGE as usize];
+    let mut work: Vec<u8> = alloc::vec![0; 256 * 1024];
     programs(|h, name| {
         if !name.ends_with(b".exe") {
             return;
         }
-        let Ok((mut file, len)) = read_program(h, 256 * 1024) else {
+        let Ok(file) = read_image(h, 256 * 1024) else {
             println!("dcmpl: pe fuzz: FAIL: cannot read {}", text(name));
             failures += 1;
             return;
         };
-        let orig = &file.bytes()[..len];
+        let len = file.len();
+        let orig = &file[..];
         images += 1;
         match pe::parse(orig) {
             Ok(img) if sane(&img, len) => {}
@@ -80,7 +78,7 @@ pub fn run(rounds: u64) -> i32 {
                 return;
             }
         }
-        let buf = &mut work.bytes()[..len];
+        let buf = &mut work[..len];
         for _ in 0..rounds {
             buf.copy_from_slice(orig);
             let mut n = len;
@@ -115,7 +113,7 @@ pub fn run(rounds: u64) -> i32 {
             if u64::from(img.size_of_image) > STAGE {
                 continue;
             }
-            let out = &mut stage.bytes()[..img.size_of_image as usize];
+            let out = &mut stage[..img.size_of_image as usize];
             out.fill(0);
             if img.layout(data, out).is_err() {
                 println!("dcmpl: pe fuzz: FAIL: accepted {} could not be laid out", text(name));
@@ -126,6 +124,7 @@ pub fn run(rounds: u64) -> i32 {
             let delta = (rng.next() & 0x0000_7FFF_FFFF_0000).wrapping_sub(img.image_base);
             let _ = img.relocate(out, delta);
             let _ = img.bind(out, dummy_resolve);
+            let _ = img.tls(out, img.image_base.wrapping_add(delta));
         }
     });
     println!(

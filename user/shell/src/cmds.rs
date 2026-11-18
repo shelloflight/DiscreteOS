@@ -87,7 +87,7 @@ fn help(sh: &Shell, what: Option<&str>) -> Res {
         for t in &sh.tools {
             rs.push(Record::new().with("command", text(&t.name)).with("also", text(&t.aliases.join(" "))).with("what it does", text(&t.description)));
         }
-        rs.push(Record::new().with("command", text("run")).with("also", text("")).with("what it does", text("run a tool by name: run <tool> [arguments]")));
+        rs.push(Record::new().with("command", text("run")).with("also", text("")).with("what it does", text("run a tool, or a Windows or Linux program under D-CMPL: run <tool or file> [arguments]")));
         rs.push(Record::new().with("command", text("start")).with("also", text("")).with("what it does", text("run a command as a job: start <command>")));
         for f in filter::NAMES {
             rs.push(Record::new().with("command", text(f)).with("also", text("")).with("what it does", text(&format!("filter: ... | {}", filter::usage(f)))));

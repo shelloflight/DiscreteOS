@@ -25,6 +25,12 @@ pub const TAG_MANAGER: u32 = sys::TAG_USER + 0x360;
 /// Tool manifests handed to a holder of `grants.tools` (read-only VMOs, named after the file).
 pub const TAG_TOOL_MANIFEST: u32 = sys::TAG_USER + 0x361;
 
+/// A foreign program `run` hands to D-CMPL (docs/compat.md): its image, read from a file (VMO).
+pub const TAG_IMAGE: u32 = sys::TAG_USER + 0x370;
+/// The wall clock for a program without a clock connection: a 16-byte VMO, the wall time (ns
+/// since 2000-01-01 UTC, `time::Time`) and the monotonic time (`clock_ns`) it corresponds to.
+pub const TAG_TIME_BASE: u32 = sys::TAG_USER + 0x371;
+
 /// Separates the shown path from the name below the handle.
 pub const SEP: u8 = 0x1F;
 

@@ -20,11 +20,13 @@ C programs use the same code through `user/include/libd.h`.
 | `Port`, `Mapping`, `Dma` | async waits on many objects; VMOs mapped here; DMA pins |
 | `fs`, `proto` | files as handles and namespaces ([storage.md](storage.md)); the driver protocol |
 | `svc` | the service manager's protocol (`CONNECT`, `SYNC`, `SHUTDOWN`, `LOG_LEVEL`) and `endpoint(name)` ([services.md](services.md)) |
-| `rec`, `term`, `tool` | typed records (what shell commands exchange; `Out` for a program's output); the terminal's session protocol; how the shell starts a tool ([shell.md](shell.md)) |
+| `rec`, `term`, `tool` | typed records (what shell commands exchange; `Out` for a program's output); the terminal's session protocol; how the shell starts a tool or a foreign program (`TAG_IMAGE`, `TAG_TIME_BASE`) ([shell.md](shell.md)) |
 | `log`, `time` | the log service's records and reader; wall-clock time (`Time`, ns since 2000-01-01 UTC) and the clock service's client; levels: `log_warn!`, `log_error!`, `log_debug!` |
 | `capi` | the C binding (feature `capi`) |
 
 A program declares its entry with `libd::entry!(_start, main)` and calls `libd::init` first.
+Every Rust program is built on libd, D-CMPL included ([compat.md](compat.md)): its Windows
+threads are libd threads (FS stays the thread control block; the foreign program uses GS).
 `init` refuses a kernel whose ABI is older than the one libd was built for.
 
 ## Heap

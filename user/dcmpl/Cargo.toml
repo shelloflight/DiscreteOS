@@ -1,8 +1,8 @@
-# D-CMPL proofs: a ring-3 Rust program embedded in the image like init.
-#   win <exe>          PE32+ loader + minimal kernel32: runs a Windows program in this process
+# D-CMPL (docs/compat.md): runs Windows and Linux console programs unchanged, on libd.
+#   win <exe> [args]   PE32+ loader + kernel32: runs a Windows program in this process
 #   linux <elf> [args] Linux server: supervises a FORWARD process and serves its syscalls
 #   pefuzz <rounds>    mutates every embedded .exe and runs it through the PE parser and binder
-# Linked by build.ps1 (ld.lld, static PIE) like the C programs. No dependencies (same policy as
+# Linked by build.ps1 (ld.lld, static PIE) like the other Rust programs. Only libd (same policy as
 # kernel/rust: CONTRIBUTING.md, "Dependencies").
 [package]
 name = "dcmpl"
@@ -18,6 +18,7 @@ test = false
 bench = false
 
 [dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
 
 [profile.dev]
 panic = "abort"

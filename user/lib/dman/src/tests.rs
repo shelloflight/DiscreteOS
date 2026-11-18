@@ -279,9 +279,9 @@ const TOOLS: &[&[u8]] = &[
 #[test]
 fn the_shell_manifest_grants_its_session() {
     let s = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
-    assert!(s.tools && s.manage_services && s.manage_power && s.log);
+    assert!(s.tools && s.manage_services && s.manage_power && s.log && s.vmex);
     assert_eq!(s.namespace, vec![NsGrant { path: "*".into(), volume: "*".into(), rights: NS_READ | NS_WRITE }]);
-    assert_eq!(summary(&s), "log, terminal.session, log.read, clock.time, every volume, manager (services, power), tools");
+    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, every volume, VMEX, manager (services, power), tools");
     let t = parse(include_bytes!("../../../init/services/terminal.dman")).unwrap();
     assert_eq!(t.devices, vec![DeviceSel::Platform("display".into())]);
     assert!(!t.tools && !t.manage_services && t.namespace.is_empty());

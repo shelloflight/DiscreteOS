@@ -205,6 +205,8 @@ pub unsafe extern "C" fn dkrnl_user_exception(f: *mut Frame, cr2: u64) -> bool {
             // SAFETY: the thread's own exit, from the fault path (no Rust state alive above).
             unsafe { ffi::uthread_exit(ffi::UTHREAD_EXIT_KILLED) }
         }
+        // SAFETY: as above; only this thread ends.
+        Some(Action::ExitThread(code)) => unsafe { ffi::uthread_exit(code) },
         None => false,
     }
 }
@@ -215,6 +217,8 @@ pub fn forward_syscall(u: &UserThread, f: &mut Frame) {
     match to_supervisor(u, f, info) {
         Some(Action::Resume) => {}
         Some(Action::Kill(code)) => u.proc.kill_with(code),
+        // SAFETY: called from the syscall dispatcher's top level: no Rust state is alive above.
+        Some(Action::ExitThread(code)) => unsafe { ffi::uthread_exit(code) },
         None => u.proc.kill_with(ffi::EXIT_FAULT), // no supervisor: nothing can run its syscalls
     }
 }
@@ -223,7 +227,8 @@ pub fn forward_syscall(u: &UserThread, f: &mut Frame) {
 const UCODE: u64 = 0x23;
 const UDATA: u64 = 0x1B;
 
-/// First entry of a thread spawned with `SPAWN_START_EXCEPTION`: before its first instruction the
+/// First entry of a thread spawned with `SPAWN_START_EXCEPTION` (or made by
+/// `thread_create_stopped`): before its first instruction the
 /// supervisor gets a `START` exception with the initial registers (RIP = entry, RSP, RDI, RSI) and
 /// may change them and the process's memory (a foreign initial stack: Linux argc/argv/auxv). No
 /// supervisor (gone already): the thread starts as usual. Never returns.
@@ -263,6 +268,8 @@ pub fn start_trap(u: &UserThread, entry: u64, stack: u64, a0: u64, a1: u64) -> !
             // SAFETY: the thread's own exit before it ever ran user code.
             unsafe { ffi::uthread_exit(ffi::UTHREAD_EXIT_KILLED) }
         }
+        // SAFETY: as above; only this thread ends.
+        Some(Action::ExitThread(code)) => unsafe { ffi::uthread_exit(code) },
         // SAFETY: into ring 3 as a thread without a START stop would; never returns.
         None => unsafe { ffi::user_enter(entry, stack, a0, a1) },
     }

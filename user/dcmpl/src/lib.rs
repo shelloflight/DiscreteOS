@@ -1,89 +1,53 @@
-//! D-CMPL proofs (design: docs/compat.md): real foreign binaries on the IPC
-//! kernel mechanisms. A ring-3 program, embedded in the image like init, with no runtime beyond
-//! this crate (no libd yet).
+//! D-CMPL (design: docs/compat.md): foreign console programs, unchanged, on libd.
 //!
-//! Arguments (from the spawner, e.g. `init run dcmpl win w1.exe` or utest):
-//!   win <exe>             load the PE32+ program <exe> (an embedded PROGRAM VMO) into this process
-//!                         and run it on the minimal kernel32 (`win.rs`); exit with its exit code
+//! Arguments (from the spawner: the shell's `run`, utest, `init run`):
+//!   win <exe> [args]      load the PE32+ program <exe> into this process and run it on D-CMPL's
+//!                         kernel32 (`win/`); exit with its exit code
 //!   linux <elf> [args]    spawn <elf> as a FORWARD process and serve its Linux syscalls
-//!                         (`linux.rs`); exit with its exit code
+//!                         (`linux/`); exit with its exit code
 //!   pefuzz <rounds>       mutate every embedded `.exe` <rounds> times through the PE parser,
 //!                         layout, relocation and import binding (`fuzz.rs`)
 //!
-//! Startup handles used: LOG, PROC_SELF, VMAR_ROOT, the PROGRAM VMOs, and VMEX (win: code is
-//! sealed before it is mapped executable, so W^X holds for loaded foreign code too).
+//! The program image is the `tool::TAG_IMAGE` startup handle (a file the shell read), else the
+//! embedded PROGRAM VMO named <exe>/<elf>. Other startup handles used: LOG, PROC_SELF, VMAR_ROOT,
+//! VMEX (code is sealed before it is mapped executable, so W^X holds for foreign code too; a
+//! Linux image from a file is allowed as unsigned code, a measured decision), `tool::TAG_OUTPUT`
+//! (standard output and error as text; else the log), `tool::TAG_TIME_BASE` (the wall clock) and
+//! a namespace (`fs::Namespace`): the first entry is the working directory. Nothing else: the
+//! foreign program can reach only what this process was given.
 //!
 //! Exit codes of D-CMPL itself: 2 = the program was refused (bad image, unsupported import,
 //! unsupported feature), 3 = bad arguments or missing program, 127 = internal panic.
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod fuzz;
 pub mod linux;
 pub mod out;
+pub mod path;
 pub mod pe;
-pub mod sys;
 pub mod win;
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use alloc::vec::Vec;
+
+use libd::sys::{self, Handle};
+use libd::{Startup, println, tool};
 
 pub const EXIT_REFUSED: i32 = 2;
 pub const EXIT_USAGE: i32 = 3;
 
-static STARTUP: AtomicU64 = AtomicU64::new(0);
-static ROOT_VMAR: AtomicU32 = AtomicU32::new(0);
+/// The user half of the address space (docs/abi.md, "User memory"); VMAR offsets are relative
+/// to its start.
+pub const USER_BASE: u64 = 0x20_0000;
+pub const USER_TOP: u64 = 0x0000_7FFF_FFFF_0000;
+pub const PAGE: u64 = sys::PAGE;
 
-// Entry point: RDI = startup block; a 16-byte aligned stack for Rust, no frame to return to.
-core::arch::global_asm!(
-    ".globl _start",
-    "_start:",
-    "  xor ebp, ebp",
-    "  and rsp, -16",
-    "  call {entry}",
-    "  ud2",
-    entry = sym dcmpl_entry,
-);
+libd::entry!(_start, main);
 
-#[repr(C)]
-struct Startup {
-    magic: u32,
-    abi_version: u32,
-    nhandles: u32,
-    args_len: u32,
-    args: u64,
-    image_base: u64,
-    stack_base: u64,
-    stack_size: u64,
-}
-
-fn startup() -> &'static Startup {
-    // SAFETY: set once in dcmpl_entry to the kernel's startup block, which lives (read-only for
-    // us) at the top of the initial stack for the life of the process.
-    unsafe { &*(STARTUP.load(Ordering::Relaxed) as *const Startup) }
-}
-
-/// Startup handles as (handle, tag).
-pub fn startup_handles() -> impl Iterator<Item = (u32, u32)> {
-    let s = startup();
-    let base = (s as *const Startup as u64) + core::mem::size_of::<Startup>() as u64;
-    (0..u64::from(s.nhandles)).map(move |i| {
-        // SAFETY: the kernel writes nhandles (handle, tag) pairs right after the header.
-        unsafe { (*((base + 8 * i) as *const u32), *((base + 8 * i + 4) as *const u32)) }
-    })
-}
-
-pub fn startup_handle(tag: u32) -> sys::Handle {
-    startup_handles().find(|&(_, t)| t == tag).map_or(0, |(h, _)| h)
-}
-
-pub fn root_vmar() -> sys::Handle {
-    ROOT_VMAR.load(Ordering::Relaxed)
-}
-
-fn args() -> &'static [u8] {
-    let s = startup();
-    // SAFETY: args_len bytes at `args` (kernel-written, NUL-terminated copy).
-    unsafe { core::slice::from_raw_parts(s.args as *const u8, s.args_len as usize) }
+pub fn text(b: &[u8]) -> &str {
+    core::str::from_utf8(b).unwrap_or("?")
 }
 
 /// The `n`-th space-separated word of `s` (empty if there is none).
@@ -112,23 +76,24 @@ pub fn parse_u(s: &[u8]) -> u64 {
     s.iter().take_while(|c| c.is_ascii_digit()).fold(0u64, |v, &c| v.saturating_mul(10).saturating_add(u64::from(c - b'0')))
 }
 
-pub fn text(b: &[u8]) -> &str {
-    core::str::from_utf8(b).unwrap_or("?")
+/// The program to run: the image handed over (`tool::TAG_IMAGE`), else the embedded program
+/// named `name`.
+pub fn find_image(name: &[u8]) -> Option<Handle> {
+    match libd::startup_handle(tool::TAG_IMAGE) {
+        0 => libd::find_program(name),
+        h => Some(h),
+    }
 }
 
-/// The embedded program named `name` (a PROGRAM VMO, found by object name).
-pub fn find_program(name: &[u8]) -> Option<sys::Handle> {
-    let mut buf = [0u8; 64];
-    startup_handles().filter(|&(_, t)| t == sys::TAG_PROGRAM).map(|(h, _)| h).find(|&h| {
-        let n = sys::object_name(h, &mut buf);
-        n >= 0 && n as usize == name.len() && buf[..name.len()] == *name
-    })
+/// Was the program handed over as a file (not embedded, so not trusted as a program yet)?
+pub fn tool_image() -> bool {
+    libd::startup_handle(tool::TAG_IMAGE) != 0
 }
 
 /// Names of every embedded program (for the fuzzer).
-pub fn programs(mut f: impl FnMut(sys::Handle, &[u8])) {
+pub fn programs(mut f: impl FnMut(Handle, &[u8])) {
     let mut buf = [0u8; 64];
-    for (h, t) in startup_handles() {
+    for (h, t) in libd::startup_handles() {
         if t == sys::TAG_PROGRAM {
             let n = sys::object_name(h, &mut buf);
             if n > 0 && (n as usize) <= buf.len() {
@@ -138,18 +103,15 @@ pub fn programs(mut f: impl FnMut(sys::Handle, &[u8])) {
     }
 }
 
-/// Read a whole program VMO into a fresh mapping (at most `max` bytes).
-pub fn read_program(h: sys::Handle, max: u64) -> Result<(sys::Mapping, usize), i64> {
-    let size = sys::vmo_size(h);
-    if size < 0 {
-        return Err(size);
-    }
-    let size = size as u64;
+/// Read a whole image VMO (at most `max` bytes).
+pub fn read_image(h: Handle, max: u64) -> Result<Vec<u8>, i64> {
+    let size = sys::vmo_size(h)?;
     if size == 0 || size > max {
-        return Err(-7); // OUT_OF_RANGE
+        return Err(sys::ERR_OUT_OF_RANGE);
     }
-    let mut m = sys::Mapping::new(root_vmar(), size)?;
-    let buf = &mut m.bytes()[..size as usize];
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(size as usize).map_err(|_| sys::ERR_NO_MEMORY)?;
+    buf.resize(size as usize, 0);
     let mut off = 0usize;
     while off < buf.len() {
         let n = (buf.len() - off).min(64 * 1024);
@@ -159,33 +121,48 @@ pub fn read_program(h: sys::Handle, max: u64) -> Result<(sys::Mapping, usize), i
         }
         off += n;
     }
-    Ok((m, size as usize))
+    Ok(buf)
 }
 
-extern "C" fn dcmpl_entry(s: *const Startup) -> ! {
-    // SAFETY: the kernel passes its startup block in RDI; checked before any other use.
-    let ok = !s.is_null() && unsafe { (*s).magic == sys::STARTUP_MAGIC && (*s).abi_version >= sys::ABI_VERSION };
-    if !ok {
-        sys::process_exit(-1);
+/// The wall clock the spawner handed over (`tool::TAG_TIME_BASE`: wall ns since 2000, monotonic ns).
+fn set_time_base() {
+    let v = libd::startup_handle(tool::TAG_TIME_BASE);
+    let mut b = [0u8; 16];
+    if v != 0 && sys::vmo_read(v, 0, &mut b) == 0 {
+        let wall = i64::from_le_bytes(b[..8].try_into().unwrap_or([0; 8]));
+        let mono = u64::from_le_bytes(b[8..].try_into().unwrap_or([0; 8]));
+        if wall != 0 {
+            libd::time::set_base(&libd::time::Base { wall: libd::time::Time(wall), mono, source: 0 });
+        }
     }
-    STARTUP.store(s as u64, Ordering::Relaxed);
-    ROOT_VMAR.store(startup_handle(sys::TAG_VMAR_ROOT), Ordering::Relaxed);
-    out::set_log(startup_handle(sys::TAG_LOG));
-    let a = args();
+}
+
+/// Wall-clock time in ns since 2000-01-01 UTC; without a clock, the time since boot counted from
+/// 2000-01-01 (so it still advances).
+pub fn wall_ns() -> i64 {
+    match libd::time::now() {
+        libd::time::Time(0) => sys::clock_ns() as i64,
+        t => t.0,
+    }
+}
+
+fn main(s: *const Startup) -> i32 {
+    // SAFETY: `s` is the startup block the kernel passed to the entry point.
+    if !unsafe { libd::init(s, "dcmpl") } {
+        return EXIT_USAGE;
+    }
+    set_time_base();
+    path::init();
+    let a = libd::args();
     let code = match word(a, 0) {
-        b"win" => win::run(word(a, 1)),
+        b"win" => win::run(word(a, 1), rest(a, 2)),
         b"linux" => linux::run(word(a, 1), rest(a, 1)),
         b"pefuzz" => fuzz::run(parse_u(word(a, 1))),
         _ => {
-            println!("dcmpl: usage: win <exe> | linux <elf> [args] | pefuzz <rounds> (got '{}')", text(a));
+            println!("dcmpl: usage: win <exe> [args] | linux <elf> [args] | pefuzz <rounds> (got '{}')", text(a));
             EXIT_USAGE
         }
     };
-    sys::process_exit(code)
-}
-
-#[panic_handler]
-fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
-    println!("dcmpl: PANIC: {}", info);
-    sys::process_exit(127)
+    out::flush_all();
+    code
 }

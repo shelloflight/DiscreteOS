@@ -1,64 +1,62 @@
-//! Output to the debug log (the LOG startup handle): `println!` formats into a small buffer and
-//! writes it with one log_write per line (lines are not interleaved with other processes').
+//! The foreign program's console output: standard output and standard error as text, line by
+//! line, to the output channel the spawner gave (`tool::TAG_OUTPUT`, the shell shows it) or else
+//! to the log. A partial line waits for its end (or `flush_all`, at exit), so lines from several
+//! threads are not cut into each other.
 
-use core::fmt::{self, Write};
-use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::vec::Vec;
 
-use crate::sys;
+use libd::rec;
+use libd::sync::Mutex;
 
-static LOG: AtomicU32 = AtomicU32::new(0);
-
-pub fn set_log(h: sys::Handle) {
-    LOG.store(h, Ordering::Relaxed);
+struct Sink {
+    pending: Vec<u8>,
+    out: Option<rec::Out>,
 }
 
-pub fn log() -> sys::Handle {
-    LOG.load(Ordering::Relaxed)
-}
+static SINK: Mutex<Sink> = Mutex::new(Sink { pending: Vec::new(), out: None });
 
-pub struct Out {
-    buf: [u8; 512],
-    n: usize,
-}
+/// Longest line kept back before it is sent anyway.
+const MAX_LINE: usize = 4096;
 
-impl Out {
-    pub const fn new() -> Out {
-        Out { buf: [0; 512], n: 0 }
+fn send(s: &mut Sink, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
     }
-    pub fn flush(&mut self) {
-        if self.n > 0 && log() != 0 {
-            sys::log_write(log(), &self.buf[..self.n]);
+    let out = s.out.get_or_insert_with(rec::Out::startup);
+    if out.is_connected() {
+        out.text(&alloc::string::String::from_utf8_lossy(bytes));
+    } else {
+        let log = libd::startup_handle(libd::sys::TAG_LOG);
+        if log != 0 {
+            libd::sys::log_write(log, bytes);
         }
-        self.n = 0;
     }
 }
 
-impl Default for Out {
-    fn default() -> Self {
-        Out::new()
+/// Text written by the program (any thread). Complete lines go out at once.
+pub fn write(bytes: &[u8]) {
+    let mut s = SINK.lock();
+    if s.pending.try_reserve(bytes.len()).is_err() {
+        return;
+    }
+    s.pending.extend_from_slice(bytes);
+    if let Some(last) = s.pending.iter().rposition(|&c| c == b'\n') {
+        let rest = s.pending.split_off(last + 1);
+        let lines = core::mem::replace(&mut s.pending, rest);
+        send(&mut s, &lines);
+    }
+    if s.pending.len() > MAX_LINE {
+        let p = core::mem::take(&mut s.pending);
+        send(&mut s, &p);
     }
 }
 
-impl Write for Out {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for &b in s.as_bytes() {
-            if self.n == self.buf.len() {
-                self.flush();
-            }
-            self.buf[self.n] = b;
-            self.n += 1;
-        }
-        Ok(())
+/// Send what is pending (a last line without its end).
+pub fn flush_all() {
+    let mut s = SINK.lock();
+    let p = core::mem::take(&mut s.pending);
+    send(&mut s, &p);
+    if let Some(o) = s.out.as_mut() {
+        o.flush();
     }
-}
-
-pub fn print(args: fmt::Arguments<'_>) {
-    let mut o = Out::new();
-    let _ = o.write_fmt(args);
-    o.flush();
-}
-
-#[macro_export]
-macro_rules! println {
-    ($($t:tt)*) => { $crate::out::print(format_args!("{}\n", format_args!($($t)*))) };
 }

@@ -75,6 +75,11 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   manager, and jobs), `objects [job | service]` (handles held, through `process_handles`),
   `end`/`restart` (services through the manager), `log [source]`, `time`, `power off | restart`
   (the manager stops every service cleanly first), `clear`, `run <tool> [arguments]`.
+- **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
+  (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place
+  (with the session's rights there) as its working directory, an output channel and the wall
+  clock, and nothing else ([compat.md](compat.md#running-a-program)). Its output shows like a
+  tool's text.
 
 ## Tools and declared rights
 

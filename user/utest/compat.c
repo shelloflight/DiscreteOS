@@ -8,6 +8,11 @@
  *     native one, a non-PE is refused by its header;
  *   - L1: the static Linux l1 runs under the Linux server (exit 0), an unsupported syscall gets
  *     -ENOSYS, a fault is reported and kills it, a non-ELF is refused;
+ *   - W2: w2.exe, built with MSVC's static C runtime, runs its checks (heap, threads, TLS, FLS,
+ *     command line, environment, SEH, C++ exceptions, time) with exit code 0; an access violation
+ *     nobody handles ends it like a native fault;
+ *   - L2: the static Linux l2 runs its checks (mmap/brk, clone threads with TLS and a futex lock,
+ *     futex timeouts, signal handlers, time, fork refused) with exit code 0;
  *   - benchmarks (PE load, forwarded Linux syscall) and PE parser fuzzing.
  */
 
@@ -76,15 +81,23 @@ static void test_start_exception(void)
     dos_handle_close(exc);
     EXPECT(wait_exit(p, S30), DOS_EXIT_FAULT);
     dos_handle_close(ch);
+    /* ABI v10 (the Linux server's mmap and clone): a process's root VMAR; a stopped thread needs
+     * someone to start it (the process's exception channel). */
+    int64_t v = dos_process_vmar(self_proc);
+    CHECK(v > 0);
+    if (v > 0)
+        dos_handle_close((dos_handle_t)v);
+    EXPECT(dos_process_vmar(0x7FFFFFF0u), DOS_ERR_BAD_HANDLE);
+    EXPECT(dos_thread_create_stopped(self_proc, 0x400000, 0x400000, 0), DOS_ERR_BAD_STATE);
     dos_printf("utest: compat: start exception (stopped before the first instruction, memory and "
-               "registers set, kill, unresolved = kill)\n");
+               "registers set, kill, unresolved = kill); process_vmar, thread_create_stopped\n");
 }
 
 /* Run "dcmpl <args>" as a process named `pname`, with the log, VMEX and every program image (as
  * init gives them to programs it trusts). Returns its exit code. */
 static int64_t run_dcmpl(const char *pname, const char *args)
 {
-    struct dos_spawn_handle hs[64];   /* the log, VMEX and every program (29 today) */
+    struct dos_spawn_handle hs[64];   /* the log, VMEX and every program (31 today) */
     uint32_t nh = 0;
     dos_handle_t image = 0;
     char buf[32];
@@ -138,6 +151,11 @@ void test_compat(void)
     EXPECT(run_dcmpl("l1", "linux l1 fault"), DOS_EXIT_FAULT);
     EXPECT(run_dcmpl("l1", "linux w1.exe"), REFUSED);       /* a PE is not an ELF */
     EXPECT(run_dcmpl("l1", "linux l1 bench 5000"), 0);
+
+    /* W2 and L2: programs on their runtimes (files are tested from the shell, which has disks). */
+    EXPECT(run_dcmpl("w2.exe", "win w2.exe alpha beta"), 0);
+    EXPECT(run_dcmpl("w2.exe", "win w2.exe fault"), DOS_EXIT_FAULT);
+    EXPECT(run_dcmpl("l2", "linux l2"), 0);
 
     /* The PE parser against mutated images. */
     EXPECT(run_dcmpl("dcmpl", "pefuzz 20000"), 0);

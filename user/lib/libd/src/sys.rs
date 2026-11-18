@@ -79,7 +79,7 @@ pub const TAG_KLOG: u32 = 11;
 pub const TAG_BOOT_TIME: u32 = 12;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 9;
+pub const ABI_VERSION: u32 = 10;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -97,6 +97,8 @@ pub const EXC_SYSCALL: u32 = 2;
 pub const EXC_START: u32 = 3;
 pub const EXC_RESUME: u32 = 0;
 pub const EXC_KILL: u32 = 1;
+/// ABI v10: end only the stopped thread.
+pub const EXC_EXIT_THREAD: u32 = 2;
 
 pub const BASE_FS: u32 = 0;
 pub const BASE_GS: u32 = 1;
@@ -174,8 +176,10 @@ pub mod nr {
     pub const LOG_RECORD: u64 = 66;
     pub const DISPLAY_INFO: u64 = 67;
     pub const PROCESS_HANDLES: u64 = 68;
+    pub const PROCESS_VMAR: u64 = 69;
+    pub const THREAD_CREATE_STOPPED: u64 = 70;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 69;
+    pub const COUNT: u64 = 71;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -705,6 +709,14 @@ pub fn spawn_raw(s: &Spawn) -> Result<Handle, i64> {
 pub fn port_cancel(port: Handle, h: Handle, key: u64) -> i64 {
     sc(nr::PORT_CANCEL, u64::from(port), u64::from(h), key, 0, 0, 0)
 }
+/// ABI v10: the root VMAR of `proc` (MANAGE).
+pub fn process_vmar(proc: Handle) -> Result<Handle, i64> {
+    hres(sc(nr::PROCESS_VMAR, u64::from(proc), 0, 0, 0, 0, 0))
+}
+/// ABI v10: a thread in `proc` that stops with a START exception before its first instruction.
+pub fn thread_create_stopped(proc: Handle, entry: u64, stack_top: u64, arg: u64) -> Result<Handle, i64> {
+    hres(sc(nr::THREAD_CREATE_STOPPED, u64::from(proc), entry, stack_top, arg, 0, 0))
+}
 pub fn process_exception_channel(proc: Handle) -> Result<Handle, i64> {
     hres(sc(nr::PROCESS_EXCEPTION_CHANNEL, u64::from(proc), 0, 0, 0, 0, 0))
 }
@@ -716,7 +728,7 @@ pub fn exception_get_regs(e: Handle) -> Result<Regs, i64> {
 pub fn exception_set_regs(e: Handle, r: &Regs) -> i64 {
     sc(nr::EXCEPTION_SET_REGS, u64::from(e), r as *const Regs as u64, 0, 0, 0, 0)
 }
-/// `EXC_RESUME`, or `EXC_KILL` with exit `code`.
+/// `EXC_RESUME`, or `EXC_KILL` (the process) / `EXC_EXIT_THREAD` (this thread) with exit `code`.
 pub fn exception_resume(e: Handle, action: u32, code: i32) -> i64 {
     sc(nr::EXCEPTION_RESUME, u64::from(e), u64::from(action), code as i64 as u64, 0, 0, 0)
 }
