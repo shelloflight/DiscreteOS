@@ -30,6 +30,7 @@ void rust_ktest_panic(void);      /* KTEST_RUSTPANIC: fails a kassert! */
 void rust_bench_box(void *ctx);   /* KTEST_BENCH */
 void rust_bench_spinlock(void *ctx);
 void rust_bench_klog(void *ctx);
+void channel_call_stats(uint64_t *calls, uint64_t *moved);   /* channel calls since boot; how many changed CPU */
 void rust_bench_spawn(void *ctx);
 uint32_t rust_objects_test(void); /* KTEST_OBJECTS: returns the number of failures */
 void rust_bench_objects_init(void);

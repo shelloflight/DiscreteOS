@@ -11,7 +11,8 @@
 //! - Calls (`call`): synchronous request/reply. The kernel gives the request a transaction id (its
 //!   first 4 bytes) and routes the reply, the first message coming back with that id, straight to
 //!   the waiting caller instead of the queue. Both directions wake the other side on this CPU
-//!   (`update_sync`), so a call is a direct switch to the server and back, with no IPI.
+//!   (`update_sync`), reserved for it until the waker blocks (the scheduler's handoff window:
+//!   idle CPUs may not take it), so a call is a direct switch to the server and back, with no IPI.
 //! - Cycles: a channel cannot carry its own endpoint or its peer (refused at write). Longer cycles
 //!   through several channels (A's end queued in B, B's end queued in A, every outside handle
 //!   closed) are found and broken by [`collect_cycles`], which runs whenever a process exits
@@ -67,6 +68,18 @@ struct Call {
     txid: u32,
     done: KRef<AtomicBool>,
     reply: Option<Message>,
+    /// The CPU the caller sent from, and the one the reply was written on (statistics).
+    cpu: u32,
+    reply_cpu: u32,
+}
+
+unsafe extern "C" {
+    fn sched_cpu_id() -> u32;
+}
+
+fn cpu_id() -> u32 {
+    // SAFETY: reads this CPU's id (GS-relative); no other effect.
+    unsafe { sched_cpu_id() }
 }
 
 struct Queue {
@@ -127,6 +140,8 @@ impl From<Status> for ReadError {
 }
 
 static CALLS: AtomicU32 = AtomicU32::new(0);
+/// Calls whose server ran, or whose caller resumed, on another CPU than the call was made on.
+static CALLS_MOVED: AtomicU32 = AtomicU32::new(0);
 
 // ---- cycle collection -------------------------------------------------------------------------
 //
@@ -319,6 +334,7 @@ impl ChannelObj {
             && let Some(c) = q.calls.iter_mut().find(|c| c.txid == t && c.reply.is_none()) {
                 moved(&msg);
                 c.reply = Some(msg);
+                c.reply_cpu = cpu_id();
                 c.done.store(true, Ordering::Release);
                 self.peer.signals.wake(true); // the server goes back to read: run the caller here
                 return Ok(());
@@ -400,12 +416,12 @@ impl ChannelObj {
             }
             let t = TXID_BIT | (q.next_txid & !TXID_BIT);
             q.next_txid = q.next_txid.wrapping_add(1);
-            q.calls.push(Call { txid: t, done: done.clone(), reply: None });
+            q.calls.push(Call { txid: t, done: done.clone(), reply: None, cpu: cpu_id(), reply_cpu: u32::MAX });
             t
         };
         msg.data[..4].copy_from_slice(&txid.to_le_bytes());
         if let Err((e, m)) = self.write_with(msg, true) {
-            self.take_call(txid);
+            self.take_call(txid, false);
             return Err((e, Some(m)));
         }
         CALLS.fetch_add(1, Ordering::Relaxed);
@@ -414,7 +430,7 @@ impl ChannelObj {
             || done.load(Ordering::Acquire) || self.me.peer_gone.load(Ordering::Acquire),
             deadline,
         );
-        let reply = self.take_call(txid);
+        let reply = self.take_call(txid, true);
         match (reply, r) {
             (Some(m), _) => Ok(m),
             (None, Err(e)) => Err((e, None)),
@@ -423,10 +439,15 @@ impl ChannelObj {
     }
 
     /// Remove a call slot; its reply, if one came.
-    fn take_call(&self, txid: u32) -> Option<Message> {
+    /// Remove a call slot; its reply, if one came. `count`: a finished call (statistics).
+    fn take_call(&self, txid: u32, count: bool) -> Option<Message> {
         let mut q = self.me.q.lock();
         let i = q.calls.iter().position(|c| c.txid == txid)?;
-        q.calls.swap_remove(i).reply
+        let c = q.calls.swap_remove(i);
+        if count && c.reply.is_some() && (c.reply_cpu != c.cpu || cpu_id() != c.cpu) {
+            CALLS_MOVED.fetch_add(1, Ordering::Relaxed);
+        }
+        c.reply
     }
 
     /// Messages waiting at this end (inspection, tests).
@@ -438,6 +459,23 @@ impl ChannelObj {
 /// Number of channel calls made since boot (inspection).
 pub fn calls_made() -> u32 {
     CALLS.load(Ordering::Relaxed)
+}
+
+/// Channel calls since boot, and how many of them involved another CPU (the server ran there, or
+/// the caller resumed there): the benchmark image reports it.
+///
+/// # Safety
+/// `calls` and `moved` must be valid, writable pointers (or NULL: nothing is written).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn channel_call_stats(calls: *mut u64, moved: *mut u64) {
+    if calls.is_null() || moved.is_null() {
+        return;
+    }
+    // SAFETY: the caller passes two valid, writable pointers (checked for NULL above).
+    unsafe {
+        *calls = u64::from(CALLS.load(Ordering::Relaxed));
+        *moved = u64::from(CALLS_MOVED.load(Ordering::Relaxed));
+    }
 }
 
 impl Drop for ChannelObj {

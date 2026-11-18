@@ -160,11 +160,13 @@ static struct thread *rq_pop(struct runqueue *rq)
 /* Highest-priority queued thread that may run on `cpu` (for stealing), unlinked; NULL if none. */
 static struct thread *rq_take_for(struct runqueue *rq, uint32_t target)
 {
+    uint64_t now = time_ns();
     for (uint32_t bm = rq->bitmap; bm; ) {
         unsigned p = 31u - (unsigned)__builtin_clz(bm);
         struct thread *prev = NULL;
         for (struct thread *t = rq->head[p]; t; prev = t, t = t->rq_next) {
-            if (!(t->affinity & THREAD_CPU(target)) || __atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE))
+            if (!(t->affinity & THREAD_CPU(target)) || __atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE) ||
+                now < t->handoff_until)
                 continue;
             if (prev)
                 prev->rq_next = t->rq_next;
@@ -271,13 +273,21 @@ static uint32_t select_cpu(const struct thread *t)
     return (allowed & THREAD_CPU(last)) ? last : (uint32_t)__builtin_ctzll(allowed);
 }
 
+/* A thread handed off by a synchronous wake stays reserved for this CPU this long: the waker
+ * blocks within a few hundred ns. Without it, an idle CPU steals the thread in that gap and every
+ * cross-process call pays two cross-CPU wake-ups. If the waker keeps running, the thread runs here
+ * at its next switch, or anywhere once this has passed. */
+#define HANDOFF_NS 20000u
+
 /* Queue a thread this caller owns (state WAKING) on a suitable CPU, preempting if it should run now.
  * `sync`: the waker is about to block, so queue it here (if allowed) and let the waker's own
  * switch pick it: a direct switch, no IPI, warm caches for the message just passed. */
 static void enqueue_woken(struct thread *t, bool sync)
 {
     uint32_t me = percpu_cpu_id();
-    uint32_t target = (sync && (allowed_cpus(t) & THREAD_CPU(me))) ? me : select_cpu(t);
+    bool here = sync && (allowed_cpus(t) & THREAD_CPU(me));
+    uint32_t target = here ? me : select_cpu(t);
+    t->handoff_until = here ? time_ns() + HANDOFF_NS : 0;
     if (target != t->cpu) {
         /* It may still be switching out on its old CPU: its stack is in use until on_cpu clears. */
         while (__atomic_load_n(&t->on_cpu, __ATOMIC_ACQUIRE)) {
@@ -441,6 +451,7 @@ static void switch_locked(struct percpu *pc)
     if (!next)
         next = pc->idle;
     set_state(next, THREAD_RUNNING);
+    next->handoff_until = 0;
     pc->need_resched = 0;
     if (next == prev) {
         update_slice(pc, 0);
@@ -626,6 +637,7 @@ int sched_block(spinlock_t *held, uint64_t flags, uint64_t deadline_ns)
 
 bool sched_wake(struct thread *t, int result) { return wake_thread(t, result); }
 bool sched_wake_sync(struct thread *t, int result) { return wake_thread_sync(t, result); }
+uint32_t sched_cpu_id(void) { return percpu_cpu_id(); }
 
 /* ---- thread API ---------------------------------------------------------------------------- */
 

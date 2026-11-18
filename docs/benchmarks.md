@@ -24,8 +24,8 @@ benchmarks run before `init`; lock-order checking is off so lock costs match rel
 
 | Group | Benchmarks |
 |---|---|
-| Kernel | slab and guard-paged allocation, page frames, Rust `Box`; spinlocks, mutex, Rust `SpinLock`; `time_ns`; yield and semaphore round trips (same CPU, cross-CPU); thread create/join; handle lookup/duplicate/close; events; VMO create; map/unmap with TLB shootdown on every CPU |
-| User (ring 3, real syscall path) | null syscall; event signal/wait/clear; handle duplicate/close; VMO create/map/touch/unmap; channel write/read; cross-process channel call; channel throughput (64 KiB messages); port batch; forwarded syscall |
+| Kernel | slab and guard-paged allocation, page frames, Rust `Box`; spinlocks, mutex, Rust `SpinLock`; `time_ns`; yield and semaphore round trips (same CPU, cross-CPU); thread create/join; handle lookup/duplicate/close; events; VMO create; map/unmap with TLB shootdown on every CPU; the parts of a process switch (CR3 reload, FPU state, IBPB) |
+| User (ring 3, real syscall path) | null syscall; event signal/wait/clear; handle duplicate/close; VMO create/map/touch/unmap; channel write/read; cross-process channel call (and how many calls since boot involved another CPU); channel throughput (64 KiB messages); port batch; forwarded syscall |
 | Storage | sequential read throughput and random 4 KiB read latency on the largest file of each volume |
 
 Kernel lines show the best batch of 64 (steady state) and the mean, in cycles and ns. `TSC: N MHz`
@@ -66,8 +66,15 @@ Ryzen 9 9900X (24 threads, TSC 4392 MHz), 32 GiB, NVMe; AutoIBRS, no KPTI.
 
 Channel throughput: 12.5 GB/s. Boot: about 85 ms for D-OS's own part (loader + kernel init).
 
-Known slow spots, good places to contribute: the cross-process call. It already runs on one CPU
-(the server is woken on the caller's CPU and the caller hands over to it); its cost is the two
-process switches. The kernel benchmark prints their parts (`switch part:` CR3 reload, FPU state,
-IBPB): on CPUs with IBPB, the barrier at every switch between processes is the likely largest.
-File reads of 32 KiB and more are bound by one driver request per 32 KiB.
+Process switch parts on the 9900X (before the call handoff below): CR3 reload 90 ns, FPU state save
+and restore (2432 bytes, AVX-512) 98 ns, IBPB 155 ns. A cross-process call makes two switches:
+0.7 µs of its 3.7 µs. The rest is most likely the call crossing CPUs: an idle CPU took the woken
+server before the caller had blocked (a cross-CPU wake-up costs about 1 µs here).
+
+**Call handoff:** a thread woken by a synchronous call (or its reply) is queued on the waker's CPU
+and reserved for it for 20 µs: no other CPU may take it in that time. The waker blocks within
+nanoseconds and switches straight to it. `channel calls that involved another CPU` shows whether
+calls stayed on one CPU.
+
+Known slow spots, good places to contribute: file reads of 32 KiB and more are bound by one driver
+request per 32 KiB (a channel message); larger requests need memory shared with the drivers.

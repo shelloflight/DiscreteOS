@@ -97,6 +97,8 @@ struct thread {
 
     uint64_t           runtime_ns, switched_in_ns, switches;
     uint64_t           woken_ns;       /* when it last became ready (wake-to-run latency) */
+    uint64_t           handoff_until;  /* woken by a waker about to block here: no other CPU may
+                                        * take it before this time (ns; 0 = none) */
 #ifdef KTEST
     uint32_t           fault_kinds;    /* fault injection (fault.h) */
     bool               fault_fired;
@@ -204,6 +206,7 @@ bool sched_wake(struct thread *t, int result);
 /* sched_wake for a waker that is about to block: queue `t` on this CPU if its affinity allows,
  * without preempting the waker (it gives the CPU up itself). The IPC fast path's direct switch. */
 bool sched_wake_sync(struct thread *t, int result);
+uint32_t sched_cpu_id(void);                   /* the CPU the caller runs on */
 /* Timeout of a sleep or wait (wait.c): takes the thread off its wait queue and wakes it. */
 void wait_timeout_cb(struct ktimer *tm, void *thread);
 

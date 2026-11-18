@@ -1398,6 +1398,9 @@ static void show(const struct klog_entry *e, size_t skip)
 void ktest_after_init(int code)
 {
     static const char *const head[] = { "D-KRNL ", "Summary: ", "TSC: ", "Boot: ", "D-KRNL: ready" };
+    uint64_t calls = 0, moved = 0;
+    channel_call_stats(&calls, &moved);
+    kprintf("BENCH user: channel calls that involved another CPU: %llu of %llu\n", (unsigned long long)moved, (unsigned long long)calls);
     struct klog_entry e;
     uint64_t seq = 0;
     unsigned n = 0;
