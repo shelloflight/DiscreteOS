@@ -1,0 +1,17 @@
+# `dosimg`: host tool that makes and inspects D-OS disk images with the OS's own storage code
+# (user/lib/fs). Built by build.ps1 for the host (std).
+[package]
+name = "dosimg"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+dosfs = { path = "../../user/lib/fs" }
+doscrypt = { path = "../../user/lib/crypto" }
+
+[profile.release]
+opt-level = 2
+debug = false
+overflow-checks = true

@@ -1,0 +1,23 @@
+# `dosfs`: storage code shared by the storage service (user/storaged), the host image tool
+# (tools/dosimg) and host tests: BLAKE3, block devices, GPT, FAT32, DFS.
+# no_std + alloc, no dependencies (CONTRIBUTING.md, "Dependencies"). A library, never built on its
+# own by build.ps1 except for `cargo test` on the host (build.ps1 test, case "storage-host").
+[package]
+name = "dosfs"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"

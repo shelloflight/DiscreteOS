@@ -1,0 +1,21 @@
+# `doscrypt`: D-OS signing and measurement crypto: SHA-256, SHA-512, Ed25519 (RFC 8032)
+# and the `.dsig` signature format. Shared by the kernel (verification, measured boot), the host tool
+# (tools/dosimg: key generation, signing) and later D-PACK. no_std, no dependencies (CONTRIBUTING.md,
+# "Dependencies"). The boot loaders verify with their own C implementation (boot/common), which
+# the tests cross-check against this one.
+[package]
+name = "doscrypt"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+
+[profile.test]
+opt-level = 2
+overflow-checks = true

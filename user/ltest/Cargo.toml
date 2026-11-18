@@ -1,0 +1,37 @@
+# libd tests: run by init ("run ltest", test case `libd`). Owned handles, the heap under
+# many threads, threads and their guarded stacks, mutexes, channels, the C API (ctest.dx). See src/lib.rs.
+# Linked by build.ps1 (ld.lld, static PIE) like the other ring-3 programs.
+[package]
+name = "ltest"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = true
+debug-assertions = false
+incremental = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

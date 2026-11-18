@@ -1,0 +1,39 @@
+# D-KRNL Rust part: a static library linked into the kernel by LLD next to the C objects.
+# Supply-chain policy (CONTRIBUTING.md, "Dependencies"): no external dependencies (in-tree crates only). Any future crate must be
+# no_std, vendored, MIT/Apache/BSD/Zlib licensed, and checked with cargo-deny + cargo-vet.
+[package]
+name = "dkrnl"
+version = "0.13.8"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+# In-tree only: the D-OS crypto crate (SHA-2, Ed25519, .dsig), shared with the host tools.
+doscrypt = { path = "../../user/lib/crypto" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2           # matches the C kernel's -O2
+lto = true
+codegen-units = 1
+debug = "line-tables-only"  # backtraces resolve with llvm-symbolizer; not part of the flat image
+overflow-checks = true  # Secure: integer overflow in kernel Rust panics instead of wrapping
+debug-assertions = false
+incremental = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ktest, ktest_selftest, ktest_rustpanic, ktest_bench, ktest_hwbench, ktest_poweroff, ktest_reboot, ktest_panic, ktest_stackprot, ktest_pagefault, ktest_doublefault, ktest_nx, ktest_wx, ktest_nullderef, ktest_stackguard, ktest_doublefree, ktest_uaf, ktest_heapguard, ktest_deadlock, ktest_lockorder, ktest_sched, ktest_threadguard, ktest_mutexdeadlock, ktest_atomicsleep, ktest_smp, ktest_lockup, ktest_softlockup, ktest_soak, ktest_objects, ktest_ubsan, ktest_ubsantrap, ktest_faultinject, ktest_user, ktest_fuzz, ktest_smap, ktest_smep, ktest_compat)'] }
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

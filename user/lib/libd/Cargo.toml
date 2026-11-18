@@ -1,0 +1,46 @@
+# `libd`: the D-OS user runtime, the one library every ring-3 program is built on. The complete
+# ABI (docs/abi.md) as raw syscalls, owned handles, the startup block, the debug log, a heap that
+# is safe for many threads, threads with guarded stacks, locks, channels and ports, files as handles
+# and the device-manager protocol. A C binding of the same runtime is in user/include/libd.h.
+# no_std, no dependencies (CONTRIBUTING.md, "Dependencies").
+#
+# Linked into the program crates that use it (devmgr, storaged, fstest, ltest). build.ps1 also
+# builds it on its own as a static library with feature `capi` for C programs that include libd.h.
+[package]
+name = "libd"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+
+[features]
+# The global allocator (heap.rs) and everything that needs it: threads, `alloc` collections.
+alloc = []
+# The C API (capi.rs, user/include/libd.h): exported `libd_*` functions for C programs.
+capi = ["alloc"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = true
+debug-assertions = false
+incremental = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

@@ -1,0 +1,33 @@
+# Build output
+build/
+
+# Intermediate / binary artifacts
+*.o
+*.obj
+*.bin
+*.elf
+*.img
+*.iso
+*.map
+*.log
+
+# Editor / OS
+.vscode/
+.vs/
+*.swp
+Thumbs.db
+.DS_Store
+
+# Rust (cargo output goes to build/; the lock file is committed)
+kernel/rust/target/
+user/*/target/
+user/lib/*/target/
+tools/*/target/
+
+# Maintainer-only files (kept locally, not part of the public repository)
+AGENTS.md
+PLAN.md
+CHANGELOG.md
+GATE-1.0.md
+tools/changelog.ps1
+.claude/

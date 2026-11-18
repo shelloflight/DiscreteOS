@@ -1,0 +1,39 @@
+# D-CMPL proofs: a ring-3 Rust program embedded in the image like init.
+#   win <exe>          PE32+ loader + minimal kernel32: runs a Windows program in this process
+#   linux <elf> [args] Linux server: supervises a FORWARD process and serves its syscalls
+#   pefuzz <rounds>    mutates every embedded .exe and runs it through the PE parser and binder
+# Linked by build.ps1 (ld.lld, static PIE) like the C programs. No dependencies (same policy as
+# kernel/rust: CONTRIBUTING.md, "Dependencies").
+[package]
+name = "dcmpl"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = true  # Secure: parsers of foreign data panic (the process exits) instead of wrapping
+debug-assertions = false
+incremental = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

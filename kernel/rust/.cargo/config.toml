@@ -1,0 +1,13 @@
+[build]
+target = "x86_64-unknown-none"   # soft-float, no SSE/red zone: matches the C kernel's ABI
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=pie",     # position-independent like the C kernel (-fpie): KASLR
+    "-C", "code-model=kernel",       # matches the precompiled core/alloc (LTO); PIC code is RIP-relative anyway
+    "-C", "force-frame-pointers=yes", # the C panic backtrace walks through Rust frames
+    # Spectre v2: indirect branches through __x86_indirect_thunk_r11 (thunk.asm; patched to a plain
+    # `jmp r11` on eIBRS/AutoIBRS CPUs). Accepted with a warning (not a stable feature name yet);
+    # the precompiled core/alloc are not covered (docs/hardening.md).
+    "-C", "target-feature=+retpoline-indirect-calls,+retpoline-indirect-branches,+retpoline-external-thunk",
+]
