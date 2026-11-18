@@ -15,10 +15,31 @@ pub const TAG_CONTROL: u32 = crate::sys::TAG_USER;
 pub const READY: u32 = 1;
 /// Driver -> manager: a key; `a` = the character.
 pub const KEY: u32 = 2;
-/// Device manager -> each client of its `input` endpoint: a key typed. `a` = the character
-/// (US layout; `\n` Enter, 0x08 Backspace), `b` = which input device (an index); payload: the
-/// driver's name (`ps2`, `xhci`, `virtio-input`).
+/// Device manager -> each client of its `input` endpoint: a key typed. `a` = the key value
+/// (`key`: a character, US layout, or a named key with modifiers), `b` = which input device (an
+/// index); payload: the driver's name (`ps2`, `xhci`, `virtio-input`).
 pub const INPUT_KEY: u32 = 410;
+
+/// Key values (`KEY`, `INPUT_KEY`): below 0x100 a character (`\n` Enter, 0x08 Backspace, 0x1B
+/// Escape, `\t` Tab, Ctrl+letter its control character); from 0x100 a named key, with the
+/// modifier bits held when it was pressed.
+pub mod key {
+    pub const UP: u32 = 0x101;
+    pub const DOWN: u32 = 0x102;
+    pub const LEFT: u32 = 0x103;
+    pub const RIGHT: u32 = 0x104;
+    pub const HOME: u32 = 0x105;
+    pub const END: u32 = 0x106;
+    pub const PAGE_UP: u32 = 0x107;
+    pub const PAGE_DOWN: u32 = 0x108;
+    pub const INSERT: u32 = 0x109;
+    pub const DELETE: u32 = 0x10A;
+    pub const SHIFT: u32 = 1 << 16;
+    pub const CTRL: u32 = 1 << 17;
+    pub const ALT: u32 = 1 << 18;
+    /// The key without its modifiers.
+    pub const MASK: u32 = 0xFFFF;
+}
 /// Manager -> block driver: read `b` sectors from `a`; reply carries the data.
 pub const BLK_READ: u32 = 10;
 /// Manager -> block driver: write `b` sectors at `a` (data in the payload).

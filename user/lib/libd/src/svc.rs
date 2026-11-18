@@ -48,3 +48,17 @@ pub fn endpoint(name: &[u8]) -> Handle {
         .position(|n| n == name)
         .map_or(0, |i| crate::startup_handle(TAG_ENDPOINT + i as u32))
 }
+
+/// Requests on a manager channel (`grants.manager`, startup tag `tool::TAG_MANAGER`), as calls.
+/// The reply has the same op; `status` 0 or an error; payloads are UTF-8 or records (`rec`).
+/// - `MGR_LIST`: every service (records: name, state, starts, restarts, memory, handles,
+///   threads, description). Needs `services`.
+/// - `MGR_STOP`, `MGR_RESTART`: payload = a service name. Needs `services`.
+/// - `MGR_OBJECTS`: payload = a service name; reply: its handles (records). Needs `services`.
+/// - `MGR_POWER`: `a` = `sys::POWER_OFF` or `POWER_REBOOT`: a clean shutdown, then the power.
+///   Needs `power`.
+pub const MGR_LIST: u32 = 310;
+pub const MGR_STOP: u32 = 311;
+pub const MGR_RESTART: u32 = 312;
+pub const MGR_OBJECTS: u32 = 313;
+pub const MGR_POWER: u32 = 314;

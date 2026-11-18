@@ -20,6 +20,7 @@ C programs use the same code through `user/include/libd.h`.
 | `Port`, `Mapping`, `Dma` | async waits on many objects; VMOs mapped here; DMA pins |
 | `fs`, `proto` | files as handles and namespaces ([storage.md](storage.md)); the driver protocol |
 | `svc` | the service manager's protocol (`CONNECT`, `SYNC`, `SHUTDOWN`, `LOG_LEVEL`) and `endpoint(name)` ([services.md](services.md)) |
+| `rec`, `term`, `tool` | typed records (what shell commands exchange; `Out` for a program's output); the terminal's session protocol; how the shell starts a tool ([shell.md](shell.md)) |
 | `log`, `time` | the log service's records and reader; wall-clock time (`Time`, ns since 2000-01-01 UTC) and the clock service's client; levels: `log_warn!`, `log_error!`, `log_debug!` |
 | `capi` | the C binding (feature `capi`) |
 

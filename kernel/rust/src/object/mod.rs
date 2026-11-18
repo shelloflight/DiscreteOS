@@ -250,6 +250,17 @@ pub enum Object {
 }
 
 impl Object {
+    /// The object's name (processes, threads, VMOs, devices); "" for the others. Lock-free.
+    pub fn name(&self) -> &str {
+        match self {
+            Object::Process(p) => p.name(),
+            Object::Thread(t) => t.name(),
+            Object::Vmo(v) => v.name(),
+            Object::Device(d) => d.name(),
+            _ => "",
+        }
+    }
+
     pub fn obj_type(&self) -> ObjType {
         match self {
             Object::Process(_) => ObjType::Process,

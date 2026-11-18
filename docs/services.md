@@ -31,7 +31,9 @@ log = true
 devices = ["pci", "platform:ps2"]   # "all", "pci", "pci:CC[SS[PP]]", "platform:<name>"
 programs = ["*.ddrv"]       # program images, by name or "*.dx" / "*.ddrv"
 connect = ["storaged.disks"]
-namespace = ["/system=system:r"]   # /<path>=<volume>:r | rw | rwa
+namespace = ["/system=system:r"]   # /<path>=<volume>:r | rw | rwa; or ["*"] / ["*:r"]: every volume
+manager = ["services", "power"]     # a channel to the manager: list/stop/restart services; power
+tools = false               # the tool manifests and their programs (the shell; docs/shell.md)
 vmex = false
 power = false
 kernel-log = false          # the kernel log reader (the log service)
@@ -64,8 +66,8 @@ Two services with one name, an image that is not an embedded program, an `after`
 or a `connect` to an endpoint no accepted service provides: refused. A refusal takes the services
 needing it along.
 
-Every decision is **measured into PCR 10** (`measure`, ABI v7): `svc accept <name>` or
-`svc refuse <source>` with the manifest's SHA-256, so an attestation report shows what the system
+Every decision is **measured into PCR 10** (`measure`, ABI v7): `svc accept <name>`, `svc tool
+<name>` or `svc refuse <source>` with the manifest's SHA-256, so an attestation report shows what the system
 was configured to grant ([attestation.md](attestation.md)).
 
 ## What a service gets
@@ -77,7 +79,9 @@ was configured to grant ([attestation.md](attestation.md)).
 | `devices` | each device the selectors match (tag `DEVICE`) |
 | `programs` | each embedded program the names match (tag `PROGRAM`) |
 | `connect` | one channel per endpoint (`TAG_ENDPOINT + i`, names in the `TAG_ENDPOINT_NAMES` VMO; `libd::svc::endpoint`) |
-| `namespace` | each volume's root, narrowed to the rights granted, at its path ([storage.md](storage.md)) |
+| `namespace` | each volume's root, narrowed to the rights granted, at its path ([storage.md](storage.md)); `*`: every volume at `/<volume>`, with at most the rights the volume has |
+| `manager` | a channel to the manager (`tool::TAG_MANAGER`): `MGR_LIST`, `MGR_STOP`, `MGR_RESTART`, `MGR_OBJECTS` with `services`; `MGR_POWER` with `power` (a clean shutdown, then the power) |
+| `tools` | every accepted tool manifest (`tool::TAG_TOOL_MANIFEST`, read-only) and each tool's program |
 | `vmex`, `power` | the VMEX / POWER resource |
 | `kernel-log` | the KLOG resource (`klog_read`); the manager also sends it every service's `log-level` |
 | `boot-time` | the boot-time record (UEFI only) |
@@ -120,7 +124,8 @@ was configured to grant ([attestation.md](attestation.md)).
 | `clock` | log, the `rtc` device, boot time | `clock.time` |
 | `storaged` | log, `clock.time` (file times) | `storaged.disks`, volumes |
 | `devmgr` | log, every PCI device and `ps2`, the `*.ddrv` drivers, `storaged.disks` | `devmgr.input` |
-| `console` | log, `devmgr.input` | |
+| `terminal` | log, the `display` device, `devmgr.input` | `terminal.session` |
+| `shell` | log, `terminal.session`, `log.read`, `clock.time`, every volume, the manager (services, power), the tools | |
 
 ### The log service
 
@@ -145,8 +150,15 @@ it.
 ### Keyboard input
 
 The device manager sends every key from any keyboard driver to each client of `devmgr.input`
-(`proto::INPUT_KEY`: the character and the driver's name). The console service echoes them and
-reports each line; it will become the terminal.
+(`proto::INPUT_KEY`: a character or a named key with modifiers, and the driver's name). The
+terminal turns them into edited lines for the shell ([shell.md](shell.md)).
+
+### Tool manifests
+
+Manifests with `kind = "tool"` describe the shell's tools, not services ([shell.md](shell.md)).
+They are embedded like service manifests, parsed strictly (`dman::tool`), refused if their image is
+not an embedded program or a name or alias is taken, and measured (`svc tool <name>`). A service
+with `grants.tools` gets them all.
 
 ## Tests
 

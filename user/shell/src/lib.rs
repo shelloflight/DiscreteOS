@@ -1,0 +1,802 @@
+//! The shell (`shell.dx`, docs/shell.md): one session on the terminal.
+//!
+//! Commands exchange typed records (`libd::rec`), not byte streams; filters in plain words
+//! (`where size > 1M | sort modified | take 5`) work on them, and they become a table only at the
+//! end of the line. Built-in commands use the session's own grants (its manifest: every volume,
+//! the log, the clock, the service manager). Tools are separate programs with a manifest that
+//! declares their parameters: the shell resolves the paths typed and gives a tool exactly those
+//! nodes with exactly the declared rights, plus an output channel. A tool never gets the session's
+//! namespace, endpoints or any other handle of the shell.
+
+#![no_std]
+
+extern crate alloc;
+
+mod cmds;
+mod filter;
+mod parse;
+mod show;
+
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::mem::ManuallyDrop;
+
+use dman::tool::{ParamKind, Tool};
+use libd::fs::{self as fp, Namespace, Node};
+use libd::handle::Owned;
+use libd::proto::{self, HEADER, Header};
+use libd::rec::{self, Record};
+use libd::sys::{self, Handle, SpawnHandle};
+use libd::{Port, Startup, println, svc, term, tool};
+
+libd::entry!(_start, main);
+
+const KEY_TERM: u64 = 1;
+const KEY_CTL: u64 = 2;
+const KEY_JOB_OUT: u64 = 3;
+const KEY_JOB_END: u64 = 4;
+
+const MAX_JOBS: usize = 16;
+/// What a tool may use (its share of the session's own quota).
+const TOOL_LIMITS: sys::Limits = sys::Limits { memory: 16 << 20, handles: 128, threads: 4 };
+
+/// A granted directory at a path (`/data`), with the rights the session has on it.
+pub struct Place {
+    pub path: String,
+    pub h: Handle,
+    pub rights: u64,
+}
+
+/// What a command printed, in order.
+pub enum Item {
+    Text(String),
+    Error(String),
+}
+
+pub struct Job {
+    pub id: u32,
+    pub line: String,
+    pub name: String,
+    pub proc: Owned,
+    out: Owned,
+    /// Records collected (filtered and shown when the job ends).
+    pub records: Vec<Record>,
+    /// Text and errors not shown yet (background jobs, or waiting behind filters).
+    pub items: Vec<Item>,
+    pub filters: Vec<Vec<String>>,
+    pub background: bool,
+    pub started: u64,
+    /// The exit code once it ended.
+    pub code: Option<i64>,
+    /// An error was shown already (no second "exited with code" line).
+    pub said_error: bool,
+}
+
+pub struct Shell {
+    term: Handle,
+    pub cols: usize,
+    pub places: Vec<Place>,
+    /// The current place: an absolute path ("/" is the list of places).
+    pub place: String,
+    pub tools: Vec<Tool>,
+    pub mgr: Handle,
+    pub log: Handle,
+    pub clock: Handle,
+    pub jobs: Vec<Job>,
+    next_job: u32,
+    /// The job whose output the terminal is waiting for.
+    fg: Option<u32>,
+    port: Port,
+    reading: bool,
+}
+
+/// A node handle we hold, used without giving it up.
+fn borrow(h: Handle) -> ManuallyDrop<Node> {
+    ManuallyDrop::new(Node::from(h))
+}
+
+/// `p` made absolute against `base`, with `.` and `..` worked out (never above `/`).
+pub fn normalize(base: &str, p: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let full = if p.starts_with('/') { String::from(p) } else { format!("{}/{}", base, p) };
+    for c in full.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            c => parts.push(c),
+        }
+    }
+    let mut s = String::new();
+    for c in parts {
+        s.push('/');
+        s.push_str(c);
+    }
+    if s.is_empty() { String::from("/") } else { s }
+}
+
+fn split_parent(abs: &str) -> (&str, &str) {
+    match abs.rsplit_once('/') {
+        Some(("", leaf)) => ("/", leaf),
+        Some((p, leaf)) => (p, leaf),
+        None => ("/", abs),
+    }
+}
+
+/// The edit distance between two short words (for "did you mean").
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = alloc::vec![i + 1; b.len() + 1];
+        for (j, &cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+impl Shell {
+    // ---- the terminal ----------------------------------------------------------------------------
+
+    fn send(&self, op: u32, a: u64, payload: &[u8]) {
+        if self.term == 0 {
+            return;
+        }
+        let mut m = Vec::with_capacity(HEADER + payload.len());
+        m.resize(HEADER, 0);
+        Header { txid: 0, op, status: 0, a, b: 0 }.put(&mut m);
+        m.extend_from_slice(payload);
+        let mut tries = 0;
+        while sys::channel_write(self.term, &m) == sys::ERR_SHOULD_WAIT && tries < 50 {
+            let _ = sys::object_wait(self.term, sys::WRITABLE | sys::PEER_CLOSED, 100_000_000);
+            tries += 1;
+        }
+    }
+
+    /// Show text (style markers allowed), in pieces a message can carry.
+    pub fn write(&self, s: &str) {
+        let b = s.as_bytes();
+        let mut at = 0;
+        while at < b.len() {
+            let mut end = (at + 32 * 1024).min(b.len());
+            while end < b.len() && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.send(term::WRITE, 0, &b[at..end]);
+            at = end;
+        }
+    }
+
+    pub fn error(&self, s: &str) {
+        self.write(&show::err_line(s));
+    }
+
+    fn prompt(&mut self) {
+        // Background jobs that ended since the last prompt.
+        let ended: Vec<u32> = self.jobs.iter().filter(|j| j.background && j.code.is_some()).map(|j| j.id).collect();
+        for id in ended {
+            if let Some(j) = self.jobs.iter().find(|j| j.id == id) {
+                let code = j.code.unwrap_or(0);
+                let what = format!("job {} ended: {} ({})", id, j.line, if code == 0 { String::from("ok") } else { format!("exit code {}", code) });
+                let pending = !j.records.is_empty() || !j.items.is_empty();
+                let msg = if pending { format!("{}; 'wait {}' shows its output", what, id) } else { what };
+                self.write(&if code == 0 { show::ok_line(&msg) } else { show::err_line(&msg) });
+                if !pending {
+                    self.jobs.retain(|j| j.id != id);
+                } else if let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) {
+                    j.background = false; // reported; kept for `wait`
+                    j.started = 0;
+                }
+            }
+        }
+        let place = if self.place == "/" { String::from("/") } else { String::from(&self.place[1..]) };
+        let p = format!("{}{} {}{}", show::style(term::LIGHT_CYAN), place, show::coloured(term::LIGHT_GREEN, "▸"), " ");
+        self.send(term::READ, 0, p.as_bytes());
+        self.reading = true;
+    }
+
+    // ---- places and paths ------------------------------------------------------------------------
+
+    /// The place holding absolute path `abs` and the rest below it.
+    pub fn resolve(&self, abs: &str) -> Option<(&Place, String)> {
+        let mut best: Option<&Place> = None;
+        for p in &self.places {
+            let inside = abs == p.path || (abs.starts_with(&p.path) && abs.as_bytes().get(p.path.len()) == Some(&b'/'));
+            if inside && best.is_none_or(|b| p.path.len() > b.path.len()) {
+                best = Some(p);
+            }
+        }
+        best.map(|p| (p, String::from(abs[p.path.len()..].trim_start_matches('/'))))
+    }
+
+    pub fn not_granted(&self, what: &str, abs: &str) -> String {
+        let granted: Vec<String> = self.places.iter().map(|p| format!("{} ({})", p.path, rights_word(p.rights))).collect();
+        format!("{}: {} is not in this session's namespace\n  granted: {}", what, abs, if granted.is_empty() { String::from("nothing") } else { granted.join(", ") })
+    }
+
+    /// Open `abs` (read-only, or with `rights`): the node and its kind.
+    pub fn open(&self, what: &str, abs: &str, flags: u64, rights: u64) -> Result<(Node, u64), String> {
+        let Some((pl, rest)) = self.resolve(abs) else { return Err(self.not_granted(what, abs)) };
+        if rights & fp::R_WRITE != 0 && pl.rights & fp::R_WRITE == 0 {
+            return Err(format!("{}: {} is read-only in this session", what, pl.path));
+        }
+        let dir = borrow(pl.h);
+        let r = if rest.is_empty() {
+            dir.clone_with(rights).and_then(|n| n.stat().map(|st| (n, st.kind)))
+        } else {
+            dir.open(rest.as_bytes(), flags, rights).map(|(n, k, _)| (n, k))
+        };
+        r.map_err(|e| format!("{}: {}: {}", what, abs, fp::message(e)))
+    }
+
+    // ---- tools -----------------------------------------------------------------------------------
+
+    pub fn find_tool(&self, name: &str) -> Option<&Tool> {
+        self.tools.iter().find(|t| t.name == name || t.aliases.iter().any(|a| a == name))
+    }
+
+    /// Start tool `t` with `args`: resolve every path with the rights its manifest declares.
+    fn launch(&mut self, t: &Tool, args: &[String], line: &str, background: bool, filters: Vec<Vec<String>>) -> Result<(), String> {
+        if self.jobs.len() >= MAX_JOBS {
+            return Err(format!("{}: too many jobs ({}); end one first", t.name, MAX_JOBS));
+        }
+        let usage = format!("usage: {}", t.usage());
+        // (parameter, shown, Some(rel) for paths, node)
+        let mut items: Vec<(String, String, Option<String>, Option<Node>)> = Vec::new();
+        let mut ai = 0;
+        let mut first_path: Option<String> = None;
+        for p in &t.params {
+            let values: Vec<String> = if p.many {
+                let v = args[ai.min(args.len())..].to_vec();
+                ai = args.len();
+                v
+            } else if ai < args.len() {
+                ai += 1;
+                alloc::vec![args[ai - 1].clone()]
+            } else {
+                Vec::new()
+            };
+            let values = if values.is_empty() {
+                match (p.optional, p.kind) {
+                    (true, ParamKind::Path) => alloc::vec![String::from(".")],
+                    (true, _) => continue,
+                    (false, _) => return Err(format!("{}: missing <{}>; {}", t.name, p.name, usage)),
+                }
+            } else {
+                values
+            };
+            for v in values {
+                match p.kind {
+                    ParamKind::Text => items.push((p.name.clone(), v, None, None)),
+                    ParamKind::Number => {
+                        if v.parse::<i64>().is_err() {
+                            return Err(format!("{}: <{}> must be a number, not '{}'", t.name, p.name, v));
+                        }
+                        items.push((p.name.clone(), v, None, None));
+                    }
+                    ParamKind::Path => {
+                        let mut abs = normalize(&self.place, &v);
+                        if abs == "/" {
+                            return Err(format!("{}: / is the list of places, not a directory (see 'places')", t.name));
+                        }
+                        if !p.write {
+                            let (n, _) = self.open(&t.name, &abs, 0, fp::R_READ)?;
+                            first_path.get_or_insert_with(|| abs.clone());
+                            items.push((p.name.clone(), abs, Some(String::new()), Some(n)));
+                            continue;
+                        }
+                        // Written (or created): the tool gets the directory it is in, and its name.
+                        if p.create
+                            && let Some(first) = &first_path
+                        {
+                            // An existing directory (or a path ending in '/') receives the first
+                            // path under its own name.
+                            let is_dir = v.ends_with('/') || self.open(&t.name, &abs, 0, fp::R_READ).is_ok_and(|(_, k)| k == fp::KIND_DIR);
+                            if is_dir {
+                                abs = normalize(&abs, split_parent(first).1);
+                            }
+                        }
+                        let (pl_path, rest) = match self.resolve(&abs) {
+                            Some((pl, rest)) => (pl.path.clone(), rest),
+                            None => return Err(self.not_granted(&t.name, &abs)),
+                        };
+                        let (dir, leaf) = if rest.is_empty() {
+                            (pl_path, String::new()) // the place itself (refused by tools that need a name)
+                        } else {
+                            let (parent, leaf) = split_parent(&abs);
+                            (String::from(parent), String::from(leaf))
+                        };
+                        let (n, kind) = self.open(&t.name, &dir, fp::O_DIRECTORY, fp::R_READ | fp::R_WRITE)?;
+                        if kind != fp::KIND_DIR {
+                            return Err(format!("{}: {}: {}", t.name, dir, fp::message(fp::ERR_NOT_DIR)));
+                        }
+                        first_path.get_or_insert_with(|| abs.clone());
+                        items.push((p.name.clone(), abs, Some(leaf), Some(n)));
+                    }
+                }
+            }
+        }
+        if ai < args.len() {
+            return Err(format!("{}: too many arguments ('{}'); {}", t.name, args[ai], usage));
+        }
+        if items.len() > tool::MAX_ITEMS {
+            return Err(format!("{}: more than {} arguments", t.name, tool::MAX_ITEMS));
+        }
+        // The arguments, and the handles: output, one node per path, the log.
+        let (mine, theirs) = sys::channel_pair().map_err(|e| format!("{}: {}", t.name, sys::status(e)))?;
+        let mut hs: Vec<SpawnHandle> = alloc::vec![SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: tool::TAG_OUTPUT, reserved: 0 }];
+        let mut argv: Vec<u8> = Vec::new();
+        for (k, (name, shown, rel, node)) in items.into_iter().enumerate() {
+            argv.extend_from_slice(name.as_bytes());
+            argv.push(b'=');
+            argv.extend_from_slice(shown.as_bytes());
+            if let Some(rel) = rel {
+                argv.push(tool::SEP);
+                argv.extend_from_slice(rel.as_bytes());
+            }
+            argv.push(0);
+            if let Some(n) = node {
+                hs.push(SpawnHandle { handle: n.into_handle(), rights: sys::RIGHTS_SAME, tag: tool::TAG_PARAM + k as u32, reserved: 0 });
+            }
+        }
+        if let Ok(l) = sys::handle_duplicate(libd::startup_handle(sys::TAG_LOG), sys::RIGHTS_SAME) {
+            hs.push(SpawnHandle { handle: l, rights: sys::RIGHTS_SAME, tag: sys::TAG_LOG, reserved: 0 });
+        }
+        let Some(image) = libd::find_program(t.image.as_bytes()) else {
+            hs.iter().for_each(|h| {
+                sys::handle_close(h.handle);
+            });
+            sys::handle_close(mine);
+            return Err(format!("{}: its program {} is not here", t.name, t.image));
+        };
+        let p = sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), image, t.name.as_bytes(), &argv, &hs, &TOOL_LIMITS).map_err(|e| {
+            sys::handle_close(mine);
+            format!("{}: cannot start: {}", t.name, sys::status(e))
+        })?;
+        let id = self.next_job;
+        self.next_job += 1;
+        self.port.arm(mine, sys::READABLE | sys::PEER_CLOSED, u64::from(id) << 8 | KEY_JOB_OUT);
+        self.port.arm(p, sys::TERMINATED, u64::from(id) << 8 | KEY_JOB_END);
+        self.jobs.push(Job {
+            id,
+            line: String::from(line),
+            name: t.name.clone(),
+            proc: Owned::from_raw(p),
+            out: Owned::from_raw(mine),
+            records: Vec::new(),
+            items: Vec::new(),
+            filters,
+            background,
+            started: sys::clock_ns(),
+            code: None,
+            said_error: false,
+        });
+        if background {
+            self.write(&show::ok_line(&format!("job {} started: {}", id, line)));
+        } else {
+            self.fg = Some(id);
+        }
+        Ok(())
+    }
+
+    /// Read what job `id` sent so far. Text and errors of the foreground job without filters are
+    /// shown at once; the rest waits.
+    fn job_output(&mut self, id: u32) {
+        let Some(k) = self.jobs.iter().position(|j| j.id == id) else { return };
+        let ch = self.jobs[k].out.raw();
+        let mut buf = alloc::vec![0u8; HEADER + rec::MAX_PAYLOAD];
+        loop {
+            match sys::channel_read(ch, &mut buf, 0) {
+                Ok(n) => {
+                    let n = n as usize;
+                    let Some(h) = Header::get(&buf[..n]) else { continue };
+                    let payload = &buf[HEADER..n];
+                    let now = self.fg == Some(id) && self.jobs[k].filters.is_empty();
+                    match h.op {
+                        rec::BATCH => self.jobs[k].records.extend(rec::decode_all(payload)),
+                        rec::TEXT => {
+                            let s = String::from_utf8_lossy(payload).into_owned();
+                            if now {
+                                self.write(&s);
+                            } else {
+                                self.jobs[k].items.push(Item::Text(s));
+                            }
+                        }
+                        rec::ERROR => {
+                            let s = String::from_utf8_lossy(payload).into_owned();
+                            self.jobs[k].said_error = true;
+                            if now {
+                                self.error(&s);
+                            } else {
+                                self.jobs[k].items.push(Item::Error(s));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.port.arm(ch, sys::READABLE | sys::PEER_CLOSED, u64::from(id) << 8 | KEY_JOB_OUT);
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn job_ended(&mut self, id: u32) {
+        self.job_output(id); // whatever it sent before it ended
+        let Some(j) = self.jobs.iter_mut().find(|j| j.id == id) else { return };
+        if j.code.is_none() {
+            j.code = Some(sys::process_exit_code(j.proc.raw()));
+        }
+        if self.fg == Some(id) {
+            self.fg = None;
+            self.finish(id);
+            self.prompt();
+        }
+    }
+
+    /// Show everything job `id` produced (filtered) and forget it.
+    pub fn finish(&mut self, id: u32) {
+        let Some(k) = self.jobs.iter().position(|j| j.id == id) else { return };
+        let j = self.jobs.remove(k);
+        for it in &j.items {
+            match it {
+                Item::Text(s) => self.write(s),
+                Item::Error(s) => self.error(s),
+            }
+        }
+        let mut rs = j.records;
+        for f in &j.filters {
+            match filter::apply(f, rs) {
+                Ok(r) => rs = r,
+                Err(e) => {
+                    self.error(&e);
+                    return;
+                }
+            }
+        }
+        self.write(&show::records(&rs, self.cols));
+        let code = j.code.unwrap_or(0);
+        if code != 0 && !j.said_error {
+            let why = match code as i32 {
+                sys::EXIT_KILLED => String::from("stopped"),
+                sys::EXIT_FAULT => String::from("crashed"),
+                _ => format!("exit code {}", code),
+            };
+            self.error(&format!("{}: {}", j.name, why));
+        }
+    }
+
+    /// Ctrl+C: end the foreground job.
+    fn interrupt(&mut self) {
+        if let Some(id) = self.fg
+            && let Some(j) = self.jobs.iter().find(|j| j.id == id)
+        {
+            sys::process_kill(j.proc.raw());
+        }
+    }
+
+    // ---- a line ----------------------------------------------------------------------------------
+
+    fn run_line(&mut self, line: &str) {
+        let l = match parse::parse(line) {
+            Ok(l) => l,
+            Err(e) => return self.error(&e),
+        };
+        if l.stages.is_empty() {
+            return;
+        }
+        let head = &l.stages[0];
+        let filters: Vec<Vec<String>> = l.stages[1..].to_vec();
+        if let Some(f) = filters.iter().find(|s| !filter::is_filter(&s[0])) {
+            return self.error(&format!(
+                "'{}' cannot follow '|': only filters can ({})",
+                f[0],
+                filter::NAMES.join(", ")
+            ));
+        }
+        let name = head[0].as_str();
+        let args = &head[1..];
+        if filter::is_filter(name) {
+            return self.error(&format!("{} works on the records of a command before it, e.g. list | {}", name, filter::usage(name)));
+        }
+        let shown = line.trim_start().trim_start_matches("start").trim();
+        if let Some(t) = self.find_tool(name).cloned() {
+            if let Err(e) = self.launch(&t, args, shown, l.background, filters) {
+                self.error(&e);
+            }
+            return;
+        }
+        if name == "run" {
+            let Some(t) = args.first().and_then(|n| self.find_tool(n)).cloned() else {
+                return self.error(&format!("run: {}", args.first().map_or(String::from("run what? (run <tool> [arguments])"), |n| format!("no tool '{}'", n))));
+            };
+            if let Err(e) = self.launch(&t, &args[1..], shown, l.background, filters) {
+                self.error(&e);
+            }
+            return;
+        }
+        match cmds::run(self, name, args) {
+            Some(Ok(rs)) => {
+                let mut rs = rs;
+                for f in &filters {
+                    match filter::apply(f, rs) {
+                        Ok(r) => rs = r,
+                        Err(e) => return self.error(&e),
+                    }
+                }
+                self.write(&show::records(&rs, self.cols));
+            }
+            Some(Err(e)) => self.error(&e),
+            None => {
+                let mut best: Option<(usize, String)> = None;
+                for n in self.command_names() {
+                    let d = distance(name, &n);
+                    let near = if name.chars().count() >= 5 { 2 } else { 1 };
+                    if d <= near && best.as_ref().is_none_or(|(bd, _)| d < *bd) {
+                        best = Some((d, n));
+                    }
+                }
+                match best {
+                    Some((_, n)) => self.error(&format!("unknown command '{}' — did you mean '{}'?", name, n)),
+                    None => self.error(&format!("unknown command '{}' (type help for the commands)", name)),
+                }
+            }
+        }
+    }
+
+    /// Every command name and alias (built-ins, tools, filters).
+    pub fn command_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for c in cmds::BUILTINS {
+            v.push(String::from(c.name));
+            v.extend(c.aliases.iter().map(|a| String::from(*a)));
+        }
+        for t in &self.tools {
+            v.push(t.name.clone());
+            v.extend(t.aliases.iter().cloned());
+        }
+        v.extend(filter::NAMES.iter().map(|n| String::from(*n)));
+        v.push(String::from("run"));
+        v.push(String::from("start"));
+        v
+    }
+
+    /// Tab: candidates for the last word of `before`.
+    fn complete(&self, before: &str) -> Vec<String> {
+        let (start, word) = parse::last_word(before);
+        let mut out: Vec<String> = Vec::new();
+        if parse::is_command_position(before, start) {
+            let after_pipe = before[..start].trim_end().ends_with('|');
+            for n in self.command_names() {
+                if n.starts_with(word) && (!after_pipe || filter::is_filter(&n)) && !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+            out.sort();
+            return out;
+        }
+        // A path: the directory part as typed, then names in it.
+        let (dir_typed, prefix) = match word.rfind('/') {
+            Some(p) => (&word[..=p], &word[p + 1..]),
+            None => ("", word),
+        };
+        let dir_abs = normalize(&self.place, if dir_typed.is_empty() { "." } else { dir_typed });
+        if dir_abs == "/" {
+            for p in &self.places {
+                let n = &p.path[1..];
+                if n.starts_with(prefix) {
+                    out.push(format!("{}{}/", dir_typed, n));
+                }
+            }
+        } else if let Ok((d, fp::KIND_DIR)) = self.open("", &dir_abs, fp::O_DIRECTORY, fp::R_READ) {
+            let _ = d.list(|n, k| {
+                if let Ok(n) = core::str::from_utf8(n)
+                    && n.starts_with(prefix)
+                    && out.len() < 200
+                {
+                    out.push(format!("{}{}{}", dir_typed, n, if k == fp::KIND_DIR { "/" } else { "" }));
+                }
+            });
+        }
+        out.sort();
+        out
+    }
+
+    // ---- events ----------------------------------------------------------------------------------
+
+    fn term_msg(&mut self, buf: &[u8]) {
+        let Some(h) = Header::get(buf) else { return };
+        let payload = &buf[HEADER..];
+        match h.op {
+            term::SIZE => self.cols = (h.a as usize).clamp(20, 400),
+            term::LINE => {
+                self.reading = false;
+                if h.a == 0 {
+                    let line = String::from_utf8_lossy(payload).into_owned();
+                    self.run_line(&line);
+                }
+                if self.fg.is_none() && !self.reading && self.term != 0 {
+                    self.prompt();
+                }
+            }
+            term::INTERRUPT => self.interrupt(),
+            term::COMPLETE => {
+                let before = String::from_utf8_lossy(payload).into_owned();
+                let c = self.complete(&before);
+                let mut p: Vec<u8> = Vec::new();
+                for s in c {
+                    p.extend_from_slice(s.as_bytes());
+                    p.push(0);
+                }
+                self.send(term::COMPLETIONS, 0, &p);
+            }
+            _ => {}
+        }
+    }
+
+    fn welcome(&mut self) {
+        let now = if self.clock != 0 { libd::time::query(self.clock).map_or(0, |b| b.now().0) } else { 0 };
+        let when = if now != 0 { format!(" · {}", show::time(now)) } else { String::new() };
+        self.write(&format!("{}D-OS{} · terminal 1{}{}\n", show::style(term::WHITE), show::plain(), when, " UTC"));
+        self.write(&show::coloured(term::DARK_GREY, "Type help for the commands. Tab completes, Up/Down recall, PgUp/PgDn scroll.\n"));
+    }
+
+    pub fn clear(&self) {
+        self.send(term::CLEAR, 0, &[]);
+    }
+
+    pub fn self_process() -> Handle {
+        libd::startup_handle(sys::TAG_PROC_SELF)
+    }
+}
+
+pub fn rights_word(r: u64) -> &'static str {
+    if r & fp::R_WRITE != 0 { "read-write" } else { "read" }
+}
+
+fn main(s: *const Startup) -> i32 {
+    // SAFETY: `s` is the startup block pointer the kernel passed to the entry point.
+    if !unsafe { libd::init(s, "shell") } {
+        return 1;
+    }
+    let ctl = libd::startup_handle(proto::TAG_CONTROL);
+    let Ok(port) = Port::new(128) else { return 1 };
+    // The places: every granted directory, with its rights.
+    let mut places: Vec<Place> = Namespace::get()
+        .entries()
+        .map(|(p, h)| Place { path: String::from_utf8_lossy(p).into_owned(), h, rights: borrow(h).stat().map_or(fp::R_READ, |st| st.rights) })
+        .collect();
+    places.sort_by(|a, b| a.path.cmp(&b.path));
+    // The tools: their manifests (handed over by the service manager).
+    let mut tools: Vec<Tool> = Vec::new();
+    for (h, t) in libd::startup_handles() {
+        if t != tool::TAG_TOOL_MANIFEST {
+            continue;
+        }
+        let size = sys::vmo_size(h).unwrap_or(0).min(dman::toml::MAX_SIZE as u64) as usize;
+        let mut b = alloc::vec![0u8; size];
+        if sys::vmo_read(h, 0, &mut b) != 0 {
+            continue;
+        }
+        while b.last() == Some(&0) {
+            b.pop();
+        }
+        match dman::tool::parse(&b) {
+            Ok(t) if !cmds::BUILTINS.iter().any(|c| c.name == t.name || c.aliases.contains(&t.name.as_str())) => tools.push(t),
+            Ok(t) => println!("shell: tool {} left out: a built-in command has that name", t.name),
+            Err(e) => println!("shell: a tool manifest is not valid: {}", e),
+        }
+    }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut sh = Shell {
+        term: svc::endpoint(b"terminal.session"),
+        cols: 80,
+        places,
+        place: String::from("/"),
+        tools,
+        mgr: libd::startup_handle(tool::TAG_MANAGER),
+        log: svc::endpoint(b"log.read"),
+        clock: svc::endpoint(b"clock.time"),
+        jobs: Vec::new(),
+        next_job: 1,
+        fg: None,
+        port,
+        reading: false,
+    };
+    if sh.clock != 0
+        && let Some(b) = libd::time::query(sh.clock)
+    {
+        libd::time::set_base(&b);
+    }
+    let names: Vec<String> = sh.places.iter().map(|p| format!("{} ({})", p.path, rights_word(p.rights))).collect();
+    println!("shell: ready: {} place(s): {}; {} tool(s)", sh.places.len(), names.join(", "), sh.tools.len());
+    if ctl != 0 {
+        sh.port.arm(ctl, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
+    }
+    if sh.term != 0 {
+        sh.port.arm(sh.term, sys::READABLE | sys::PEER_CLOSED, KEY_TERM);
+        sh.welcome();
+        sh.prompt();
+    }
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    loop {
+        let Some((key, _)) = sh.port.wait(sys::WAIT_FOREVER) else { continue };
+        match key & 0xFF {
+            KEY_TERM => loop {
+                match sys::channel_read(sh.term, &mut buf, 0) {
+                    Ok(n) => {
+                        let m = buf[..n as usize].to_vec();
+                        sh.term_msg(&m);
+                    }
+                    Err(sys::ERR_SHOULD_WAIT) => {
+                        sh.port.arm(sh.term, sys::READABLE | sys::PEER_CLOSED, KEY_TERM);
+                        break;
+                    }
+                    Err(_) => {
+                        // The terminal is gone; the service manager connects us to the next one.
+                        sys::handle_close(sh.term);
+                        sh.term = 0;
+                        break;
+                    }
+                }
+            },
+            KEY_JOB_OUT => sh.job_output((key >> 8) as u32),
+            KEY_JOB_END => sh.job_ended((key >> 8) as u32),
+            _ => loop {
+                let mut hs = [0 as Handle; 1];
+                match sys::channel_read_h(ctl, &mut buf, &mut hs, 0) {
+                    Ok((n, nh)) => {
+                        let handle = if nh > 0 { hs[0] } else { 0 };
+                        match Header::get(&buf[..n]) {
+                            Some(h) if h.op == svc::CONNECT && handle != 0 => {
+                                let which = &buf[HEADER..n];
+                                let slot = match which {
+                                    b"terminal.session" => &mut sh.term,
+                                    b"log.read" => &mut sh.log,
+                                    b"clock.time" => &mut sh.clock,
+                                    _ => {
+                                        sys::handle_close(handle);
+                                        continue;
+                                    }
+                                };
+                                if *slot != 0 {
+                                    sys::handle_close(*slot);
+                                }
+                                *slot = handle;
+                                if which == b"terminal.session" {
+                                    sh.port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_TERM);
+                                    sh.welcome();
+                                    if sh.fg.is_none() {
+                                        sh.prompt();
+                                    }
+                                }
+                            }
+                            Some(h) if h.op == svc::SHUTDOWN => {
+                                for j in &sh.jobs {
+                                    sys::process_kill(j.proc.raw());
+                                }
+                                return 0;
+                            }
+                            _ => {
+                                if handle != 0 {
+                                    sys::handle_close(handle);
+                                }
+                            }
+                        }
+                    }
+                    Err(sys::ERR_SHOULD_WAIT) => {
+                        sh.port.arm(ctl, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            },
+        }
+    }
+}

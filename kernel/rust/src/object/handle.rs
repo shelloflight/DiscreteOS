@@ -178,6 +178,21 @@ impl HandleTable {
         }
     }
 
+    /// Visit every entry (type, koid, rights, name) in slot order, at most `max`; returns how
+    /// many entries the table holds. No allocation, no other lock.
+    pub fn list(&self, max: usize, mut f: impl FnMut(&Object, Rights)) -> u32 {
+        let mut seen = 0;
+        for s in &self.slots {
+            if let Slot::Used { rights, obj, .. } = s {
+                if seen < max {
+                    f(obj, *rights);
+                }
+                seen += 1;
+            }
+        }
+        self.count
+    }
+
     /// Remove an entry; the caller drops the object after unlocking.
     pub fn remove(&mut self, h: Handle) -> KResult<(Object, Rights)> {
         let idx = self.find(h).ok_or(Status::BadHandle)?;

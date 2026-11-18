@@ -200,6 +200,28 @@ function Get-ManyDeviceArgs([int]$Count) {
     return ,$a
 }
 
+# Lines typed on the keyboard as QEMU key names: each line ends with Enter and a pause (the command
+# runs). '@name' is a key by its QEMU name (tab, up, ctrl-c), with no Enter after it.
+function ConvertTo-QemuKeys([string[]]$Lines, [int]$PauseMs = 900) {
+    $named = @{ ' ' = 'spc'; '/' = 'slash'; '.' = 'dot'; '-' = 'minus'; '|' = 'shift-backslash'; '>' = 'shift-dot'; '<' = 'shift-comma'
+                '=' = 'equal'; '_' = 'shift-minus'; ':' = 'shift-semicolon'; '"' = 'shift-apostrophe'; '*' = 'shift-8' }
+    $keys = @()
+    foreach ($l in $Lines) {
+        if ($l.StartsWith('@')) { $keys += $l.Substring(1); continue }
+        $tab = $l.EndsWith('<tab>')            # 'go /sy<tab>': Tab completes, then Enter
+        if ($tab) { $l = $l.Substring(0, $l.Length - 5) }
+        foreach ($c in $l.ToCharArray()) {
+            $s = [string]$c
+            if ($named.ContainsKey($s)) { $keys += $named[$s] }
+            elseif ($s -cmatch '[A-Z]') { $keys += "shift-$($s.ToLowerInvariant())" }
+            else { $keys += $s }
+        }
+        if ($tab) { $keys += @('tab', '~400') }
+        $keys += @('ret', "~$PauseMs")
+    }
+    return ,$keys
+}
+
 $KernelStages = @('D-KRNL 1.', 'BootInfo OK',
                 'GDT/TSS/IDT loaded', 'PMM:', 'VMM: kernel W^X', 'NULL page unmapped', 'KASLR: image 17 bits, direct map', 'Heap:', 'Speculation: Meltdown ', 'Speculation: MDS/TAA ',
                 'APIC timer:', 'Interrupts enabled, timer OK', 'Scheduler: preemptive', 'SMP: ', 'Rust: dkrnl', 'Objects: handles',
@@ -212,28 +234,28 @@ $Halted = 'System halted.'
 $TestCases = [ordered]@{
     boot        = @{ Define = $null;         Devices = $true; Expect = $BootStages + @('SMP: 4 CPUs online (x2APIC)', 'D-KRNL: ready', 'init: started devmgr', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'MiB free, generation 2, 0 snapshot(s), read-only', 'init: 4 volume(s)', 'devmgr: running'); Forbid = @('KERNEL PANIC', 'FAIL', 'OFF (unsupported)', 'did not start', 'warning', 'exited with code', 'NOT confined'); Post = 'Test-DisksUnchanged' }
     'boot-amd'  = @{ Define = $null;         Devices = $true; Iommu = 'amd'; Expect = @('IOMMU: AMD-Vi, 1 unit(s)', 'IOMMU: DMA remapping on for every device', '(the IOMMU itself: kept by the kernel)', 'D-KRNL: ready', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'init: 4 volume(s)', 'devmgr: running'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not start', 'warning', 'exited with code', 'NOT confined', 'unusable', 'blocked DMA'); Post = 'Test-DisksUnchanged' }
-    uefi        = @{ Define = $null;         Devices = $true; Uefi = $true; Timeout = 90; Expect = $UefiStages + @('SMP: 4 CPUs online (x2APIC)', 'D-KRNL: ready', 'init: started devmgr', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'init: 4 volume(s)', 'devmgr: running'); Forbid = @('KERNEL PANIC', 'FAIL', 'OFF (unsupported)', 'did not start', 'warning', 'exited with code', 'NOT confined', 'NOT confined', 'stage1'); Post = 'Test-DisksUnchanged' }
+    uefi        = @{ Define = $null;         Devices = $true; Uefi = $true; Timeout = 90; Expect = $UefiStages + @('SMP: 4 CPUs online (x2APIC)', 'D-KRNL: ready', 'init: started devmgr', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'init: 4 volume(s)', 'devmgr: running', 'terminal: ready: framebuffer', 'shell: ready'); Forbid = @('KERNEL PANIC', 'FAIL', 'OFF (unsupported)', 'did not start', 'warning', 'exited with code', 'NOT confined', 'NOT confined', 'stage1'); Post = 'Test-DisksUnchanged' }
     'uefi-uniproc' = @{ Define = $null;       Uefi = $true; Smp = 1; Timeout = 60; Expect = $UefiStages + @('SMP: 1 CPU', 'D-KRNL: ready'); Forbid = @('KERNEL PANIC', 'FAIL') }
     'uefi-selftest' = @{ Define = 'SELFTEST';  Uefi = $true; Timeout = 60; Expect = $UefiStages + @('KTEST selftest: PASSED', 'KTEST rust selftest: PASSED', 'D-KRNL: ready'); Forbid = @('KERNEL PANIC', 'FAIL') }
-    keyboard    = @{ Define = $null;         Expect = @('ps2: keyboard ready', 'console: you typed: Disc OS (ps2)');  Forbid = @('KERNEL PANIC')
+    keyboard    = @{ Define = $null;         Expect = @('ps2: keyboard ready', 'terminal: line from ps2: Disc OS');  Forbid = @('KERNEL PANIC')
                      Keys = @('shift-d', 'i', 's', 'c', 'spc', 'shift-o', 'shift-s', 'ret'); KeysAfter = 'devmgr: ps2.ddrv ready' }
     # USB: a qemu-xhci controller with a tablet (not a keyboard: probed and left unused) and a
     # keyboard on its USB 2 ports; keys typed go to the USB keyboard (the input device created last).
     usbkbd      = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-tablet,bus=xhci.0', '-device', 'usb-kbd,bus=xhci.0')
-                     Expect = @('xhci: controller ready on pci-', 'HID device 0627:0001 (left unused)', ': keyboard ready on port ', 'DMA confined by the IOMMU', 'devmgr: xhci.ddrv ready', 'console: you typed: Usb Kbd (xhci)')
+                     Expect = @('xhci: controller ready on pci-', 'HID device 0627:0001 (left unused)', ': keyboard ready on port ', 'DMA confined by the IOMMU', 'devmgr: xhci.ddrv ready', 'terminal: line from xhci: Usb Kbd')
                      Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL'); Timeout = 60
                      Keys = @('shift-u', 's', 'b', 'spc', 'shift-k', 'b', 'd', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready' }
     # USB without a keyboard: a tablet and a mouse are probed and reported once each, then left
     # alone (a probe's own port reset must not trigger another probe); typing still works on PS/2.
     usbnokbd    = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-tablet,bus=xhci.0', '-device', 'usb-mouse,bus=xhci.0')
-                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', ': mouse 0627:0001 (left unused)', 'devmgr: xhci.ddrv ready', 'console: you typed: Disc OS (ps2)')
+                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', ': mouse 0627:0001 (left unused)', 'devmgr: xhci.ddrv ready', 'terminal: line from ps2: Disc OS')
                      Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'keyboard ready on port'); Timeout = 60
                      Keys = @('shift-d', 'i', 's', 'c', 'spc', 'shift-o', 'shift-s', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready'
                      Post = 'Test-UsbProbedOnce' }
     # USB hot-plug: a tablet unplugged and plugged back three times is reported once, then left
     # alone (third identical probe); a keyboard plugged into a hub later is found and types.
     usbplug     = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-hub,bus=xhci.0,port=1', '-device', 'usb-tablet,bus=xhci.0,port=2,id=tab')
-                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', 'device keeps reconnecting; left alone until unplugged', '.4 (USB HID boot protocol', 'console: you typed: Plug (xhci)')
+                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', 'device keeps reconnecting; left alone until unplugged', '.4 (USB HID boot protocol', 'terminal: line from xhci: Plug')
                      Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'not set up', 'stopped answering'); Timeout = 60
                      Keys = @('!device_del tab', '~400', '!device_add usb-tablet,bus=xhci.0,port=2,id=tab', '~600', '!device_del tab', '~400', '!device_add usb-tablet,bus=xhci.0,port=2,id=tab', '~600',
                               '!device_del tab', '~400', '!device_add usb-tablet,bus=xhci.0,port=2,id=tab', '~600', '!device_add usb-kbd,bus=xhci.0,port=1.4,id=kbd', '~2500',
@@ -243,7 +265,7 @@ $TestCases = [ordered]@{
     # tablet on the first hub's port 2. Both hubs are configured, the keyboard found two tiers down.
     usbhub      = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-hub,bus=xhci.0,port=1', '-device', 'usb-hub,bus=xhci.0,port=1.1',
                                                         '-device', 'usb-tablet,bus=xhci.0,port=1.2', '-device', 'usb-kbd,bus=xhci.0,port=1.1.3')
-                     Expect = @('xhci: controller ready on pci-', ': hub 0409:55aa, 8 ports', '.1: hub 0409:55aa, 8 ports', '.2: HID device 0627:0001 (left unused)', '.1.3 (USB HID boot protocol', 'devmgr: xhci.ddrv ready', 'console: you typed: Usb Hub (xhci)')
+                     Expect = @('xhci: controller ready on pci-', ': hub 0409:55aa, 8 ports', '.1: hub 0409:55aa, 8 ports', '.2: HID device 0627:0001 (left unused)', '.1.3 (USB HID boot protocol', 'devmgr: xhci.ddrv ready', 'terminal: line from xhci: Usb Hub')
                      Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'not set up', 'stopped answering'); Timeout = 60
                      Keys = @('shift-u', 's', 'b', 'spc', 'shift-h', 'u', 'b', 'ret'); KeysAfter = ': keyboard ready on port ' }
     selftest    = @{ Define = 'SELFTEST';    Expect = @('  measured boot: Ed25519 vectors', 'KTEST selftest: PASSED', 'KTEST rust selftest: PASSED', 'D-KRNL: ready');  Forbid = @('KERNEL PANIC', 'FAIL') }
@@ -343,7 +365,7 @@ $TestCases = [ordered]@{
                                 'init: service hello accepted (esp:/DOS/SERVICES/HELLO.DMAN)', 'hello: a signed program loaded from disk is running', 'ltest: svc-grants: exactly the granted handles', 'ltest: svc-quota: limits from the manifest',
                                 'init: restarting svc-crash in 50 ms (restart 1 of 2)', 'init: restarting svc-crash in 100 ms (restart 2 of 2)', 'init: svc-crash keeps failing: given up after 2 restart(s)',
                                 'init: test: storaged killed and restarted', 'devmgr: storage service reconnected', 'init: test: devmgr killed and restarted',
-                                'log: running:', 'clock: ', 'console: ready', 'storaged: file times from the clock service',
+                                'log: running:', 'clock: ', 'terminal: ready', 'shell: ready', 'storaged: file times from the clock service',
                                 'svc-log: ', 'no kernel address (', 'levels applied (warn kept, info dropped)',
                                 'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown:', 'init: shutdown: every service stopped', 'init: test: PASSED', 'Power: switching off')
                      Forbid = @('KERNEL PANIC', 'test FAIL', 'svc FAIL', 'PANIC', 'could not measure', 'sync failed', 'did not confirm', 'did not stop in time'); Post = 'Test-ServicesOrder' }
@@ -356,6 +378,21 @@ $TestCases = [ordered]@{
     'time-uefi' = @{ Define = 'TIME';        Devices = $true; Uefi = $true; Timeout = 180; MustExit = $true; Post = 'Test-TimeRebootUefi'
                      Expect = @('(from UEFI GetTime at boot)', 'svc-time: first boot: the time is recorded', 'init: time test: first boot done', 'Power: switching off')
                      Forbid = @('KERNEL PANIC', 'svc FAIL', 'PANIC', 'test FAIL', 'FAILED') }
+    # The terminal and the shell (init "shell test": writable disks, the terminal mirrored to serial):
+    # a session typed on the keyboard. Places, file tools with declared rights, filters over records,
+    # a path outside the namespace refused, completion, the services, the log, then power off.
+    shell       = @{ Define = 'SHELL';       Devices = $true; Timeout = 180; MustExit = $true; KeysAfter = 'shell: ready'
+                     Keys = (ConvertTo-QemuKeys @('places', 'go data', 'make notes', 'copy /boot/README.TXT notes', 'list notes | where size > 10 | pick name size',
+                                                 'show notes/README.TXT', 'move notes/README.TXT notes/readme.txt', 'copy notes/readme.txt /nowhere/x.txt', 'lst',
+                                                 'help copy', 'tasks | where kind = service | where state = running | count', 'log | where source = shell | take 1',
+                                                 'objects | where type = channel | count', 'delete notes/readme.txt notes', 'go /sy<tab>', 'time', 'power off'))
+                     Expect = @('terminal: display 80x25 VGA text', 'shell: ready: 4 place(s): /boot (read-write), /data (read-write), /esp (read-write), /system (read-write); 6 tool(s)',
+                                'terminal| / > places', 'terminal|  place', 'terminal| data > make notes', 'terminal| v made /data/notes', 'terminal| v copied /data/notes/README.TXT (58 B)',
+                                'terminal|  README.TXT', 'terminal| D-OS boot volume (FAT32). Written by dosimg on the host.', 'terminal| v moved /data/notes/README.TXT to /data/notes/readme.txt',
+                                "terminal| x copy: /nowhere/x.txt is not in this session's namespace", "terminal| x unknown command 'lst' - did you mean 'list'?",
+                                'terminal|   usage: copy <from> <to>', 'terminal|  count', 'shell: ready: 4 place(s)', 'terminal| v deleted /data/notes/readme.txt', 'terminal| v deleted /data/notes',
+                                'terminal| system > time', ' UTC', 'init: shell asked to switch off', 'init: shutdown: every service stopped', 'Power: switching off')
+                     Forbid = @('KERNEL PANIC', 'PANIC', 'user fault', 'crashed', 'cannot start') }
     poweroff    = @{ Define = 'POWEROFF';    Expect = @('Power: power-off by ACPI S5', 'init: power: the VMEX resource is refused (-5)', 'Power: switch-off requested by process init', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
     'poweroff-uefi' = @{ Define = 'POWEROFF'; Uefi = $true; Expect = @('Power: power-off by ACPI S5', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 60; MustExit = $true }
     reboot      = @{ Define = 'REBOOT';      Expect = @('reset by reset register', 'init: power: the VMEX resource is refused (-5)', 'Power: reset requested by process init', 'Power: resetting'); Forbid = @('KERNEL PANIC', 'FAIL', 'no reset method worked', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
@@ -371,7 +408,7 @@ $TestCases = [ordered]@{
                                 'fstest: readonly: /boot:', 'fstest: readonly: /system:', 'fstest: readonly: /data:', 'fstest: readonly: /esp:', 'fstest: readonly PASSED', 'init: fstest readonly exited with code 0')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC') }
     manydevices = @{ Define = $null;         Qemu = (Get-ManyDeviceArgs 64); Timeout = 30
-                     Expect = @('PCI 00:0f.7', 'PCI 00:1f.2', '69 functions', 'Devices: 71 for user-space drivers', 'User: init started in ring 3', 'init: started devmgr with 70 devices', 'devmgr: 70 devices, 2 with a driver', 'init: 1 volume(s)', 'devmgr: running')
+                     Expect = @('PCI 00:0f.7', 'PCI 00:1f.2', '69 functions', 'Devices: 72 for user-space drivers', 'User: init started in ring 3', 'init: started devmgr with 70 devices', 'devmgr: 70 devices, 2 with a driver', 'init: 1 volume(s)', 'devmgr: running')
                      Forbid = @('KERNEL PANIC', 'cannot start init', 'left out', 'FAIL', 'not used: the limit') }
     'storage-host' = @{ Host = 'Test-DosfsHost' }
     'crypto-host' = @{ Host = 'Test-CryptoHost' }
@@ -563,6 +600,8 @@ function Invoke-Build([string]$OutDir = $Build, [string]$KernelTest = $null, [sw
     # manager's test ones only in its test image. The kernel hands them to init as MANIFEST VMOs.
     $manDir = Join-Path $Root 'user\init\services'
     $manifests = @(Get-ChildItem $manDir -Filter *.dman -File | Sort-Object Name)
+    # Tool manifests (docs/shell.md): the shell's commands and the rights each parameter gets.
+    $manifests += @(Get-ChildItem (Join-Path $Root 'user\tools\manifests') -Filter *.dman -File | Sort-Object Name)
     $testMan = @{ 'SERVICES' = 'test'; 'TIME' = 'time' }[$KernelTest]
     if ($testMan) { $manifests += @(Get-ChildItem (Join-Path $manDir $testMan) -Filter *.dman -File | Sort-Object Name) }
     $programs = @($programs) + @($manifests | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Path = $_.FullName } })
@@ -856,15 +895,27 @@ function Invoke-RustUserBuild($Crate, [string]$OutDir, [string]$Lld, [scriptbloc
     } finally { Pop-Location }
     $a = Join-Path $targetDir "x86_64-unknown-none\release\lib$name.a"
     if (-not (Test-Path $a)) { throw "cargo did not produce $a" }
-    $dx = Join-Path $OutDir "user\$name.dx"
-    & $Log "  LD    user\$name.dx"
     $ldflags = @('-pie', '--no-dynamic-linker', '-nostdlib', '--build-id=none', '-s', '--gc-sections',
         '-z', 'noexecstack', '-z', 'relro', '-z', 'now', '-z', 'separate-loadable-segments', '-z', 'max-page-size=4096')
+    $toml = Get-Content (Join-Path $Crate.FullName 'Cargo.toml') -Raw
+    $out = @()
+    if ($toml -match '(?m)^dx\s*=\s*\[([^\]]*)\]') {
+        # Several programs in one crate ([package.metadata.dos] dx = ["list", "show"]): the library
+        # linked once per program with its own entry (dx_list, dx_show) -> <name>.dx; no <crate>.dx.
+        foreach ($d in @([regex]::Matches($Matches[1], '"([a-z0-9-]+)"') | ForEach-Object { $_.Groups[1].Value })) {
+            $dx = Join-Path $OutDir "user\$d.dx"
+            & $Log "  LD    user\$d.dx"
+            Invoke-Native $Lld ($ldflags + @('-e', "dx_$($d -replace '-', '_')", '-o', $dx, $a))
+            $out += [pscustomobject]@{ Name = "$d.dx"; Path = $dx }
+        }
+        return $out
+    }
+    $dx = Join-Path $OutDir "user\$name.dx"
+    & $Log "  LD    user\$name.dx"
     Invoke-Native $Lld ($ldflags + @('-e', '_start', '-o', $dx, $a))
     $out = @([pscustomobject]@{ Name = "$name.dx"; Path = $dx })
     # User-space drivers in the same crate ([package.metadata.dos] ddrv = ["a", "b-c"]): the same
     # library linked once more per driver with its own entry (ddrv_a, ddrv_b_c) -> <name>.ddrv.
-    $toml = Get-Content (Join-Path $Crate.FullName 'Cargo.toml') -Raw
     if ($toml -match '(?m)^ddrv\s*=\s*\[([^\]]*)\]') {
         foreach ($d in @([regex]::Matches($Matches[1], '"([a-z0-9-]+)"') | ForEach-Object { $_.Groups[1].Value })) {
             $ddrv = Join-Path $OutDir "user\$d.ddrv"
@@ -1192,11 +1243,11 @@ function Test-TimeRebootUefi([string]$DiskDir, [string]$Image, [string]$Log) { T
 # after the services depending on it (console, then devmgr, then storaged), then the power goes.
 function Test-ServicesOrder([string]$DiskDir, [string]$Image, [string]$Log) {
     $at = { param($s) $Log.IndexOf($s) }
-    $seq = @('init: syncing storaged', 'storaged: sync: 4 volume(s) durable', 'init: stopping console', 'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown: 4 volume(s) durable', 'init: shutdown: every service stopped', 'Power: switch-off requested by process init')
+    $seq = @('init: syncing storaged', 'storaged: sync: 4 volume(s) durable', 'init: stopping shell', 'init: stopping terminal', 'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown: 4 volume(s) durable', 'init: shutdown: every service stopped', 'Power: switch-off requested by process init')
     $pos = @($seq | ForEach-Object { & $at $_ })
     $ok = ($pos -notcontains -1)
     for ($i = 1; $i -lt $pos.Count; $i++) { if ($pos[$i] -lt $pos[$i - 1]) { $ok = $false } }
-    Write-Host "  services: shutdown order $(if ($ok) { 'volumes made durable, then console, devmgr, storaged (each after what depends on it), then power-off' } else { 'WRONG: ' + ($pos -join ', ') })"
+    Write-Host "  services: shutdown order $(if ($ok) { 'volumes made durable, then shell, terminal, devmgr, storaged (each after what depends on it), then power-off' } else { 'WRONG: ' + ($pos -join ', ') })"
     return $ok
 }
 
@@ -1388,7 +1439,7 @@ function Test-StaticAnalysis {
         $findings += $n
     }
     $cargo = Initialize-Rust
-    $crates = @('kernel\rust', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\lib\dman', 'user\init', 'user\log', 'user\clock', 'user\console', 'user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
+    $crates = @('kernel\rust', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\lib\dman', 'user\init', 'user\log', 'user\clock', 'user\terminal', 'user\shell', 'user\tools','user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
     foreach ($c in $crates) {
         Push-Location (Join-Path $Root $c)
         try {

@@ -1,4 +1,4 @@
-# User ABI (version 8)
+# User ABI (version 9)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **8**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **9**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -30,6 +30,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 6 | power control (63) |
 | 7 | service manager decisions in the measurement log (64); MANIFEST and MEASURE startup handles; `vmo_verify` accepts manifest signatures |
 | 8 | the log service (65-66): kernel log records name the writing process; KLOG and BOOT_TIME startup handles |
+| 9 | the terminal and the shell (67-68): the `display` device and `display_info`; `process_handles` |
 
 ## Calling convention (x86-64)
 
@@ -140,6 +141,8 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 64 | measure | MEASURE resource, digest (32 bytes), text, len (<= 52, printable ASCII) | 0 (PCR 10 extended, logged as `svc <text>`) | MANAGE on resource |
 | 65 | klog_read | KLOG resource, seq, buf, cap | records copied (`struct dos_klog_entry`, 176 bytes; at most 64), kernel addresses replaced by `[kaddr]` | MANAGE on resource |
 | 66 | log_record | log, level (0 error .. 3 debug), text, len | len (`log_write` is level 2, info) | WRITE |
+| 67 | display_info | device, `struct dos_display_info *` | 0 (`WRONG_TYPE` unless it is the display) | INSPECT |
+| 68 | process_handles | process, `struct dos_handle_entry *`, cap | handles it holds (at most 256 entries copied: type, rights, koid, name; never handle values) | INSPECT |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.
@@ -256,6 +259,13 @@ manager, which grants each to its driver.
 - **DMA**: `device_dma_map` pins VMO pages and returns device addresses. With an IOMMU, everything
   else the device tries to reach is blocked and counted; without one, the boot log says DMA is not
   confined. Sealed (code) VMOs can never be DMA targets.
+- **The display** (ABI v9): a platform device named `display`, the screen the kernel console used
+  (UEFI GOP framebuffer, or VGA text after a BIOS boot). BAR 0 is its memory, mapped
+  write-combining; `display_info` gives its layout (`struct dos_display_info`: RGB32 or VGA text,
+  width, height, pitch, colour shifts); VGA text has the CRT controller ports as I/O window 1.
+  **Mapping BAR 0 takes the screen**: the kernel console writes to serial only from then on, until
+  a panic takes the screen back. The graphics card's PCI BAR that holds the framebuffer can no
+  longer be mapped by a driver. Init gives it to the terminal ([shell.md](shell.md)).
 
 ## Tests
 
@@ -264,4 +274,4 @@ FPU state, IPC, ports, exceptions; `kasan-user` repeats it under KASAN), `fuzz` 
 mutations and random syscalls), `smap`, `smep`, `compat`, `drivers` (`drivers-amd` on AMD-Vi),
 `keyboard`, `usbkbd` (`usbnokbd`: no keyboard; `usbhub`: behind two hubs; `usbplug`: hot-plug, a reconnecting device), `attest`, `poweroff`,
 `services` (MANIFEST and MEASURE handles, `measure`, manifest signatures, `klog_read` filtering,
-`log_record` levels), `time`, `time-uefi` (BOOT_TIME).
+`log_record` levels), `time`, `time-uefi` (BOOT_TIME), `shell` (the display, `process_handles`).

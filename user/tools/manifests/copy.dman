@@ -1,0 +1,14 @@
+# copy: one file to a new name or into a directory.
+kind = "tool"
+name = "copy"
+image = "copy.dx"
+aliases = ["cp"]
+description = "copy a file"
+
+[parameters]
+from = "path:read"
+to = "path:write,create"
+
+[about]
+from = "the file to copy"
+to = "the new file, or a directory to copy it into (the name stays)"

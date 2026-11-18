@@ -12,7 +12,8 @@ const SEEDS: &[&[u8]] = &[
     DEVMGR,
     include_bytes!("../../../init/services/log.dman"),
     include_bytes!("../../../init/services/clock.dman"),
-    include_bytes!("../../../init/services/console.dman"),
+    include_bytes!("../../../init/services/terminal.dman"),
+    include_bytes!("../../../init/services/shell.dman"),
     include_bytes!("../../../init/services/test/svc-grants.dman"),
     include_bytes!("../../../init/services/test/svc-quota.dman"),
     include_bytes!("../../../init/services/test/svc-crash.dman"),
@@ -202,7 +203,7 @@ fn invariants(m: &Manifest) {
     assert!(valid_name(&m.name) && valid_program(&m.image));
     assert!(m.after.iter().all(|s| valid_name(s)) && m.endpoints.iter().all(|s| valid_name(s)));
     assert!(m.connect.iter().all(|c| valid_name(&c.service) && valid_name(&c.endpoint) && c.service != m.name));
-    assert!(m.namespace.iter().all(|n| n.path.starts_with('/') && valid_name(&n.path[1..]) && valid_name(&n.volume) && n.rights & NS_READ != 0));
+    assert!(m.namespace.iter().all(|n| ((n.path.starts_with('/') && valid_name(&n.path[1..]) && valid_name(&n.volume)) || (n.path == "*" && n.volume == "*" && m.namespace.len() == 1)) && n.rights & NS_READ != 0));
     assert!((64 << 10..=1 << 30).contains(&m.quota.memory) && (16..=4096).contains(&m.quota.handles) && (1..=256).contains(&m.quota.threads));
     assert!(m.restart.limit <= 100 && (10..=60_000).contains(&m.restart.backoff_ms));
 }
@@ -262,4 +263,174 @@ fn fuzz_manifests() {
     }
     std::println!("dman fuzz: {} mutated manifests ({} accepted, {} refused), every truncation of {} seeds", ROUNDS, accepted, refused, SEEDS.len());
     assert!(accepted > 0 && refused > 0);
+}
+
+// ---- tool manifests and the shell's grants ------------------------------------------------------
+
+const TOOLS: &[&[u8]] = &[
+    include_bytes!("../../../tools/manifests/list.dman"),
+    include_bytes!("../../../tools/manifests/show.dman"),
+    include_bytes!("../../../tools/manifests/copy.dman"),
+    include_bytes!("../../../tools/manifests/move.dman"),
+    include_bytes!("../../../tools/manifests/delete.dman"),
+    include_bytes!("../../../tools/manifests/make.dman"),
+];
+
+#[test]
+fn the_shell_manifest_grants_its_session() {
+    let s = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
+    assert!(s.tools && s.manage_services && s.manage_power && s.log);
+    assert_eq!(s.namespace, vec![NsGrant { path: "*".into(), volume: "*".into(), rights: NS_READ | NS_WRITE }]);
+    assert_eq!(summary(&s), "log, terminal.session, log.read, clock.time, every volume, manager (services, power), tools");
+    let t = parse(include_bytes!("../../../init/services/terminal.dman")).unwrap();
+    assert_eq!(t.devices, vec![DeviceSel::Platform("display".into())]);
+    assert!(!t.tools && !t.manage_services && t.namespace.is_empty());
+    let r = parse(b"name = \"x\"
+image = \"x.dx\"
+group = \"test\"
+[grants]
+namespace = [\"*:r\"]
+manager = [\"services\"]
+").unwrap();
+    assert_eq!(r.namespace[0].rights, NS_READ);
+    assert!(r.manage_services && !r.manage_power);
+    assert!(refused("name = \"x\"
+image = \"x.dx\"
+group = \"test\"
+[grants]
+namespace = [\"*\", \"/a=b:r\"]
+").contains("must be the only entry"));
+    assert!(refused("name = \"x\"
+image = \"x.dx\"
+group = \"test\"
+[grants]
+manager = [\"kernel\"]
+").contains("unknown manager right"));
+    assert!(refused("name = \"x\"
+image = \"x.dx\"
+group = \"test\"
+[grants]
+namespace = [\"*:rwa\"]
+").contains("not a namespace entry"));
+    // A tool manifest is not a service manifest.
+    assert!(parse(TOOLS[0]).is_err());
+}
+
+#[test]
+fn the_tool_manifests_parse() {
+    for t in TOOLS {
+        assert!(tool::is_tool(t));
+        let m = tool::parse(t).unwrap();
+        assert!(m.image == format!("{}.dx", m.name) && !m.aliases.is_empty() && !m.description.is_empty());
+        assert!(m.params.iter().all(|p| !p.about.is_empty()));
+    }
+    let c = tool::parse(TOOLS[2]).unwrap();
+    assert_eq!(c.usage(), "copy <from> <to>");
+    assert!(c.params[0].read && !c.params[0].write && c.params[1].write && c.params[1].create);
+    assert_eq!(tool::parse(TOOLS[0]).unwrap().usage(), "list [place]");
+    assert_eq!(tool::parse(TOOLS[4]).unwrap().usage(), "delete <path>...");
+    assert!(!tool::is_tool(STORAGED));
+}
+
+fn tool_refused(src: &str) -> String {
+    match tool::parse(src.as_bytes()) {
+        Ok(t) => panic!("accepted: {:?}
+{}", t.name, src),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn bad_tool_manifests_are_refused() {
+    let head = "kind = \"tool\"
+name = \"t\"
+image = \"t.dx\"
+";
+    let with = |rest: &str| format!("{}{}", head, rest);
+    assert!(tool_refused("name = \"t\"
+image = \"t.dx\"
+").contains("missing 'kind'"));
+    assert!(tool_refused("kind = \"service\"
+name = \"t\"
+image = \"t.dx\"
+").contains("'kind' must be"));
+    assert!(tool_refused(&with("image2 = \"x\"
+")).contains("unknown key 'image2'"));
+    assert!(tool_refused(&with("[grants]
+log = true
+")).contains("unknown table [grants]"));
+    assert!(tool_refused("kind = \"tool\"
+name = \"t\"
+image = \"t.ddrv\"
+").contains("'image'"));
+    assert!(tool_refused(&with("[parameters]
+a = \"path\"
+")).contains("needs read or write"));
+    assert!(tool_refused(&with("[parameters]
+a = \"path:read,create\"
+")).contains("create needs write"));
+    assert!(tool_refused(&with("[parameters]
+a = \"text:read\"
+")).contains("paths only"));
+    assert!(tool_refused(&with("[parameters]
+a = \"file:read\"
+")).contains("unknown kind"));
+    assert!(tool_refused(&with("[parameters]
+a = \"path:read,fly\"
+")).contains("unknown flag"));
+    assert!(tool_refused(&with("[parameters]
+a = \"path:read,read\"
+")).contains("given twice"));
+    assert!(tool_refused(&with("[parameters]
+a = \"path:read,many\"
+b = \"text\"
+")).contains("only the last"));
+    assert!(tool_refused(&with("[parameters]
+a = \"text,optional\"
+")).contains("unknown kind"));
+    assert!(tool_refused(&with("[parameters]
+a = \"text:optional\"
+b = \"text\"
+")).contains("cannot follow an optional"));
+    assert!(tool_refused(&with("[about]
+z = \"x\"
+")).contains("no such parameter"));
+    assert!(tool_refused(&with("aliases = [\"a\", \"a\"]
+")).contains("listed twice"));
+    let w = tool::parse(with("[parameters]
+a = \"path:write\"
+").as_bytes()).unwrap();
+    assert!(w.params[0].read && w.params[0].write, "write includes read");
+}
+
+#[test]
+fn fuzz_tool_manifests() {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut accepted = 0usize;
+    for _ in 0..50_000 {
+        let mut b = TOOLS[rng.below(TOOLS.len())].to_vec();
+        for _ in 0..1 + rng.below(6) {
+            let at = rng.below(b.len() + 1);
+            match rng.below(4) {
+                0 if !b.is_empty() => {
+                    let i = rng.below(b.len());
+                    b[i] ^= 1 << rng.below(8);
+                }
+                1 => {
+                    let t = TOKENS[rng.below(TOKENS.len())];
+                    b.splice(at..at, t.iter().copied());
+                }
+                2 => b.truncate(at),
+                _ => b.insert(at, rng.next() as u8),
+            }
+        }
+        if let Ok(t) = tool::parse(&b) {
+            accepted += 1;
+            assert!(valid_name(&t.name) && t.image.ends_with(".dx") && t.params.len() <= 8);
+            assert!(t.params.iter().all(|p| p.kind != tool::ParamKind::Path || p.read));
+            assert!(t.params.iter().all(|p| !p.create || p.write));
+            assert!(t.params.iter().rev().skip(1).all(|p| !p.many && !p.optional));
+        }
+    }
+    assert!(accepted > 0);
 }

@@ -33,6 +33,7 @@
 
 extern crate alloc;
 
+pub mod tool;
 pub mod toml;
 
 #[cfg(test)]
@@ -103,7 +104,8 @@ pub const NS_ADMIN: u8 = 4;
 /// A volume (or the whole of it) placed in the service's namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NsGrant {
-    /// Where the service sees it, e.g. `/system`.
+    /// Where the service sees it, e.g. `/system`; `*` with volume `*`: every volume, each at
+    /// `/<volume>`, with at most the rights the volume has.
     pub path: String,
     /// The volume's name, as the storage service announces it.
     pub volume: String,
@@ -166,6 +168,12 @@ pub struct Manifest {
     pub kernel_log: bool,
     /// The boot-time record (wall clock captured by the loader; the clock service).
     pub boot_time: bool,
+    /// A channel to the service manager (`grants.manager`): list, stop and restart services.
+    pub manage_services: bool,
+    /// ... and switch the machine off or restart it (a clean shutdown first).
+    pub manage_power: bool,
+    /// The tool manifests and the tools' program images (the shell).
+    pub tools: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
@@ -186,7 +194,7 @@ pub fn valid_name(s: &str) -> bool {
 }
 
 /// A program file name: a valid name, then `.dx` or `.ddrv`.
-fn valid_program(s: &str) -> bool {
+pub fn valid_program(s: &str) -> bool {
     match s.rsplit_once('.') {
         Some((n, "dx" | "ddrv")) => valid_name(n),
         _ => false,
@@ -233,6 +241,14 @@ fn parse_device(s: &str) -> Option<DeviceSel> {
 }
 
 fn parse_ns(s: &str) -> Option<NsGrant> {
+    if let Some(r) = s.strip_prefix('*') {
+        let rights = match r {
+            "" | ":rw" => NS_READ | NS_WRITE,
+            ":r" => NS_READ,
+            _ => return None,
+        };
+        return Some(NsGrant { path: "*".to_string(), volume: "*".to_string(), rights });
+    }
     let (path, rest) = s.split_once('=')?;
     let (volume, rights) = rest.split_once(':')?;
     let p = path.strip_prefix('/')?;
@@ -282,6 +298,8 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "power", Want::Bool),
     ("grants", "kernel-log", Want::Bool),
     ("grants", "boot-time", Want::Bool),
+    ("grants", "manager", Want::Strings),
+    ("grants", "tools", Want::Bool),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -330,6 +348,9 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         power: false,
         kernel_log: false,
         boot_time: false,
+        manage_services: false,
+        manage_power: false,
+        tools: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -386,6 +407,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                 "grants.power" => m.power = *b,
                 "grants.kernel-log" => m.kernel_log = *b,
                 "grants.boot-time" => m.boot_time = *b,
+                "grants.tools" => m.tools = *b,
                 _ => return Err(bad("known")),
             },
             (Want::Bool, v) => return Err(bad(&format!("true or false, not {}", v.type_name()))),
@@ -461,11 +483,23 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                     }
                     "grants.namespace" => {
                         for s in &list {
-                            let g = parse_ns(s).ok_or_else(|| invalid("not a namespace entry (/<path>=<volume>:r|rw|rwa)", s))?;
+                            let g = parse_ns(s).ok_or_else(|| invalid("not a namespace entry (/<path>=<volume>:r|rw|rwa, or * / *:r for every volume)", s))?;
                             if m.namespace.iter().any(|x| x.path == g.path) {
                                 return Err(invalid("path granted twice:", &g.path));
                             }
                             m.namespace.push(g);
+                        }
+                        if m.namespace.len() > 1 && m.namespace.iter().any(|g| g.path == "*") {
+                            return Err(err(e.line, format!("'{}': '*' (every volume) must be the only entry", fk)));
+                        }
+                    }
+                    "grants.manager" => {
+                        for s in &list {
+                            match s.as_str() {
+                                "services" => m.manage_services = true,
+                                "power" => m.manage_power = true,
+                                _ => return Err(invalid("unknown manager right (services, power)", s)),
+                            }
                         }
                     }
                     _ => return Err(bad("known")),
@@ -513,7 +547,11 @@ pub fn summary(m: &Manifest) -> String {
         add(&format!("{}.{}", c.service, c.endpoint));
     }
     for n in &m.namespace {
-        add(&format!("{}={}", n.path, n.volume));
+        if n.path == "*" {
+            add("every volume");
+        } else {
+            add(&format!("{}={}", n.path, n.volume));
+        }
     }
     if m.vmex {
         add("VMEX");
@@ -526,6 +564,12 @@ pub fn summary(m: &Manifest) -> String {
     }
     if m.boot_time {
         add("boot time");
+    }
+    if m.manage_services || m.manage_power {
+        add(&format!("manager ({}{}{})", if m.manage_services { "services" } else { "" }, if m.manage_services && m.manage_power { ", " } else { "" }, if m.manage_power { "power" } else { "" }));
+    }
+    if m.tools {
+        add("tools");
     }
     if s.is_empty() {
         s.push_str("nothing");

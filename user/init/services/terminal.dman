@@ -1,16 +1,20 @@
-# The console service: keyboard input from the device manager, echoed and assembled into lines
-# (the start of the terminal).
-name = "console"
-image = "console.dx"
+# The terminal: the screen (the display device, taken from the kernel console) and the keyboard (the
+# device manager's input endpoint); line editing and scrollback for the shell's session.
+name = "terminal"
+image = "terminal.dx"
 group = "system"
-description = "keyboard input"
+description = "the screen and the keyboard"
+
+[provides]
+endpoints = ["session"]   # the shell
 
 [grants]
 log = true
+devices = ["platform:display"]
 connect = ["devmgr.input"]
 
 [quota]
-memory = "1M"
+memory = "8M"
 handles = 32
 threads = 1
 

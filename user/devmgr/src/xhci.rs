@@ -313,6 +313,8 @@ struct Kbd {
     buf_at: [u8; RING_TRBS as usize],
     last: [u8; 8],
     keys: Keys,
+    /// Report transfers completed (the first is logged: a diagnostic).
+    transfers: u64,
 }
 
 /// Result of a probe. The keyboard is large but short-lived (moved into `Xhci::kbd`).
@@ -839,6 +841,7 @@ impl Xhci {
             buf_at: [u8::MAX; RING_TRBS as usize],
             last: [0; 8],
             keys: Keys::default(),
+            transfers: 0,
         };
         for b in 0..REPORTS as u8 {
             self.queue_report(&mut k, b);
@@ -1078,11 +1081,20 @@ impl Xhci {
         if usize::from(buf) >= REPORTS {
             return Err("transfer event for a TRB that is not queued");
         }
+        let got = 8u32.saturating_sub(e.status & 0xFF_FFFF);
+        k.transfers += 1;
+        if k.transfers == 1 {
+            // Diagnostic for keyboards that are found but never type (behind a transaction
+            // translator on real hubs): whether the first report transfer completes, and how.
+            println!("xhci: keyboard: first report transfer: completion code {}, {} byte(s)", e.code(), got);
+        }
         match e.code() {
             CC_SUCCESS | CC_SHORT => {}
-            _ => return Err("keyboard transfer failed (device gone?)"),
+            c => {
+                println!("xhci: keyboard: report transfer failed with completion code {}", c);
+                return Err("keyboard transfer failed (device gone?)");
+            }
         }
-        let got = 8u32.saturating_sub(e.status & 0xFF_FFFF);
         if got >= 3 {
             self.reports += 1;
             let mut r = [0u8; 8];
@@ -1167,16 +1179,19 @@ fn usage_code(u: u8) -> Option<u16> {
         0x1E..=0x26 => Some(u16::from(u - 0x1E + 2)), // 1-9
         0x27 => Some(11),                              // 0
         0x28..=0x39 => Some(u16::from(OTHER[usize::from(u - 0x28)])).filter(|&c| c != 0),
+        // Insert, Home, PgUp, Delete, End, PgDn, Right, Left, Down, Up: the keypad's set 1 codes.
+        0x49..=0x52 => Some([82, 71, 73, 83, 79, 81, 77, 75, 80, 72][usize::from(u - 0x49)]),
         _ => None,
     }
 }
 
-/// Feed the change from `old` to `new` (boot reports) through `keys`; the characters typed.
-fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> impl Iterator<Item = u8> {
-    let mut out = [0u8; 8];
+/// Feed the change from `old` to `new` (boot reports) through `keys`; the key values typed.
+fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> impl Iterator<Item = u32> {
+    let mut out = [0u32; 8];
     let mut n = 0;
-    // Modifiers first: left/right control and shift.
-    for (bit, code) in [(0, keymap::CTRL), (1, keymap::LSHIFT), (4, keymap::CTRL), (5, keymap::RSHIFT)] {
+    // Modifiers first: left/right control, shift and alt.
+    let mods = [(0, keymap::CTRL), (1, keymap::LSHIFT), (2, keymap::ALT), (4, keymap::CTRL), (5, keymap::RSHIFT), (6, keymap::ALT)];
+    for (bit, code) in mods {
         let (was, is) = (old[0] >> bit & 1, new[0] >> bit & 1);
         if was != is {
             keys.key(code, is == 1);

@@ -1,0 +1,39 @@
+# The core tools the shell runs (docs/shell.md): list, show, copy, move, delete, make. One library,
+# linked once per tool with its own entry (dx_<name>); each tool has a manifest in manifests/.
+[package]
+name = "tools"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = true
+debug-assertions = false
+incremental = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[package.metadata.dos]
+dx = ["list", "show", "copy", "move", "delete", "make"]

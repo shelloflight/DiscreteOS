@@ -1,0 +1,26 @@
+# The shell: one session on the terminal. Everything a session may do is listed here: every volume
+# (with the rights the storage service gives it: read-only on a normal boot), the log, the clock,
+# the service manager (services and power) and the tools. A tool it starts gets only the paths
+# typed, with the rights its own manifest declares.
+name = "shell"
+image = "shell.dx"
+group = "system"
+after = ["storaged"]
+description = "the command shell"
+
+[grants]
+log = true
+connect = ["terminal.session", "log.read", "clock.time"]
+namespace = ["*"]
+manager = ["services", "power"]
+tools = true
+
+[quota]
+memory = "32M"
+handles = 512
+threads = 4
+
+[restart]
+policy = "always"
+limit = 10
+backoff = 200

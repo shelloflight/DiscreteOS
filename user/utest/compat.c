@@ -84,7 +84,7 @@ static void test_start_exception(void)
  * init gives them to programs it trusts). Returns its exit code. */
 static int64_t run_dcmpl(const char *pname, const char *args)
 {
-    struct dos_spawn_handle hs[24];
+    struct dos_spawn_handle hs[64];   /* the log, VMEX and every program (29 today) */
     uint32_t nh = 0;
     dos_handle_t image = 0;
     char buf[32];
@@ -94,7 +94,7 @@ static int64_t run_dcmpl(const char *pname, const char *args)
     int64_t vx = dos_handle_duplicate(dos_startup_handle(DOS_TAG_VMEX), DOS_RIGHTS_SAME);
     if (vx > 0)
         hs[nh++] = (struct dos_spawn_handle){ (dos_handle_t)vx, DOS_RIGHTS_SAME, DOS_TAG_VMEX, 0 };
-    for (uint32_t i = 0; i < dos_start->nhandles && nh < 24; i++) {
+    for (uint32_t i = 0; i < dos_start->nhandles && nh < 64; i++) {
         dos_handle_t h = dos_start->handles[i].handle;
         if (dos_start->handles[i].tag != DOS_TAG_PROGRAM)
             continue;

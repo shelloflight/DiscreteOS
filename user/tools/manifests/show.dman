@@ -1,0 +1,12 @@
+# show: the contents of a file, as text.
+kind = "tool"
+name = "show"
+image = "show.dx"
+aliases = ["cat", "type"]
+description = "show the contents of a file"
+
+[parameters]
+file = "path:read"
+
+[about]
+file = "the file to show"

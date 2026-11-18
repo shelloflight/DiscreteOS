@@ -156,6 +156,8 @@ unsafe extern "C" {
     pub fn console_lock() -> u64;
     pub fn console_unlock(flags: u64);
     pub fn console_write_locked(s: *const u8, n: usize);
+    pub fn console_display(out: *mut ConsoleDisplay) -> bool;
+    pub fn console_release_screen();
 
     // mm.h
     pub fn kmalloc(size: usize) -> *mut u8;
@@ -281,6 +283,23 @@ pub struct RawProgram {
     pub len: u64,
 }
 
+/// `struct console_display` (console.h).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ConsoleDisplay {
+    pub base: u64,
+    pub size: u64,
+    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub red_shift: u8,
+    pub green_shift: u8,
+    pub blue_shift: u8,
+    pub reserved: [u8; 5],
+}
+const _: () = assert!(core::mem::size_of::<ConsoleDisplay>() == 40);
+
 /// `USER_BASE` / `USER_TOP` (mm.h).
 pub const USER_BASE: u64 = 0x20_0000;
 pub const USER_TOP: u64 = 0x0000_7FFF_FFFF_0000;
@@ -288,6 +307,7 @@ pub const USER_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 pub const VMM_W: u32 = 1 << 0;
 pub const VMM_X: u32 = 1 << 1;
 pub const VMM_UC: u32 = 1 << 2;
+pub const VMM_WC: u32 = 1 << 3;
 /// `WAIT_INTERRUPTED` (thread.h).
 pub const WAIT_INTERRUPTED: c_int = 2;
 /// `UTHREAD_EXIT_KILLED`, `DOS_EXIT_*` (user.h).

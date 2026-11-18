@@ -1,7 +1,7 @@
-# The console service: keyboard input from the device manager's input endpoint, echoed and assembled
-# into lines (the start of the terminal; docs/services.md).
+# The terminal service: the screen (the display device) and the keyboard (the device manager's
+# input endpoint); line editing, history and scrollback for the shell (docs/shell.md).
 [package]
-name = "console"
+name = "terminal"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"

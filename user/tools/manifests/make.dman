@@ -1,0 +1,12 @@
+# make: a new directory.
+kind = "tool"
+name = "make"
+image = "make.dx"
+aliases = ["mkdir", "md"]
+description = "make a directory"
+
+[parameters]
+place = "path:write,create"
+
+[about]
+place = "the directory to make"

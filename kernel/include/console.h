@@ -39,6 +39,18 @@ void console_write(const char *s, size_t n);          /* takes the console lock 
 void console_set_color(enum vga_color fg, enum vga_color bg);
 void console_clear(void);                             /* blank the screen (not serial), cursor home */
 
+/* The screen as a device for user space (the `display` platform device, docs/abi.md). */
+enum { CONSOLE_DISPLAY_RGB32 = 1, CONSOLE_DISPLAY_VGA_TEXT = 2 };
+struct console_display {
+    uint64_t base, size;                       /* physical */
+    uint32_t kind, width, height, pitch;       /* pixels (RGB32) or cells (VGA text); pitch in bytes */
+    uint8_t  red_shift, green_shift, blue_shift, reserved[5];
+};
+bool console_display(struct console_display *out);   /* false: no screen */
+/* The terminal took the screen: the kernel writes only to serial until a panic takes it back. */
+void console_release_screen(void);
+bool console_screen_released(void);
+
 /* Hold the console across several writes (one message stays together). Bypassed during a panic. */
 uint64_t console_lock(void);
 void     console_unlock(uint64_t flags);

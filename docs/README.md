@@ -13,6 +13,7 @@ that cover it.
 | [abi.md](abi.md) | The user/kernel ABI: syscalls, status codes, startup block, ELF rules |
 | [libd.md](libd.md) | The user runtime: heap, threads, locks, owned handles, channels; its C binding |
 | [services.md](services.md) | init, the service manager: manifests, exact grants, supervision, shutdown |
+| [shell.md](shell.md) | The terminal, the shell (typed records, places, jobs) and the tools with declared rights |
 | [storage.md](storage.md) | Block drivers, `storaged`, files as handles, DFS and FAT32 |
 | [compat.md](compat.md) | D-CMPL: running Windows and Linux programs unchanged |
 | [signing.md](signing.md) | Verified boot, measured boot, code signing, `.dsig` format |

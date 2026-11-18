@@ -1,0 +1,12 @@
+# list: the entries of a directory (or one file) as records.
+kind = "tool"
+name = "list"
+image = "list.dx"
+aliases = ["ls", "dir"]
+description = "list a directory"
+
+[parameters]
+place = "path:read,optional"
+
+[about]
+place = "the directory (or file) to list; the current place if left out"

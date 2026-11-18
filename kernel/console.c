@@ -14,6 +14,10 @@
 
 static spinlock_t console_lk = SPINLOCK_INIT("console", LOCK_RANK_CONSOLE);
 static enum { SCREEN_NONE, SCREEN_VGA, SCREEN_FB } screen;
+/* The screen was handed to user space (the terminal mapped the display device): only serial
+ * from then on. A panic takes it back (`reclaimed`): the screen is cleared once, then the report. */
+static bool released, reclaimed;
+static struct console_display fbdesc;
 
 #define CONSOLE_LOCKED (1ull << 63)   /* marker in the returned flags: lock was really taken */
 
@@ -45,9 +49,37 @@ bool console_attach_framebuffer(const BootInfo *bi)
             fbcon_write("\n", 1);
     }
     screen = SCREEN_FB;
+    fbdesc = (struct console_display){
+        .base = bi->fb_base, .size = bi->fb_size, .kind = CONSOLE_DISPLAY_RGB32,
+        .width = bi->fb_width, .height = bi->fb_height, .pitch = bi->fb_pitch,
+        .red_shift = bi->fb_red_shift, .green_shift = bi->fb_green_shift, .blue_shift = bi->fb_blue_shift,
+    };
     console_unlock(f);
     return true;
 }
+
+bool console_display(struct console_display *out)
+{
+    if (screen == SCREEN_FB) {
+        *out = fbdesc;
+        return true;
+    }
+    if (screen == SCREEN_VGA) {
+        *out = (struct console_display){ .base = vga_phys_base(), .size = 4096, .kind = CONSOLE_DISPLAY_VGA_TEXT,
+                                         .width = 80, .height = 25, .pitch = 160 };
+        return true;
+    }
+    return false;
+}
+
+void console_release_screen(void)
+{
+    uint64_t f = console_lock();
+    released = true;
+    console_unlock(f);
+}
+
+bool console_screen_released(void) { return released; }
 
 uint64_t console_lock(void)
 {
@@ -65,6 +97,17 @@ void console_unlock(uint64_t flags)
 void console_write_locked(const char *s, size_t n)
 {
     serial_write(s, n);
+    if (released) {
+        if (!panic_in_progress())
+            return;
+        if (!reclaimed) {
+            reclaimed = true;
+            if (screen == SCREEN_VGA)
+                vga_clear();
+            else if (screen == SCREEN_FB)
+                fbcon_clear();
+        }
+    }
     if (screen == SCREEN_VGA)
         vga_write(s, n);
     else if (screen == SCREEN_FB)
@@ -81,6 +124,10 @@ void console_write(const char *s, size_t n)
 void console_clear(void)
 {
     uint64_t f = console_lock();
+    if (released && !reclaimed) {
+        console_unlock(f);
+        return;
+    }
     if (screen == SCREEN_VGA)
         vga_clear();
     else if (screen == SCREEN_FB)

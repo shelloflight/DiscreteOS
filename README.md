@@ -21,8 +21,8 @@ measured**. Where standards cost nothing, D-OS uses them: ELF, UEFI, ACPI, GPT, 
 ## Where it stands
 
 **D-KRNL 1.0.** The kernel is complete (stable SMP, a versioned ABI, every protection proven by a
-test, fuzzers and sanitizers clean). It boots in QEMU and on real PCs (BIOS and UEFI) to user space. There is no
-shell or GUI yet.
+test, fuzzers and sanitizers clean). It boots in QEMU and on real PCs (BIOS and UEFI) to a terminal and a shell. There
+is no GUI yet.
 
 - Own BIOS and UEFI loaders with verified boot (Ed25519) and KASLR; one GPT image for both
 - SMP kernel (x2APIC), W^X everywhere, SMEP/SMAP/UMIP, KPTI, retpolines and other speculation
@@ -36,9 +36,11 @@ shell or GUI yet.
 - A service manager: each service gets exactly the capabilities its signed manifest lists, and is
   restarted with backoff when it fails; core services for a structured system log, wall-clock time
   and keyboard input
+- A terminal and a shell whose commands pass typed records (`list | where size > 1M | sort
+  modified`); each tool gets only the paths typed, with the rights its manifest declares
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
 - An MSVC-built Windows program and a static Linux program run unchanged
-- 79 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
+- 80 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
   stress, reproducible builds
 
 ## Quick start

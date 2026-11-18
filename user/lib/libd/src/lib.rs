@@ -10,6 +10,8 @@
 //! - `heap` (feature `alloc`): the global allocator, safe for many threads;
 //! - `proto`: the device manager <-> driver messages; `fs`: files as handles, namespaces;
 //! - `svc`: the service manager <-> service messages and endpoint lookup;
+//! - `rec` (feature `alloc`): typed records, what shell commands exchange; `term`: the
+//!   terminal's session protocol; `tool`: how the shell starts a tool;
 //! - `capi` (feature `capi`): the C binding (user/include/libd.h).
 //!
 //! A program defines its entry with `libd::entry!(symbol, main)`; `main` returns the exit code
@@ -29,12 +31,16 @@ pub mod handle;
 pub mod heap;
 pub mod log;
 pub mod proto;
+#[cfg(feature = "alloc")]
+pub mod rec;
 pub mod svc;
 pub mod sync;
 pub mod sys;
+pub mod term;
 #[cfg(feature = "alloc")]
 pub mod thread;
 pub mod time;
+pub mod tool;
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};

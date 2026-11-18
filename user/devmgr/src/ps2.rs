@@ -7,7 +7,7 @@ use libd::proto::{self, HEADER, Header};
 use libd::sys::{self, Handle};
 use libd::{Port, Startup, println};
 
-use crate::keymap::Keys;
+use crate::keymap::{self, Keys};
 
 const DATA: u64 = 0;
 const CTL: u64 = 1;
@@ -119,10 +119,11 @@ pub fn main(s: *const Startup) -> i32 {
                 continue;
             }
             let ext = core::mem::take(&mut extended);
-            if ext {
-                continue; // arrows etc. come later
+            let code = u16::from(sc & 0x7F);
+            if ext && (code == keymap::LSHIFT || code == keymap::RSHIFT) {
+                continue; // the fake shifts some keyboards send around the navigation block
             }
-            if let Some(c) = keys.key(u16::from(sc & 0x7F), sc & 0x80 == 0) {
+            if let Some(c) = keys.key(code, sc & 0x80 == 0) {
                 proto::send(ch, proto::KEY, u64::from(c), 0);
             }
         }

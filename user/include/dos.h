@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 8
+#define DOS_ABI_VERSION 9
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -112,6 +112,8 @@ enum {
     DOS_SYS_MEASURE,
     /* ABI v8: the log service */
     DOS_SYS_KLOG_READ, DOS_SYS_LOG_RECORD,
+    /* ABI v9: the terminal and the shell */
+    DOS_SYS_DISPLAY_INFO, DOS_SYS_PROCESS_HANDLES,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -397,6 +399,30 @@ struct dos_klog_entry {
 };
 _Static_assert(sizeof(struct dos_klog_entry) == 176, "dos_klog_entry layout");
 static inline int64_t dos_klog_read(dos_handle_t klog, uint64_t seq, struct dos_klog_entry *buf, uint64_t cap) { return DOS_SC(DOS_SYS_KLOG_READ, klog, seq, buf, cap, 0, 0); }
+
+/* ABI v9: the display device (a platform device named "display"): its memory window is BAR 0
+ * (mapped write-combining; mapping it takes the screen from the kernel console). VGA text also
+ * has the CRT controller's index/data ports (0x3D4-0x3D5) as I/O window 1. */
+enum { DOS_DISPLAY_RGB32 = 1, DOS_DISPLAY_VGA_TEXT = 2 };
+struct dos_display_info {
+    uint32_t kind;                            /* DOS_DISPLAY_* */
+    uint32_t width, height;                   /* pixels (RGB32) or cells (VGA text) */
+    uint32_t pitch;                           /* bytes per line */
+    uint64_t size;                            /* bytes of BAR 0 */
+    uint8_t  red_shift, green_shift, blue_shift, reserved[5];
+};
+_Static_assert(sizeof(struct dos_display_info) == 32, "dos_display_info layout");
+static inline int64_t dos_display_info(dos_handle_t dev, struct dos_display_info *i) { return DOS_SC(DOS_SYS_DISPLAY_INFO, dev, i, 0, 0, 0, 0); }
+
+/* ABI v9, INSPECT on the process: the handles it holds (at most cap entries, at most 256 per
+ * call); returns how many it holds. Handle values are never returned. */
+struct dos_handle_entry {
+    uint32_t type, rights;
+    uint64_t koid;
+    char     name[32];                        /* NUL-terminated; empty for unnamed objects */
+};
+_Static_assert(sizeof(struct dos_handle_entry) == 48, "dos_handle_entry layout");
+static inline int64_t dos_process_handles(dos_handle_t proc, struct dos_handle_entry *buf, uint64_t cap) { return DOS_SC(DOS_SYS_PROCESS_HANDLES, proc, buf, cap, 0, 0, 0); }
 
 /* ABI v8: the boot-time record (DOS_TAG_BOOT_TIME). */
 struct dos_boot_time {

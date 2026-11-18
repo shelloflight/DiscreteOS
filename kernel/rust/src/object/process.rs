@@ -382,6 +382,12 @@ impl Process {
         target.add(obj, rights)
     }
 
+    /// Every handle of this process, at most `max` (type, koid, rights, name), via `f`, under the
+    /// table lock; returns how many it holds.
+    pub fn handle_list(&self, max: usize, f: impl FnMut(&Object, Rights)) -> u32 {
+        self.handles.lock().list(max, f)
+    }
+
     /// (type, koid, rights) of a handle. Needs no right.
     pub fn object_info(&self, h: Handle) -> KResult<(ObjType, u64, Rights)> {
         let (obj, rights) = self.get(h, Rights::NONE)?;

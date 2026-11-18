@@ -1,0 +1,12 @@
+# delete: files and empty directories.
+kind = "tool"
+name = "delete"
+image = "delete.dx"
+aliases = ["rm", "del"]
+description = "delete files or empty directories"
+
+[parameters]
+path = "path:write,many"
+
+[about]
+path = "what to delete (several may be given)"

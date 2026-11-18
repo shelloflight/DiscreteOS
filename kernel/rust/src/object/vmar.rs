@@ -247,7 +247,11 @@ impl Vmar {
         g.entries.try_reserve(1).map_err(|_| Status::NoMemory)?;
         let first = (vmo_off / PAGE) as usize;
         let frames = &vmo.frames()[first..first + (len / PAGE) as usize];
-        let uc = if vmo.is_device() { ffi::VMM_UC } else { 0 };
+        let uc = match (vmo.is_device(), vmo.is_write_combining()) {
+            (true, true) => ffi::VMM_WC,
+            (true, false) => ffi::VMM_UC,
+            _ => 0,
+        };
         self.aspace.map(start, frames, vmm_flags(perms) | uc)?;
         g.entries.insert(
             pos,

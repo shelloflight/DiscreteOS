@@ -99,7 +99,10 @@ pub mod nr {
     // ABI v8: the log service
     pub const KLOG_READ: u64 = 65;
     pub const LOG_RECORD: u64 = 66;
-    pub const COUNT: u64 = 67;
+    // ABI v9: the terminal and the shell
+    pub const DISPLAY_INFO: u64 = 67;
+    pub const PROCESS_HANDLES: u64 = 68;
+    pub const COUNT: u64 = 69;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -263,11 +266,92 @@ fn device_info(u: &UserThread, dh: u64, out: u64) -> KResult<i64> {
                 i.bar_size[k] = u64::from(len);
                 i.bar_kind[k] = if len != 0 { 2 } else { 0 };
             }
+            if p.mem.1 != 0 {
+                (i.bar_size[0], i.bar_kind[0]) = (p.mem.1, 1); // the memory window is BAR 0
+            }
         }
     }
     drop(d);
     uaccess::write(out, &i)?;
     Ok(0)
+}
+
+/// `struct dos_display_info` (docs/abi.md).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DisplayInfo {
+    kind: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    size: u64,
+    red_shift: u8,
+    green_shift: u8,
+    blue_shift: u8,
+    reserved: [u8; 5],
+}
+// SAFETY: repr(C), integers only, no padding (asserted).
+unsafe impl Pod for DisplayInfo {}
+const _: () = assert!(core::mem::size_of::<DisplayInfo>() == 32);
+
+/// display_info(device, struct dos_display_info *): the layout of the display device's memory
+/// window (BAR 0). `WRONG_TYPE` for any other device.
+fn display_info(u: &UserThread, dh: u64, out: u64) -> KResult<i64> {
+    use crate::object::device::Kind;
+    let (d, _) = u.proc.get_device(h(dh), Rights::INSPECT)?;
+    let Kind::Platform(p) = &d.kind else { return Err(Status::WrongType) };
+    let disp = p.display.ok_or(Status::WrongType)?;
+    let i = DisplayInfo {
+        kind: disp.kind,
+        width: disp.width,
+        height: disp.height,
+        pitch: disp.pitch,
+        size: p.mem.1,
+        red_shift: disp.shifts[0],
+        green_shift: disp.shifts[1],
+        blue_shift: disp.shifts[2],
+        reserved: [0; 5],
+    };
+    drop(d);
+    uaccess::write(out, &i)?;
+    Ok(0)
+}
+
+/// `struct dos_handle_entry` (docs/abi.md).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct HandleEntry {
+    ty: u32,
+    rights: u32,
+    koid: u64,
+    name: [u8; 32],
+}
+// SAFETY: repr(C), integers only, no padding (asserted).
+unsafe impl Pod for HandleEntry {}
+const _: () = assert!(core::mem::size_of::<HandleEntry>() == 48);
+/// Entries one process_handles call returns at most.
+const HANDLES_MAX: usize = 256;
+
+/// process_handles(process, buf, cap) -> handles the process holds. Copies at most `cap` (and at
+/// most 256) entries: type, rights, koid and name; never the handle values (they mean nothing
+/// outside that process). Needs INSPECT.
+fn process_handles(u: &UserThread, ph: u64, buf: u64, cap: u64) -> KResult<i64> {
+    let (target, _) = u.proc.get_process(h(ph), Rights::INSPECT)?;
+    let max = usize::try_from(cap).unwrap_or(usize::MAX).min(HANDLES_MAX);
+    let mut v: alloc::vec::Vec<HandleEntry> = alloc::vec::Vec::new();
+    v.try_reserve_exact(max).map_err(|_| Status::NoMemory)?;
+    let total = target.handle_list(max, |o, r| {
+        let mut e = HandleEntry { ty: o.obj_type() as u32, rights: r.0, koid: o.koid(), name: [0; 32] };
+        let n = o.name().as_bytes();
+        let k = n.len().min(31);
+        e.name[..k].copy_from_slice(&n[..k]);
+        v.push(e); // capacity reserved: never allocates under the lock
+    });
+    drop(target);
+    for (k, e) in v.iter().enumerate() {
+        uaccess::write(buf + (k * core::mem::size_of::<HandleEntry>()) as u64, e)?;
+    }
+    Ok(i64::from(total))
 }
 
 fn device_map_bar(u: &UserThread, dh: u64, bar: u64) -> KResult<i64> {
@@ -446,13 +530,7 @@ fn object_name(u: &UserThread, hv: u64, ptr: u64, len: u64) -> KResult<i64> {
     let (obj, _) = u.proc.get(h(hv), Rights::NONE)?;
     let mut tmp = [0u8; 32];
     let n = {
-        let s = match &obj {
-            crate::object::Object::Process(p) => p.name(),
-            crate::object::Object::Thread(t) => t.name(),
-            crate::object::Object::Vmo(v) => v.name(),
-            crate::object::Object::Device(d) => d.name(),
-            _ => "",
-        };
+        let s = obj.name();
         tmp[..s.len()].copy_from_slice(s.as_bytes());
         s.len()
     };
@@ -967,6 +1045,8 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
         nr::MEASURE => measure(u, a[0], a[1], a[2], a[3]),
         nr::KLOG_READ => klog_read(u, a[0], a[1], a[2], a[3]),
         nr::LOG_RECORD => log_record(u, a[0], a[1], a[2], a[3]),
+        nr::DISPLAY_INFO => display_info(u, a[0], a[1]),
+        nr::PROCESS_HANDLES => process_handles(u, a[0], a[1], a[2]),
         #[cfg(ktest)]
         nr::KTEST_SMAP => {
             // SAFETY: test builds only: makes the kernel fault on purpose (SMAP).

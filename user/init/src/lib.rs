@@ -8,6 +8,8 @@
 //!   (none)              the system: the embedded manifests of group `system` (storaged,
 //!                       devmgr), then signed ones from the boot volume (`esp:/DOS/SERVICES`);
 //!                       supervised for ever. Disks are read-only (docs/hardware.md)
+//!   shell test          the system with writable disks and the terminal mirrored to the log
+//!                       (the host types a session on the keyboard)
 //!   time test           writable storage and svc-time (the wall-clock time across a reboot),
 //!                       then a clean shutdown and power-off
 //!   services test       the service manager's test run: system and test services, signed and
@@ -163,7 +165,7 @@ fn list_programs() {
         }
     }
     println!("init: programs:{}", progs);
-    println!("init: service manifests:{}", if mans.is_empty() { " none" } else { &mans });
+    println!("init: manifests:{}", if mans.is_empty() { " none" } else { &mans });
 }
 
 fn main(s: *const Startup) -> i32 {
@@ -228,6 +230,19 @@ fn main(s: *const Startup) -> i32 {
         "power off" => return power(sys::POWER_OFF),
         "power reboot" => return power(sys::POWER_REBOOT),
         "services test" => return services_test(),
+        "shell test" => {
+            // The system with writable disks and the terminal mirrored to the log: the host types
+            // a session and reads it back on serial (a power-off typed in the shell ends it).
+            let Some(mut m) = start_system(&[("storaged", "test"), ("devmgr", "rw"), ("terminal", "mirror")], &[Group::System]) else { return 1 };
+            loop {
+                m.pump(sys::WAIT_FOREVER);
+                if let Some(action) = m.power_request.take() {
+                    m.shutdown();
+                    let r = sys::system_power(startup(sys::TAG_POWER), action);
+                    println!("init: power: system_power returned {}", r);
+                }
+            }
+        }
         "time test" => return time_test(),
         _ => {}
     }
@@ -239,6 +254,13 @@ fn main(s: *const Startup) -> i32 {
     }
     loop {
         m.pump(sys::WAIT_FOREVER);
+        // The shell (or another holder of `grants.manager = ["power"]`) asked for the power: every
+        // service stops cleanly first, volumes made durable.
+        if let Some(action) = m.power_request.take() {
+            m.shutdown();
+            let r = sys::system_power(startup(sys::TAG_POWER), action);
+            println!("init: power: system_power returned {}", r);
+        }
     }
 }
 

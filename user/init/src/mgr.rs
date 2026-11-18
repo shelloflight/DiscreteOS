@@ -26,12 +26,14 @@ use libd::fs::{self as fp, NsBuilder, Node};
 use libd::handle::Owned;
 use libd::proto::{self, HEADER, Header};
 use libd::sys::{self, Handle, MsgHandle, SpawnHandle};
-use libd::{Port, println, svc};
+use libd::rec::{Record, Value};
+use libd::{Port, println, svc, tool};
 
 const MS: u64 = 1_000_000;
 const SEC: u64 = 1_000_000_000;
 const KEY_PROC: u64 = 1;
 const KEY_CTL: u64 = 2;
+const KEY_MGR: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -64,6 +66,28 @@ pub struct Service {
     pub last_code: i64,
     /// Arguments replacing the manifest's (test modes: `storage test` runs storaged with `test`).
     pub args: Option<String>,
+    /// The manager's end of its manager channel (`grants.manager`).
+    mgr: Owned,
+    /// Asked to stop or restart (`MGR_STOP`, `MGR_RESTART`): what happens at its exit, and when
+    /// it is ended if it has not stopped by then (clock_ns; 0 = no deadline).
+    on_exit: OnExit,
+    kill_by: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OnExit {
+    /// Its restart policy decides.
+    Policy,
+    /// Stopped for good.
+    Stop,
+    /// Started again at once (not counted as a restart).
+    Restart,
+}
+
+/// An accepted tool manifest: what it says, and its VMO (handed to holders of `grants.tools`).
+pub struct ToolEntry {
+    pub t: dman::tool::Tool,
+    vmo: Handle,
 }
 
 /// A volume a provider announced: name and a channel to its root with every right.
@@ -82,6 +106,9 @@ pub struct Mgr {
     /// Connections whose provider is not in the set (`devmgr test`): skipped instead of refused.
     pub standalone: bool,
     pub refused: u32,
+    pub tools: Vec<ToolEntry>,
+    /// A manager channel asked for the power (`MGR_POWER`): a clean shutdown, then this action.
+    pub power_request: Option<u64>,
 }
 
 fn startup(tag: u32) -> Handle {
@@ -143,6 +170,8 @@ impl Mgr {
             order: Vec::new(),
             standalone: false,
             refused: 0,
+            tools: Vec::new(),
+            power_request: None,
         })
     }
 
@@ -189,8 +218,32 @@ impl Mgr {
             restarts: 0,
             last_code: 0,
             args: None,
+            mgr: Owned::default(),
+            on_exit: OnExit::Policy,
+            kill_by: 0,
         });
         true
+    }
+
+    /// A tool manifest (`kind = "tool"`): accepted if it parses, its image is an embedded program
+    /// and neither its name nor an alias is taken; measured either way.
+    fn offer_tool(&mut self, source: &str, bytes: &[u8], vmo: Handle) {
+        let digest = sha256(bytes);
+        let t = match dman::tool::parse(bytes) {
+            Ok(t) => t,
+            Err(e) => return self.refuse(source, &digest, &e.to_string()),
+        };
+        if libd::find_program(t.image.as_bytes()).is_none() {
+            return self.refuse(source, &digest, &format!("image {} is not an embedded program", t.image));
+        }
+        let names = |x: &dman::tool::Tool| -> Vec<String> { core::iter::once(x.name.clone()).chain(x.aliases.iter().cloned()).collect() };
+        let mine = names(&t);
+        if let Some(n) = self.tools.iter().flat_map(|e| names(&e.t)).find(|n| mine.contains(n)) {
+            return self.refuse(source, &digest, &format!("the name '{}' is taken by another tool", n));
+        }
+        measure(&digest, &format!("tool {}", t.name));
+        println!("init: tool {} accepted ({}): {}", t.name, source, t.usage());
+        self.tools.push(ToolEntry { t, vmo });
     }
 
     /// The embedded manifests (startup tag MANIFEST), of the given groups.
@@ -199,6 +252,7 @@ impl Mgr {
         for h in hs {
             let name = object_name(h);
             match vmo_bytes(h, dman::toml::MAX_SIZE) {
+                Some(b) if dman::tool::is_tool(&b) => self.offer_tool(&name, &b, h),
                 Some(b) => {
                     self.offer(&name, &b, groups);
                 }
@@ -332,6 +386,24 @@ impl Mgr {
         {
             give(&mut hs, h, sys::TAG_BOOT_TIME);
         }
+        // The tools: their manifests (read-only) and their program images.
+        if m.tools {
+            for e in &self.tools {
+                if let Ok(h) = sys::handle_duplicate(e.vmo, sys::RIGHT_READ | sys::RIGHT_TRANSFER) {
+                    give(&mut hs, h, tool::TAG_TOOL_MANIFEST);
+                }
+                if let Some(h) = libd::find_program(e.t.image.as_bytes()).and_then(dup) {
+                    give(&mut hs, h, sys::TAG_PROGRAM);
+                }
+            }
+        }
+        // A channel to the manager itself (list, stop and restart services; power).
+        let mut mgr_end = Owned::default();
+        if m.manage_services || m.manage_power {
+            let (mine, theirs) = sys::channel_pair().map_err(|e| format!("no channel: {}", sys::status(e)))?;
+            give(&mut hs, theirs, tool::TAG_MANAGER);
+            mgr_end = Owned::from_raw(mine);
+        }
         let mut ndev = 0;
         let mut left_out = 0;
         let starts: Vec<(Handle, u32)> = libd::startup_handles().collect();
@@ -392,7 +464,18 @@ impl Mgr {
         // Namespace: the granted volumes, each narrowed to the rights granted.
         if !m.namespace.is_empty() {
             let mut ns = NsBuilder::new();
-            for g in &m.namespace {
+            if m.namespace.first().is_some_and(|g| g.path == "*") {
+                // Every volume at /<name>, with at most the rights the volume has (read-only on
+                // a normal boot: the storage service hands out read rights only).
+                let want = u64::from(m.namespace[0].rights);
+                for v in &self.volumes {
+                    let have = v.root.stat().map_or(fp::R_READ, |st| st.rights);
+                    if let Ok(n) = v.root.clone_with(want & have) {
+                        ns.add(format!("/{}", v.name).as_bytes(), n);
+                    }
+                }
+            }
+            for g in m.namespace.iter().filter(|g| g.path != "*") {
                 let Some(v) = self.volumes.iter().find(|v| v.name == g.volume) else {
                     close_all(&hs);
                     return Err(format!("volume '{}' does not exist", g.volume));
@@ -421,6 +504,12 @@ impl Mgr {
         s.ctl = Owned::from_raw(ours);
         s.state = State::Running;
         s.starts += 1;
+        s.on_exit = OnExit::Policy;
+        s.kill_by = 0;
+        if mgr_end.raw() != 0 {
+            self.port.arm(mgr_end.raw(), sys::READABLE | sys::PEER_CLOSED, (i as u64) << 8 | KEY_MGR);
+        }
+        s.mgr = mgr_end;
         self.port.arm(p, sys::TERMINATED, (i as u64) << 8 | KEY_PROC);
         self.port.arm(ours, sys::READABLE | sys::PEER_CLOSED, (i as u64) << 8 | KEY_CTL);
         self.order.retain(|&x| x != i);
@@ -477,7 +566,21 @@ impl Mgr {
     pub fn pump(&mut self, timeout: u64) -> bool {
         self.start_ready();
         let now = sys::clock_ns();
-        let due = self.svcs.iter().filter_map(|s| if let State::Backoff(t) = s.state { Some(t.saturating_sub(now).max(1)) } else { None }).min();
+        // Services asked to stop that are still running at their deadline are ended.
+        for s in self.svcs.iter_mut().filter(|s| s.kill_by != 0 && s.kill_by <= now && s.state == State::Running) {
+            println!("init: {} did not stop in time: ended", s.m.name);
+            sys::process_kill(s.proc.raw());
+            s.kill_by = 0;
+        }
+        let due = self
+            .svcs
+            .iter()
+            .filter_map(|s| match s.state {
+                State::Backoff(t) => Some(t.saturating_sub(now).max(1)),
+                State::Running if s.kill_by > now => Some(s.kill_by - now),
+                _ => None,
+            })
+            .min();
         let wait = due.map_or(timeout, |d| d.min(timeout));
         let Some((key, _)) = self.port.wait(wait) else {
             self.start_ready();
@@ -488,6 +591,7 @@ impl Mgr {
             match key & 0xFF {
                 KEY_PROC => self.ended(i),
                 KEY_CTL => self.control(i),
+                KEY_MGR => self.manage(i),
                 _ => {}
             }
         }
@@ -518,9 +622,24 @@ impl Mgr {
         let code = sys::process_exit_code(s.proc.raw());
         s.proc = Owned::default();
         s.ctl = Owned::default();
+        s.mgr = Owned::default();
         s.last_code = code;
+        s.kill_by = 0;
         let name = s.m.name.clone();
         println!("init: {} exited with code {}{}", name, code, exit_text(code));
+        match core::mem::replace(&mut s.on_exit, OnExit::Policy) {
+            OnExit::Stop => {
+                s.state = State::Done(code);
+                println!("init: {} stopped on request", name);
+                return;
+            }
+            OnExit::Restart => {
+                s.state = State::Backoff(sys::clock_ns());
+                println!("init: restarting {} on request", name);
+                return;
+            }
+            OnExit::Policy => {}
+        }
         let restart = match s.m.restart.policy {
             Policy::Always => true,
             Policy::OnFailure => code != 0,
@@ -581,6 +700,114 @@ impl Mgr {
                 Err(_) => return, // gone: the process watch handles it
             }
         }
+    }
+
+    /// Requests on service `i`'s manager channel (`svc::MGR_*`), each answered with the same op.
+    fn manage(&mut self, i: usize) {
+        let mut buf = [0u8; HEADER + 64];
+        loop {
+            let ch = self.svcs[i].mgr.raw();
+            if ch == 0 {
+                return;
+            }
+            let n = match sys::channel_read(ch, &mut buf, 0) {
+                Ok(n) => n as usize,
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.port.arm(ch, sys::READABLE | sys::PEER_CLOSED, (i as u64) << 8 | KEY_MGR);
+                    return;
+                }
+                Err(_) => return,
+            };
+            let Some(h) = Header::get(&buf[..n]) else { continue };
+            let arg = String::from_utf8_lossy(&buf[HEADER..n]).into_owned();
+            let (status, payload) = self.request(i, &h, &arg);
+            let mut out = alloc::vec![0u8; HEADER];
+            Header { txid: h.txid, op: h.op, status: status as i32, a: 0, b: 0 }.put(&mut out);
+            out.extend_from_slice(&payload[..payload.len().min(libd::rec::MAX_PAYLOAD)]);
+            sys::channel_write(ch, &out);
+        }
+    }
+
+    /// One manager request from service `i`: (status, payload).
+    fn request(&mut self, i: usize, h: &Header, arg: &str) -> (i64, Vec<u8>) {
+        let (services, power) = (self.svcs[i].m.manage_services, self.svcs[i].m.manage_power);
+        let who = self.svcs[i].m.name.clone();
+        let refuse = |st: i64, why: &str| (st, why.as_bytes().to_vec());
+        match h.op {
+            svc::MGR_LIST if services => (0, self.list_records()),
+            svc::MGR_OBJECTS if services => match self.find(arg) {
+                Some(k) if self.svcs[k].proc.raw() != 0 => (0, objects_records(self.svcs[k].proc.raw())),
+                Some(_) => refuse(sys::ERR_BAD_STATE, "it is not running"),
+                None => refuse(fp::ERR_NOT_FOUND, "no such service"),
+            },
+            svc::MGR_STOP | svc::MGR_RESTART if services => {
+                let stop = h.op == svc::MGR_STOP;
+                let Some(k) = self.find(arg) else { return refuse(fp::ERR_NOT_FOUND, "no such service") };
+                if stop && k == i {
+                    return refuse(sys::ERR_ACCESS_DENIED, "it cannot stop itself (restart it instead)");
+                }
+                let s = &mut self.svcs[k];
+                match s.state {
+                    State::Running => {
+                        s.on_exit = if stop { OnExit::Stop } else { OnExit::Restart };
+                        s.kill_by = sys::clock_ns() + 5 * SEC;
+                        println!("init: {} {} (asked by {})", if stop { "stopping" } else { "restarting" }, s.m.name, who);
+                        let mut msg = [0u8; HEADER];
+                        Header { txid: 0, op: svc::SHUTDOWN, status: 0, a: 0, b: 0 }.put(&mut msg);
+                        if sys::channel_write(s.ctl.raw(), &msg) < 0 {
+                            sys::process_kill(s.proc.raw());
+                        }
+                        (0, Vec::new())
+                    }
+                    State::Done(_) | State::GaveUp | State::Failed if !stop => {
+                        s.restarts = 0;
+                        s.state = State::Waiting;
+                        println!("init: starting {} again (asked by {})", s.m.name, who);
+                        (0, Vec::new())
+                    }
+                    _ => refuse(sys::ERR_BAD_STATE, "it is not running"),
+                }
+            }
+            svc::MGR_POWER if power && (h.a == sys::POWER_OFF || h.a == sys::POWER_REBOOT) => {
+                println!("init: {} asked to {}", who, if h.a == sys::POWER_OFF { "switch off" } else { "restart the machine" });
+                self.power_request = Some(h.a);
+                (0, Vec::new())
+            }
+            svc::MGR_LIST | svc::MGR_OBJECTS | svc::MGR_STOP | svc::MGR_RESTART | svc::MGR_POWER => {
+                refuse(sys::ERR_ACCESS_DENIED, "not granted by its manifest")
+            }
+            _ => (sys::ERR_NOT_SUPPORTED, Vec::new()),
+        }
+    }
+
+    /// Every service as a record (`MGR_LIST`).
+    fn list_records(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for s in &self.svcs {
+            let state = match s.state {
+                State::Waiting => "waiting",
+                State::Running if s.on_exit != OnExit::Policy => "stopping",
+                State::Running => "running",
+                State::Backoff(_) => "restarting",
+                State::Done(0) => "done",
+                State::Done(_) => "stopped",
+                State::GaveUp => "given up",
+                State::Failed => "failed",
+            };
+            let q = if s.proc.raw() != 0 { sys::process_quota(s.proc.raw()).ok() } else { None };
+            let none = || Value::Text(String::new());
+            Record::new()
+                .with("name", Value::Text(s.m.name.clone()))
+                .with("state", Value::Text(state.into()))
+                .with("restarts", Value::Int(i64::from(s.restarts)))
+                .with("memory", q.map_or_else(none, |q| Value::Size(q.used.memory)))
+                .with("quota", Value::Size(s.m.quota.memory))
+                .with("handles", q.map_or_else(none, |q| Value::Int(q.used.handles as i64)))
+                .with("threads", q.map_or_else(none, |q| Value::Int(q.used.threads as i64)))
+                .with("description", Value::Text(s.m.description.clone()))
+                .encode(&mut out);
+        }
+        out
     }
 
     /// End a service on purpose (tests): it is restarted like after any other exit.
@@ -715,4 +942,43 @@ fn verify_signed(bytes: &[u8], sig: &[u8], file: &str) -> Result<(), String> {
 
 fn sys_spawn_max() -> usize {
     256
+}
+
+/// The handles a process holds, as records (`MGR_OBJECTS`, the shell's `objects`).
+pub fn objects_records(p: Handle) -> Vec<u8> {
+    let mut buf = alloc::vec![sys::HandleEntry::default(); 256];
+    let n = sys::process_handles(p, &mut buf).map_or(0, |n| (n as usize).min(buf.len()));
+    let mut out = Vec::new();
+    for e in &buf[..n] {
+        Record::new()
+            .with("type", Value::Text(object_type(e.ty).into()))
+            .with("name", Value::Text(e.name().into()))
+            .with("rights", Value::Text(rights_text(e.rights)))
+            .with("koid", Value::Int(e.koid as i64))
+            .encode(&mut out);
+    }
+    out
+}
+
+pub fn object_type(t: u32) -> &'static str {
+    const N: [&str; 15] = ["?", "process", "thread", "vmo", "vmar", "event", "timer", "log", "channel", "port", "exception", "resource", "device", "interrupt", "pin"];
+    N.get(t as usize).copied().unwrap_or("?")
+}
+
+/// Rights as letters: read, write, execute, map, transfer, duplicate, wait, signal, inspect,
+/// manage (a dash where missing).
+pub fn rights_text(r: u32) -> String {
+    let bits = [
+        (sys::RIGHT_READ, 'r'),
+        (sys::RIGHT_WRITE, 'w'),
+        (sys::RIGHT_EXECUTE, 'x'),
+        (sys::RIGHT_MAP, 'm'),
+        (sys::RIGHT_TRANSFER, 't'),
+        (sys::RIGHT_DUPLICATE, 'd'),
+        (sys::RIGHT_WAIT, 'W'),
+        (sys::RIGHT_SIGNAL, 's'),
+        (sys::RIGHT_INSPECT, 'i'),
+        (sys::RIGHT_MANAGE, 'M'),
+    ];
+    bits.iter().map(|&(b, c)| if r & b != 0 { c } else { '-' }).collect()
 }

@@ -38,12 +38,30 @@ pub const MAX_PIN_PAGES: u64 = 16384;
 /// MSI-X entries a driver may bind (the first 64; more are refused).
 pub const MAX_MSIX: u16 = 64;
 
-/// A legacy device on fixed ports and ISA interrupt lines.
-#[derive(Clone, Copy)]
+/// A legacy device on fixed ports and ISA interrupt lines, or the screen.
+#[derive(Clone, Copy, Default)]
 pub struct Platform {
     pub io: [(u16, u16); 2], // (base, length)
     pub irqs: [u8; 2],
     pub nirqs: u8,
+    /// Memory window (physical base, bytes), mapped as BAR 0 (the display's framebuffer or VGA
+    /// text buffer); (0, 0) for none.
+    pub mem: (u64, u64),
+    /// The screen's layout, for the display device (`display_info`).
+    pub display: Option<Display>,
+}
+
+/// The screen the kernel used for its console, handed to user space (the terminal).
+#[derive(Clone, Copy, Default)]
+pub struct Display {
+    /// 1 = RGB32 framebuffer (sizes in pixels), 2 = VGA text (sizes in cells).
+    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes per line.
+    pub pitch: u32,
+    /// Bit positions of red, green and blue in a pixel (RGB32).
+    pub shifts: [u8; 3],
 }
 
 pub enum Kind {
@@ -149,6 +167,13 @@ impl DeviceObj {
     // ---- BARs ----------------------------------------------------------------------------
 
     fn bar(&self, i: u64) -> KResult<Bar> {
+        if let Kind::Platform(p) = &self.kind {
+            // A platform device's memory window is BAR 0 (its I/O windows are separate).
+            return match p.mem {
+                (addr, size) if i == 0 && size != 0 => Ok(Bar { kind: BarKind::Memory, addr, size, ..Bar::default() }),
+                _ => Err(Status::NotSupported),
+            };
+        }
         let f = self.pci().ok_or(Status::NotSupported)?;
         let b = *f.bars.get(usize::try_from(i).map_err(|_| Status::InvalidArgs)?).ok_or(Status::InvalidArgs)?;
         if b.kind == BarKind::None {
@@ -168,8 +193,26 @@ impl DeviceObj {
         let end = b.addr.checked_add(b.size).ok_or(Status::BadState)?.div_ceil(PAGE) * PAGE;
         // A BAR must not overlap RAM (a misprogrammed BAR would hand out kernel memory), and a
         // page must not be shared with another device's BAR.
+        // The one exception: VGA text memory, in the legacy video window below 1 MiB (which the
+        // RAM check refuses as a whole); never anything else there.
+        let vga_text = matches!(&self.kind, Kind::Platform(p) if p.display.is_some_and(|d| d.kind == 2)) && start >= 0xA_0000 && end <= 0xC_0000;
         // SAFETY: plain query of the boot memory map.
-        if b.addr == 0 || unsafe { ffi::pmm_range_is_ram(start, end - start) } || crate::dev::page_shared(self, start, end) {
+        if b.addr == 0 || (!vga_text && unsafe { ffi::pmm_range_is_ram(start, end - start) }) {
+            return Err(Status::AccessDenied);
+        }
+        if let Kind::Platform(p) = &self.kind {
+            // The screen: its framebuffer usually lies inside the graphics card's BAR (that PCI
+            // function gets no driver). Mapped write-combining; from now on the kernel writes its
+            // console to serial only (a panic takes the screen back).
+            let display = p.display.is_some();
+            let v = Vmo::create_device(acct, start, (end - start) / PAGE, self.name(), display, |_| false)?;
+            if display {
+                // SAFETY: plain call; takes the console lock.
+                unsafe { ffi::console_release_screen() };
+            }
+            return Ok(v);
+        }
+        if crate::dev::page_shared(self, start, end) {
             return Err(Status::AccessDenied);
         }
         let f = self.pci().ok_or(Status::NotSupported)?;
@@ -188,7 +231,7 @@ impl DeviceObj {
         };
         let mut nm = crate::fmtbuf::FmtBuf::<32>::new();
         let _ = core::fmt::Write::write_fmt(&mut nm, format_args!("{}.bar{}", self.name(), i));
-        Vmo::create_device(acct, start, (end - start) / PAGE, core::str::from_utf8(nm.as_bytes()).unwrap_or("bar"), hidden)
+        Vmo::create_device(acct, start, (end - start) / PAGE, core::str::from_utf8(nm.as_bytes()).unwrap_or("bar"), false, hidden)
     }
 
     fn io_port(&self, bar: u64, off: u64, size: u64) -> KResult<u16> {

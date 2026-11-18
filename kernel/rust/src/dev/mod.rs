@@ -20,7 +20,8 @@ pub mod pci;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::object::device::{DeviceObj, Kind, Platform};
+use crate::ffi;
+use crate::object::device::{DeviceObj, Display, Kind, Platform};
 use crate::object::KRef;
 
 static DEVICES: AtomicPtr<Vec<KRef<DeviceObj>>> = AtomicPtr::new(core::ptr::null_mut());
@@ -37,10 +38,11 @@ pub fn devices() -> &'static [KRef<DeviceObj>] {
 
 /// Does [start, end) of physical memory hold a BAR of a device other than `me`?
 pub fn page_shared(me: &DeviceObj, start: u64, end: u64) -> bool {
-    devices().iter().filter(|d| !core::ptr::eq(&***d, me)).any(|d| {
-        d.pci().is_some_and(|f| {
-            f.bars.iter().any(|b| b.kind == pci::BarKind::Memory && b.addr < end && start < b.addr.saturating_add(b.size))
-        })
+    devices().iter().filter(|d| !core::ptr::eq(&***d, me)).any(|d| match &d.kind {
+        Kind::Pci(f) => f.bars.iter().any(|b| b.kind == pci::BarKind::Memory && b.addr < end && start < b.addr.saturating_add(b.size)),
+        // The screen's framebuffer usually lies inside the graphics card's BAR: whoever has the
+        // display owns those pages, so the card's BAR cannot be mapped by a driver.
+        Kind::Platform(p) => p.mem.1 != 0 && p.mem.0 < end && start < p.mem.0.saturating_add(p.mem.1),
     })
 }
 
@@ -110,7 +112,7 @@ pub fn init() {
     }
     // The 8042 PS/2 controller: data port 0x60, command/status 0x64, keyboard IRQ 1, mouse 12.
     if inb(0x64) != 0xFF {
-        let p = Platform { io: [(0x60, 1), (0x64, 1)], irqs: [1, 12], nirqs: 2 };
+        let p = Platform { io: [(0x60, 1), (0x64, 1)], irqs: [1, 12], nirqs: 2, ..Platform::default() };
         let idx = devs.len() as u16;
         if let Ok(d) = DeviceObj::new(idx, "ps2", Kind::Platform(p))
             && devs.try_reserve(1).is_ok()
@@ -124,9 +126,25 @@ pub fn init() {
         outb(0x70, 0x0A);
         inb(0x71) != 0xFF
     } {
-        let p = Platform { io: [(0x70, 2), (0, 0)], irqs: [8, 0], nirqs: 0 };
+        let p = Platform { io: [(0x70, 2), (0, 0)], irqs: [8, 0], nirqs: 0, ..Platform::default() };
         let idx = devs.len() as u16;
         if let Ok(d) = DeviceObj::new(idx, "rtc", Kind::Platform(p))
+            && devs.try_reserve(1).is_ok()
+        {
+            devs.push(d);
+        }
+    }
+    // The screen (GOP framebuffer or VGA text), for the terminal. Mapping it takes it from the
+    // kernel console. VGA text also gets the CRT controller's index/data ports (the cursor).
+    let mut cd = ffi::ConsoleDisplay::default();
+    // SAFETY: fills `cd`; plain call.
+    if unsafe { ffi::console_display(&mut cd) } {
+        let io = if cd.kind == 2 { [(0, 0), (0x3D4, 2)] } else { [(0, 0); 2] };
+        let shifts = [cd.red_shift, cd.green_shift, cd.blue_shift];
+        let d = Display { kind: cd.kind, width: cd.width, height: cd.height, pitch: cd.pitch, shifts };
+        let p = Platform { io, mem: (cd.base, cd.size), display: Some(d), ..Platform::default() };
+        let idx = devs.len() as u16;
+        if let Ok(d) = DeviceObj::new(idx, "display", Kind::Platform(p))
             && devs.try_reserve(1).is_ok()
         {
             devs.push(d);

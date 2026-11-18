@@ -228,7 +228,7 @@ impl Mgr {
                         }
                         proto::KEY => {
                             let from = d.prog;
-                            self.key(h.a as u8, from, i);
+                            self.key(h.a as u32, from, i);
                         }
                         proto::DISK => {
                             let payload = &buf[HEADER..n as usize];
@@ -359,14 +359,15 @@ impl Mgr {
 
     /// A key from an input driver: to every client of the input endpoint. Lines are also
     /// assembled here (silently) for the driver tests.
-    fn key(&mut self, c: u8, from: &'static str, dev: usize) {
+    fn key(&mut self, k: u32, from: &'static str, dev: usize) {
         let mut msg = [0u8; HEADER + 24];
-        Header { txid: 0, op: proto::INPUT_KEY, status: 0, a: u64::from(c), b: dev as u64 }.put(&mut msg);
+        Header { txid: 0, op: proto::INPUT_KEY, status: 0, a: u64::from(k), b: dev as u64 }.put(&mut msg);
         let n = from.len().min(24);
         msg[HEADER..HEADER + n].copy_from_slice(&from.as_bytes()[..n]);
         for ch in self.input.iter().copied().filter(|&c| c != 0) {
             sys::channel_write(ch, &msg[..HEADER + n]); // a full or closed client loses the key, never us
         }
+        let Ok(c) = u8::try_from(k) else { return }; // a named key: not part of a line
         match c {
             b'\n' => {
                 let l = &self.line[..self.line_len];

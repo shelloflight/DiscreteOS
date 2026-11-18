@@ -48,6 +48,8 @@ pub struct Vmo {
     name: Name,
     /// Device memory (MMIO): `frames` are not RAM and are not owned, except `dummy`.
     device: bool,
+    /// Device memory mapped write-combining (the display) instead of uncached.
+    wc: bool,
     /// The zero page standing in for hidden device pages (0 = none); owned and freed.
     dummy: u64,
     _charge: Charge,
@@ -78,6 +80,7 @@ impl Vmo {
             wstate: AtomicU64::new(0),
             name: Name::new(name),
             device: false,
+            wc: false,
             dummy: 0,
             _charge: charge,
         };
@@ -96,7 +99,7 @@ impl Vmo {
     /// A device VMO over `pages` pages of MMIO starting at `phys` (page aligned). Page `i` is
     /// hidden (backed by a private zero page) when `hide(i)`. One page is charged to `acct` (the
     /// frame list and the zero page); the device memory itself is not RAM and is not charged.
-    pub fn create_device(acct: &KRef<Account>, phys: u64, pages: u64, name: &str, hide: impl Fn(u64) -> bool) -> KResult<KRef<Vmo>> {
+    pub fn create_device(acct: &KRef<Account>, phys: u64, pages: u64, name: &str, wc: bool, hide: impl Fn(u64) -> bool) -> KResult<KRef<Vmo>> {
         if pages == 0 || pages > MAX_SIZE / PAGE || !phys.is_multiple_of(PAGE) {
             return Err(Status::InvalidArgs);
         }
@@ -112,6 +115,7 @@ impl Vmo {
             wstate: AtomicU64::new(0),
             name: Name::new(name),
             device: true,
+            wc,
             dummy: 0,
             _charge: charge,
         };
@@ -135,6 +139,11 @@ impl Vmo {
     /// Device memory (MMIO): mapped uncached, never accessed through the kernel, never DMA'd to.
     pub fn is_device(&self) -> bool {
         self.device
+    }
+
+    /// Device memory to be mapped write-combining (the display).
+    pub fn is_write_combining(&self) -> bool {
+        self.wc
     }
 
     pub fn size(&self) -> u64 {

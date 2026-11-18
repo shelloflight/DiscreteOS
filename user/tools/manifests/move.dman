@@ -1,0 +1,14 @@
+# move: rename a file or directory, or move it into another directory.
+kind = "tool"
+name = "move"
+image = "move.dx"
+aliases = ["mv", "rename"]
+description = "move or rename a file or directory"
+
+[parameters]
+from = "path:write"
+to = "path:write,create"
+
+[about]
+from = "what to move"
+to = "the new name, or a directory to move it into (the name stays)"

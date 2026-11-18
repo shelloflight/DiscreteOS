@@ -128,6 +128,25 @@ pub fn status(e: i64) -> &'static str {
     }
 }
 
+/// A status in words, for people (the shell and its tools).
+pub fn message(e: i64) -> &'static str {
+    match e {
+        ERR_NOT_FOUND => "not found",
+        ERR_EXISTS => "already exists",
+        ERR_NOT_DIR => "is not a directory",
+        ERR_IS_DIR => "is a directory",
+        ERR_NOT_EMPTY => "is not empty",
+        ERR_IO => "disk error",
+        ERR_CORRUPT => "damaged (a checksum does not match)",
+        ERR_BAD_NAME => "is not a valid name",
+        ERR_READ_ONLY => "is read-only",
+        sys::ERR_ACCESS_DENIED => "access denied (not granted)",
+        sys::ERR_PEER_CLOSED => "the storage service is gone",
+        sys::ERR_NO_RESOURCES | sys::ERR_NO_MEMORY => "out of resources",
+        _ => status(e),
+    }
+}
+
 /// A valid name: 1..=255 bytes, not `.` or `..`, no `/`, no NUL or other control bytes.
 pub fn valid_name(n: &[u8]) -> bool {
     !n.is_empty() && n.len() <= MAX_NAME && n != b"." && n != b".." && n.iter().all(|&c| c >= 0x20 && c != b'/' && c != 0x7F)

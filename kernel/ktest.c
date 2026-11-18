@@ -45,6 +45,8 @@
  *                     signed on disk, refusals, exact grants, quotas, restarts with backoff, storaged
  *                     and devmgr killed and restarted with I/O working again, clean shutdown)
  *   KTEST_TIME      - the wall-clock time across a reboot (init "time test"; the host boots twice)
+ *   KTEST_SHELL     - the terminal and the shell with writable disks (init "shell test"); the host
+ *                     types a session on the keyboard and reads it back on serial
  *   KTEST_OBJECTS   - kernel objects, handles, rights, quotas (Rust), and out-of-memory paths
  *                     proven by fault injection (C threads/heap and the whole object layer)
  * KTEST_SELFTEST also covers locks, the clock, timers, the kernel log, threads and blocking
@@ -106,6 +108,8 @@ const char *ktest_init_args(void)
     return "services test";
 #elif defined(KTEST_TIME)
     return "time test";
+#elif defined(KTEST_SHELL)
+    return "shell test";
 #elif defined(KTEST_FUZZ)
     return "run utest fuzz 200000";
 #elif defined(KTEST_ATTEST)
@@ -2273,7 +2277,7 @@ void ktest_after_init(int code)
 }
 
 #elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES) || \
-    defined(KTEST_TIME)
+    defined(KTEST_TIME) || defined(KTEST_SHELL)
 
 /* Ring-3 tests: init runs utest (ktest_init_args); nothing to do in the kernel first. */
 void ktest_run(void) {}

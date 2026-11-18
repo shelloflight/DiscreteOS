@@ -79,7 +79,7 @@ pub const TAG_KLOG: u32 = 11;
 pub const TAG_BOOT_TIME: u32 = 12;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 8;
+pub const ABI_VERSION: u32 = 9;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -172,8 +172,10 @@ pub mod nr {
     pub const MEASURE: u64 = 64;
     pub const KLOG_READ: u64 = 65;
     pub const LOG_RECORD: u64 = 66;
+    pub const DISPLAY_INFO: u64 = 67;
+    pub const PROCESS_HANDLES: u64 = 68;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 67;
+    pub const COUNT: u64 = 69;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -433,6 +435,54 @@ pub fn device_info(dev: Handle) -> Result<DeviceInfo, i64> {
     res(sc(nr::DEVICE_INFO, u64::from(dev), &mut i as *mut DeviceInfo as u64, 0, 0, 0, 0))?;
     Ok(i)
 }
+/// The display device's layout (ABI v9, `struct dos_display_info`).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct DisplayInfo {
+    pub kind: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub size: u64,
+    pub red_shift: u8,
+    pub green_shift: u8,
+    pub blue_shift: u8,
+    pub reserved: [u8; 5],
+}
+const _: () = assert!(core::mem::size_of::<DisplayInfo>() == 32);
+pub const DISPLAY_RGB32: u32 = 1;
+pub const DISPLAY_VGA_TEXT: u32 = 2;
+
+/// ABI v9: the layout of the display device (`WRONG_TYPE` for other devices).
+pub fn display_info(dev: Handle) -> Result<DisplayInfo, i64> {
+    let mut i = DisplayInfo::default();
+    res(sc(nr::DISPLAY_INFO, u64::from(dev), &mut i as *mut DisplayInfo as u64, 0, 0, 0, 0))?;
+    Ok(i)
+}
+
+/// One handle a process holds (ABI v9, `struct dos_handle_entry`); never the handle's value.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct HandleEntry {
+    pub ty: u32,
+    pub rights: u32,
+    pub koid: u64,
+    pub name: [u8; 32],
+}
+const _: () = assert!(core::mem::size_of::<HandleEntry>() == 48);
+
+impl HandleEntry {
+    pub fn name(&self) -> &str {
+        let n = self.name.iter().position(|&c| c == 0).unwrap_or(32);
+        core::str::from_utf8(&self.name[..n]).unwrap_or("?")
+    }
+}
+
+/// ABI v9, INSPECT on `process`: its handles into `buf` (at most 256); returns how many it holds.
+pub fn process_handles(process: Handle, buf: &mut [HandleEntry]) -> R {
+    res(sc(nr::PROCESS_HANDLES, u64::from(process), buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0))
+}
+
 pub fn config_read(dev: Handle, off: u64, size: u64) -> R {
     res(sc(nr::DEVICE_CONFIG_READ, u64::from(dev), off, size, 0, 0, 0))
 }
