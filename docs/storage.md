@@ -10,6 +10,7 @@ Storage is entirely in user space: disk drivers, a storage service and filesyste
 
 ```
  init ──ctl──► storaged ◄──disks── devmgr ──spawns──► ahci / nvme / virtio-blk drivers
+  (service manager: `storaged.disks` endpoint, CONNECT / SYNC / SHUTDOWN, docs/services.md)
   │              ▲  ▲                                        │
   │ VOLUME       │  └──── one channel per disk (BLK_*) ──────┘
   ▼              │
@@ -23,6 +24,10 @@ Storage is entirely in user space: disk drivers, a storage service and filesyste
   interrupted request; filesystems do not notice.
 - **storaged** reads each GPT (falls back to the backup table), mounts FAT32 and DFS partitions, and
   announces each volume to init. NTFS/exFAT partitions are named and left alone.
+- **Service restarts** ([services.md](services.md)): a restarted device manager reaches storaged
+  through a new `disks` channel and its disks come back under the same names; a restarted storaged
+  gets every known disk again from the device manager and announces its volumes anew. At shutdown,
+  storaged makes every written volume durable (`SYNC`) before any driver stops.
 - All DMA buffers are pinned through the IOMMU.
 
 ## Read-only by default

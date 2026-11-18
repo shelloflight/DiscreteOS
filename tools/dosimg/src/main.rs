@@ -256,7 +256,8 @@ fn dsig_kind(s: &str) -> Result<u32, String> {
         "program" => KIND_PROGRAM,
         "driver" => KIND_DRIVER,
         "package" => KIND_PACKAGE,
-        _ => return Err(format!("unknown signature kind '{}' (kernel, program, driver, package)", s)),
+        "manifest" => KIND_MANIFEST,
+        _ => return Err(format!("unknown signature kind '{}' (kernel, program, driver, package, manifest)", s)),
     })
 }
 
@@ -342,12 +343,13 @@ fn run(args: &[String]) -> Result<(), String> {
                         "no TPM (software evidence: rooted in the verified kernel)"
                     };
                     println!(
-                        "attest: VALID: D-KRNL {} ({}), the reference kernel, verified by its loader; {} events replayed to PCR 8 and 10; {} signed program(s), {} unsigned; attestation key {}; {}",
+                        "attest: VALID: D-KRNL {} ({}), the reference kernel, verified by its loader; {} events replayed to PCR 8 and 10; {} signed program(s), {} unsigned; {} service decision(s); attestation key {}; {}",
                         ver,
                         if v.firmware == 2 { "UEFI" } else { "BIOS" },
                         v.events,
                         v.signed_code,
                         v.unsigned_code,
+                        v.decisions,
                         to_hex(&v.ak[..8]),
                         tpm
                     );

@@ -31,6 +31,8 @@ pub const KIND_KERNEL: u32 = 1;
 pub const KIND_PROGRAM: u32 = 2;
 pub const KIND_DRIVER: u32 = 3;
 pub const KIND_PACKAGE: u32 = 4;
+/// A service manifest (`.dman`): data the service manager trusts, never runnable.
+pub const KIND_MANIFEST: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

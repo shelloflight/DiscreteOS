@@ -1,4 +1,4 @@
-//! D-OS user ABI v6 (docs/abi.md): every raw syscall and structure. Mirrors user/include/dos.h;
+//! D-OS user ABI v7 (docs/abi.md): every raw syscall and structure. Mirrors user/include/dos.h;
 //! numbers and layouts never change meaning. Results: `Ok(value)` or `Err(status)` (< 0).
 //! Programs built on libd need a kernel of at least `ABI_VERSION` (checked by `init`).
 
@@ -71,9 +71,11 @@ pub const TAG_PROGRAM: u32 = 5;
 pub const TAG_VMEX: u32 = 6;
 pub const TAG_DEVICE: u32 = 7;
 pub const TAG_POWER: u32 = 8;
+pub const TAG_MEASURE: u32 = 9;
+pub const TAG_MANIFEST: u32 = 10;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -163,8 +165,9 @@ pub mod nr {
     pub const VMO_ALLOW_UNSIGNED: u64 = 61;
     pub const ATTEST: u64 = 62;
     pub const SYSTEM_POWER: u64 = 63;
+    pub const MEASURE: u64 = 64;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 64;
+    pub const COUNT: u64 = 65;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -691,6 +694,12 @@ pub fn process_write_memory(proc: Handle, addr: u64, data: &[u8]) -> i64 {
 pub fn attest(nonce: &[u8; 32], buf: &mut [u8]) -> R {
     res(sc(nr::ATTEST, nonce.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0))
 }
+/// ABI v7, with the MEASURE resource: extend PCR 10 with `digest`, logged as `svc <text>`
+/// (printable ASCII, at most `MEASURE_TEXT` bytes).
+pub fn measure(res: Handle, digest: &[u8; 32], text: &[u8]) -> i64 {
+    sc(nr::MEASURE, u64::from(res), digest.as_ptr() as u64, text.as_ptr() as u64, text.len() as u64, 0, 0)
+}
+pub const MEASURE_TEXT: usize = 52;
 /// `POWER_OFF` or `POWER_REBOOT` with the POWER resource; returns only on failure.
 pub fn system_power(power: Handle, action: u64) -> i64 {
     sc(nr::SYSTEM_POWER, u64::from(power), action, 0, 0, 0, 0)

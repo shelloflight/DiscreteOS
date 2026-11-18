@@ -1,0 +1,8 @@
+# Test (services): a key the schema does not know; the manifest must be refused, naming it.
+name = "svc-badkey"
+image = "ltest.dx"
+group = "test"
+
+[grants]
+log = true
+kernel-memory = true

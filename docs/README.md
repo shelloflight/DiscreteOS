@@ -12,6 +12,7 @@ that cover it.
 | [objects.md](objects.md) | Kernel objects, handles, rights, quotas, lifetimes |
 | [abi.md](abi.md) | The user/kernel ABI: syscalls, status codes, startup block, ELF rules |
 | [libd.md](libd.md) | The user runtime: heap, threads, locks, owned handles, channels; its C binding |
+| [services.md](services.md) | init, the service manager: manifests, exact grants, supervision, shutdown |
 | [storage.md](storage.md) | Block drivers, `storaged`, files as handles, DFS and FAT32 |
 | [compat.md](compat.md) | D-CMPL: running Windows and Linux programs unchanged |
 | [signing.md](signing.md) | Verified boot, measured boot, code signing, `.dsig` format |

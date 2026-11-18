@@ -41,6 +41,9 @@
  *   KTEST_STORAGE   - storage (init runs "storage test": storaged with its test hooks, the AHCI
  *                     and NVMe drivers, then fstest: GPT, FAT32, DFS, snapshots, power cuts,
  *                     corruption detection, namespace isolation)
+ *   KTEST_SERVICES  - the service manager (init runs "services test": manifests embedded and
+ *                     signed on disk, refusals, exact grants, quotas, restarts with backoff, storaged
+ *                     and devmgr killed and restarted with I/O working again, clean shutdown)
  *   KTEST_OBJECTS   - kernel objects, handles, rights, quotas (Rust), and out-of-memory paths
  *                     proven by fault injection (C threads/heap and the whole object layer)
  * KTEST_SELFTEST also covers locks, the clock, timers, the kernel log, threads and blocking
@@ -78,7 +81,7 @@ void ktest_user_smep(uint64_t user_ptr)
     kprintf("KTEST smep: FAILED (user code ran in ring 0)\n");
 }
 
-/* What init runs in this test image ("" = just start; see user/init/init.c). */
+/* What init runs in this test image ("" = just start; see user/init/src/lib.rs). */
 const char *ktest_init_args(void)
 {
 #if defined(KTEST_USER) || defined(KTEST_SPEC)
@@ -95,6 +98,8 @@ const char *ktest_init_args(void)
     return "storage readonly";
 #elif defined(KTEST_STORAGE)
     return "storage test";
+#elif defined(KTEST_SERVICES)
+    return "services test";
 #elif defined(KTEST_FUZZ)
     return "run utest fuzz 200000";
 #elif defined(KTEST_ATTEST)
@@ -2233,7 +2238,7 @@ void ktest_after_init(int code)
     kprintf("KTEST drivers: %s\n", same && code == 0 ? "PASSED" : "FAILED");
 }
 
-#elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT)
+#elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES)
 
 /* Ring-3 tests: init runs utest (ktest_init_args); nothing to do in the kernel first. */
 void ktest_run(void) {}

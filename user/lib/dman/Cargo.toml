@@ -1,0 +1,24 @@
+# `dman`: D-OS service manifests (`.dman`). A strict TOML subset (tables, strings, integers,
+# booleans, arrays) and the manifest schema the service manager (init) enforces: unknown keys,
+# wrong types and out-of-range values refuse the whole manifest, naming the line and the key.
+# no_std + alloc, no dependencies (CONTRIBUTING.md, "Dependencies"); unit tests and the fuzzer run
+# on the host (`cargo test`, build.ps1 test case `manifest-host`).
+[package]
+name = "dman"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"

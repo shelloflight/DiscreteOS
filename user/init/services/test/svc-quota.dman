@@ -1,0 +1,17 @@
+# Test (services): a service with a 4 MiB memory quota tries to use 32 MiB; the kernel refuses.
+name = "svc-quota"
+image = "ltest.dx"
+args = "svc-quota"
+group = "test"
+after = ["svc-grants"]
+
+[grants]
+log = true
+
+[quota]
+memory = "4M"
+handles = 32
+threads = 2
+
+[restart]
+policy = "never"

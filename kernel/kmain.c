@@ -307,7 +307,7 @@ void kmain(BootInfo *bi_phys)
     ktest_run();
     boot_summary();
 
-    /* User space: init, the first ring-3 process (embedded; see user/init/init.c) */
+    /* User space: init, the first ring-3 process and service manager (embedded; user/init) */
 #ifdef KTEST
     const char *init_args = ktest_init_args();
 #else

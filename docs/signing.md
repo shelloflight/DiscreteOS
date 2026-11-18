@@ -25,7 +25,8 @@ The kernel decides what code may run, before the image is parsed:
 | Kernel image | programs embedded in the kernel (covered by its signature) |
 | Unsigned | `vmo_allow_unsigned(vmo, vmex)` by a holder of the VMEX resource |
 
-Both calls seal the VMO first, so nothing can change it afterwards.
+Both calls seal the VMO first, so nothing can change it afterwards. `vmo_verify` also checks
+signed service manifests (kind 5): the manifest is known genuine, but never becomes runnable.
 
 ## Keys
 
@@ -42,7 +43,7 @@ Both calls seal the VMO first, so nothing can change it afterwards.
 | 0 | 4 | magic `DSIG` |
 | 4 | 2 | version 1 |
 | 6 | 2 | algorithm 1 (Ed25519) |
-| 8 | 4 | kind: 1 kernel, 2 program, 3 driver, 4 package |
+| 8 | 4 | kind: 1 kernel, 2 program, 3 driver, 4 package, 5 manifest |
 | 12 | 4 | flags (0) |
 | 16 | 16 | key id |
 | 32 | 8 | content size |
@@ -59,7 +60,7 @@ The kernel keeps a measurement log and software PCRs (SHA-256 bank, TPM extend r
 | PCR | Contents |
 |---|---|
 | 8 | the kernel's `.dsig` header, then this boot's attestation key |
-| 10 | every program the kernel verified (`.dsig` header) or allowed unsigned (content hash) |
+| 10 | every program the kernel verified (`.dsig` header) or allowed unsigned (content hash); every service manifest the service manager accepted or refused (`svc ...`, [services.md](services.md)) |
 
 On UEFI machines with a TPM, the loader also extends PCR 8 through TCG2. The kernel's TPM 2.0
 driver (ACPI `TPM2` table, TIS or CRB interface) replays the log into the TPM and mirrors every

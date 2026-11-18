@@ -124,12 +124,13 @@ fn sig_status(e: dsig::Error) -> Status {
     }
 }
 
-/// `vmo_verify`: seal `v`, check `d` (a `.dsig` of kind program or driver) against its contents
-/// and the D-OS key, mark it Signed and measure it. Bytes past the signed size must be zero, so
+/// `vmo_verify`: seal `v`, check `d` (a `.dsig` of kind program, driver or manifest) against
+/// its contents and the D-OS key and measure it. Programs and drivers become Signed (spawnable); a
+/// manifest (ABI v7) is data and never becomes runnable: the caller only learns it is genuine. Bytes past the signed size must be zero, so
 /// nothing unsigned can hide in the VMO's last page.
 pub fn verify_vmo(v: &Vmo, d: &[u8]) -> Result<dsig::Header, Status> {
     let h = dsig::parse(d).map_err(sig_status)?;
-    if h.kind != dsig::KIND_PROGRAM && h.kind != dsig::KIND_DRIVER {
+    if h.kind != dsig::KIND_PROGRAM && h.kind != dsig::KIND_DRIVER && h.kind != dsig::KIND_MANIFEST {
         return Err(Status::BadSignature);
     }
     if h.size > v.size() {
@@ -150,7 +151,9 @@ pub fn verify_vmo(v: &Vmo, d: &[u8]) -> Result<dsig::Header, Status> {
         off += n as u64;
     }
     let h = dsig::verify_hashed(d, trusted_key(), h.size, &s.finish()).map_err(sig_status)?;
-    v.set_trust(Trust::Signed);
+    if h.kind != dsig::KIND_MANIFEST {
+        v.set_trust(Trust::Signed);
+    }
     let mut text = crate::fmtbuf::FmtBuf::<{ measure::TEXT_MAX }>::new();
     let _ = core::fmt::Write::write_fmt(&mut text, format_args!("signed {}", h.name_str()));
     measure::measure(measure::PCR_CODE, &sha256(&d[..dsig::SIGNED]), core::str::from_utf8(text.as_bytes()).unwrap_or("?"), false);

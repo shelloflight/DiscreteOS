@@ -54,7 +54,7 @@ It:
    KASAN);
 3. boots each case in QEMU and checks the serial log: required lines must appear, forbidden
    lines (`KERNEL PANIC`, `FAIL`, ...) must not;
-4. runs the host cases: `cargo test` for `dosfs` and `doscrypt`, the loaders' KASLR code, and
+4. runs the host cases: `cargo test` for `dosfs`, `doscrypt` and `dman`, the loaders' KASLR code, and
    static analysis (clang analyzer over all C, clippy `-D warnings` over all Rust);
 5. writes **`build\test-report.md`**: result per case, commit, tool versions. Attach it to your
    pull request.
@@ -68,8 +68,8 @@ Main groups:
 | Protections fire | `stackprot`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `kaslr`, ... |
 | Kernel | `selftest`, `sched`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
-| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `storage`, `readonly`, `attest`, `poweroff`, `reboot` |
-| Host | `storage-host`, `crypto-host`, `kaslr-host`, `static` |
+| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `storage`, `readonly`, `services`, `attest`, `poweroff`, `reboot` |
+| Host | `storage-host`, `crypto-host`, `manifest-host`, `kaslr-host`, `static` |
 
 ## Adding a test
 

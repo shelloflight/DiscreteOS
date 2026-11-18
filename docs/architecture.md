@@ -36,12 +36,13 @@ firmware ─► loader (BIOS stage 1-3 or BOOTX64.EFI)
               verifies the kernel's signature, applies KASLR, builds BootInfo
           ─► D-KRNL: validates BootInfo, CPU/memory/interrupts, SMP, Rust subsystems,
               PCI + IOMMU, measured boot, then starts init in ring 3
-          ─► init: starts storaged and devmgr, links them, supervises devmgr
+          ─► init (service manager): reads the service manifests, starts storaged and devmgr
+              with exactly the grants they list, links them, supervises and restarts them
           ─► devmgr: starts one user-space driver per device (virtio, AHCI, NVMe, xHCI, PS/2)
 ```
 
-User programs are embedded in the kernel image today (there is no installer yet); `init` gets a
-read-only VMO for each one.
+User programs and the system's service manifests are embedded in the kernel image today (there is no
+installer yet); `init` gets a read-only VMO for each one ([services.md](services.md)).
 
 ## Source tree
 
@@ -61,7 +62,8 @@ read-only VMO for each one.
 | `user/include/dos.h`, `user/lib/dos.c` | C | C binding of the ABI and a minimal runtime for C programs |
 | `user/lib/libd/`, `user/include/libd.h` | Rust, C | `libd`: the user runtime (complete ABI, owned handles, heap, threads, locks, channels, files, driver protocol), also for C ([libd.md](libd.md)) |
 | `user/lib/fs/`, `user/lib/crypto/` | Rust | `dosfs` (GPT, FAT32, DFS, BLAKE3); `doscrypt` (SHA-2, Ed25519, `.dsig`, attestation) |
-| `user/init/`, `user/devmgr/`, `user/storaged/` | C, Rust | first process, device manager + drivers, storage service |
+| `user/init/`, `user/lib/dman/` | Rust | first process and service manager, its manifests; the manifest parser ([services.md](services.md)) |
+| `user/devmgr/`, `user/storaged/` | Rust | device manager + drivers, storage service |
 | `user/dcmpl/`, `compat/` | Rust, C | D-CMPL and its Windows/Linux proof programs ([compat.md](compat.md)) |
 | `user/utest/`, `user/fstest/`, `user/ltest/`, `user/ctest/`, `user/hello/` | C, Rust | ring-3 test programs |
 | `tools/dosimg/` | Rust | host tool: disk images, signing, fsck, attestation verifier |
@@ -104,6 +106,7 @@ with a `// SAFETY:` comment (clippy enforces it in the kernel).
 | A filesystem or on-disk parser | `user/lib/fs/` (host-testable, `no_std + alloc`) | unit tests and a fuzzer in `fuzz.rs` |
 | A kernel object or syscall | `kernel/rust/src/object/` and `user/syscall.rs`; C binding in `dos.h` | bump the ABI version, update [abi.md](abi.md), add `utest` cases |
 | A user program | `user/<name>/`: a Rust crate on libd with its own `_start` (see `user/ltest`), or `.c` files (include `libd.h` for the heap, threads and locks); `build.ps1` embeds it as `<name>.dx` | run it from `init` (`init run <name>`) in a test case |
+| A service | a program as above, plus a manifest in `user/init/services/` naming exactly what it gets ([services.md](services.md)) | the `services` case; a test manifest in `user/init/services/test/` |
 | Low-level arch code | `kernel/arch/x86_64/` | a KTEST variant if it can fail in an interesting way |
 
 ## Dependencies

@@ -1,0 +1,20 @@
+# Test (services): a service that may see exactly what is granted here: the log, the system volume
+# read-only at /system, PCI mass-storage devices (class 01) and nothing else. ltest checks it.
+name = "svc-grants"
+image = "ltest.dx"
+args = "svc-grants"
+group = "test"
+after = ["devmgr"]
+
+[grants]
+log = true
+devices = ["pci:01"]
+namespace = ["/system=system:r"]
+
+[quota]
+memory = "16M"
+handles = 64
+threads = 4
+
+[restart]
+policy = "never"

@@ -1,0 +1,23 @@
+# The storage service: the block layer over the disk drivers, partitions, filesystems and the file
+# service (every open file is a channel). It owns no device: disks reach it from the device manager.
+name = "storaged"
+image = "storaged.dx"
+group = "system"
+description = "disks, volumes and files"
+
+[provides]
+endpoints = ["disks"]   # the device manager hands each disk over this
+volumes = true          # announces the volumes it mounts
+
+[grants]
+log = true
+
+[quota]
+memory = "96M"
+handles = 2048
+threads = 8
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

@@ -15,6 +15,11 @@
 //! then flows between those two directly. A restarted driver announces its disks again and the
 //! storage service gets fresh channels under the same names.
 //!
+//! As a service (started by the service manager from its manifest), it gets the disks endpoint
+//! `storaged.disks` and a control channel: svc::CONNECT replaces the storage channel when the
+//! storage service was restarted (every known disk is handed over again), svc::SHUTDOWN stops the
+//! drivers and ends the device manager.
+//!
 //! Arguments: none (service: runs for ever), `rw` (the same with writable disks: storage tests), or
 //! `test` (the driver tests: device ABI rules, block I/O, crash + restart, DMA blocked by the IOMMU,
 //! interrupt delivery, keyboard input; exit 0 when everything passed). Without `rw` or `test`,
@@ -34,6 +39,7 @@ mod xhci;
 
 use libd::fs;
 use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
+use libd::svc;
 use libd::sys::{self, DeviceInfo, Handle};
 use libd::{Mapping, Port, Startup, println};
 
@@ -46,6 +52,19 @@ libd::entry!(ddrv_nvme, nvme::main);
 libd::entry!(ddrv_xhci, xhci::main);
 
 const MAX_DRIVERS: usize = 8;
+const MAX_DISKS: usize = 16;
+/// Port key of the control channel from the service manager.
+const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
+
+/// A disk a driver announced (kept to hand it over again to a restarted storage service).
+#[derive(Clone, Copy)]
+struct Disk {
+    drv: usize,
+    unit: u64,
+    sectors: u64,
+    model: [u8; 40],
+    model_len: usize,
+}
 
 /// Formats into a byte buffer (no allocator).
 struct Cursor<'a> {
@@ -90,6 +109,11 @@ struct Mgr {
     /// Channel to the storage service (0: none, e.g. `devmgr test`).
     storage: Handle,
     disks: u32,
+    known: [Option<Disk>; MAX_DISKS],
+    /// Control channel from the service manager (0: started without one).
+    mgr: Handle,
+    /// SHUTDOWN received.
+    stop: bool,
     /// Block drivers may write (argument `rw` or `test`); otherwise they start read-only.
     writable: bool,
 }
@@ -167,6 +191,10 @@ impl Mgr {
     /// Handle one event (or time out). Returns false on timeout.
     fn pump(&mut self, timeout: u64) -> bool {
         let Some((key, _)) = self.port.wait(timeout) else { return false };
+        if key == KEY_MGR {
+            self.manager();
+            return true;
+        }
         let i = (key >> 8) as usize;
         if i >= MAX_DRIVERS {
             return true;
@@ -216,6 +244,55 @@ impl Mgr {
         }
     }
 
+    /// Messages from the service manager: a new storage channel (the storage service was
+    /// restarted: hand every known disk over again), or the request to stop.
+    fn manager(&mut self) {
+        let mut buf = [0u8; HEADER + 64];
+        loop {
+            let mut hs = [0 as Handle; 1];
+            match sys::channel_read_h(self.mgr, &mut buf, &mut hs, 0) {
+                Ok((n, nh)) => {
+                    let handle = if nh > 0 { hs[0] } else { 0 };
+                    match Header::get(&buf[..n]) {
+                        Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"storaged.disks" && handle != 0 => {
+                            if self.storage != 0 {
+                                sys::handle_close(self.storage);
+                            }
+                            self.storage = handle;
+                            let known = self.known;
+                            let mut again = 0;
+                            for k in known.iter().flatten() {
+                                if self.drv[k.drv].as_ref().is_some_and(|d| d.ready) {
+                                    self.disk(k.drv, k.unit, k.sectors, &k.model[..k.model_len]);
+                                    again += 1;
+                                }
+                            }
+                            proto::send(self.storage, fs::DISKS_SETTLED, again, 0);
+                            println!("devmgr: storage service reconnected: {} disk(s) handed over again", again);
+                        }
+                        Some(h) if h.op == svc::SHUTDOWN => {
+                            if handle != 0 {
+                                sys::handle_close(handle);
+                            }
+                            self.stop = true;
+                            return;
+                        }
+                        _ => {
+                            if handle != 0 {
+                                sys::handle_close(handle);
+                            }
+                        }
+                    }
+                }
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.port.arm(self.mgr, sys::READABLE | sys::PEER_CLOSED, KEY_MGR);
+                    return;
+                }
+                Err(_) => return, // the manager is gone: keep serving
+            }
+        }
+    }
+
     /// A driver announced a disk: attach a channel to it and hand the other end to storage.
     fn disk(&mut self, i: usize, unit: u64, sectors: u64, model: &[u8]) {
         let Some(d) = self.drv[i].as_ref() else { return };
@@ -223,14 +300,23 @@ impl Mgr {
         let mut w = Cursor { b: &mut name, n: 0 };
         let _ = core::fmt::write(&mut w, format_args!("{}:{}:{}", d.prog, d.info.name(), unit));
         let len = w.n;
-        println!(
-            "devmgr: {}.ddrv disk {}: {} sectors ({} MiB), {}",
-            d.prog,
-            unit,
-            sectors,
-            sectors / 2048,
-            core::str::from_utf8(model).unwrap_or("?")
-        );
+        let mut rec = Disk { drv: i, unit, sectors, model: [0; 40], model_len: model.len().min(40) };
+        rec.model[..rec.model_len].copy_from_slice(&model[..rec.model_len]);
+        let slot = self.known.iter().position(|k| k.is_some_and(|k| k.drv == i && k.unit == unit));
+        let first = slot.is_none();
+        if let Some(s) = slot.or_else(|| self.known.iter().position(|k| k.is_none())) {
+            self.known[s] = Some(rec);
+        }
+        if first {
+            println!(
+                "devmgr: {}.ddrv disk {}: {} sectors ({} MiB), {}",
+                d.prog,
+                unit,
+                sectors,
+                sectors / 2048,
+                core::str::from_utf8(model).unwrap_or("?")
+            );
+        }
         if self.storage == 0 {
             return;
         }
@@ -366,12 +452,22 @@ fn devmgr_main(s: *const Startup) -> i32 {
         last_len: 0,
         last_from: "",
         lines: 0,
-        storage: libd::startup_handle(fs::TAG_STORAGE),
+        // The storage endpoint from the service manager, or (tests) the tagged channel.
+        storage: match svc::endpoint(b"storaged.disks") {
+            0 => libd::startup_handle(fs::TAG_STORAGE),
+            h => h,
+        },
         disks: 0,
+        known: [None; MAX_DISKS],
+        mgr: libd::startup_handle(proto::TAG_CONTROL),
+        stop: false,
         writable,
     };
     if !writable {
         println!("devmgr: disks are read-only (block drivers refuse writes)");
+    }
+    if m.mgr != 0 {
+        m.port.arm(m.mgr, sys::READABLE | sys::PEER_CLOSED, KEY_MGR);
     }
     // Bind drivers to devices.
     let mut ndev = 0;
@@ -423,9 +519,19 @@ fn devmgr_main(s: *const Startup) -> i32 {
         proto::send(m.storage, fs::DISKS_SETTLED, u64::from(m.disks), 0);
     }
     println!("devmgr: running (drivers are restarted when they fail); typed lines are echoed (Enter ends a line)");
-    loop {
+    while !m.stop {
         m.pump(sys::WAIT_FOREVER);
     }
+    let mut n = 0;
+    for d in m.drv.iter_mut().flatten() {
+        if d.proc != 0 {
+            sys::process_kill(d.proc);
+            let _ = sys::object_wait(d.proc, sys::TERMINATED, 2 * SEC);
+            n += 1;
+        }
+    }
+    println!("devmgr: shutdown: {} driver(s) stopped", n);
+    0
 }
 
 // ---- tests (`devmgr test`) -----------------------------------------------------------------

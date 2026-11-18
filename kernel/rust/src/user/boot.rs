@@ -5,8 +5,11 @@
 //! - its own process, thread and root VMAR (like every spawned process);
 //! - the debug log (`WRITE`): the only way to print;
 //! - one read-only VMO per embedded program (tag PROGRAM, named "<name>.dx"), to spawn them;
+//! - one read-only VMO per embedded service manifest (tag MANIFEST, named "<name>.dman"): data,
+//!   trusted because the verified kernel image carries it, never runnable;
 //! - the VMEX resource (tag VMEX): the authority to make sealed VMOs executable, for user-space
 //!   program loaders. init hands it on only deliberately;
+//! - the POWER and MEASURE resources (switch off / reset; record decisions in PCR 10);
 //! - one handle per device (tag DEVICE): init passes them to the device manager.
 
 use alloc::vec::Vec;
@@ -15,7 +18,7 @@ use core::ffi::{CStr, c_char};
 use super::loader::{self, tag};
 use crate::ffi::{self, RawProgram};
 use crate::object::quota::Limits;
-use crate::object::resource::{KIND_POWER, KIND_VMEX};
+use crate::object::resource::{KIND_MEASURE, KIND_POWER, KIND_VMEX};
 use crate::object::{
     KRef, LogObj, ObjType, Object, Process, ResourceObj, Rights, Status, Vmo, default_rights, kernel_process,
     kernel_process_ref, sig,
@@ -40,13 +43,20 @@ pub fn programs() -> impl Iterator<Item = (&'static str, &'static [u8])> {
     })
 }
 
-/// A read-only VMO holding a copy of an embedded program.
+/// Embedded service manifests (`*.dman`) are data for init, not programs.
+fn is_manifest(name: &str) -> bool {
+    name.ends_with(".dman")
+}
+
+/// A read-only VMO holding a copy of an embedded program (or manifest: sealed, never runnable).
 fn program_vmo(name: &str, data: &[u8]) -> Result<KRef<Vmo>, Status> {
     let v = Vmo::create_named(kernel_process().account(), (data.len() as u64).max(1), name)?;
     v.write(0, data)?;
     // Part of the kernel image, which the loader verified: sealed and trusted as such.
     v.seal()?;
-    v.set_trust(crate::security::Trust::KernelImage);
+    if !is_manifest(name) {
+        v.set_trust(crate::security::Trust::KernelImage);
+    }
     Ok(v)
 }
 
@@ -64,15 +74,18 @@ fn start(args: &[u8]) -> Result<KRef<Process>, Status> {
     let mut handles = Vec::new();
     let n = programs().count();
     let devs = crate::dev::devices();
-    handles.try_reserve_exact(n + 3 + devs.len()).map_err(|_| Status::NoMemory)?;
+    handles.try_reserve_exact(n + 4 + devs.len()).map_err(|_| Status::NoMemory)?;
     handles.push((Object::Log(LogObj::create()?), default_rights(ObjType::Log), tag::LOG));
     let vmex = ResourceObj::new(KIND_VMEX)?;
     handles.push((Object::Resource(vmex), default_rights(ObjType::Resource), tag::VMEX));
     let power = ResourceObj::new(KIND_POWER)?;
     handles.push((Object::Resource(power), default_rights(ObjType::Resource), tag::POWER));
+    let measure = ResourceObj::new(KIND_MEASURE)?;
+    handles.push((Object::Resource(measure), default_rights(ObjType::Resource), tag::MEASURE));
     let prog_rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT;
     for (name, data) in programs() {
-        handles.push((Object::Vmo(program_vmo(name, data)?), prog_rights, tag::PROGRAM));
+        let t = if is_manifest(name) { tag::MANIFEST } else { tag::PROGRAM };
+        handles.push((Object::Vmo(program_vmo(name, data)?), prog_rights, t));
     }
     for d in devs {
         handles.push((Object::Device(d.clone()), default_rights(ObjType::Device), tag::DEVICE));
@@ -120,10 +133,11 @@ pub extern "C" fn dkrnl_start_init(args: *const c_char, len: u64) {
         }
     };
     crate::kprintln!(
-        "User: init started in ring 3 (koid {}), ABI v{}, {} programs embedded",
+        "User: init started in ring 3 (koid {}), ABI v{}, {} programs and {} service manifests embedded",
         init.header.koid,
         loader::ABI_VERSION,
-        programs().count()
+        programs().filter(|(n, _)| !is_manifest(n)).count(),
+        programs().filter(|(n, _)| is_manifest(n)).count()
     );
     let watcher = crate::thread::spawn(c"init.watch", ffi::prio::NORMAL, move || {
         let _ = init.signals.wait(sig::TERMINATED, ffi::WAIT_FOREVER);

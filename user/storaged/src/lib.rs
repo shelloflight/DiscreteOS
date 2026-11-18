@@ -1,6 +1,9 @@
 //! The storage service (`storaged.dx`): block layer, partitions, filesystems and the
 //! file service. Reference: docs/storage.md.
 //!
+//! - Started by the service manager (init) from its manifest: the control channel (TAG_CONTROL)
+//!   carries the disks endpoint (svc::CONNECT "disks", once per device manager instance) and
+//!   svc::SHUTDOWN (every volume is synced, then the service exits).
 //! - Disks arrive from the device manager (TAG_DISKS: DISK_ADD, each carrying a channel to the
 //!   driver serving that disk). A disk whose driver restarts comes back under the same name; its
 //!   channel is replaced and interrupted requests are retried, so filesystems never notice.
@@ -29,6 +32,7 @@ use core::cell::{Cell, RefCell};
 
 use libd::fs::{self as fp, R_ADMIN, R_ALL, R_READ, R_WRITE};
 use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
+use libd::svc;
 use libd::sys::{self, Handle, MsgHandle};
 use libd::{Port, Startup, println};
 use dosfs::dev::{BlockDev, CutDev, Part, SharedCut};
@@ -266,6 +270,8 @@ struct Svc {
     /// `rocheck`: ask each driver to write, expecting a refusal.
     rocheck: bool,
     announced: bool,
+    /// The service manager asked us to stop (svc::SHUTDOWN).
+    stop: bool,
     buf: Vec<u8>,
     out: Vec<u8>,
 }
@@ -473,15 +479,37 @@ impl Svc {
             match r {
                 Ok((n, nh)) => {
                     let handle = if nh > 0 { hs[0] } else { 0 };
+                    let h = Header::get(&buf[..n]);
                     if key == KEY_DISKS {
                         self.disks_message(&buf[..n], handle);
-                    } else if let Some(h) = Header::get(&buf[..n])
-                        && h.op == fp::DISKS_LINK
+                    } else if let Some(h) = h
+                        && (h.op == fp::DISKS_LINK || (h.op == svc::CONNECT && &buf[HEADER..n] == b"disks"))
                         && handle != 0
                     {
+                        // The device manager (re)connects: disks arrive on this channel from now on.
                         sys::handle_close(self.disks_ch.get());
                         self.disks_ch.set(handle);
                         self.port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_DISKS);
+                    } else if let Some(h) = h
+                        && h.op == svc::SYNC
+                    {
+                        if handle != 0 {
+                            sys::handle_close(handle);
+                        }
+                        let n = self.sync_all();
+                        println!("storaged: sync: {} volume(s) durable", n);
+                        let mut r = [0u8; HEADER];
+                        Header { txid: h.txid, op: svc::SYNC, status: 0, a: n as u64, b: 0 }.put(&mut r);
+                        sys::channel_write(self.ctl, &r);
+                    } else if let Some(h) = h
+                        && h.op == svc::SHUTDOWN
+                    {
+                        if handle != 0 {
+                            sys::handle_close(handle);
+                        }
+                        self.stop = true;
+                        self.buf = buf;
+                        return;
                     } else if handle != 0 {
                         sys::handle_close(handle);
                     }
@@ -795,6 +823,24 @@ impl Svc {
         }
     }
 
+    /// Shutdown: commit every volume written to since its last commit (read-only volumes never
+    /// are). Returns how many volumes are durable now (all of them, unless a commit failed).
+    fn sync_all(&mut self) -> usize {
+        let mut n = 0;
+        for v in self.vols.iter_mut() {
+            if v.dirty
+                && let Some(f) = v.fs.as_mut()
+                && let Err(e) = f.fs().sync()
+            {
+                println!("storaged: '{}': sync failed: {:?}", v.name, e);
+                continue;
+            }
+            v.dirty = false;
+            n += 1;
+        }
+        n
+    }
+
     /// Commit volumes that have been written to (after the service has been idle a while).
     fn commit_idle(&mut self) {
         for v in self.vols.iter_mut().filter(|v| v.dirty) {
@@ -854,6 +900,7 @@ fn main(s: *const Startup) -> i32 {
         writable: test,
         rocheck,
         announced: false,
+        stop: false,
         buf: vec![0u8; HEADER + fp::MAX_IO + 64],
         out: vec![0u8; fp::MAX_IO],
     };
@@ -883,6 +930,11 @@ fn main(s: *const Startup) -> i32 {
             KEY_CTL => svc.drain(ctl, KEY_CTL),
             k if k >= KEY_CONN => svc.conn_ready((k - KEY_CONN) as usize),
             _ => {}
+        }
+        if svc.stop {
+            let n = svc.sync_all();
+            println!("storaged: shutdown: {} volume(s) durable, stopping", n);
+            return 0;
         }
     }
 }

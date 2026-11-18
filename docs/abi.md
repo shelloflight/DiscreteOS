@@ -1,4 +1,4 @@
-# User ABI (version 6)
+# User ABI (version 7)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **6**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **7**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -28,6 +28,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 4 | code signing (60-61); `spawn` runs only trusted images |
 | 5 | remote attestation (62) |
 | 6 | power control (63) |
+| 7 | service manager decisions in the measurement log (64); MANIFEST and MEASURE startup handles; `vmo_verify` accepts manifest signatures |
 
 ## Calling convention (x86-64)
 
@@ -131,10 +132,11 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 57 | device_interrupt | device, index, flags (0) | interrupt handle | MANAGE |
 | 58 | interrupt_ack | interrupt | times fired so far | WRITE |
 | 59 | device_dma_map | device, vmo, offset, len, flags, `uint64_t addrs[]` | pin handle | MANAGE; READ/WRITE on VMO |
-| 60 | vmo_verify | vmo, dsig vmo | 0 (sealed, trusted as a program) | READ on both |
+| 60 | vmo_verify | vmo, dsig vmo | 0 (sealed; a program or driver is trusted to run, a manifest is only known genuine) | READ on both |
 | 61 | vmo_allow_unsigned | vmo, VMEX resource | 0 (sealed, trusted as unsigned code) | READ; MANAGE on resource |
 | 62 | attest | nonce (32 bytes), buf, cap | report length | |
 | 63 | system_power | POWER resource, action (1 off, 2 reset) | does not return, or `NOT_SUPPORTED` | MANAGE on resource |
+| 64 | measure | MEASURE resource, digest (32 bytes), text, len (<= 52, printable ASCII) | 0 (PCR 10 extended, logged as `svc <text>`) | MANAGE on resource |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.
@@ -160,8 +162,11 @@ At the entry point, RDI points at `struct dos_startup`: magic `DOSS`, ABI versio
 bytes (<= 4096), the image base and the stack.
 
 Tags: `PROC_SELF` 1, `THREAD_SELF` 2, `VMAR_ROOT` 3, `LOG` 4, `PROGRAM` 5, `VMEX` 6, `DEVICE` 7,
-`POWER` 8, and `DOS_TAG_USER` (0x10000) and up for the spawner's own. `init` gets its own handles,
-the log, one read-only VMO per embedded program, the VMEX and POWER resources and every device.
+`POWER` 8, `MEASURE` 9, `MANIFEST` 10, and `DOS_TAG_USER` (0x10000) and up for the spawner's own.
+`init` gets its own handles, the log, one read-only VMO per embedded program and per embedded service
+manifest (`*.dman`: data, never runnable), the VMEX, POWER and MEASURE resources and every device.
+Tags user space agrees on: the service manager's control channel and endpoints
+([services.md](services.md)), namespaces ([storage.md](storage.md)).
 
 ## Processes
 
@@ -224,6 +229,8 @@ Register sets from user space are validated (user addresses only, user-settable 
 - `attest` returns a signed report for the caller's nonce ([attestation.md](attestation.md));
   `DOS_ATTEST_MAX` bytes hold any report.
 - `system_power` needs the POWER resource; nothing is flushed by the kernel ([power.md](power.md)).
+- `measure` needs the MEASURE resource (init only): the service manager records each manifest it
+  accepts or refuses in PCR 10 ([services.md](services.md)).
 
 ## Devices (for user-space drivers)
 
@@ -246,4 +253,5 @@ manager, which grants each to its driver.
 `user` (`utest all`: handles, rights, invalid pointers, memory, threads, spawn, user faults, kill,
 FPU state, IPC, ports, exceptions; `kasan-user` repeats it under KASAN), `fuzz` (ELF parser
 mutations and random syscalls), `smap`, `smep`, `compat`, `drivers` (`drivers-amd` on AMD-Vi),
-`keyboard`, `usbkbd` (`usbnokbd`: no keyboard; `usbhub`: behind two hubs; `usbplug`: hot-plug, a reconnecting device), `attest`, `poweroff`.
+`keyboard`, `usbkbd` (`usbnokbd`: no keyboard; `usbhub`: behind two hubs; `usbplug`: hot-plug, a reconnecting device), `attest`, `poweroff`,
+`services` (MANIFEST and MEASURE handles, `measure`, manifest signatures).

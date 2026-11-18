@@ -1,5 +1,5 @@
 /*
- * D-OS user ABI, version 3 (C binding). Reference: docs/abi.md. A program built for version N runs
+ * D-OS user ABI, version 7 (C binding). Reference: docs/abi.md. A program built for version N runs
  * on any kernel whose version is at least N (syscall numbers and structures never change meaning).
  *
  * Every syscall: `syscall` with the number in RAX, arguments in RDI, RSI, RDX, R10, R8, R9.
@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 6
+#define DOS_ABI_VERSION 7
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -108,6 +108,8 @@ enum {
     DOS_SYS_ATTEST,
     /* ABI v6: power control */
     DOS_SYS_SYSTEM_POWER,
+    /* ABI v7: service manager decisions in the measurement log */
+    DOS_SYS_MEASURE,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -198,6 +200,8 @@ struct dos_exception_msg {
 #define DOS_TAG_VMEX        6             /* resource: may make sealed VMOs executable */
 #define DOS_TAG_DEVICE      7             /* a device (ABI v3): init gets all, devmgr what init passes */
 #define DOS_TAG_POWER       8             /* resource (ABI v6): may switch the machine off or reset it */
+#define DOS_TAG_MEASURE     9             /* resource (ABI v7): may record decisions in PCR 10 (init) */
+#define DOS_TAG_MANIFEST    10            /* ABI v7: an embedded service manifest <name>.dman (init) */
 #define DOS_TAG_USER        0x10000       /* first tag for handles a spawner passes */
 
 struct dos_startup_handle { dos_handle_t handle; uint32_t tag; };
@@ -364,6 +368,9 @@ static inline int64_t dos_vmo_allow_unsigned(dos_handle_t vmo, dos_handle_t vmex
 #define DOS_POWER_REBOOT 2
 /* With the POWER resource: switch off (returns DOS_ERR_NOT_SUPPORTED if the machine cannot) or reset. */
 static inline int64_t dos_system_power(dos_handle_t power, uint64_t action) { return DOS_SC(DOS_SYS_SYSTEM_POWER, power, action, 0, 0, 0, 0); }
+/* ABI v7, with the MEASURE resource: extend PCR 10 with digest, logged as "svc <text>" (printable
+ * ASCII, at most 52 bytes). */
+static inline int64_t dos_measure(dos_handle_t measure, const uint8_t digest[32], const char *text, uint64_t len) { return DOS_SC(DOS_SYS_MEASURE, measure, digest, text, len, 0, 0); }
 static inline int64_t dos_attest(const uint8_t nonce[32], void *buf, uint64_t cap) { return DOS_SC(DOS_SYS_ATTEST, nonce, buf, cap, 0, 0, 0); }
 
 /* ---- storage (docs/storage.md; mirrors user/lib/libd/src/fs.rs) ---------------------------

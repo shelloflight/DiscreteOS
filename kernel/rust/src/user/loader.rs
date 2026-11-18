@@ -33,7 +33,7 @@ pub const MAX_HANDLES: usize = 256;
 /// ABI version (docs/abi.md): 2 added IPC, ports and exceptions; 3 added devices for user-space
 /// drivers. A program built for version N runs on any kernel whose
 /// version is at least N.
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44; // "DOSS"
 
 /// Startup handle tags (docs/abi.md).
@@ -48,6 +48,10 @@ pub mod tag {
     pub const DEVICE: u32 = 7;
     /// The POWER resource (ABI v6): init only.
     pub const POWER: u32 = 8;
+    /// The MEASURE resource (ABI v7): init only.
+    pub const MEASURE: u32 = 9;
+    /// A service manifest embedded in the kernel image (ABI v7, `<name>.dman`, read-only): init only.
+    pub const MANIFEST: u32 = 10;
 }
 
 struct VmoSource<'a>(&'a Vmo);

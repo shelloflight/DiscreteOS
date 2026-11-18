@@ -47,8 +47,13 @@
                    every disk image is byte-identical to before (also checked after boot and uefi)
       manydevices  the release image with 64 extra PCIe root ports (70 devices, more than the
                    old 64-handle spawn limit; a real PC had 50): init and devmgr still start
+      services     the service manager (init "services test"): manifests embedded and on disk
+                   (signed accepted; unsigned, tampered, unknown key, ungranted endpoint refused),
+                   exact grants and quotas, restart with backoff and giving up, storaged and devmgr
+                   killed with I/O working again, shutdown in reverse order, power-off
       storage-host dosfs unit tests on the host (cargo test): BLAKE3 vectors, GPT, FAT32, DFS,
                    power-cut sweep over every sector of a workload
+      manifest-host the service manifest parser on the host: schema tests and a mutation fuzzer
       selftest     in-kernel runtime library tests pass
       panic        KASSERT failure produces a kernel panic with location
       stackprot    stack buffer overflow is caught by the stack protector
@@ -324,6 +329,19 @@ $TestCases = [ordered]@{
                                 'init: 4 volume(s)', 'fstest: fat32:', 'fstest: dfs:', 'BENCH storage: DFS write 1 MiB', 'fstest: snapshots:', 'fstest: child:',
                                 'fstest: code signing: hello.dx from the boot volume', 'fstest: namespace isolation:', 'fstest: power cut:', 'fstest: corruption:', 'fstest: PASSED', 'init: fstest exited with code 0')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC') }
+    # The service manager (init "services test"): manifests embedded and on disk (signed, unsigned,
+    # tampered), refusals named, exact grants and quotas (ltest inside the services), restart with
+    # backoff and giving up, storaged then devmgr killed with I/O working again, then shutdown in
+    # reverse start order and power-off.
+    services    = @{ Define = 'SERVICES';    Devices = $true; Timeout = 120; MustExit = $true
+                     Expect = @('init: service storaged accepted', 'init: service devmgr accepted', "unknown key 'grants.kernel-memory'",
+                                'init: manifest svc-badcap.dman refused: it asks for endpoint nosuch.secrets, which no service provides',
+                                'init: manifest esp:/DOS/SERVICES/TAMPERED.DMAN refused: signature check failed', 'init: manifest esp:/DOS/SERVICES/UNSIGNED.DMAN refused: not signed',
+                                'init: service hello accepted (esp:/DOS/SERVICES/HELLO.DMAN)', 'hello: a signed program loaded from disk is running', 'ltest: svc-grants: exactly the granted handles', 'ltest: svc-quota: limits from the manifest',
+                                'init: restarting svc-crash in 50 ms (restart 1 of 2)', 'init: restarting svc-crash in 100 ms (restart 2 of 2)', 'init: svc-crash keeps failing: given up after 2 restart(s)',
+                                'init: test: storaged killed and restarted', 'devmgr: storage service reconnected', 'init: test: devmgr killed and restarted',
+                                'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown:', 'init: shutdown: every service stopped', 'init: test: PASSED', 'Power: switching off')
+                     Forbid = @('KERNEL PANIC', 'test FAIL', 'svc FAIL', 'PANIC', 'could not measure', 'sync failed', 'did not confirm', 'did not stop in time'); Post = 'Test-ServicesOrder' }
     poweroff    = @{ Define = 'POWEROFF';    Expect = @('Power: power-off by ACPI S5', 'init: power: the VMEX resource is refused (-5)', 'Power: switch-off requested by process init', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
     'poweroff-uefi' = @{ Define = 'POWEROFF'; Uefi = $true; Expect = @('Power: power-off by ACPI S5', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 60; MustExit = $true }
     reboot      = @{ Define = 'REBOOT';      Expect = @('reset by reset register', 'init: power: the VMEX resource is refused (-5)', 'Power: reset requested by process init', 'Power: resetting'); Forbid = @('KERNEL PANIC', 'FAIL', 'no reset method worked', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
@@ -343,6 +361,7 @@ $TestCases = [ordered]@{
                      Forbid = @('KERNEL PANIC', 'cannot start init', 'left out', 'FAIL', 'not used: the limit') }
     'storage-host' = @{ Host = 'Test-DosfsHost' }
     'crypto-host' = @{ Host = 'Test-CryptoHost' }
+    'manifest-host' = @{ Host = 'Test-ManifestHost' }
     'uefi-badsig' = @{ Define = $null;       Uefi = $true; Tamper = $true; Timeout = 60; Expect = @('D-OS: UEFI loader', 'D-OS: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 1.', 'kernel signature valid') }
     'bios-badsig' = @{ Define = $null;       Tamper = $true; Expect = @('D-OS: stage2 OK', 'D-OS: stage3: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 1.', 'kernel signature valid') }
     kaslr       = @{ Define = 'KASLR';       Expect = @('D-OS: stage3: kernel relocated (KASLR', 'KTEST kaslr: layout image 0xffffff', 'KTEST kaslr: PASSED', 'D-KRNL: ready'); Forbid = @('KERNEL PANIC', 'FAIL'); Post = 'Test-KaslrReboots' }
@@ -526,6 +545,12 @@ function Invoke-Build([string]$OutDir = $Build, [string]$KernelTest = $null, [sw
 
     # --- User programs (ring 3), embedded in the kernel image (no filesystem yet) ---------
     $programs = Invoke-UserBuild -OutDir $OutDir -Clang $clang -Lld $lld -Log ${function:Log}
+    # Service manifests (docs/services.md) ride along: the system ones in every image, the service
+    # manager's test ones only in its test image. The kernel hands them to init as MANIFEST VMOs.
+    $manDir = Join-Path $Root 'user\init\services'
+    $manifests = @(Get-ChildItem $manDir -Filter *.dman -File | Sort-Object Name)
+    if ($KernelTest -eq 'SERVICES') { $manifests += @(Get-ChildItem (Join-Path $manDir 'test') -Filter *.dman -File | Sort-Object Name) }
+    $programs = @($programs) + @($manifests | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Path = $_.FullName } })
     $progAsm = Join-Path $objDir 'programs.asm'
     $progObj = Join-Path $objDir 'programs.o'
     Write-ProgramsAsm $progAsm $programs
@@ -597,12 +622,31 @@ function Invoke-Build([string]$OutDir = $Build, [string]$KernelTest = $null, [sw
     $hello = (@($programs) | Where-Object Name -eq 'hello.dx' | Select-Object -First 1).Path
     $helloSig = Join-Path $OutDir 'hello.dsig'
     Invoke-Native (Get-Dosimg) @('sign', $key.Seed, 'program', 'hello.dx', $hello, $helloSig)
+    $extraFiles = @("DOS/APPS/HELLO.DX=$hello", "DOS/APPS/HELLO.DSIG=$helloSig")
+    if ($KernelTest -eq 'SERVICES') {
+        # Manifests on the boot volume for the service manager's test: one signed, one unsigned, one
+        # whose content changed after it was signed.
+        $svcDir = Join-Path $OutDir 'services'
+        New-Item -ItemType Directory -Force $svcDir | Out-Null
+        $src = Join-Path $Root 'user\init\services\disk\hello.dman'
+        $sig = Join-Path $svcDir 'HELLO.DSIG'
+        Invoke-Native (Get-Dosimg) @('sign', $key.Seed, 'manifest', 'hello.dman', $src, $sig)
+        $unsigned = Join-Path $svcDir 'UNSIGNED.DMAN'
+        [IO.File]::WriteAllText($unsigned, ([IO.File]::ReadAllText($src) -replace 'name = "hello"', 'name = "unsigned"'))
+        $tampered = Join-Path $svcDir 'TAMPERED.DMAN'
+        [IO.File]::WriteAllText($tampered, ([IO.File]::ReadAllText($src) -replace 'name = "hello"', 'name = "tampered"'))
+        $tsig = Join-Path $svcDir 'TAMPERED.DSIG'
+        Invoke-Native (Get-Dosimg) @('sign', $key.Seed, 'manifest', 'tampered.dman', $tampered, $tsig)
+        [IO.File]::AppendAllText($tampered, "# changed after it was signed`n")
+        $extraFiles += @("DOS/SERVICES/HELLO.DMAN=$src", "DOS/SERVICES/HELLO.DSIG=$sig", "DOS/SERVICES/UNSIGNED.DMAN=$unsigned",
+                         "DOS/SERVICES/TAMPERED.DMAN=$tampered", "DOS/SERVICES/TAMPERED.DSIG=$tsig")
+    }
 
     # --- Disk image (BIOS + UEFI, GPT) ----------------------------------------------
     Log '  IMAGE discrete.img (dosimg boot)'
     $dosimg = Get-Dosimg
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { $made = & $dosimg boot $image $stage1Bin $stage2Bin $stage3Bin $kernelBin $kernelSig $efi "DOS/APPS/HELLO.DX=$hello" "DOS/APPS/HELLO.DSIG=$helloSig" 2>&1 | ForEach-Object { "$_" } }
+    try { $made = & $dosimg boot $image $stage1Bin $stage2Bin $stage3Bin $kernelBin $kernelSig $efi @extraFiles 2>&1 | ForEach-Object { "$_" } }
     finally { $ErrorActionPreference = $prev }
     if ($LASTEXITCODE -ne 0) { throw "dosimg boot failed: $made" }
     $size = (Get-Item $image).Length
@@ -1105,6 +1149,18 @@ function Test-UsbProbedOnce([string]$DiskDir, [string]$Image, [string]$Log) {
     return $n -eq 2
 }
 
+# Service manager: the volumes are made durable while the drivers still run, then the services stop
+# in the reverse order of their starts (devmgr before storaged), then the power goes.
+function Test-ServicesOrder([string]$DiskDir, [string]$Image, [string]$Log) {
+    $at = { param($s) $Log.IndexOf($s) }
+    $seq = @('init: syncing storaged', 'storaged: sync: 4 volume(s) durable', 'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown: 4 volume(s) durable', 'init: shutdown: every service stopped', 'Power: switch-off requested by process init')
+    $pos = @($seq | ForEach-Object { & $at $_ })
+    $ok = ($pos -notcontains -1)
+    for ($i = 1; $i -lt $pos.Count; $i++) { if ($pos[$i] -lt $pos[$i - 1]) { $ok = $false } }
+    Write-Host "  services: shutdown order $(if ($ok) { 'volumes made durable, then devmgr, then storaged, then power-off' } else { 'WRONG: ' + ($pos -join ', ') })"
+    return $ok
+}
+
 # USB hot-plug: the reconnecting tablet is reported once and left alone once.
 function Test-UsbPlugOnce([string]$DiskDir, [string]$Image, [string]$Log) {
     $n = ([regex]::Matches($Log, 'left unused')).Count
@@ -1293,7 +1349,7 @@ function Test-StaticAnalysis {
         $findings += $n
     }
     $cargo = Initialize-Rust
-    $crates = @('kernel\rust', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
+    $crates = @('kernel\rust', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\lib\dman', 'user\init', 'user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
     foreach ($c in $crates) {
         Push-Location (Join-Path $Root $c)
         try {
@@ -1366,6 +1422,18 @@ function Test-KaslrHost {
     $same = $okList -and $ours.Count -gt 0 -and (($ours | Sort-Object) -join ',') -eq (($theirs | Sort-Object) -join ',')
     Write-Host "  host: kernel.bin RELR: $($ours.Count) relocations decoded, llvm-readobj lists $($theirs.Count): $(if ($same) { 'identical' } else { 'DIFFERENT' })"
     return $ok -and $same
+}
+
+# manifest-host: the service manifest parser on the host: schema tests and the mutation fuzzer.
+function Test-ManifestHost {
+    $cargo = Initialize-Rust
+    Push-Location (Join-Path $Root 'user\lib\dman')
+    try {
+        $out = & $cargo test --release --locked --quiet --target-dir (Join-Path $Build 'host') -- --nocapture 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } finally { Pop-Location }
+    Write-Host ($out.Trim() -split "`n" | Where-Object { $_ -match 'test result|FAILED|panicked|dman fuzz' } | Out-String).Trim()
+    return $code -eq 0
 }
 
 function Test-DosfsHost {

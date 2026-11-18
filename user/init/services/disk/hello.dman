@@ -1,0 +1,16 @@
+# Test (services): a signed manifest loaded from the boot volume (DOS/SERVICES/HELLO.DMAN with its
+# .DSIG): accepted and started. Unsigned and tampered copies next to it must be refused.
+name = "hello"
+image = "hello.dx"
+group = "test"
+
+[grants]
+log = true
+
+[quota]
+memory = "2M"
+handles = 16
+threads = 1
+
+[restart]
+policy = "never"

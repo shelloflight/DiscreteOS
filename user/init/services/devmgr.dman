@@ -1,0 +1,23 @@
+# The device manager: starts one driver process per device it knows, restarts drivers that fail,
+# hands disks to the storage service and collects keyboard input.
+name = "devmgr"
+image = "devmgr.dx"
+group = "system"
+after = ["storaged"]
+description = "devices and their drivers"
+
+[grants]
+log = true
+devices = ["all"]
+programs = ["*.ddrv"]
+connect = ["storaged.disks"]
+
+[quota]
+memory = "96M"
+handles = 2048
+threads = 48
+
+[restart]
+policy = "always"
+limit = 3
+backoff = 100

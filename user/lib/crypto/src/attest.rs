@@ -167,6 +167,8 @@ pub struct Verified {
     pub events: usize,
     pub signed_code: usize,
     pub unsigned_code: usize,
+    /// Service manager decisions (PCR 10 "svc ..." events: manifests accepted or refused).
+    pub decisions: usize,
     pub ak: [u8; 32],
 }
 
@@ -204,7 +206,7 @@ pub fn verify(r: &[u8], nonce: &[u8; 32], p: &Policy<'_>) -> Result<Verified, Er
     }
     // Replay the log.
     let (mut pcr8, mut pcr10) = ([0u8; 32], [0u8; 32]);
-    let mut v = Verified { flags: u32_at(r, 12), firmware: u32_at(r, 16), kernel_version: [0; 16], events: count, signed_code: 0, unsigned_code: 0, ak };
+    let mut v = Verified { flags: u32_at(r, 12), firmware: u32_at(r, 16), kernel_version: [0; 16], events: count, signed_code: 0, unsigned_code: 0, decisions: 0, ak };
     v.kernel_version.copy_from_slice(&r[56..72]);
     let mut kernel_events = 0;
     let want_kernel = sha256(p.kernel_dsig.get(..dsig::SIGNED).ok_or(Error::UnknownKernel)?);
@@ -236,6 +238,8 @@ pub fn verify(r: &[u8], nonce: &[u8; 32], p: &Policy<'_>) -> Result<Verified, Er
             kernel_events += 1;
         } else if text.starts_with(b"unsigned ") {
             v.unsigned_code += 1;
+        } else if text.starts_with(b"svc ") {
+            v.decisions += 1;
         } else {
             v.signed_code += 1;
         }
@@ -327,6 +331,10 @@ mod tests {
         let v = verify(&r, &[1; 32], &p).unwrap();
         assert_eq!((v.events, v.signed_code, v.unsigned_code), (3, 1, 0));
         assert_eq!(&v.kernel_version[..6], b"0.13.5");
+        // Service manager decisions are counted on their own, never as code.
+        let r = report(&f, [1; 32], false, |ev| ev.push((PCR_CODE, [5; 32], "svc accept storaged")));
+        let v = verify(&r, &[1; 32], &p).unwrap();
+        assert_eq!((v.events, v.signed_code, v.unsigned_code, v.decisions), (4, 1, 0, 1));
     }
 
     #[test]

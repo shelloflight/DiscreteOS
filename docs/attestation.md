@@ -17,7 +17,8 @@ code has it run?" and get a fresh answer it can check.
                           ◄──── report ─────          signed by this boot's attestation key
  doscrypt::attest::verify(report, nonce, policy):
    signature, nonce (no replay), log replays to the PCRs, PCR 8 = the reference kernel then the
-   attestation key, the trusted D-OS key, policy on unsigned code
+   attestation key, the trusted D-OS key, policy on unsigned code; service manager decisions
+   (PCR 10 "svc ..." events) are counted on their own
 ```
 
 `dosimg attest-verify <report> <nonce hex> <KERNEL.DSIG> <public key hex> [allow-unsigned]` is a

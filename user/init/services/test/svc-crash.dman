@@ -1,0 +1,14 @@
+# Test (services): a service that always fails; restarted with backoff, then given up.
+name = "svc-crash"
+image = "ltest.dx"
+args = "svc-crash"
+group = "test"
+after = ["svc-quota"]
+
+[grants]
+log = true
+
+[restart]
+policy = "on-failure"
+limit = 2
+backoff = 50

@@ -21,7 +21,7 @@ use super::uaccess::{self, Pod};
 use crate::ffi;
 use crate::object::exception::{Action, Regs};
 use crate::object::quota::Limits;
-use crate::object::resource::{KIND_POWER, KIND_VMEX};
+use crate::object::resource::{KIND_MEASURE, KIND_POWER, KIND_VMEX};
 use crate::object::{Handle, KResult, ObjType, Object, Rights, Status, default_rights, log::MAX_WRITE};
 
 pub mod nr {
@@ -94,7 +94,9 @@ pub mod nr {
     pub const ATTEST: u64 = 62;
     // ABI v6: power control
     pub const SYSTEM_POWER: u64 = 63;
-    pub const COUNT: u64 = 64;
+    // ABI v7: service manager decisions in the measurement log
+    pub const MEASURE: u64 = 64;
+    pub const COUNT: u64 = 65;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -644,6 +646,32 @@ fn system_power(u: &UserThread, rh: u64, action: u64) -> KResult<i64> {
     }
 }
 
+/// measure (ABI v7): with the MEASURE authority, extend PCR 10 with a 32-byte digest and record it
+/// in the measurement log as `svc <text>` (printable ASCII; at most `TEXT_MAX - 4` bytes). The
+/// service manager records every manifest it accepts or refuses, so an attestation shows it.
+fn measure(u: &UserThread, rh: u64, digest: u64, text: u64, len: u64) -> KResult<i64> {
+    use crate::security::measure as m;
+    let (res, _) = u.proc.get_resource(Handle(rh as u32), Rights::MANAGE)?;
+    if res.kind != KIND_MEASURE {
+        return Err(Status::AccessDenied);
+    }
+    if len > (m::TEXT_MAX - 4) as u64 {
+        return Err(Status::InvalidArgs);
+    }
+    let n = len as usize;
+    let mut d = [0u8; 32];
+    uaccess::copy_from_user(&mut d, digest)?;
+    let mut t = [0u8; m::TEXT_MAX];
+    t[..4].copy_from_slice(b"svc ");
+    uaccess::copy_from_user(&mut t[4..4 + n], text)?;
+    // Printable ASCII only: the log is shown by kdb and parsed by verifiers.
+    if t[4..4 + n].iter().any(|c| !(b' '..=b'~').contains(c)) {
+        return Err(Status::InvalidArgs);
+    }
+    m::measure(m::PCR_CODE, &d, core::str::from_utf8(&t[..4 + n]).unwrap_or("svc ?"), false);
+    Ok(0)
+}
+
 /// vmo_allow_unsigned (ABI v4): with the VMEX authority, let an unsigned image run (sealed, measured).
 fn vmo_allow_unsigned(u: &UserThread, vh: u64, rh: u64) -> KResult<i64> {
     let (res, _) = u.proc.get_resource(Handle(rh as u32), Rights::MANAGE)?;
@@ -888,6 +916,7 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
         nr::VMO_ALLOW_UNSIGNED => vmo_allow_unsigned(u, a[0], a[1]),
         nr::ATTEST => attest(a[0], a[1], a[2]),
         nr::SYSTEM_POWER => system_power(u, a[0], a[1]),
+        nr::MEASURE => measure(u, a[0], a[1], a[2], a[3]),
         #[cfg(ktest)]
         nr::KTEST_SMAP => {
             // SAFETY: test builds only: makes the kernel fault on purpose (SMAP).

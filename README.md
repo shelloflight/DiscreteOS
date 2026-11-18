@@ -33,9 +33,11 @@ shell or GUI yet.
   USB keyboards (xHCI)
 - Storage: GPT, FAT32, and DFS (copy-on-write B+tree with BLAKE3 checksums and snapshots); files
   are handles; per-app namespaces; disks are read-only by default
+- A service manager: each service gets exactly the capabilities its signed manifest lists, and is
+  restarted with backoff when it fails
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
 - An MSVC-built Windows program and a static Linux program run unchanged
-- 75 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
+- 77 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
   stress, reproducible builds
 
 ## Quick start

@@ -1,0 +1,8 @@
+# Test (services): asks for an endpoint no service provides; the manager must refuse it.
+name = "svc-badcap"
+image = "ltest.dx"
+group = "test"
+
+[grants]
+log = true
+connect = ["nosuch.secrets"]

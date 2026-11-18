@@ -9,6 +9,7 @@
 //! - `thread` (feature `alloc`): threads with guarded stacks and a TCB at the FS base;
 //! - `heap` (feature `alloc`): the global allocator, safe for many threads;
 //! - `proto`: the device manager <-> driver messages; `fs`: files as handles, namespaces;
+//! - `svc`: the service manager <-> service messages and endpoint lookup;
 //! - `capi` (feature `capi`): the C binding (user/include/libd.h).
 //!
 //! A program defines its entry with `libd::entry!(symbol, main)`; `main` returns the exit code
@@ -27,6 +28,7 @@ pub mod handle;
 #[cfg(feature = "alloc")]
 pub mod heap;
 pub mod proto;
+pub mod svc;
 pub mod sync;
 pub mod sys;
 #[cfg(feature = "alloc")]
