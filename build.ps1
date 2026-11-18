@@ -27,6 +27,12 @@
       keyboard     keys typed via the QEMU monitor reach the user-space PS/2 driver (ps2.ddrv)
       usbkbd       a USB keyboard on an xHCI controller (xhci.ddrv): controller bring-up, port
                    enumeration (a tablet is probed and skipped), HID boot reports become typed keys
+      usbnokbd     xHCI with only a tablet and a mouse: each probed and reported once, no
+                   re-probing; keys still reach the PS/2 driver
+      usbplug      hot-plug: a tablet reconnecting three times is reported once then left alone; a
+                   keyboard plugged into a hub later is found and types
+      usbhub       a keyboard two hubs down (hub on a root port, hub on its port 1): hubs
+                   configured and their ports probed, keys typed arrive
       drivers      user-space drivers (devmgr test): device ABI, virtio-blk I/O, crash + restart,
                    DMA blocked by the IOMMU, MSI-X interrupts, virtio-input keys
       drivers-amd  the same on an AMD-Vi IOMMU (amd-iommu): IVRS, device table, command buffer,
@@ -163,7 +169,8 @@ $KernelLba      = $KsigLba + 8                  # keep in sync with tools/dosimg
 #   Forbid : strings that must never appear
 #   MustExit : after the Expect strings, QEMU itself must end within 5 s (a power-off or reset
 #              really happened: -no-reboot makes a reset end QEMU, and -no-shutdown is dropped)
-#   Keys   : optional QEMU 'sendkey' names typed once KeysAfter appears on serial
+#   Keys   : optional QEMU 'sendkey' names typed once KeysAfter appears on serial ('!cmd': a monitor
+#            command such as device_add/device_del; '~ms': a pause)
 #   Serial : optional lines typed into COM1 (kdb) once SerialAfter appears
 #   Devices: attach the user-space driver devices (virtio-blk with the test disk, virtio keyboard)
 #   Smp, Cpu, Timeout : optional CPU count (default 4), QEMU CPU model (default max), seconds
@@ -205,9 +212,32 @@ $TestCases = [ordered]@{
     # USB: a qemu-xhci controller with a tablet (not a keyboard: probed and left unused) and a
     # keyboard on its USB 2 ports; keys typed go to the USB keyboard (the input device created last).
     usbkbd      = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-tablet,bus=xhci.0', '-device', 'usb-kbd,bus=xhci.0')
-                     Expect = @('xhci: controller ready on pci-', 'not a boot keyboard (left unused)', 'xhci: keyboard ready on port', 'DMA confined by the IOMMU', 'devmgr: xhci.ddrv ready', 'console: you typed: Usb Kbd (xhci)')
+                     Expect = @('xhci: controller ready on pci-', 'HID device 0627:0001 (left unused)', ': keyboard ready on port ', 'DMA confined by the IOMMU', 'devmgr: xhci.ddrv ready', 'console: you typed: Usb Kbd (xhci)')
                      Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL'); Timeout = 60
                      Keys = @('shift-u', 's', 'b', 'spc', 'shift-k', 'b', 'd', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready' }
+    # USB without a keyboard: a tablet and a mouse are probed and reported once each, then left
+    # alone (a probe's own port reset must not trigger another probe); typing still works on PS/2.
+    usbnokbd    = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-tablet,bus=xhci.0', '-device', 'usb-mouse,bus=xhci.0')
+                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', ': mouse 0627:0001 (left unused)', 'devmgr: xhci.ddrv ready', 'console: you typed: Disc OS (ps2)')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'keyboard ready on port'); Timeout = 60
+                     Keys = @('shift-d', 'i', 's', 'c', 'spc', 'shift-o', 'shift-s', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready'
+                     Post = 'Test-UsbProbedOnce' }
+    # USB hot-plug: a tablet unplugged and plugged back three times is reported once, then left
+    # alone (third identical probe); a keyboard plugged into a hub later is found and types.
+    usbplug     = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-hub,bus=xhci.0,port=1', '-device', 'usb-tablet,bus=xhci.0,port=2,id=tab')
+                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', 'device keeps reconnecting; left alone until unplugged', '.4 (USB HID boot protocol', 'console: you typed: Plug (xhci)')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'not set up', 'stopped answering'); Timeout = 60
+                     Keys = @('!device_del tab', '~400', '!device_add usb-tablet,bus=xhci.0,port=2,id=tab', '~600', '!device_del tab', '~400', '!device_add usb-tablet,bus=xhci.0,port=2,id=tab', '~600',
+                              '!device_del tab', '~400', '!device_add usb-tablet,bus=xhci.0,port=2,id=tab', '~600', '!device_add usb-kbd,bus=xhci.0,port=1.4,id=kbd', '~2500',
+                              'shift-p', 'l', 'u', 'g', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready'
+                     Post = 'Test-UsbPlugOnce' }
+    # USB hubs: a hub on a root port, a second hub on its port 1 with the keyboard on port 3, and a
+    # tablet on the first hub's port 2. Both hubs are configured, the keyboard found two tiers down.
+    usbhub      = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-hub,bus=xhci.0,port=1', '-device', 'usb-hub,bus=xhci.0,port=1.1',
+                                                        '-device', 'usb-tablet,bus=xhci.0,port=1.2', '-device', 'usb-kbd,bus=xhci.0,port=1.1.3')
+                     Expect = @('xhci: controller ready on pci-', ': hub 0409:55aa, 8 ports', '.1: hub 0409:55aa, 8 ports', '.2: HID device 0627:0001 (left unused)', '.1.3 (USB HID boot protocol', 'devmgr: xhci.ddrv ready', 'console: you typed: Usb Hub (xhci)')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'not set up', 'stopped answering'); Timeout = 60
+                     Keys = @('shift-u', 's', 'b', 'spc', 'shift-h', 'u', 'b', 'ret'); KeysAfter = ': keyboard ready on port ' }
     selftest    = @{ Define = 'SELFTEST';    Expect = @('  measured boot: Ed25519 vectors', 'KTEST selftest: PASSED', 'KTEST rust selftest: PASSED', 'D-KRNL: ready');  Forbid = @('KERNEL PANIC', 'FAIL') }
     panic       = @{ Define = 'PANIC';       Expect = @('KERNEL PANIC', 'KASSERT failed: one == 2', 'ktest.c:', $Halted); Forbid = @('FAILED') }
     stackprot   = @{ Define = 'STACKPROT';   Expect = @('KERNEL PANIC', 'stack smashing detected', $Halted);              Forbid = @('FAILED') }
@@ -1067,6 +1097,22 @@ function Test-AttestReport([string]$DiskDir, [string]$Image, [string]$Log) {
     return $ok
 }
 
+# xHCI without a keyboard: the devices are probed once (one line each, then nothing more while
+# keys are typed elsewhere).
+function Test-UsbProbedOnce([string]$DiskDir, [string]$Image, [string]$Log) {
+    $n = ([regex]::Matches($Log, 'left unused')).Count
+    Write-Host "  xhci: $n 'left unused' line(s) (expected 2: tablet, mouse)"
+    return $n -eq 2
+}
+
+# USB hot-plug: the reconnecting tablet is reported once and left alone once.
+function Test-UsbPlugOnce([string]$DiskDir, [string]$Image, [string]$Log) {
+    $n = ([regex]::Matches($Log, 'left unused')).Count
+    $g = ([regex]::Matches($Log, 'keeps reconnecting')).Count
+    Write-Host "  xhci: $n 'left unused', $g 'keeps reconnecting' line(s) (expected 1, 1)"
+    return $n -eq 1 -and $g -eq 1
+}
+
 function Test-DisksUnchanged([string]$DiskDir, [string]$Image) {
     $same = { param($a, $b) (Get-FileHash -Algorithm SHA256 $a).Hash -eq (Get-FileHash -Algorithm SHA256 $b).Hash }
     $ok = $true
@@ -1339,7 +1385,7 @@ function Get-FreeTcpPort {
     return $port
 }
 
-# Types keys into the guest through the QEMU monitor (TCP).
+# Types keys into the guest through the QEMU monitor (TCP); '!cmd' sends a monitor command, '~ms' waits.
 function Send-QemuKeys([int]$Port, [string[]]$Keys) {
     $client = $null
     for ($i = 0; $i -lt 20 -and -not $client; $i++) {
@@ -1349,7 +1395,12 @@ function Send-QemuKeys([int]$Port, [string[]]$Keys) {
     try {
         $w = [IO.StreamWriter]::new($client.GetStream())
         $w.AutoFlush = $true
-        foreach ($k in $Keys) { $w.Write("sendkey $k`n"); Start-Sleep -Milliseconds 60 }
+        foreach ($k in $Keys) {
+            if ($k.StartsWith('!')) { $w.Write("$($k.Substring(1))`n") }            # a monitor command
+            elseif ($k.StartsWith('~')) { Start-Sleep -Milliseconds ([int]$k.Substring(1)) }   # a pause (ms)
+            else { $w.Write("sendkey $k`n") }
+            Start-Sleep -Milliseconds 60
+        }
     } finally { $client.Dispose() }
 }
 

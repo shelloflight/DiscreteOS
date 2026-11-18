@@ -7,7 +7,7 @@ code base.
 ## What makes a good contribution
 
 **Welcome:**
-- new hardware support (drivers: USB hubs, mice and storage, network cards, ...);
+- new hardware support (drivers: USB 3 hubs, mice and storage, network cards, ...);
 - features that move the system forward (see the limitations at the end of each doc page);
 - bug fixes, with a test that reproduces the bug;
 - measurable performance work, with before/after numbers from the same machine;

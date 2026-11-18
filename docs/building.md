@@ -68,7 +68,7 @@ Main groups:
 | Protections fire | `stackprot`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `kaslr`, ... |
 | Kernel | `selftest`, `sched`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
-| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `storage`, `readonly`, `attest`, `poweroff`, `reboot` |
+| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `storage`, `readonly`, `attest`, `poweroff`, `reboot` |
 | Host | `storage-host`, `crypto-host`, `kaslr-host`, `static` |
 
 ## Adding a test

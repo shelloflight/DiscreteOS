@@ -34,7 +34,7 @@ shell or GUI yet.
   are handles; per-app namespaces; disks are read-only by default
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
 - An MSVC-built Windows program and a static Linux program run unchanged
-- 72 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
+- 75 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
   stress, reproducible builds
 
 ## Quick start

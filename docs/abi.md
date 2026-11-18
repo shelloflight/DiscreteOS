@@ -246,4 +246,4 @@ manager, which grants each to its driver.
 `user` (`utest all`: handles, rights, invalid pointers, memory, threads, spawn, user faults, kill,
 FPU state, IPC, ports, exceptions; `kasan-user` repeats it under KASAN), `fuzz` (ELF parser
 mutations and random syscalls), `smap`, `smep`, `compat`, `drivers` (`drivers-amd` on AMD-Vi),
-`keyboard`, `usbkbd`, `attest`, `poweroff`.
+`keyboard`, `usbkbd` (`usbnokbd`: no keyboard; `usbhub`: behind two hubs; `usbplug`: hot-plug, a reconnecting device), `attest`, `poweroff`.
