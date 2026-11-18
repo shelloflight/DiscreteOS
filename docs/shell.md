@@ -42,6 +42,10 @@ line editor cannot reach a file, and the shell cannot draw outside the terminal'
   (Up/Down, 100 lines), Tab (the shell completes commands and paths), Escape clears, Ctrl+C
   cancels the line or stops the running command, Ctrl+L clears. PgUp/PgDn scroll back through
   2000 lines.
+- **Keyboard notices**: until the first key arrives, the shell shows (dimmed, at most 40 lines)
+  what the log says about keyboards (the keyboard drivers, lines that mention a keyboard) and every
+  warning or error. A keyboard that is found but never types can be diagnosed from a photo of the
+  screen; the first key ends it.
 - Every typed line is logged (`terminal: line from ps2: ...`). With the argument `mirror`, or
   without a display, every line shown is logged too (`terminal| ...`): a session can be followed
   on serial.

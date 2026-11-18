@@ -261,6 +261,13 @@ $TestCases = [ordered]@{
                               '!device_del tab', '~400', '!device_add usb-tablet,bus=xhci.0,port=2,id=tab', '~600', '!device_add usb-kbd,bus=xhci.0,port=1.4,id=kbd', '~2500',
                               'shift-p', 'l', 'u', 'g', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready'
                      Post = 'Test-UsbPlugOnce' }
+    # Two keyboards on one controller: one on a root port, one behind a hub (QEMU types on the one
+    # created last). Both are served: a first boot keyboard (on a PC often a receiver or a lighting
+    # controller) must not keep the real one from being probed.
+    usbtwo      = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-kbd,bus=xhci.0,port=1', '-device', 'usb-hub,bus=xhci.0,port=2', '-device', 'usb-kbd,bus=xhci.0,port=2.1')
+                     Expect = @('xhci: controller ready on pci-', ': keyboard ready on port 5 (', ': keyboard ready on port 6.1 (', 'devmgr: xhci.ddrv ready', 'terminal: line from xhci: Two')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'not set up'); Timeout = 60
+                     Keys = @('shift-t', 'w', 'o', 'ret'); KeysAfter = ': keyboard ready on port 6.1 (' }
     # USB hubs: a hub on a root port, a second hub on its port 1 with the keyboard on port 3, and a
     # tablet on the first hub's port 2. Both hubs are configured, the keyboard found two tiers down.
     usbhub      = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-hub,bus=xhci.0,port=1', '-device', 'usb-hub,bus=xhci.0,port=1.1',

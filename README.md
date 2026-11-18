@@ -40,7 +40,7 @@ is no GUI yet.
   modified`); each tool gets only the paths typed, with the rights its manifest declares
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
 - An MSVC-built Windows program and a static Linux program run unchanged
-- 80 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
+- 81 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
   stress, reproducible builds
 
 ## Quick start

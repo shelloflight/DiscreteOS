@@ -18,7 +18,7 @@ mod parse;
 mod show;
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::mem::ManuallyDrop;
 
@@ -36,6 +36,13 @@ const KEY_TERM: u64 = 1;
 const KEY_CTL: u64 = 2;
 const KEY_JOB_OUT: u64 = 3;
 const KEY_JOB_END: u64 = 4;
+const KEY_NOTICES: u64 = 5;
+
+/// Until the first key arrives, keyboard notices from the log are shown on the screen (a keyboard
+/// that is found but never types can be diagnosed without one): every this often, at most
+/// `NOTICES_MAX` lines.
+const NOTICES_EVERY: u64 = 1_000_000_000;
+const NOTICES_MAX: u32 = 40;
 
 const MAX_JOBS: usize = 16;
 /// What a tool may use (its share of the session's own quota).
@@ -89,6 +96,9 @@ pub struct Shell {
     fg: Option<u32>,
     port: Port,
     reading: bool,
+    /// Keyboard notices (until the first key): the timer and the next log sequence number.
+    notices: Option<(libd::Timer, u64)>,
+    notices_shown: u32,
 }
 
 /// A node handle we hold, used without giving it up.
@@ -613,6 +623,9 @@ impl Shell {
     fn term_msg(&mut self, buf: &[u8]) {
         let Some(h) = Header::get(buf) else { return };
         let payload = &buf[HEADER..];
+        if h.op != term::SIZE && self.notices.take().is_some() {
+            println!("shell: a key arrived; keyboard notices are no longer shown");
+        }
         match h.op {
             term::SIZE => self.cols = (h.a as usize).clamp(20, 400),
             term::LINE => {
@@ -637,6 +650,49 @@ impl Shell {
                 self.send(term::COMPLETIONS, 0, &p);
             }
             _ => {}
+        }
+    }
+
+    /// Start showing keyboard notices (until the first key).
+    fn start_notices(&mut self) {
+        if self.log == 0 || self.notices.is_some() {
+            return;
+        }
+        if let Ok(t) = libd::Timer::new() {
+            t.set(NOTICES_EVERY);
+            self.port.arm(t.0.raw(), sys::SIGNALED, KEY_NOTICES);
+            self.notices = Some((t, 0));
+        }
+    }
+
+    /// New log records about keyboards (the keyboard drivers, lines that mention a keyboard) and
+    /// every warning or error, shown dimmed above the prompt.
+    fn show_notices(&mut self) {
+        let Some((t, mut seq)) = self.notices.take() else { return };
+        let mut out = String::new();
+        while self.notices_shown < NOTICES_MAX {
+            let Ok(b) = libd::log::read(self.log, seq, libd::log::MAX_PER_READ, false, 500_000_000) else { break };
+            for r in &b.records[..b.count] {
+                let src = String::from_utf8_lossy(r.source()).into_owned();
+                let text = String::from_utf8_lossy(r.text()).trim_end().to_string();
+                let about_keys = matches!(src.as_str(), "xhci" | "ps2" | "virtio-input") || text.contains("keyboard");
+                if (about_keys || u32::from(r.level) <= sys::LOG_WARN) && self.notices_shown < NOTICES_MAX {
+                    out.push_str(&show::coloured(term::DARK_GREY, &format!("  · {}\n", text)));
+                    self.notices_shown += 1;
+                }
+            }
+            if b.count == 0 || b.next <= seq {
+                break;
+            }
+            seq = b.next;
+        }
+        if !out.is_empty() {
+            self.write(&out);
+        }
+        if self.notices_shown < NOTICES_MAX {
+            t.set(NOTICES_EVERY);
+            self.port.arm(t.0.raw(), sys::SIGNALED, KEY_NOTICES);
+            self.notices = Some((t, seq));
         }
     }
 
@@ -708,6 +764,8 @@ fn main(s: *const Startup) -> i32 {
         fg: None,
         port,
         reading: false,
+        notices: None,
+        notices_shown: 0,
     };
     if sh.clock != 0
         && let Some(b) = libd::time::query(sh.clock)
@@ -722,6 +780,7 @@ fn main(s: *const Startup) -> i32 {
     if sh.term != 0 {
         sh.port.arm(sh.term, sys::READABLE | sys::PEER_CLOSED, KEY_TERM);
         sh.welcome();
+        sh.start_notices();
         sh.prompt();
     }
     let mut buf = alloc::vec![0u8; 64 * 1024];
@@ -748,6 +807,7 @@ fn main(s: *const Startup) -> i32 {
             },
             KEY_JOB_OUT => sh.job_output((key >> 8) as u32),
             KEY_JOB_END => sh.job_ended((key >> 8) as u32),
+            KEY_NOTICES => sh.show_notices(),
             _ => loop {
                 let mut hs = [0 as Handle; 1];
                 match sys::channel_read_h(ctl, &mut buf, &mut hs, 0) {

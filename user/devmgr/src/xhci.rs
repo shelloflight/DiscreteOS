@@ -1,7 +1,9 @@
 //! xHCI (USB 3) host controller driver (`xhci.ddrv`): USB keyboards through the HID boot
-//! protocol, on a root port or behind USB 2 hubs (up to five tiers). One keyboard at a time: the
-//! first boot keyboard found is used; hubs stay configured, other devices are disabled again.
-//! Ports are watched, so a keyboard plugged in later, or again, is picked up.
+//! protocol, on a root port or behind USB 2 hubs (up to five tiers). Up to `MAX_KBDS` keyboards at
+//! once, each with its own interrupt ring: a PC often has several devices that offer a boot
+//! keyboard interface (receivers, lighting controllers), and the real keyboard must not be left
+//! unprobed behind one of them. Hubs stay configured, other devices are disabled again. Every port
+//! stays watched, so a keyboard plugged in later, or again, is picked up.
 //!
 //! Bring-up: firmware ownership taken (USB legacy support capability, SMIs off), controller
 //! reset, one command ring, one interrupter with a one-segment event ring (MSI-X entry 0 or MSI),
@@ -125,10 +127,11 @@ const PG_CMD: u64 = 1;
 const PG_EVENT: u64 = 2;
 const PG_ERST: u64 = 3;
 const PG_IN: u64 = 4; // input context
-const PG_INTR: u64 = 5; // the keyboard's interrupt ring
 const PG_DESC: u64 = 6; // descriptor / status buffer
-const PG_REPORT: u64 = 7; // report buffers, 64 bytes each
-const PAGES: u64 = 8;
+const PG_REPORT: u64 = 7; // report buffers, 64 bytes each (REPORTS per keyboard)
+const PG_INTR: u64 = 8; // the interrupt ring of keyboard i: PG_INTR + i
+const MAX_KBDS: usize = 4;
+const PAGES: u64 = PG_INTR + MAX_KBDS as u64;
 /// Pages from here are in slot_mem (a pinned buffer holds at most 32 pages): per slot, the
 /// output device context, then the endpoint 0 ring.
 const PG_SLOTS: u64 = PAGES;
@@ -300,24 +303,22 @@ struct Hub {
     ps: [PortState; HUB_PORTS as usize],
 }
 
-/// The boot keyboard being served.
+/// A boot keyboard being served.
 struct Kbd {
+    /// Which of the `MAX_KBDS` (its interrupt ring page, its report buffers).
+    idx: usize,
+    id: Ident,
     slot: u32,
     loc: Loc,
     dci: u32,
-    /// The hub it is on (slot, port); 0 = a root port.
-    parent: u32,
-    port: u32,
     intr: Ring,
     /// Report buffer of each interrupt-ring position (u8::MAX: none queued there).
     buf_at: [u8; RING_TRBS as usize],
     last: [u8; 8],
     keys: Keys,
-    /// Report transfers completed (the first is logged: a diagnostic).
-    transfers: u64,
 }
 
-/// Result of a probe. The keyboard is large but short-lived (moved into `Xhci::kbd`).
+/// Result of a probe. The keyboard is large but short-lived (moved into `Xhci::kbds`).
 #[allow(clippy::large_enum_variant)]
 enum Found {
     Keyboard(Kbd),
@@ -349,7 +350,7 @@ struct Xhci {
     owner: [(u32, u32); MAX_SLOTS as usize + 1],
     hubs: [Option<Hub>; MAX_HUBS],
     root: [PortState; 64],
-    kbd: Option<Kbd>,
+    kbds: [Option<Kbd>; MAX_KBDS],
     /// Root port status changes seen (bit p-1).
     port_events: u64,
     /// Keyboard transfer events seen while waiting for something else.
@@ -456,7 +457,7 @@ impl Xhci {
     /// reports kept for the main loop, the rest dropped.
     fn wait_event(&mut self, ms: u64, mut want: impl FnMut(&Trb) -> bool) -> Option<Trb> {
         let deadline = sys::clock_ns() + ms * MS;
-        let kbd = self.kbd.as_ref().map_or((0, 0), |k| (k.slot, k.dci));
+        let kbds: [(u32, u32); MAX_KBDS] = core::array::from_fn(|i| self.kbds[i].as_ref().map_or((0, 0), |k| (k.slot, k.dci)));
         loop {
             while let Some(e) = self.poll_event() {
                 if want(&e) {
@@ -469,7 +470,7 @@ impl Xhci {
                             self.port_events |= 1 << (p - 1);
                         }
                     }
-                    E_TRANSFER if kbd.0 != 0 && (e.slot(), e.endpoint()) == kbd && self.ndeferred < self.deferred.len() => {
+                    E_TRANSFER if kbds.iter().any(|&k| k.0 != 0 && (e.slot(), e.endpoint()) == k) && self.ndeferred < self.deferred.len() => {
                         self.deferred[self.ndeferred] = e;
                         self.ndeferred += 1;
                     }
@@ -691,7 +692,7 @@ impl Xhci {
         }
         self.owner[slot as usize] = (parent, port);
         self.ep0[slot as usize] = Ring::new(slot_page(slot) + 1);
-        match self.setup_device(slot, loc, parent, port) {
+        match self.setup_device(slot, loc) {
             Ok(Found::Other(id)) => {
                 self.disable_slot(slot);
                 Ok(Found::Other(id))
@@ -724,14 +725,16 @@ impl Xhci {
                 self.hubs[i] = None;
                 say!(self, "hub on port {} unplugged", loc);
             }
-            if let Some(k) = self.kbd.take_if(|k| k.slot == s) {
-                say!(self, "keyboard on port {} unplugged", k.loc);
+            for k in self.kbds.iter_mut() {
+                if let Some(k) = k.take_if(|k| k.slot == s) {
+                    println!("xhci: keyboard {:04x}:{:04x} on port {} unplugged", k.id.vid, k.id.pid, k.loc);
+                }
             }
             self.disable_slot(s);
         }
     }
 
-    fn setup_device(&mut self, slot: u32, loc: Loc, parent: u32, port: u32) -> Result<Found, &'static str> {
+    fn setup_device(&mut self, slot: u32, loc: Loc) -> Result<Found, &'static str> {
         let out = slot_page(slot);
         self.clear_page(out);
         self.clear_page(out + 1);
@@ -805,6 +808,9 @@ impl Xhci {
         if epn == 0 || ep_mps == 0 {
             return Err("bad keyboard endpoint descriptor");
         }
+        let Some(idx) = self.kbds.iter().position(Option::is_none) else {
+            return Ok(Found::Other(id)); // MAX_KBDS keyboards served already
+        };
         self.control(slot, [0, 9, cfg_value, 0, 0, 0, 0, 0], 0).map_err(|_| "SET_CONFIGURATION failed")?;
         // The interrupt-IN endpoint: device context index 2 * n + 1.
         let dci = u32::from(epn) * 2 + 1;
@@ -815,13 +821,13 @@ impl Xhci {
             u32::from(interval.clamp(1, 16)) - 1
         };
         self.clear_page(PG_IN);
-        self.clear_page(PG_INTR);
+        self.clear_page(PG_INTR + idx as u64);
         self.ctx_w(PG_IN, 0, 1, 1 | 1 << dci);
         self.slot_ctx(&loc, dci, 0, 0);
         let e = u64::from(dci) + 1;
         self.ctx_w(PG_IN, e, 0, exp << 16);
         self.ctx_w(PG_IN, e, 1, 3 << 1 | 7 << 3 | ep_mps << 16);
-        let ring = self.addr(PG_INTR, 0) | 1;
+        let ring = self.addr(PG_INTR + idx as u64, 0) | 1;
         self.ctx_w(PG_IN, e, 2, ring as u32);
         self.ctx_w(PG_IN, e, 3, (ring >> 32) as u32);
         self.ctx_w(PG_IN, e, 4, ep_mps | ep_mps << 16);
@@ -832,16 +838,15 @@ impl Xhci {
         // not used again).
         let _ = self.control(slot, [0x21, 0x0A, 0, 0, iface, 0, 0, 0], 0);
         let mut k = Kbd {
+            idx,
+            id,
             slot,
             loc,
             dci,
-            parent,
-            port,
-            intr: Ring::new(PG_INTR),
+            intr: Ring::new(PG_INTR + idx as u64),
             buf_at: [u8::MAX; RING_TRBS as usize],
             last: [0; 8],
             keys: Keys::default(),
-            transfers: 0,
         };
         for b in 0..REPORTS as u8 {
             self.queue_report(&mut k, b);
@@ -900,8 +905,9 @@ impl Xhci {
         }
         match r {
             Ok(Found::Keyboard(k)) => {
-                say!(self, "keyboard ready on port {} (USB HID boot protocol, US layout, slot {})", at, k.slot);
-                self.kbd = Some(k);
+                say!(self, "keyboard ready on port {} (USB HID boot protocol, US layout, slot {}): {:04x}:{:04x}", at, k.slot, k.id.vid, k.id.pid);
+                let i = k.idx;
+                self.kbds[i] = Some(k);
             }
             Ok(Found::Hub(n, id)) if !repeat => say!(self, "port {}: hub {:04x}:{:04x}, {} ports", at, id.vid, id.pid, n),
             Ok(Found::Other(id)) if !repeat => say!(self, "port {}: {} {:04x}:{:04x} (left unused)", at, id.kind(), id.vid, id.pid),
@@ -962,7 +968,7 @@ impl Xhci {
                 continue;
             }
             let ps = self.root[i];
-            if ps.pending && self.kbd.is_none() && now >= ps.changed_at + DEBOUNCE {
+            if ps.pending && now >= ps.changed_at + DEBOUNCE {
                 self.root[i].pending = false;
                 if self.portsc(p) & PS_CCS != 0 && !ps.done {
                     self.probe_port(0, p, now);
@@ -976,24 +982,15 @@ impl Xhci {
         for h in 0..MAX_HUBS {
             let Some(hub) = self.hubs[h] else { continue };
             let pending = hub.ps[..hub.ports as usize].iter().any(|p| p.pending);
-            if hub.dead || !(due || pending && self.kbd.is_none()) {
+            if hub.dead || !(due || pending) {
                 continue;
             }
-            // While a keyboard is served only its own port is watched (for the unplug).
-            let only = match &self.kbd {
-                Some(k) if k.parent == hub.slot => Some(k.port),
-                Some(_) => continue,
-                None => None,
-            };
-            self.poll_hub(h, hub.slot, hub.ports, only, now);
+            self.poll_hub(h, hub.slot, hub.ports, now);
         }
     }
 
-    fn poll_hub(&mut self, h: usize, slot: u32, ports: u32, only: Option<u32>, now: u64) {
+    fn poll_hub(&mut self, h: usize, slot: u32, ports: u32, now: u64) {
         for port in 1..=ports {
-            if only.is_some_and(|o| o != port) {
-                continue;
-            }
             let Ok((st, chg)) = self.hub_status(slot, port) else {
                 if let Some(hub) = self.hubs[h].as_mut() {
                     hub.dead = true;
@@ -1032,10 +1029,10 @@ impl Xhci {
                 ps.pending = false;
                 continue;
             }
-            if ps.pending && now >= ps.changed_at + DEBOUNCE && !ps.done && only.is_none() {
+            if ps.pending && now >= ps.changed_at + DEBOUNCE && !ps.done {
                 ps.pending = false;
                 self.probe_port(slot, port, now);
-                if self.kbd.is_some() || self.hubs[h].is_none_or(|x| x.slot != slot) {
+                if self.hubs[h].is_none_or(|x| x.slot != slot) {
                     return;
                 }
             }
@@ -1047,7 +1044,7 @@ impl Xhci {
     fn wake_after(&self) -> u64 {
         let live = |h: &&Hub| !h.dead;
         let hubs = self.hubs.iter().flatten().filter(live);
-        if self.kbd.is_none() {
+        {
             let root = self.root[..self.ports as usize].iter().any(|p| p.pending);
             if root || hubs.clone().any(|h| h.ps[..h.ports as usize].iter().any(|p| p.pending)) {
                 return SETTLE_TICK;
@@ -1063,16 +1060,16 @@ impl Xhci {
 
     fn queue_report(&self, k: &mut Kbd, buf: u8) {
         let pos = k.intr.enq as usize;
-        let t = Trb { param: self.addr(PG_REPORT, u64::from(buf) * 64), status: 8, control: T_NORMAL << 10 | TRB_IOC | TRB_ISP };
+        let t = Trb { param: self.addr(PG_REPORT, report_off(k.idx, buf)), status: 8, control: T_NORMAL << 10 | TRB_IOC | TRB_ISP };
         k.buf_at[pos] = buf;
-        let mut r = core::mem::replace(&mut k.intr, Ring::new(PG_INTR));
+        let mut r = core::mem::replace(&mut k.intr, Ring::new(PG_INTR + k.idx as u64));
         self.enqueue(&mut r, t);
         k.intr = r;
     }
 
     /// A finished report transfer: diff it against the last one, send the characters, requeue.
     fn report(&mut self, k: &mut Kbd, e: &Trb, ch: Handle) -> Result<(), &'static str> {
-        let base = self.addr(PG_INTR, 0);
+        let base = self.addr(PG_INTR + k.idx as u64, 0);
         if e.param < base || e.param >= base + u64::from(RING_TRBS - 1) * 16 || !(e.param - base).is_multiple_of(16) {
             return Err("transfer event for a TRB that is not ours");
         }
@@ -1082,12 +1079,6 @@ impl Xhci {
             return Err("transfer event for a TRB that is not queued");
         }
         let got = 8u32.saturating_sub(e.status & 0xFF_FFFF);
-        k.transfers += 1;
-        if k.transfers == 1 {
-            // Diagnostic for keyboards that are found but never type (behind a transaction
-            // translator on real hubs): whether the first report transfer completes, and how.
-            println!("xhci: keyboard: first report transfer: completion code {}, {} byte(s)", e.code(), got);
-        }
         match e.code() {
             CC_SUCCESS | CC_SHORT => {}
             c => {
@@ -1099,7 +1090,7 @@ impl Xhci {
             self.reports += 1;
             let mut r = [0u8; 8];
             for (i, x) in r.iter_mut().enumerate().take(got as usize) {
-                *x = self.mem.map.r8(PG_REPORT * 4096 + u64::from(buf) * 64 + i as u64);
+                *x = self.mem.map.r8(PG_REPORT * 4096 + report_off(k.idx, buf) + i as u64);
             }
             // Rollover (too many keys): every key slot reads 1; keep the last state.
             if r[2] != 1 {
@@ -1117,15 +1108,12 @@ impl Xhci {
     fn on_event(&mut self, e: Trb, ch: Handle) {
         match e.ty() {
             E_TRANSFER => {
-                let Some(mut k) = self.kbd.take() else { return };
-                if (e.slot(), e.endpoint()) != (k.slot, k.dci) {
-                    self.kbd = Some(k);
-                    return;
-                }
+                let Some(i) = self.kbds.iter().position(|k| k.as_ref().is_some_and(|k| (e.slot(), e.endpoint()) == (k.slot, k.dci))) else { return };
+                let Some(mut k) = self.kbds[i].take() else { return };
                 match self.report(&mut k, &e, ch) {
-                    Ok(()) => self.kbd = Some(k),
+                    Ok(()) => self.kbds[i] = Some(k),
                     Err(why) => {
-                        say!(self, "keyboard on port {}: {}", k.loc, why);
+                        say!(self, "keyboard {:04x}:{:04x} on port {}: {}", k.id.vid, k.id.pid, k.loc, why);
                         self.disable_slot(k.slot);
                     }
                 }
@@ -1152,6 +1140,11 @@ impl Xhci {
             self.on_event(e, ch);
         }
     }
+}
+
+/// Where report buffer `buf` of keyboard `idx` is in the report page.
+fn report_off(idx: usize, buf: u8) -> u64 {
+    ((idx * REPORTS) as u64 + u64::from(buf)) * 64
 }
 
 /// Output device context page of `slot` (its endpoint 0 ring is the next page).
@@ -1321,7 +1314,7 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         owner: [(0, 0); MAX_SLOTS as usize + 1],
         hubs: [None; MAX_HUBS],
         root: [PortState::default(); 64],
-        kbd: None,
+        kbds: [const { None }; MAX_KBDS],
         port_events: 0,
         deferred: [Trb { param: 0, status: 0, control: 0 }; REPORTS * 2],
         ndeferred: 0,
@@ -1444,3 +1437,4 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         x.drain(ch); // keyboard reports that arrived during hub requests
     }
 }
+

@@ -55,8 +55,9 @@ Large screens get doubled glyphs. If the log scrolls too fast, film it.
 ## 4. Not supported yet
 
 - **USB**: keyboards only (boot protocol, US layout, no key repeat), on any port of an xHCI
-  controller, also behind USB 2 hubs (many boards wire their back-panel ports through one). Mice,
-  storage and USB 3 hubs are not supported yet. The driver prints one line per device it finds
+  controller, also behind USB 2 hubs (many boards wire their back-panel ports through one), up to
+  four keyboards at once (receivers and lighting controllers often offer a keyboard interface
+  too). Mice, storage and USB 3 hubs are not supported yet. The driver prints one line per device it finds
   (xhci 10:00.0: port 8.2: mouse 046d:c077 (left unused)), with the controller's PCI address and
   the port path through any hubs. A device that keeps disconnecting and reconnecting on its own is
   left alone after three tries, until it is unplugged.
