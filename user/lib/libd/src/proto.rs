@@ -15,6 +15,10 @@ pub const TAG_CONTROL: u32 = crate::sys::TAG_USER;
 pub const READY: u32 = 1;
 /// Driver -> manager: a key; `a` = the character.
 pub const KEY: u32 = 2;
+/// Device manager -> each client of its `input` endpoint: a key typed. `a` = the character
+/// (US layout; `\n` Enter, 0x08 Backspace), `b` = which input device (an index); payload: the
+/// driver's name (`ps2`, `xhci`, `virtio-input`).
+pub const INPUT_KEY: u32 = 410;
 /// Manager -> block driver: read `b` sectors from `a`; reply carries the data.
 pub const BLK_READ: u32 = 10;
 /// Manager -> block driver: write `b` sectors at `a` (data in the payload).

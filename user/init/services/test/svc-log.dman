@@ -1,0 +1,20 @@
+# Test (services): a reader of the log service. Its own level is warn: its info and debug lines
+# must not be kept. ltest checks the records it reads (order, sources, no kernel address).
+name = "svc-log"
+image = "ltest.dx"
+args = "svc-log"
+group = "test"
+after = ["devmgr"]
+log-level = "warn"
+
+[grants]
+log = true
+connect = ["log.read"]
+
+[quota]
+memory = "4M"
+handles = 32
+threads = 2
+
+[restart]
+policy = "never"

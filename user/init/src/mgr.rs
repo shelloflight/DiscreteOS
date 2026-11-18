@@ -237,6 +237,11 @@ impl Mgr {
             if !self.svcs[k].measured {
                 self.svcs[k].measured = true;
                 measure(&self.svcs[k].digest, &format!("accept {}", self.svcs[k].m.name));
+                for to in 0..self.svcs.len() {
+                    if self.svcs[to].m.kernel_log && self.svcs[to].state == State::Running {
+                        self.send_level(to, k);
+                    }
+                }
                 println!("init: service {} accepted ({}): {}", self.svcs[k].m.name, self.svcs[k].source, dman::summary(&self.svcs[k].m));
             }
         }
@@ -316,6 +321,16 @@ impl Mgr {
             && let Some(h) = dup(startup(sys::TAG_POWER))
         {
             give(&mut hs, h, sys::TAG_POWER);
+        }
+        if m.kernel_log
+            && let Some(h) = dup(startup(sys::TAG_KLOG))
+        {
+            give(&mut hs, h, sys::TAG_KLOG);
+        }
+        if m.boot_time
+            && let Some(h) = dup(startup(sys::TAG_BOOT_TIME))
+        {
+            give(&mut hs, h, sys::TAG_BOOT_TIME);
         }
         let mut ndev = 0;
         let mut left_out = 0;
@@ -410,6 +425,12 @@ impl Mgr {
         self.port.arm(ours, sys::READABLE | sys::PEER_CLOSED, (i as u64) << 8 | KEY_CTL);
         self.order.retain(|&x| x != i);
         self.order.push(i);
+        if m.kernel_log {
+            // The log service: every service's level (its own manifest's, or info).
+            for k in 0..self.svcs.len() {
+                self.send_level(i, k);
+            }
+        }
         if ndev > 0 {
             println!("init: started {} with {} devices", m.name, ndev);
         } else {
@@ -434,6 +455,19 @@ impl Mgr {
             }
         }
         Ok(())
+    }
+
+    /// Tell kernel-log holder `to` the log level of service `k` (svc::LOG_LEVEL).
+    fn send_level(&self, to: usize, k: usize) {
+        let ctl = self.svcs[to].ctl.raw();
+        if ctl == 0 {
+            return;
+        }
+        let name = self.svcs[k].m.name.as_bytes();
+        let mut msg = [0u8; HEADER + 32];
+        Header { txid: 0, op: svc::LOG_LEVEL, status: 0, a: u64::from(self.svcs[k].m.log_level), b: 0 }.put(&mut msg);
+        msg[HEADER..HEADER + name.len()].copy_from_slice(name);
+        sys::channel_write(ctl, &msg[..HEADER + name.len()]);
     }
 
     // ---- events ---------------------------------------------------------------------------------
@@ -559,8 +593,9 @@ impl Mgr {
     // ---- shutdown -------------------------------------------------------------------------------
 
     /// Stop every running service: first every volume provider makes its volumes durable (while
-    /// the drivers under it still run), then the services stop, the last started first: SHUTDOWN,
-    /// then up to 5 s, then kill.
+    /// the drivers under it still run), then the services stop, each after every service that
+    /// depends on it (the last started first among those free to stop): SHUTDOWN, then up to 5 s,
+    /// then kill.
     pub fn shutdown(&mut self) {
         for s in self.svcs.iter().filter(|s| s.state == State::Running && s.m.volumes) {
             println!("init: syncing {}", s.m.name);
@@ -571,11 +606,15 @@ impl Mgr {
                 println!("init: {} did not confirm its volumes are durable", s.m.name);
             }
         }
-        let order: Vec<usize> = self.order.iter().rev().copied().collect();
-        for i in order {
-            if self.svcs[i].state != State::Running {
-                continue;
-            }
+        loop {
+            // Next: a running service no other running service depends on (`after` or
+            // `connect`), the last started first; with a cycle, simply the last started.
+            let running: Vec<usize> = self.order.iter().rev().copied().filter(|&i| self.svcs[i].state == State::Running).collect();
+            let needed = |d: usize| {
+                let name = &self.svcs[d].m.name;
+                running.iter().any(|&s| s != d && (self.svcs[s].m.after.contains(name) || self.svcs[s].m.connect.iter().any(|c| &c.service == name)))
+            };
+            let Some(&i) = running.iter().find(|&&i| !needed(i)).or(running.first()) else { break };
             let name = self.svcs[i].m.name.clone();
             println!("init: stopping {}", name);
             let mut msg = [0u8; HEADER];

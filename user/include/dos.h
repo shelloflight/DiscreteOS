@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 7
+#define DOS_ABI_VERSION 8
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -110,6 +110,8 @@ enum {
     DOS_SYS_SYSTEM_POWER,
     /* ABI v7: service manager decisions in the measurement log */
     DOS_SYS_MEASURE,
+    /* ABI v8: the log service */
+    DOS_SYS_KLOG_READ, DOS_SYS_LOG_RECORD,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -202,6 +204,8 @@ struct dos_exception_msg {
 #define DOS_TAG_POWER       8             /* resource (ABI v6): may switch the machine off or reset it */
 #define DOS_TAG_MEASURE     9             /* resource (ABI v7): may record decisions in PCR 10 (init) */
 #define DOS_TAG_MANIFEST    10            /* ABI v7: an embedded service manifest <name>.dman (init) */
+#define DOS_TAG_KLOG        11            /* resource (ABI v8): may read the kernel log (init; the log service) */
+#define DOS_TAG_BOOT_TIME   12            /* ABI v8: the wall-clock time the loader read (32-byte VMO; UEFI only) */
 #define DOS_TAG_USER        0x10000       /* first tag for handles a spawner passes */
 
 struct dos_startup_handle { dos_handle_t handle; uint32_t tag; };
@@ -371,6 +375,41 @@ static inline int64_t dos_system_power(dos_handle_t power, uint64_t action) { re
 /* ABI v7, with the MEASURE resource: extend PCR 10 with digest, logged as "svc <text>" (printable
  * ASCII, at most 52 bytes). */
 static inline int64_t dos_measure(dos_handle_t measure, const uint8_t digest[32], const char *text, uint64_t len) { return DOS_SC(DOS_SYS_MEASURE, measure, digest, text, len, 0, 0); }
+
+/* ABI v8: log levels, a record in the kernel log with a level (log_write is DOS_LOG_INFO). */
+enum { DOS_LOG_ERROR = 0, DOS_LOG_WARN = 1, DOS_LOG_INFO = 2, DOS_LOG_DEBUG = 3 };
+static inline int64_t dos_log_record(dos_handle_t log, int level, const void *s, size_t n) { return DOS_SC(DOS_SYS_LOG_RECORD, log, level, s, n, 0, 0); }
+
+/* ABI v8, with the KLOG resource: kernel log records with sequence >= seq, at most 64, into buf
+ * (cap bytes). Returns how many. Kernel addresses in the text read "[kaddr]". */
+#define DOS_KLOG_TEXT 120
+#define DOS_KLOG_SOURCE 24
+enum { DOS_KLOG_ORIGIN_KERNEL = 0, DOS_KLOG_ORIGIN_PROGRAM = 1 };
+#define DOS_KLOG_CONTINUES 1                  /* flags: no newline at the end */
+struct dos_klog_entry {
+    uint64_t seq;
+    uint64_t time_us;                         /* monotonic, since kernel entry */
+    uint8_t  level, len, origin, flags;
+    uint32_t koid;                            /* program records: the writing process */
+    char     source[DOS_KLOG_SOURCE];         /* program records: its name (set by the kernel) */
+    char     text[DOS_KLOG_TEXT];             /* len bytes, not NUL-terminated */
+    uint8_t  reserved[8];
+};
+_Static_assert(sizeof(struct dos_klog_entry) == 176, "dos_klog_entry layout");
+static inline int64_t dos_klog_read(dos_handle_t klog, uint64_t seq, struct dos_klog_entry *buf, uint64_t cap) { return DOS_SC(DOS_SYS_KLOG_READ, klog, seq, buf, cap, 0, 0); }
+
+/* ABI v8: the boot-time record (DOS_TAG_BOOT_TIME). */
+struct dos_boot_time {
+    uint32_t magic;                           /* "DTIM" */
+    uint32_t source;                          /* 1: UEFI GetTime */
+    uint16_t year;
+    uint8_t  month, day, hour, minute, second, pad;
+    uint32_t nanosecond;
+    int16_t  time_zone;                       /* minutes from UTC; 2047: unspecified */
+    uint16_t pad2;
+    int64_t  mono_ns;                         /* the monotonic clock at that moment (< 0: before the kernel) */
+};
+_Static_assert(sizeof(struct dos_boot_time) == 32, "dos_boot_time layout");
 static inline int64_t dos_attest(const uint8_t nonce[32], void *buf, uint64_t cap) { return DOS_SC(DOS_SYS_ATTEST, nonce, buf, cap, 0, 0, 0); }
 
 /* ---- storage (docs/storage.md; mirrors user/lib/libd/src/fs.rs) ---------------------------

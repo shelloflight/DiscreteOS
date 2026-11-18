@@ -10,6 +10,9 @@ const DEVMGR: &[u8] = include_bytes!("../../../init/services/devmgr.dman");
 const SEEDS: &[&[u8]] = &[
     STORAGED,
     DEVMGR,
+    include_bytes!("../../../init/services/log.dman"),
+    include_bytes!("../../../init/services/clock.dman"),
+    include_bytes!("../../../init/services/console.dman"),
     include_bytes!("../../../init/services/test/svc-grants.dman"),
     include_bytes!("../../../init/services/test/svc-quota.dman"),
     include_bytes!("../../../init/services/test/svc-crash.dman"),
@@ -29,15 +32,26 @@ fn the_system_manifests_parse() {
     let s = parse(STORAGED).unwrap();
     assert_eq!((s.name.as_str(), s.image.as_str(), s.group), ("storaged", "storaged.dx", Group::System));
     assert_eq!(s.endpoints, vec!["disks".to_string()]);
-    assert!(s.volumes && s.log && !s.vmex && !s.power && s.devices.is_empty());
+    assert!(s.volumes && s.log && !s.vmex && !s.power && s.devices.is_empty() && !s.kernel_log && !s.boot_time);
+    assert_eq!(s.connect, vec![Connect { service: "clock".into(), endpoint: "time".into() }]);
+    assert_eq!(s.log_level, LEVEL_INFO);
     assert_eq!(s.quota, Quota { memory: 96 << 20, handles: 2048, threads: 8 });
     assert_eq!(s.restart, Restart { policy: Policy::Always, limit: 5, backoff_ms: 100 });
     let d = parse(DEVMGR).unwrap();
     assert_eq!(d.after, vec!["storaged".to_string()]);
-    assert_eq!(d.devices, vec![DeviceSel::All]);
+    assert_eq!(d.devices, vec![DeviceSel::AllPci, DeviceSel::Platform("ps2".into())]);
+    assert!(d.devices[0].matches(true, 1, 6, 1, "") && !d.devices[0].matches(false, 0, 0, 0, "rtc") && !d.devices[1].matches(false, 0, 0, 0, "rtc"));
+    assert_eq!(d.endpoints, vec!["input".to_string()]);
     assert_eq!(d.programs, vec!["*.ddrv".to_string()]);
     assert_eq!(d.connect, vec![Connect { service: "storaged".into(), endpoint: "disks".into() }]);
-    assert_eq!(summary(&d), "log, 1 device selector(s), programs *.ddrv, storaged.disks");
+    assert_eq!(summary(&d), "log, 2 device selector(s), programs *.ddrv, storaged.disks");
+    let l = parse(include_bytes!("../../../init/services/log.dman")).unwrap();
+    assert!(l.kernel_log && !l.boot_time && l.endpoints == vec!["read".to_string()]);
+    assert_eq!(summary(&l), "log, kernel log");
+    let c = parse(include_bytes!("../../../init/services/clock.dman")).unwrap();
+    assert!(c.boot_time && !c.kernel_log && c.devices == vec![DeviceSel::Platform("rtc".into())]);
+    let x = parse(b"name = \"x\"\nimage = \"x.dx\"\ngroup = \"test\"\nlog-level = \"debug\"\n").unwrap();
+    assert_eq!(x.log_level, LEVEL_DEBUG);
 }
 
 #[test]
@@ -142,6 +156,10 @@ fn every_kind_of_bad_manifest_is_refused() {
         "[restart]\npolicy = \"sometimes\"\n",
         "[restart]\nbackoff = 1\n",
         "[restart]\nlimit = 1000\n",
+        "log-level = \"loud\"\n",
+        "log-level = 3\n",
+        "[grants]\nkernel-log = \"yes\"\n",
+        "[grants]\ndevices = [\"pcie\"]\n",
     ] {
         let src = base.to_string() + extra;
         assert!(parse(src.as_bytes()).is_err(), "accepted: {:?}", extra);

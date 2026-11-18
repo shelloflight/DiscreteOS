@@ -1,0 +1,20 @@
+# The console service: keyboard input from the device manager, echoed and assembled into lines
+# (the start of the terminal).
+name = "console"
+image = "console.dx"
+group = "system"
+description = "keyboard input"
+
+[grants]
+log = true
+connect = ["devmgr.input"]
+
+[quota]
+memory = "1M"
+handles = 32
+threads = 1
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

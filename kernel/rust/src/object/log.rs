@@ -22,21 +22,21 @@ impl LogObj {
         .map_err(|_| Status::NoMemory)
     }
 
-    pub fn write(&self, text: &mut [u8]) {
+    /// Record `text` in the kernel log as process `koid` (`name`) at `level`, and show it.
+    pub fn write(&self, level: core::ffi::c_int, koid: u32, name: &[u8], text: &mut [u8]) {
         for b in text.iter_mut() {
             if (*b < 0x20 && !matches!(*b, b'\n' | b'\t' | 0x08)) || *b == 0x7F {
                 *b = b'?';
             }
         }
-        // Valid UTF-8 is printed as is; anything else byte by byte as Latin-1-ish ASCII.
-        match core::str::from_utf8(text) {
-            Ok(s) => crate::kprint!("{}", s),
-            Err(_) => {
-                for &b in text.iter() {
-                    let c = if b.is_ascii() { b as char } else { '?' };
-                    crate::kprint!("{}", c);
+        // Valid UTF-8 is kept as is; anything else byte by byte as ASCII ('?' for the rest).
+        if core::str::from_utf8(text).is_err() {
+            for b in text.iter_mut() {
+                if !b.is_ascii() {
+                    *b = b'?';
                 }
             }
         }
+        crate::klog::write_program(level, koid, name, text);
     }
 }

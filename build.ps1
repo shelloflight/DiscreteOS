@@ -54,6 +54,9 @@
       storage-host dosfs unit tests on the host (cargo test): BLAKE3 vectors, GPT, FAT32, DFS,
                    power-cut sweep over every sector of a workload
       manifest-host the service manifest parser on the host: schema tests and a mutation fuzzer
+      time         the wall-clock time across a reboot (clock service from the CMOS RTC, file times
+                   on DFS and FAT32; the host boots the same disks twice); time-uefi: the same with
+                   the UEFI boot-time record
       selftest     in-kernel runtime library tests pass
       panic        KASSERT failure produces a kernel panic with location
       stackprot    stack buffer overflow is caught by the stack protector
@@ -309,7 +312,7 @@ $TestCases = [ordered]@{
                                 'devmgr: test: virtio-blk: 2048 sectors', 'write + read back OK', 'devmgr: test: interrupt delivery: virtio-blk', "user fault: process 'virtio-blk.ddrv'", 'devmgr: restarting virtio-blk.ddrv',
                                 'devmgr: test: virtio-blk.ddrv crashed and was restarted; I/O works again', 'IOMMU: blocked DMA write by 00:02.0 at 0x100000',
                                 'devmgr: test: DMA outside the driver''s pins blocked by the IOMMU', 'devmgr: test: virtio-blk recovered after the DMA test',
-                                'console: you typed: virtio (virtio-input)', 'devmgr: test: interrupt delivery: virtio-input', 'devmgr: test PASSED', 'init: devmgr exited with code 0', 'KTEST drivers: kernel memory at 0x100000 unchanged', 'KTEST drivers: PASSED')
+                                "devmgr: test: keyboard: 'virtio' typed on virtio-input", 'devmgr: test: interrupt delivery: virtio-input', 'devmgr: test PASSED', 'init: devmgr exited with code 0', 'KTEST drivers: kernel memory at 0x100000 unchanged', 'KTEST drivers: PASSED')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC'); Timeout = 90
                      Keys = @('v', 'i', 'r', 't', 'i', 'o', 'ret'); KeysAfter = 'devmgr: test: waiting for keys' }
     # AMD-Vi: the IOMMU is PCI function 00:02.0 (kept by the kernel), so virtio-blk is 00:03.0. QEMU
@@ -320,14 +323,14 @@ $TestCases = [ordered]@{
                                 'devmgr: test: virtio-blk: 2048 sectors', 'write + read back OK', 'devmgr: test: interrupt delivery: virtio-blk',
                                 'devmgr: test: virtio-blk.ddrv crashed and was restarted; I/O works again', 'IOMMU: blocked DMA access by 00:03.0 at ',
                                 'devmgr: test: DMA outside the driver''s pins blocked by the IOMMU', 'devmgr: test: virtio-blk recovered after the DMA test',
-                                'console: you typed: virtio (virtio-input)', 'devmgr: test PASSED', 'init: devmgr exited with code 0', 'KTEST drivers: kernel memory at 0x100000 unchanged', 'KTEST drivers: PASSED')
+                                "devmgr: test: keyboard: 'virtio' typed on virtio-input", 'devmgr: test PASSED', 'init: devmgr exited with code 0', 'KTEST drivers: kernel memory at 0x100000 unchanged', 'KTEST drivers: PASSED')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC', 'unusable'); Timeout = 90
                      Keys = @('v', 'i', 'r', 't', 'i', 'o', 'ret'); KeysAfter = 'devmgr: test: waiting for keys' }
     storage     = @{ Define = 'STORAGE';     Devices = $true; Timeout = 300; Post = 'Test-StorageImages'
                      Expect = @('ahci: port 1:', 'nvme: NVMe', 'storaged: volume ''boot'': FAT32', 'storaged: volume ''system'': DFS', 'storaged: volume ''data'': DFS',
                                 'partition 2 (''Basic data partition''): NTFS, not supported (left alone)',
                                 'init: 4 volume(s)', 'fstest: fat32:', 'fstest: dfs:', 'BENCH storage: DFS write 1 MiB', 'fstest: snapshots:', 'fstest: child:',
-                                'fstest: code signing: hello.dx from the boot volume', 'fstest: namespace isolation:', 'fstest: power cut:', 'fstest: corruption:', 'fstest: PASSED', 'init: fstest exited with code 0')
+                                'fstest: code signing: hello.dx from the boot volume', 'fstest: namespace isolation:', 'fstest: rename: DFS and FAT32', 'fstest: rename: power cut at 6 points', 'fstest: power cut:', 'fstest: corruption:', 'fstest: PASSED', 'init: fstest exited with code 0')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC') }
     # The service manager (init "services test"): manifests embedded and on disk (signed, unsigned,
     # tampered), refusals named, exact grants and quotas (ltest inside the services), restart with
@@ -340,8 +343,19 @@ $TestCases = [ordered]@{
                                 'init: service hello accepted (esp:/DOS/SERVICES/HELLO.DMAN)', 'hello: a signed program loaded from disk is running', 'ltest: svc-grants: exactly the granted handles', 'ltest: svc-quota: limits from the manifest',
                                 'init: restarting svc-crash in 50 ms (restart 1 of 2)', 'init: restarting svc-crash in 100 ms (restart 2 of 2)', 'init: svc-crash keeps failing: given up after 2 restart(s)',
                                 'init: test: storaged killed and restarted', 'devmgr: storage service reconnected', 'init: test: devmgr killed and restarted',
+                                'log: running:', 'clock: ', 'console: ready', 'storaged: file times from the clock service',
+                                'svc-log: ', 'no kernel address (', 'levels applied (warn kept, info dropped)',
                                 'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown:', 'init: shutdown: every service stopped', 'init: test: PASSED', 'Power: switching off')
                      Forbid = @('KERNEL PANIC', 'test FAIL', 'svc FAIL', 'PANIC', 'could not measure', 'sync failed', 'did not confirm', 'did not stop in time'); Post = 'Test-ServicesOrder' }
+    # The wall-clock time across a reboot (init "time test"): the clock service (CMOS RTC under
+    # BIOS, the UEFI boot-time record under UEFI), file times on DFS and FAT32. The first boot
+    # records the time; the host then boots the same disks again (Test-TimeReboot).
+    time        = @{ Define = 'TIME';        Devices = $true; Timeout = 120; MustExit = $true; Post = 'Test-TimeReboot'
+                     Expect = @('(from the CMOS real-time clock)', 'svc-time: wall-clock time ', 'svc-time: first boot: the time is recorded on DFS (/data) and FAT32 (/boot)', 'init: time test: first boot done', 'Power: switching off')
+                     Forbid = @('KERNEL PANIC', 'svc FAIL', 'PANIC', 'test FAIL', 'FAILED') }
+    'time-uefi' = @{ Define = 'TIME';        Devices = $true; Uefi = $true; Timeout = 180; MustExit = $true; Post = 'Test-TimeRebootUefi'
+                     Expect = @('(from UEFI GetTime at boot)', 'svc-time: first boot: the time is recorded', 'init: time test: first boot done', 'Power: switching off')
+                     Forbid = @('KERNEL PANIC', 'svc FAIL', 'PANIC', 'test FAIL', 'FAILED') }
     poweroff    = @{ Define = 'POWEROFF';    Expect = @('Power: power-off by ACPI S5', 'init: power: the VMEX resource is refused (-5)', 'Power: switch-off requested by process init', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
     'poweroff-uefi' = @{ Define = 'POWEROFF'; Uefi = $true; Expect = @('Power: power-off by ACPI S5', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 60; MustExit = $true }
     reboot      = @{ Define = 'REBOOT';      Expect = @('reset by reset register', 'init: power: the VMEX resource is refused (-5)', 'Power: reset requested by process init', 'Power: resetting'); Forbid = @('KERNEL PANIC', 'FAIL', 'no reset method worked', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
@@ -357,7 +371,7 @@ $TestCases = [ordered]@{
                                 'fstest: readonly: /boot:', 'fstest: readonly: /system:', 'fstest: readonly: /data:', 'fstest: readonly: /esp:', 'fstest: readonly PASSED', 'init: fstest readonly exited with code 0')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC') }
     manydevices = @{ Define = $null;         Qemu = (Get-ManyDeviceArgs 64); Timeout = 30
-                     Expect = @('PCI 00:0f.7', 'PCI 00:1f.2', '69 functions', 'Devices: 70 for user-space drivers', 'User: init started in ring 3', 'init: started devmgr with 70 devices', 'devmgr: 70 devices, 2 with a driver', 'init: 1 volume(s)', 'devmgr: running')
+                     Expect = @('PCI 00:0f.7', 'PCI 00:1f.2', '69 functions', 'Devices: 71 for user-space drivers', 'User: init started in ring 3', 'init: started devmgr with 70 devices', 'devmgr: 70 devices, 2 with a driver', 'init: 1 volume(s)', 'devmgr: running')
                      Forbid = @('KERNEL PANIC', 'cannot start init', 'left out', 'FAIL', 'not used: the limit') }
     'storage-host' = @{ Host = 'Test-DosfsHost' }
     'crypto-host' = @{ Host = 'Test-CryptoHost' }
@@ -549,7 +563,8 @@ function Invoke-Build([string]$OutDir = $Build, [string]$KernelTest = $null, [sw
     # manager's test ones only in its test image. The kernel hands them to init as MANIFEST VMOs.
     $manDir = Join-Path $Root 'user\init\services'
     $manifests = @(Get-ChildItem $manDir -Filter *.dman -File | Sort-Object Name)
-    if ($KernelTest -eq 'SERVICES') { $manifests += @(Get-ChildItem (Join-Path $manDir 'test') -Filter *.dman -File | Sort-Object Name) }
+    $testMan = @{ 'SERVICES' = 'test'; 'TIME' = 'time' }[$KernelTest]
+    if ($testMan) { $manifests += @(Get-ChildItem (Join-Path $manDir $testMan) -Filter *.dman -File | Sort-Object Name) }
     $programs = @($programs) + @($manifests | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Path = $_.FullName } })
     $progAsm = Join-Path $objDir 'programs.asm'
     $progObj = Join-Path $objDir 'programs.o'
@@ -1149,15 +1164,39 @@ function Test-UsbProbedOnce([string]$DiskDir, [string]$Image, [string]$Log) {
     return $n -eq 2
 }
 
-# Service manager: the volumes are made durable while the drivers still run, then the services stop
-# in the reverse order of their starts (devmgr before storaged), then the power goes.
+# time: the second boot of the same disks must find the records and a later time; both boots'
+# clocks must agree with the host's (UTC) within 15 minutes.
+function Test-TimeBoots([string]$DiskDir, [string]$Image, [string]$Log, [bool]$Uefi) {
+    $log2 = Join-Path (Split-Path $Image -Parent) ("serial-time-second" + $(if ($Uefi) { "-uefi" } else { "" }) + ".log")
+    $expect = @('svc-time: second boot: PASSED', 'init: time test: second boot PASSED', 'Power: switching off')
+    $r = Invoke-QemuCapture $Image $log2 $expect @('KERNEL PANIC', 'svc FAIL', 'PANIC', 'FAILED') 180 -Devices -DiskDir $DiskDir -Uefi:$Uefi -MustExit
+    $ok = @($expect | Where-Object { -not $r.Log.Contains($_) }).Count -eq 0
+    $line = ($r.Log -split "`n" | Where-Object { $_ -match 'svc-time: second boot' } | Select-Object -First 1)
+    Write-Host "  time: second boot: $(if ($ok) { $line.Trim() } else { 'FAILED' })"
+    if (-not $ok) { Write-Host ($r.Log -split "`n" | Select-Object -Last 15 | Out-String) }
+    $now = [DateTime]::UtcNow
+    foreach ($l in @($Log, $r.Log)) {
+        if ($l -match 'clock: (\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d) UTC') {
+            $t = [DateTime]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4], [int]$Matches[5], [int]$Matches[6], [DateTimeKind]::Utc)
+            $off = [Math]::Abs(($now - $t).TotalMinutes)
+            Write-Host ("  time: D-OS said {0:u}, the host {1:u} ({2:N1} min apart)" -f $t, $now, $off)
+            if ($off -gt 15) { $ok = $false }
+        } else { Write-Host '  time: no clock line'; $ok = $false }
+    }
+    return $ok
+}
+function Test-TimeReboot([string]$DiskDir, [string]$Image, [string]$Log) { Test-TimeBoots $DiskDir $Image $Log $false }
+function Test-TimeRebootUefi([string]$DiskDir, [string]$Image, [string]$Log) { Test-TimeBoots $DiskDir $Image $Log $true }
+
+# Service manager: the volumes are made durable while the drivers still run, then each service stops
+# after the services depending on it (console, then devmgr, then storaged), then the power goes.
 function Test-ServicesOrder([string]$DiskDir, [string]$Image, [string]$Log) {
     $at = { param($s) $Log.IndexOf($s) }
-    $seq = @('init: syncing storaged', 'storaged: sync: 4 volume(s) durable', 'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown: 4 volume(s) durable', 'init: shutdown: every service stopped', 'Power: switch-off requested by process init')
+    $seq = @('init: syncing storaged', 'storaged: sync: 4 volume(s) durable', 'init: stopping console', 'init: stopping devmgr', 'devmgr: shutdown:', 'init: stopping storaged', 'storaged: shutdown: 4 volume(s) durable', 'init: shutdown: every service stopped', 'Power: switch-off requested by process init')
     $pos = @($seq | ForEach-Object { & $at $_ })
     $ok = ($pos -notcontains -1)
     for ($i = 1; $i -lt $pos.Count; $i++) { if ($pos[$i] -lt $pos[$i - 1]) { $ok = $false } }
-    Write-Host "  services: shutdown order $(if ($ok) { 'volumes made durable, then devmgr, then storaged, then power-off' } else { 'WRONG: ' + ($pos -join ', ') })"
+    Write-Host "  services: shutdown order $(if ($ok) { 'volumes made durable, then console, devmgr, storaged (each after what depends on it), then power-off' } else { 'WRONG: ' + ($pos -join ', ') })"
     return $ok
 }
 
@@ -1349,7 +1388,7 @@ function Test-StaticAnalysis {
         $findings += $n
     }
     $cargo = Initialize-Rust
-    $crates = @('kernel\rust', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\lib\dman', 'user\init', 'user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
+    $crates = @('kernel\rust', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\lib\dman', 'user\init', 'user\log', 'user\clock', 'user\console', 'user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
     foreach ($c in $crates) {
         Push-Location (Join-Path $Root $c)
         try {

@@ -41,7 +41,8 @@ bool console_attach_framebuffer(const BootInfo *bi)
     uint64_t seq = 0;
     while (klog_read(&seq, &e)) {
         fbcon_write(e.text, e.len);
-        fbcon_write("\n", 1);
+        if (!(e.flags & KLOG_FLAG_CONTINUES))
+            fbcon_write("\n", 1);
     }
     screen = SCREEN_FB;
     console_unlock(f);

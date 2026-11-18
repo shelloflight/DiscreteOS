@@ -75,6 +75,20 @@ _Static_assert(sizeof(struct boot_timing) == 24 + 24 * BOOT_TIMING_STEPS, "boot 
 _Static_assert(BOOT_TIMING_OFFSET >= 416 && BOOT_TIMING_OFFSET + sizeof(struct boot_timing) <= 4096,
                "boot timing fits in the BootInfo page after the BootInfo");
 
+/* Wall-clock time at boot (optional, not part of the BootInfo ABI): the UEFI loader stores what
+ * GetTime said, and the TSC when it said it, at BOOT_WALL_OFFSET in the BootInfo page. The kernel
+ * hands it to the clock service; under BIOS there is none (the clock service reads the RTC). */
+#define BOOT_WALL_OFFSET 3584u
+#define BOOT_WALL_MAGIC  0x314C4C4157534F44ull   /* "DOSWALL1" */
+struct boot_wall {
+    uint64_t magic;
+    uint64_t tsc;           /* TSC right after GetTime returned */
+    efi_time time;
+};
+_Static_assert(sizeof(struct boot_wall) == 32, "boot wall layout");
+_Static_assert(BOOT_TIMING_OFFSET + sizeof(struct boot_timing) <= BOOT_WALL_OFFSET && BOOT_WALL_OFFSET + 32 <= 4096,
+               "boot wall time fits in the BootInfo page after the step times");
+
 static struct boot_timing timing;           /* copied into the BootInfo page at the end */
 static uint64_t con_cycles;
 
@@ -623,6 +637,16 @@ efi_status efi_main(efi_handle image, efi_system_table *systab)
     /* 3: firmware facts */
     find_framebuffer(bi);
     find_acpi(bi);
+    {
+        struct boot_wall w = { 0 };
+        efi_time t;
+        if (st->runtime_services && st->runtime_services->get_time && st->runtime_services->get_time(&t, NULL) == 0) {
+            w.tsc = rdtsc();
+            w.time = t;
+            w.magic = BOOT_WALL_MAGIC;
+        }
+        memcpy((void *)(uintptr_t)(bi_pa + BOOT_WALL_OFFSET), &w, sizeof(w));
+    }
     mark("GOP + ACPI");
 
     /* Identity map up to the end of RAM (at least 4 GiB, at most 512 GiB). */

@@ -306,7 +306,7 @@ fn fuzz_fat32() {
 fn dfs_base() -> &'static (MemDev, Vec<usize>) {
     static BASE: std::sync::OnceLock<(MemDev, Vec<usize>)> = std::sync::OnceLock::new();
     BASE.get_or_init(|| {
-        let mut fs = Dfs::format(Box::new(MemDev::new(16 * 2048)), &FormatOpts { label: b"fuzz", uuid: [5; 16] }).unwrap();
+        let mut fs = Dfs::format(Box::new(MemDev::new(16 * 2048)), &FormatOpts { label: b"fuzz", uuid: [5; 16], time: 0 }).unwrap();
         populate(&mut fs);
         fs.snapshot(b"before").unwrap();
         let r = fs.root();

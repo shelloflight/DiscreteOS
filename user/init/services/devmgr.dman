@@ -1,14 +1,17 @@
 # The device manager: starts one driver process per device it knows, restarts drivers that fail,
-# hands disks to the storage service and collects keyboard input.
+# hands disks to the storage service and offers keyboard input on its input endpoint.
 name = "devmgr"
 image = "devmgr.dx"
 group = "system"
 after = ["storaged"]
 description = "devices and their drivers"
 
+[provides]
+endpoints = ["input"]   # every key typed, to each client (the console)
+
 [grants]
 log = true
-devices = ["all"]
+devices = ["pci", "platform:ps2"]   # not the RTC: that is the clock's
 programs = ["*.ddrv"]
 connect = ["storaged.disks"]
 

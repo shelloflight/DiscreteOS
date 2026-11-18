@@ -10,6 +10,10 @@
 //! - the VMEX resource (tag VMEX): the authority to make sealed VMOs executable, for user-space
 //!   program loaders. init hands it on only deliberately;
 //! - the POWER and MEASURE resources (switch off / reset; record decisions in PCR 10);
+//! - the KLOG resource (read the kernel log, kernel addresses filtered: for the log service);
+//! - the boot-time record (tag BOOT_TIME, a read-only VMO named "boot-time"): the wall-clock time
+//!   the UEFI loader read from the firmware, and the monotonic time it corresponds to (none under
+//!   BIOS, where the clock service reads the RTC itself);
 //! - one handle per device (tag DEVICE): init passes them to the device manager.
 
 use alloc::vec::Vec;
@@ -18,7 +22,7 @@ use core::ffi::{CStr, c_char};
 use super::loader::{self, tag};
 use crate::ffi::{self, RawProgram};
 use crate::object::quota::Limits;
-use crate::object::resource::{KIND_MEASURE, KIND_POWER, KIND_VMEX};
+use crate::object::resource::{KIND_KLOG, KIND_MEASURE, KIND_POWER, KIND_VMEX};
 use crate::object::{
     KRef, LogObj, ObjType, Object, Process, ResourceObj, Rights, Status, Vmo, default_rights, kernel_process,
     kernel_process_ref, sig,
@@ -74,7 +78,7 @@ fn start(args: &[u8]) -> Result<KRef<Process>, Status> {
     let mut handles = Vec::new();
     let n = programs().count();
     let devs = crate::dev::devices();
-    handles.try_reserve_exact(n + 4 + devs.len()).map_err(|_| Status::NoMemory)?;
+    handles.try_reserve_exact(n + 6 + devs.len()).map_err(|_| Status::NoMemory)?;
     handles.push((Object::Log(LogObj::create()?), default_rights(ObjType::Log), tag::LOG));
     let vmex = ResourceObj::new(KIND_VMEX)?;
     handles.push((Object::Resource(vmex), default_rights(ObjType::Resource), tag::VMEX));
@@ -82,6 +86,16 @@ fn start(args: &[u8]) -> Result<KRef<Process>, Status> {
     handles.push((Object::Resource(power), default_rights(ObjType::Resource), tag::POWER));
     let measure = ResourceObj::new(KIND_MEASURE)?;
     handles.push((Object::Resource(measure), default_rights(ObjType::Resource), tag::MEASURE));
+    let klog = ResourceObj::new(KIND_KLOG)?;
+    handles.push((Object::Resource(klog), default_rights(ObjType::Resource), tag::KLOG));
+    let mut rec = [0u8; 32];
+    // SAFETY: a 32-byte buffer, the size of struct boot_time_record.
+    if unsafe { ffi::boot_time_record(rec.as_mut_ptr()) } {
+        let v = Vmo::create_named(kernel_process().account(), 32, "boot-time")?;
+        v.write(0, &rec)?;
+        v.seal()?;
+        handles.push((Object::Vmo(v), Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT, tag::BOOT_TIME));
+    }
     let prog_rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT;
     for (name, data) in programs() {
         let t = if is_manifest(name) { tag::MANIFEST } else { tag::PROGRAM };

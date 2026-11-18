@@ -7,6 +7,7 @@
 #ifndef DOS_BOOTINFO_H
 #define DOS_BOOTINFO_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "compiler.h"
 
@@ -115,6 +116,39 @@ _Static_assert(sizeof(struct boot_timing) == 24 + 24 * BOOT_TIMING_STEPS, "boot 
 _Static_assert(BOOT_TIMING_OFFSET >= 416 && BOOT_TIMING_OFFSET + sizeof(struct boot_timing) <= 4096,
                "boot timing fits in the BootInfo page after the BootInfo");
 
+
+/* Wall-clock time at boot (optional, not part of the BootInfo ABI): the UEFI loader stores what
+ * GetTime said and the TSC right after, at BOOT_WALL_OFFSET in the BootInfo page. The kernel hands
+ * it to init as the boot-time record (boot_time_record); under BIOS there is none. */
+#define BOOT_WALL_OFFSET 3584u
+#define BOOT_WALL_MAGIC  0x314C4C4157534F44ull   /* "DOSWALL1" */
+struct boot_wall {
+    uint64_t magic;
+    uint64_t tsc;
+    uint16_t year;                   /* EFI_TIME */
+    uint8_t  month, day, hour, minute, second, pad1;
+    uint32_t nanosecond;
+    int16_t  time_zone;              /* minutes from UTC; 2047 = unspecified */
+    uint8_t  daylight, pad2;
+};
+_Static_assert(sizeof(struct boot_wall) == 32, "boot wall layout (UEFI loader)");
+_Static_assert(BOOT_TIMING_OFFSET + sizeof(struct boot_timing) <= BOOT_WALL_OFFSET && BOOT_WALL_OFFSET + 32 <= 4096,
+               "boot wall time fits in the BootInfo page after the step times");
+
+/* The boot-time record init gets (tag BOOT_TIME, ABI v8; struct dos_boot_time in dos.h). */
+struct boot_time_record {
+    uint32_t magic;                  /* "DTIM" */
+    uint32_t source;                 /* 1: UEFI GetTime */
+    uint16_t year;
+    uint8_t  month, day, hour, minute, second, pad;
+    uint32_t nanosecond;
+    int16_t  time_zone;              /* minutes from UTC (2047: unspecified, taken as UTC) */
+    uint16_t pad2;
+    int64_t  mono_ns;                /* the monotonic clock (ns since kernel entry) at that time; < 0 */
+};
+_Static_assert(sizeof(struct boot_time_record) == 32, "boot time record layout");
+#define BOOT_TIME_MAGIC 0x4D495444u  /* "DTIM" */
+bool boot_time_record(struct boot_time_record *out);
 
 /* Kernel image header: the first bytes of kernel.bin (kernel/arch/x86_64/entry.asm, section
  * .boothdr). Both loaders read the entry point, sizes and relocation table from it. All values are

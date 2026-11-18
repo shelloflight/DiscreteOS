@@ -15,7 +15,8 @@
 //! - benchmarks: thread spawn+join, uncontended mutex, small allocation
 //!
 //! Arguments: none (the tests), `overflow` (the stack-guard child), or `svc-grants`,
-//! `svc-quota`, `svc-crash` (services of the service manager's test run, src/svc.rs).
+//! `svc-quota`, `svc-crash`, `svc-log` (services of the service manager's test run) and
+//! `svc-time` (the clock across a reboot), all in src/svc.rs.
 
 #![no_std]
 
@@ -472,6 +473,10 @@ fn main(s: *const Startup) -> i32 {
         return svc::quota();
     } else if a.starts_with(b"svc-crash") {
         return svc::crash();
+    } else if a.starts_with(b"svc-log") {
+        return svc::log_read();
+    } else if a.starts_with(b"svc-time") {
+        return svc::time();
     }
     let ok = test_abi()
         && test_handles()

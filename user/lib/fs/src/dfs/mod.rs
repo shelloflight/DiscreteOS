@@ -343,14 +343,20 @@ pub struct Dfs {
     /// Mount: how many superblocks were skipped because they (or the roots they name) were
     /// damaged.
     pub fallbacks: u32,
+    /// The wall-clock time new and changed objects get (`set_time`; 0: unknown).
+    now: i64,
 }
 
+/// An inode item: 48 bytes (32 before file times existed: those read as time 0, unknown).
 #[derive(Clone, Copy)]
 struct Inode {
     kind: Kind,
     size: u64,
     cgen: u64,
     mgen: u64,
+    /// D-OS time (ns since 2000-01-01 UTC) of creation and of the last change; 0 = unknown.
+    ctime: i64,
+    mtime: i64,
 }
 
 impl Fsck {
@@ -364,15 +370,17 @@ impl Fsck {
 
 impl Inode {
     fn bytes(&self) -> Vec<u8> {
-        let mut v = vec![0u8; 32];
+        let mut v = vec![0u8; 48];
         v[0] = if self.kind == Kind::Dir { 2 } else { 1 };
         v[8..16].copy_from_slice(&self.size.to_le_bytes());
         v[16..24].copy_from_slice(&self.cgen.to_le_bytes());
         v[24..32].copy_from_slice(&self.mgen.to_le_bytes());
+        v[32..40].copy_from_slice(&self.ctime.to_le_bytes());
+        v[40..48].copy_from_slice(&self.mtime.to_le_bytes());
         v
     }
     fn parse(v: &[u8]) -> Result<Inode> {
-        if v.len() != 32 {
+        if v.len() != 32 && v.len() != 48 {
             return Err(Error::Corrupt);
         }
         let kind = match v[0] {
@@ -381,7 +389,8 @@ impl Inode {
             _ => return Err(Error::Corrupt),
         };
         let u = |o: usize| u64::from_le_bytes(v[o..o + 8].try_into().unwrap_or_default());
-        Ok(Inode { kind, size: u(8), cgen: u(16), mgen: u(24) })
+        let (ctime, mtime) = if v.len() == 48 { (u(32) as i64, u(40) as i64) } else { (0, 0) };
+        Ok(Inode { kind, size: u(8), cgen: u(16), mgen: u(24), ctime, mtime })
     }
 }
 
@@ -436,6 +445,8 @@ fn valid_name(n: &[u8]) -> bool {
 pub struct FormatOpts<'a> {
     pub label: &'a [u8],
     pub uuid: [u8; 16],
+    /// D-OS time of the root directory's creation (0: unknown).
+    pub time: i64,
 }
 
 impl Dfs {
@@ -494,7 +505,7 @@ impl Dfs {
         }
         d.fs = Tree::new(TREE_FS);
         d.alloc = Tree::new(TREE_ALLOC);
-        d.put_inode(ROOT_OBJ, &Inode { kind: Kind::Dir, size: 0, cgen: 1, mgen: 1 })?;
+        d.put_inode(ROOT_OBJ, &Inode { kind: Kind::Dir, size: 0, cgen: 1, mgen: 1, ctime: o.time, mtime: o.time })?;
         let z = [0u8; BS];
         for s in 0..=SLOTS {
             d.io.dev.write(s * SPB, &z)?; // no stale superblocks from an earlier filesystem
@@ -517,6 +528,7 @@ impl Dfs {
             views: Vec::new(),
             broken: false,
             fallbacks: 0,
+            now: 0,
             sb,
         }
     }
@@ -1023,6 +1035,9 @@ impl Dfs {
         let mut i = self.inode(obj)?;
         f(&mut i);
         i.mgen = self.generation;
+        if self.now != 0 {
+            i.mtime = self.now;
+        }
         self.put_inode(obj, &i)
     }
 
@@ -1123,7 +1138,8 @@ impl FileSystem for Dfs {
             return Err(Error::TooBig);
         }
         let generation = self.generation;
-        self.put_inode(obj, &Inode { kind, size: 0, cgen: generation, mgen: generation })?;
+        let now = self.now;
+        self.put_inode(obj, &Inode { kind, size: 0, cgen: generation, mgen: generation, ctime: now, mtime: now })?;
         self.fs.insert(&mut self.io, Key::new(d, K_DIRENT, name_hash(name)), v)?;
         self.touch(d, |_| {})?;
         Ok(obj)
@@ -1131,7 +1147,73 @@ impl FileSystem for Dfs {
 
     fn stat(&mut self, ino: Ino) -> Result<Stat> {
         let i = self.inode(ino)?;
-        Ok(Stat { kind: i.kind, size: i.size })
+        Ok(Stat { kind: i.kind, size: i.size, created: i.ctime, modified: i.mtime })
+    }
+
+    fn set_time(&mut self, now: i64) {
+        self.now = now;
+    }
+
+    /// One commit holds both sides: after a power cut the object is under exactly one name.
+    fn rename(&mut self, from_dir: Ino, from: &[u8], to_dir: Ino, to: &[u8], replace: bool) -> Result<()> {
+        self.writable(from_dir)?;
+        self.writable(to_dir)?;
+        if !valid_name(from) || !valid_name(to) {
+            return Err(Error::BadName);
+        }
+        let (fd, td) = (Self::obj(from_dir), Self::obj(to_dir));
+        let (obj, kind, mut src) = self.find_entry(0, fd, from)?;
+        if fd == td && from == to {
+            return Ok(());
+        }
+        if self.inode(to_dir)?.kind != Kind::Dir {
+            return Err(Error::NotDir);
+        }
+        // The destination: refused if it exists, unless eplace and both are files.
+        let mut old: Option<u64> = None;
+        match self.find_entry(0, td, to) {
+            Ok((o, k, _)) => {
+                if !replace {
+                    return Err(Error::Exists);
+                }
+                if k == Kind::Dir || kind == Kind::Dir {
+                    return Err(if k == Kind::Dir { Error::IsDir } else { Error::NotDir });
+                }
+                old = Some(o);
+            }
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        // Will the new name's group still fit an item? Checked before anything changes.
+        let tkey = Key::new(td, K_DIRENT, name_hash(to));
+        let dst_len = self.fs.get(&mut self.io, &tkey)?.map_or(0, |v| v.len());
+        if dst_len + 10 + to.len() > tree::MAX_VAL {
+            return Err(Error::TooBig);
+        }
+        // Take the old name out first (its group may also be the new name's group).
+        src.retain(|e| e.2 != from);
+        let skey = Key::new(fd, K_DIRENT, name_hash(from));
+        if src.is_empty() {
+            self.fs.delete(&mut self.io, &skey)?;
+        } else {
+            self.fs.insert(&mut self.io, skey, group_bytes(&src))?;
+        }
+        let mut dst = match self.fs.get(&mut self.io, &tkey)? {
+            Some(v) => parse_group(&v)?,
+            None => Vec::new(),
+        };
+        dst.retain(|e| e.2 != to);
+        dst.push((obj, kind, to.to_vec()));
+        self.fs.insert(&mut self.io, tkey, group_bytes(&dst))?;
+        if let Some(o) = old {
+            self.drop_extents(o, 0)?;
+            self.fs.delete(&mut self.io, &Key::new(o, K_INODE, 0))?;
+        }
+        self.touch(fd, |_| {})?;
+        if td != fd {
+            self.touch(td, |_| {})?;
+        }
+        Ok(())
     }
 
     fn read(&mut self, ino: Ino, off: u64, buf: &mut [u8]) -> Result<usize> {

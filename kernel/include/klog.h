@@ -21,6 +21,10 @@
 enum { KLOG_ERROR = 0, KLOG_WARN = 1, KLOG_INFO = 2, KLOG_DEBUG = 3 };
 
 #define KLOG_MSG_MAX 120          /* bytes of text per record; longer messages are split */
+#define KLOG_SOURCE_MAX 24
+
+enum { KLOG_ORIGIN_KERNEL = 0, KLOG_ORIGIN_PROGRAM = 1 };
+#define KLOG_FLAG_CONTINUES 1     /* no newline at the end: the process's next record continues it */
 
 /* Shared with Rust (#[repr(C)] KlogEntry). */
 struct klog_entry {
@@ -28,10 +32,14 @@ struct klog_entry {
     uint64_t time_us;             /* monotonic, since kernel entry */
     uint8_t  level;
     uint8_t  len;
+    uint8_t  origin;              /* KLOG_ORIGIN_* */
+    uint8_t  flags;               /* KLOG_FLAG_* */
+    uint32_t koid;                /* program records: the writing process */
+    char     source[KLOG_SOURCE_MAX]; /* program records: its name, set by the kernel */
     char     text[KLOG_MSG_MAX];  /* not NUL-terminated */
-    uint8_t  reserved[6];
+    uint8_t  reserved[8];
 };
-_Static_assert(sizeof(struct klog_entry) == 144, "klog_entry layout is shared with Rust");
+_Static_assert(sizeof(struct klog_entry) == 176, "klog_entry layout is shared with Rust");
 
 void klog(int level, const char *fmt, ...) PRINTF_FMT(2, 3);
 

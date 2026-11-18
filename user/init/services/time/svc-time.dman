@@ -1,0 +1,19 @@
+# Test (time): the wall-clock time across a reboot. The first boot records the time on a DFS and a
+# FAT32 volume; the second checks the clock moved forward and the files kept their times.
+name = "svc-time"
+image = "ltest.dx"
+args = "svc-time"
+group = "test"
+
+[grants]
+log = true
+connect = ["clock.time"]
+namespace = ["/data=data:rw", "/boot=boot:rw"]
+
+[quota]
+memory = "4M"
+handles = 32
+threads = 2
+
+[restart]
+policy = "never"

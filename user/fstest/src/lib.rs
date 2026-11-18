@@ -2,7 +2,8 @@
 //! (`/boot` FAT32 on SATA, `/system` DFS on SATA, `/data` DFS on NVMe) and storaged's test hooks
 //! on. Checks: files written on the host (FAT32 long names, DFS), FAT32 writes, DFS operations
 //! and a benchmark, snapshots, namespace isolation (a child process with two granted
-//! directories), power cuts (crash consistency), and corruption detection. Exit 0: all passed.
+//! directories), rename (and a rename cut by power failures), power cuts (crash consistency),
+//! and corruption detection. Exit 0: all passed.
 //!
 //! Arguments: none (the tests), `child` (the isolated child of the namespace test), `bench` (read
 //! throughput and latency on every volume; read only), or `readonly`
@@ -338,6 +339,64 @@ fn power_cuts(data: &Node) -> bool {
     true
 }
 
+// ---- rename -----------------------------------------------------------------------------------
+
+/// Rename on one volume: across directories, refusals (an existing name, a directory into itself),
+/// replacing a file, and the file times (the clock service is running: they are known).
+fn renames(vol: &Node, what: &str) -> bool {
+    let data = pattern(77, 9000);
+    let made = vol.open(b"rn-a", fp::O_CREATE | fp::O_DIRECTORY, R_READ | R_WRITE).is_ok()
+        && vol.open(b"rn-b", fp::O_CREATE | fp::O_DIRECTORY, R_READ | R_WRITE).is_ok()
+        && write_file(vol, "rn-a/Report draft.txt", &data).is_ok()
+        && write_file(vol, "rn-b/old.txt", b"old").is_ok();
+    check!(made, "{}: set up the rename test", what);
+    let t = open(vol, "rn-a/Report draft.txt", 0, R_READ).and_then(|n| n.stat());
+    check!(t.is_ok_and(|s| s.created != 0 && s.modified >= s.created), "{}: file times {:?}", what, t);
+    let r = vol.rename(b"rn-a/Report draft.txt", b"rn-b/Final report.txt", false);
+    check!(r.is_ok(), "{}: rename across directories: {}", what, st(r));
+    check!(read_file(vol, "rn-a/Report draft.txt") == Err(fp::ERR_NOT_FOUND), "{}: the old name is still there", what);
+    check!(read_file(vol, "rn-b/Final report.txt").is_ok_and(|b| b == data), "{}: content after the rename", what);
+    let r = vol.rename(b"rn-b/Final report.txt", b"rn-b/old.txt", false);
+    check!(r == Err(fp::ERR_EXISTS), "{}: an existing name was not refused: {}", what, st(r));
+    let r = vol.rename(b"rn-b/Final report.txt", b"rn-b/old.txt", true);
+    check!(r.is_ok() && read_file(vol, "rn-b/old.txt").is_ok_and(|b| b == data), "{}: replace: {}", what, st(r));
+    let r = vol.rename(b"rn-a", b"rn-a/inside", false);
+    check!(r == Err(sys::ERR_INVALID_ARGS), "{}: a directory moved into itself: {}", what, st(r));
+    let r = vol.rename(b"rn-b", b"rn-a/rn-b", false);
+    check!(r.is_ok() && read_file(vol, "rn-a/rn-b/old.txt").is_ok_and(|b| b == data), "{}: a directory moved: {}", what, st(r));
+    let ro = vol.clone_with(R_READ).map(|n| n.rename(b"rn-a", b"rn-c", false));
+    check!(ro.is_ok_and(|r| r == Err(sys::ERR_ACCESS_DENIED)), "{}: renamed through a read-only handle", what);
+    check!(vol.sync().is_ok(), "{}: sync", what);
+    true
+}
+
+/// A rename cut by a power failure at several points: after the remount the file is under
+/// exactly one of its names, intact (DFS commits both sides at once).
+fn rename_power_cuts(data: &Node) -> bool {
+    let body = pattern(5, 7000);
+    let mut outcomes = [0u32; 2];
+    for (round, k) in [0u64, 2, 6, 12, 30, 80].into_iter().enumerate() {
+        let (a, b) = (format!("rc{}/before", round), format!("rc{}/after", round));
+        let made = data.open(format!("rc{}", round).as_bytes(), fp::O_CREATE | fp::O_DIRECTORY, R_READ | R_WRITE).is_ok()
+            && write_file(data, &a, &body).is_ok()
+            && data.sync().is_ok();
+        check!(made, "set up the rename cut");
+        check!(data.test(fp::TEST_POWERCUT, k).is_ok(), "arm the power cut");
+        let _ = data.rename(a.as_bytes(), b.as_bytes(), false).and_then(|_| data.sync());
+        let r = data.test(fp::TEST_REMOUNT, 0);
+        check!(r.is_ok(), "remount after a rename cut at {} sectors: {}", k, st(r));
+        let f = data.test(fp::TEST_FSCK, 0);
+        check!(f.is_ok_and(|(e, _)| e == 0), "fsck after a rename cut at {} sectors: {:?}", k, f);
+        let (old, new) = (read_file(data, &a), read_file(data, &b));
+        check!(old.is_ok() != new.is_ok(), "a rename cut at {} sectors: old {}, new {}", k, st(old.clone()), st(new.clone()));
+        check!(old.or(new).is_ok_and(|x| x == body), "a rename cut at {} sectors: content", k);
+        outcomes[usize::from(read_file(data, &b).is_ok())] += 1;
+    }
+    check!(outcomes[0] > 0 && outcomes[1] > 0, "the cuts did not span the rename: {:?}", outcomes);
+    println!("fstest: rename: power cut at 6 points: always exactly one name, content intact ({} before, {} after)", outcomes[0], outcomes[1]);
+    true
+}
+
 // ---- corruption -----------------------------------------------------------------------------
 
 fn corruption(data: &Node) -> bool {
@@ -456,7 +515,12 @@ fn tests() -> bool {
         println!("fstest: FAIL: expected /esp (the boot disk's EFI System Partition)");
         return false;
     };
-    code_signing(&esp) && fat32(&boot) && dfs_basics(&sys_) && snapshots(&sys_) && isolation(&sys_, &boot) && power_cuts(&data) && corruption(&data)
+    let ok = code_signing(&esp) && fat32(&boot) && dfs_basics(&sys_) && snapshots(&sys_) && isolation(&sys_, &boot);
+    let ok = ok && renames(&data, "dfs") && renames(&boot, "fat32");
+    if ok {
+        println!("fstest: rename: DFS and FAT32: across directories, existing names refused, a file replaced, a directory moved (never into itself), file times set");
+    }
+    ok && rename_power_cuts(&data) && power_cuts(&data) && corruption(&data)
 }
 
 /// Read-only storage (docs/hardware.md): every volume is readable; writing, creating, truncating

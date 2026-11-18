@@ -1,0 +1,23 @@
+# The clock service: wall-clock time (UTC), from the UEFI boot-time record or the CMOS RTC.
+name = "clock"
+image = "clock.dx"
+group = "system"
+description = "wall-clock time"
+
+[provides]
+endpoints = ["time"]   # clock.time
+
+[grants]
+log = true
+devices = ["platform:rtc"]
+boot-time = true
+
+[quota]
+memory = "2M"
+handles = 128
+threads = 1
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

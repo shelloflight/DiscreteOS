@@ -122,7 +122,7 @@ fn make_sata(out: &str) -> Result<(), String> {
     put(&mut f, "EFI/BOOT/NOTE.TXT", b"A UEFI loader goes here.\r\n")?;
     ok(f.sync(), "fat sync")?;
     let p = Part { disk: disk.clone(), start: made[1].first, len: made[1].sectors() };
-    let mut d = ok(Dfs::format(Box::new(p), &FormatOpts { label: b"system", uuid: *b"D-OS-DFS-SYSTEM0" }), "dfs format")?;
+    let mut d = ok(Dfs::format(Box::new(p), &FormatOpts { label: b"system", uuid: *b"D-OS-DFS-SYSTEM0", time: 0 }), "dfs format")?;
     put(&mut d, "hello.txt", DFS_HELLO)?;
     mkdirs(&mut d, "apps")?;
     ok(d.sync(), "dfs sync")?;
@@ -146,7 +146,7 @@ fn make_nvme(out: &str) -> Result<(), String> {
     let mut np = Part { disk: disk.clone(), start: made[1].first, len: made[1].sectors() };
     ok(np.write(0, &ntfs), "ntfs boot sector")?;
     let p = Part { disk: disk.clone(), start: made[0].first, len: made[0].sectors() };
-    let mut d = ok(Dfs::format(Box::new(p), &FormatOpts { label: b"data", uuid: *b"D-OS-DFS-DATA-00" }), "dfs format")?;
+    let mut d = ok(Dfs::format(Box::new(p), &FormatOpts { label: b"data", uuid: *b"D-OS-DFS-DATA-00", time: 0 }), "dfs format")?;
     put(&mut d, "hello.txt", DFS_HELLO)?;
     ok(d.sync(), "dfs sync")?;
     Ok(())

@@ -19,7 +19,8 @@ C programs use the same code through `user/include/libd.h`.
 | `heap` | the global allocator and its statistics (feature `alloc`) |
 | `Port`, `Mapping`, `Dma` | async waits on many objects; VMOs mapped here; DMA pins |
 | `fs`, `proto` | files as handles and namespaces ([storage.md](storage.md)); the driver protocol |
-| `svc` | the service manager's protocol (`CONNECT`, `SYNC`, `SHUTDOWN`) and `endpoint(name)` ([services.md](services.md)) |
+| `svc` | the service manager's protocol (`CONNECT`, `SYNC`, `SHUTDOWN`, `LOG_LEVEL`) and `endpoint(name)` ([services.md](services.md)) |
+| `log`, `time` | the log service's records and reader; wall-clock time (`Time`, ns since 2000-01-01 UTC) and the clock service's client; levels: `log_warn!`, `log_error!`, `log_debug!` |
 | `capi` | the C binding (feature `capi`) |
 
 A program declares its entry with `libd::entry!(_start, main)` and calls `libd::init` first.

@@ -34,10 +34,11 @@ shell or GUI yet.
 - Storage: GPT, FAT32, and DFS (copy-on-write B+tree with BLAKE3 checksums and snapshots); files
   are handles; per-app namespaces; disks are read-only by default
 - A service manager: each service gets exactly the capabilities its signed manifest lists, and is
-  restarted with backoff when it fails
+  restarted with backoff when it fails; core services for a structured system log, wall-clock time
+  and keyboard input
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
 - An MSVC-built Windows program and a static Linux program run unchanged
-- 77 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
+- 79 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
   stress, reproducible builds
 
 ## Quick start

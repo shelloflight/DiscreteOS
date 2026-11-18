@@ -16,6 +16,7 @@ pub mod dev;
 pub mod dfs;
 pub mod fat;
 pub mod gpt;
+pub mod time;
 
 #[cfg(test)]
 mod fuzz;
@@ -56,6 +57,9 @@ pub enum Kind {
 pub struct Stat {
     pub kind: Kind,
     pub size: u64,
+    /// D-OS time (ns since 2000-01-01 00:00:00 UTC; 0 = unknown) of creation and last change.
+    pub created: i64,
+    pub modified: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -88,6 +92,12 @@ pub trait FileSystem {
     /// cookie to continue from (None at the end).
     fn readdir(&mut self, dir: Ino, cookie: u64, max: usize) -> Result<(Vec<Entry>, Option<u64>)>;
     fn unlink(&mut self, dir: Ino, name: &[u8]) -> Result<()>;
+    /// Move entry `from` of `from_dir` to `to` in `to_dir` (same volume). An existing `to`
+    /// is refused (`Exists`) unless `replace` and both are files. The caller makes sure
+    /// `to_dir` is not the moved directory or inside it.
+    fn rename(&mut self, from_dir: Ino, from: &[u8], to_dir: Ino, to: &[u8], replace: bool) -> Result<()>;
+    /// The wall-clock time (D-OS time, 0 = unknown) that creating or changing something records.
+    fn set_time(&mut self, _now: i64) {}
     /// Make everything written durable.
     fn sync(&mut self) -> Result<()>;
     fn info(&mut self) -> Info;

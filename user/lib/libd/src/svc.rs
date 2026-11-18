@@ -10,6 +10,7 @@
 //!   once it is. Sent to every volume provider before any service is stopped.
 //! - `SHUTDOWN` (manager -> service): make everything durable, then exit with code 0. The
 //!   manager waits a few seconds, then ends the process.
+//! - `LOG_LEVEL` (manager -> the log service): a service's log level, from its manifest.
 //!
 //! Endpoints a manifest connects to are also passed at start: startup tag `TAG_ENDPOINT + i`, with
 //! the names (NUL-separated, in the same order) in a VMO tagged `TAG_ENDPOINT_NAMES`.
@@ -21,6 +22,10 @@ pub const SHUTDOWN: u32 = 301;
 /// Manager -> volume provider (a call): make every volume durable now, while the disk drivers
 /// are still running (the first step of a shutdown). Reply: the same op, `a` = volumes synced.
 pub const SYNC: u32 = 302;
+/// Manager -> a holder of the kernel log (the log service): the log level of service `a`-named
+/// processes. Payload: the service's name; `a` = its level (`sys::LOG_*`): records below are
+/// not kept.
+pub const LOG_LEVEL: u32 = 303;
 
 pub const TAG_ENDPOINT_NAMES: u32 = sys::TAG_USER + 0x1FF;
 pub const TAG_ENDPOINT: u32 = sys::TAG_USER + 0x200;

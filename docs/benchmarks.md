@@ -66,6 +66,8 @@ Ryzen 9 9900X (24 threads, TSC 4392 MHz), 32 GiB, NVMe; AutoIBRS, no KPTI.
 
 Channel throughput: 12.5 GB/s. Boot: about 85 ms for D-OS's own part (loader + kernel init).
 
-Known slow spots, good places to contribute: the cross-process call (the caller and server run on
-different CPUs; a same-CPU handoff should bring it well under 1 µs) and file reads (one 4 KiB block
-per request, uncached FAT).
+Known slow spots, good places to contribute: the cross-process call. It already runs on one CPU
+(the server is woken on the caller's CPU and the caller hands over to it); its cost is the two
+process switches. The kernel benchmark prints their parts (`switch part:` CR3 reload, FPU state,
+IBPB): on CPUs with IBPB, the barrier at every switch between processes is the likely largest.
+File reads of 32 KiB and more are bound by one driver request per 32 KiB.

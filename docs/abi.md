@@ -1,4 +1,4 @@
-# User ABI (version 7)
+# User ABI (version 8)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **7**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **8**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -29,6 +29,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 5 | remote attestation (62) |
 | 6 | power control (63) |
 | 7 | service manager decisions in the measurement log (64); MANIFEST and MEASURE startup handles; `vmo_verify` accepts manifest signatures |
+| 8 | the log service (65-66): kernel log records name the writing process; KLOG and BOOT_TIME startup handles |
 
 ## Calling convention (x86-64)
 
@@ -137,6 +138,8 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 62 | attest | nonce (32 bytes), buf, cap | report length | |
 | 63 | system_power | POWER resource, action (1 off, 2 reset) | does not return, or `NOT_SUPPORTED` | MANAGE on resource |
 | 64 | measure | MEASURE resource, digest (32 bytes), text, len (<= 52, printable ASCII) | 0 (PCR 10 extended, logged as `svc <text>`) | MANAGE on resource |
+| 65 | klog_read | KLOG resource, seq, buf, cap | records copied (`struct dos_klog_entry`, 176 bytes; at most 64), kernel addresses replaced by `[kaddr]` | MANAGE on resource |
+| 66 | log_record | log, level (0 error .. 3 debug), text, len | len (`log_write` is level 2, info) | WRITE |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.
@@ -162,9 +165,11 @@ At the entry point, RDI points at `struct dos_startup`: magic `DOSS`, ABI versio
 bytes (<= 4096), the image base and the stack.
 
 Tags: `PROC_SELF` 1, `THREAD_SELF` 2, `VMAR_ROOT` 3, `LOG` 4, `PROGRAM` 5, `VMEX` 6, `DEVICE` 7,
-`POWER` 8, `MEASURE` 9, `MANIFEST` 10, and `DOS_TAG_USER` (0x10000) and up for the spawner's own.
-`init` gets its own handles, the log, one read-only VMO per embedded program and per embedded service
-manifest (`*.dman`: data, never runnable), the VMEX, POWER and MEASURE resources and every device.
+`POWER` 8, `MEASURE` 9, `MANIFEST` 10, `KLOG` 11, `BOOT_TIME` 12, and `DOS_TAG_USER` (0x10000) and
+up for the spawner's own. `init` gets its own handles, the log, one read-only VMO per embedded program
+and per embedded service manifest (`*.dman`: data, never runnable), the VMEX, POWER, MEASURE and
+KLOG resources, the boot-time record (UEFI only: the firmware's time at boot and the monotonic
+time it corresponds to, `struct dos_boot_time`) and every device.
 Tags user space agrees on: the service manager's control channel and endpoints
 ([services.md](services.md)), namespaces ([storage.md](storage.md)).
 
@@ -229,6 +234,10 @@ Register sets from user space are validated (user addresses only, user-settable 
 - `attest` returns a signed report for the caller's nonce ([attestation.md](attestation.md));
   `DOS_ATTEST_MAX` bytes hold any report.
 - `system_power` needs the POWER resource; nothing is flushed by the kernel ([power.md](power.md)).
+- The kernel log: every `log_write`/`log_record` becomes records attributed by the kernel to the
+  writing process (koid and name; a program cannot write under another's name). `klog_read`
+  needs the KLOG resource (the log service only) and never returns a kernel address: hex runs in
+  the kernel half are replaced by `[kaddr]` first (KASLR).
 - `measure` needs the MEASURE resource (init only): the service manager records each manifest it
   accepts or refuses in PCR 10 ([services.md](services.md)).
 
@@ -254,4 +263,5 @@ manager, which grants each to its driver.
 FPU state, IPC, ports, exceptions; `kasan-user` repeats it under KASAN), `fuzz` (ELF parser
 mutations and random syscalls), `smap`, `smep`, `compat`, `drivers` (`drivers-amd` on AMD-Vi),
 `keyboard`, `usbkbd` (`usbnokbd`: no keyboard; `usbhub`: behind two hubs; `usbplug`: hot-plug, a reconnecting device), `attest`, `poweroff`,
-`services` (MANIFEST and MEASURE handles, `measure`, manifest signatures).
+`services` (MANIFEST and MEASURE handles, `measure`, manifest signatures, `klog_read` filtering,
+`log_record` levels), `time`, `time-uefi` (BOOT_TIME).

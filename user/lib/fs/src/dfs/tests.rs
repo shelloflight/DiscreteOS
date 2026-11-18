@@ -9,7 +9,7 @@ use core::cell::RefCell;
 use std::format;
 
 fn fresh(mib: u64) -> Dfs {
-    Dfs::format(Box::new(MemDev::new(mib * 2048)), &FormatOpts { label: b"test", uuid: [9; 16] }).unwrap()
+    Dfs::format(Box::new(MemDev::new(mib * 2048)), &FormatOpts { label: b"test", uuid: [9; 16], time: 0 }).unwrap()
 }
 
 fn remount(d: Dfs) -> Dfs {
@@ -211,7 +211,7 @@ fn check_state(d: &mut Dfs) -> u64 {
 fn power_cut_sweep() {
     const STEPS: u64 = 5;
     let cut = Rc::new(RefCell::new(CutDev::new(MemDev::new(8 * 2048))));
-    drop(Dfs::format(Box::new(SharedCut(cut.clone())), &FormatOpts { label: b"cut", uuid: [5; 16] }).unwrap());
+    drop(Dfs::format(Box::new(SharedCut(cut.clone())), &FormatOpts { label: b"cut", uuid: [5; 16], time: 0 }).unwrap());
     let base = cut.borrow().inner.data.clone();
     let mut d = match Dfs::mount(Box::new(SharedCut(cut.clone()))) {
         Ok(d) => d,
@@ -255,4 +255,100 @@ fn power_cut_sweep() {
     }
     // Every committed version was reachable as a post-cut state.
     assert_eq!(seen.len() as u64, STEPS + 1, "states seen: {:?}", seen);
+}
+
+#[test]
+fn rename_moves_replaces_and_refuses() {
+    let mut d = fresh(4);
+    let r = d.root();
+    d.set_time(1_000_000_000);
+    let a = d.create(r, b"a", Kind::Dir).unwrap();
+    let b = d.create(r, b"b", Kind::Dir).unwrap();
+    let f = d.create(a, b"file", Kind::File).unwrap();
+    d.write(f, 0, b"hello").unwrap();
+    let st = d.stat(f).unwrap();
+    assert_eq!((st.created, st.modified), (1_000_000_000, 1_000_000_000));
+    d.set_time(2_000_000_000);
+    d.rename(a, b"file", b, b"moved", false).unwrap();
+    assert_eq!(d.lookup(a, b"file"), Err(Error::NotFound));
+    let m = d.lookup(b, b"moved").unwrap();
+    let mut buf = [0u8; 5];
+    d.read(m, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"hello");
+    assert_eq!(d.stat(m).unwrap().created, 1_000_000_000); // the file itself did not change
+    assert_eq!(d.stat(b).unwrap().modified, 2_000_000_000);
+    // An existing name is refused unless replacing a file with a file.
+    let g = d.create(b, b"other", Kind::File).unwrap();
+    d.write(g, 0, b"xx").unwrap();
+    assert_eq!(d.rename(b, b"moved", b, b"other", false), Err(Error::Exists));
+    d.rename(b, b"moved", b, b"other", true).unwrap();
+    let o = d.lookup(b, b"other").unwrap();
+    d.read(o, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"hello");
+    assert_eq!(d.rename(r, b"a", b, b"other", true), Err(Error::NotDir));
+    assert_eq!(d.rename(b, b"other", r, b"a", true), Err(Error::IsDir));
+    assert_eq!(d.rename(r, b"nope", r, b"x", false), Err(Error::NotFound));
+    // Directories move with their contents; the commit makes it durable.
+    d.rename(r, b"b", a, b"b2", false).unwrap();
+    d.sync().unwrap();
+    let b2 = d.lookup(a, b"b2").unwrap();
+    assert!(d.lookup(b2, b"other").is_ok());
+    assert_eq!(d.fsck().unwrap().errors, 0);
+}
+
+/// A rename cut at every sector: afterwards the file is under exactly one name, intact.
+#[test]
+fn rename_power_cut_sweep() {
+    let cut = Rc::new(RefCell::new(CutDev::new(MemDev::new(8 * 2048))));
+    {
+        let mut d = Dfs::format(Box::new(SharedCut(cut.clone())), &FormatOpts { label: b"cut", uuid: [5; 16], time: 0 }).unwrap();
+        let r = d.root();
+        let a = d.create(r, b"a", Kind::Dir).unwrap();
+        d.create(r, b"b", Kind::Dir).unwrap();
+        let f = d.create(a, b"doc", Kind::File).unwrap();
+        d.write(f, 0, &pattern(7, 9000)).unwrap();
+        d.sync().unwrap();
+    }
+    let base = cut.borrow().inner.data.clone();
+    let mut total = 0;
+    {
+        let mut d = Dfs::mount(Box::new(SharedCut(cut.clone()))).ok().unwrap();
+        let w0 = cut.borrow().writes;
+        let (r, _) = (d.root(), ());
+        let (a, b) = (d.lookup(r, b"a").unwrap(), d.lookup(r, b"b").unwrap());
+        d.rename(a, b"doc", b, b"doc2", false).unwrap();
+        d.sync().unwrap();
+        total += cut.borrow().writes - w0;
+    }
+    let mut outcomes = std::collections::BTreeSet::new();
+    for n in 0..=total {
+        for seed in [1u64, 2] {
+            {
+                let mut c = cut.borrow_mut();
+                c.inner.data.copy_from_slice(&base);
+                c.restore();
+                c.arm(n, seed * 31 + n);
+            }
+            if let Ok(mut d) = Dfs::mount(Box::new(SharedCut(cut.clone()))) {
+                let r = d.root();
+                let (a, b) = (d.lookup(r, b"a").unwrap(), d.lookup(r, b"b").unwrap());
+                let _ = d.rename(a, b"doc", b, b"doc2", false).and_then(|_| d.sync());
+            }
+            cut.borrow_mut().restore();
+            let mut d = Dfs::mount(Box::new(SharedCut(cut.clone()))).ok().unwrap();
+            assert_eq!(d.fsck().unwrap().errors, 0, "cut after {} writes", n);
+            let r = d.root();
+            let (a, b) = (d.lookup(r, b"a").unwrap(), d.lookup(r, b"b").unwrap());
+            let old = d.lookup(a, b"doc").ok();
+            let new = d.lookup(b, b"doc2").ok();
+            assert!(old.is_some() != new.is_some(), "cut after {} writes: old {:?}, new {:?}", n, old.is_some(), new.is_some());
+            let f = old.or(new).unwrap();
+            let mut g = vec![0u8; 9000];
+            d.read(f, 0, &mut g).unwrap();
+            assert!(g == pattern(7, 9000), "cut after {} writes: content", n);
+            outcomes.insert(new.is_some());
+        }
+    }
+    assert_eq!(outcomes.len(), 2, "both outcomes (before, after) seen");
+    std::println!("rename power cut sweep: {} cut points x 2 seeds, always exactly one name", total + 1);
 }

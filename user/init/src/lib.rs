@@ -8,6 +8,8 @@
 //!   (none)              the system: the embedded manifests of group `system` (storaged,
 //!                       devmgr), then signed ones from the boot volume (`esp:/DOS/SERVICES`);
 //!                       supervised for ever. Disks are read-only (docs/hardware.md)
+//!   time test           writable storage and svc-time (the wall-clock time across a reboot),
+//!                       then a clean shutdown and power-off
 //!   services test       the service manager's test run: system and test services, signed and
 //!                       refused disk manifests, exact grants, quotas, restart with backoff and
 //!                       giving up, storaged and devmgr killed and restarted with I/O working
@@ -226,6 +228,7 @@ fn main(s: *const Startup) -> i32 {
         "power off" => return power(sys::POWER_OFF),
         "power reboot" => return power(sys::POWER_REBOOT),
         "services test" => return services_test(),
+        "time test" => return time_test(),
         _ => {}
     }
 
@@ -280,6 +283,29 @@ fn state(m: &Mgr, name: &str) -> Option<State> {
     m.find(name).map(|i| m.svcs[i].state)
 }
 
+/// The `time` test: writable storage and the svc-time service, which records the time (first
+/// boot: exit 10) or checks it against the record (second boot: exit 0). Then a clean shutdown and
+/// power-off; the host boots the same disks again for the second part.
+fn time_test() -> i32 {
+    let groups = [Group::System, Group::Test];
+    let Some(mut m) = start_system(&[("storaged", "test"), ("devmgr", "rw")], &groups) else { return 1 };
+    let ok = m.run_until(60 * SEC, |m| matches!(state(m, "svc-time"), Some(State::Done(_) | State::Failed)));
+    check!(ok, "svc-time did not finish");
+    let code = match state(&m, "svc-time") {
+        Some(State::Done(c)) => c,
+        _ => -1,
+    };
+    println!("init: time test: {}", match code {
+        10 => "first boot done (time recorded)",
+        0 => "second boot PASSED",
+        _ => "FAILED",
+    });
+    m.shutdown();
+    let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
+    println!("init: power: system_power returned {}", r);
+    1
+}
+
 fn services_test() -> i32 {
     let groups = [Group::System, Group::Test];
     let Some(mut m) = start_system(&[], &groups) else { return 1 };
@@ -302,17 +328,18 @@ fn services_test() -> i32 {
         matches!(state(m, "svc-grants"), Some(State::Done(_)))
             && matches!(state(m, "svc-quota"), Some(State::Done(_)))
             && matches!(state(m, "hello"), Some(State::Done(_)))
+            && matches!(state(m, "svc-log"), Some(State::Done(_)))
             && state(m, "svc-crash") == Some(State::GaveUp)
     });
     check!(ok, "the test services did not finish");
-    for s in ["svc-grants", "svc-quota"] {
+    for s in ["svc-grants", "svc-quota", "svc-log"] {
         check!(state(&m, s) == Some(State::Done(0)), "{} ended with {:?}", s, state(&m, s));
     }
     // hello.dx says it ran by exiting with 42.
     check!(state(&m, "hello") == Some(State::Done(42)), "hello ended with {:?}", state(&m, "hello"));
     let c = m.find("svc-crash").map_or(0, |i| m.svcs[i].starts);
     check!(c == 3, "svc-crash started {} times, expected 3 (1 + 2 restarts)", c);
-    println!("init: test: grants, quota, restart with backoff and giving up: as the manifests say");
+    println!("init: test: grants, quota, restart with backoff and giving up: as the manifests say; the log read back");
 
     // Crash + restart of the storage service: devmgr is linked to the new one, I/O works.
     let first = read_check(&m);

@@ -27,12 +27,14 @@ pub mod fs;
 pub mod handle;
 #[cfg(feature = "alloc")]
 pub mod heap;
+pub mod log;
 pub mod proto;
 pub mod svc;
 pub mod sync;
 pub mod sys;
 #[cfg(feature = "alloc")]
 pub mod thread;
+pub mod time;
 
 use core::fmt::{self, Write};
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
@@ -142,16 +144,25 @@ pub fn find_program(name: &[u8]) -> Option<Handle> {
 pub struct Out {
     buf: [u8; 512],
     n: usize,
+    level: u32,
 }
 
 impl Out {
     pub const fn new() -> Out {
-        Out { buf: [0; 512], n: 0 }
+        Out { buf: [0; 512], n: 0, level: sys::LOG_INFO }
+    }
+    /// Output at a log level (`sys::LOG_*`; the kernel records it with the level).
+    pub const fn with_level(level: u32) -> Out {
+        Out { buf: [0; 512], n: 0, level }
     }
     pub fn flush(&mut self) {
         let log = LOG.load(Ordering::Relaxed);
         if self.n > 0 && log != 0 {
-            sys::log_write(log, &self.buf[..self.n]);
+            if self.level == sys::LOG_INFO {
+                sys::log_write(log, &self.buf[..self.n]);
+            } else {
+                sys::log_record(log, self.level, &self.buf[..self.n]);
+            }
         }
         self.n = 0;
     }
@@ -185,6 +196,27 @@ pub fn print(args: fmt::Arguments<'_>) {
 #[macro_export]
 macro_rules! println {
     ($($t:tt)*) => { $crate::print(format_args!("{}\n", format_args!($($t)*))) };
+}
+
+/// A line at a log level (`sys::LOG_*`): the log service keeps it if the program's manifest
+/// level allows (`println` is `LOG_INFO`).
+pub fn log_line(level: u32, args: fmt::Arguments<'_>) {
+    let mut o = Out::with_level(level);
+    let _ = o.write_fmt(format_args!("{}\n", args));
+    o.flush();
+}
+
+#[macro_export]
+macro_rules! log_error {
+    ($($t:tt)*) => { $crate::log_line($crate::sys::LOG_ERROR, format_args!($($t)*)) };
+}
+#[macro_export]
+macro_rules! log_warn {
+    ($($t:tt)*) => { $crate::log_line($crate::sys::LOG_WARN, format_args!($($t)*)) };
+}
+#[macro_export]
+macro_rules! log_debug {
+    ($($t:tt)*) => { $crate::log_line($crate::sys::LOG_DEBUG, format_args!($($t)*)) };
 }
 
 fn name() -> &'static str {

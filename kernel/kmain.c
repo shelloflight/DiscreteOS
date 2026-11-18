@@ -54,6 +54,29 @@ static void print_us(const char *what, uint64_t cycles)
 }
 
 static struct boot_timing boot_timing;      /* UEFI loader step times, if it left them */
+static struct boot_wall boot_wall;          /* UEFI GetTime at boot, if the loader left it */
+
+bool boot_time_record(struct boot_time_record *out)
+{
+    const struct boot_wall *w = &boot_wall;
+    if (w->magic != BOOT_WALL_MAGIC || w->tsc > kernel_entry_tsc || w->year < 2000 || w->year > 2399 ||
+        w->month < 1 || w->month > 12 || w->day < 1 || w->day > 31 || w->hour > 23 || w->minute > 59 ||
+        w->second > 59 || w->nanosecond >= 1000000000u)
+        return false;
+    memset(out, 0, sizeof(*out));
+    out->magic = BOOT_TIME_MAGIC;
+    out->source = 1;
+    out->year = w->year;
+    out->month = w->month;
+    out->day = w->day;
+    out->hour = w->hour;
+    out->minute = w->minute;
+    out->second = w->second;
+    out->nanosecond = w->nanosecond;
+    out->time_zone = (w->time_zone >= -1440 && w->time_zone <= 1440) ? w->time_zone : 2047;
+    out->mono_ns = -(int64_t)time_cycles_to_ns(kernel_entry_tsc - w->tsc);
+    return true;
+}
 
 /* "Boot: loader steps: read kernel 120.4 ms, verify 4.1 ms, ..." (UEFI; the loader's own stamps),
  * wrapped so every line fits one kernel log record. */
@@ -219,6 +242,7 @@ void kmain(BootInfo *bi_phys)
         }
         if (!ok)
             boot_timing.count = 0;
+        memcpy(&boot_wall, (const uint8_t *)bi_phys + BOOT_WALL_OFFSET, sizeof(boot_wall));
     }
     const BootInfo *bi = &boot_info;
     if (bi->rsdp)

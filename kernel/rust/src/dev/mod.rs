@@ -51,6 +51,11 @@ fn inb(port: u16) -> u8 {
     v
 }
 
+fn outb(port: u16, v: u8) {
+    // SAFETY: only used to select CMOS register 0x0A (status A; NMIs stay enabled): harmless.
+    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") v, options(nostack, preserves_flags)) }
+}
+
 /// Called once from dkrnl_init (after ACPI, the VMM and the object layer are up).
 pub fn init() {
     let (funcs, method, base, start, end) = pci::enumerate();
@@ -108,6 +113,20 @@ pub fn init() {
         let p = Platform { io: [(0x60, 1), (0x64, 1)], irqs: [1, 12], nirqs: 2 };
         let idx = devs.len() as u16;
         if let Ok(d) = DeviceObj::new(idx, "ps2", Kind::Platform(p))
+            && devs.try_reserve(1).is_ok()
+        {
+            devs.push(d);
+        }
+    }
+    // The CMOS real-time clock (ports 0x70-0x71): the clock service reads the wall-clock time
+    // from it. Present unless the index port floats (reads 0xFF) and status register A does too.
+    if inb(0x71) != 0xFF || {
+        outb(0x70, 0x0A);
+        inb(0x71) != 0xFF
+    } {
+        let p = Platform { io: [(0x70, 2), (0, 0)], irqs: [8, 0], nirqs: 0 };
+        let idx = devs.len() as u16;
+        if let Ok(d) = DeviceObj::new(idx, "rtc", Kind::Platform(p))
             && devs.try_reserve(1).is_ok()
         {
             devs.push(d);

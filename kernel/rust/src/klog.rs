@@ -17,7 +17,15 @@ use crate::ffi::{self, KLOG_DEBUG, KLOG_ERROR, KLOG_INFO, KLOG_WARN, rank};
 use crate::sync::{SpinGuard, SpinLock};
 
 pub const MSG_MAX: usize = 120;
-pub const SLOTS: usize = 512; // 512 x 144 B = 72 KiB
+pub const SOURCE_MAX: usize = 24;
+pub const SLOTS: usize = 512; // 512 x 176 B = 88 KiB
+
+/// Where a record came from.
+pub const ORIGIN_KERNEL: u8 = 0;
+/// A program's `log_write` / `log_record`: `koid` and `source` name the process.
+pub const ORIGIN_PROGRAM: u8 = 1;
+/// `flags`: the text did not end with a newline (the next record of this process continues it).
+pub const FLAG_CONTINUES: u8 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -26,10 +34,16 @@ pub struct KlogEntry {
     pub time_us: u64,
     pub level: u8,
     pub len: u8,
+    pub origin: u8,
+    pub flags: u8,
+    pub koid: u32,
+    /// The writing process's name (programs; empty for the kernel), set by the kernel: a program
+    /// cannot write under another's name.
+    pub source: [u8; SOURCE_MAX],
     pub text: [u8; MSG_MAX],
-    pub reserved: [u8; 6],
+    pub reserved: [u8; 8],
 }
-const _: () = assert!(core::mem::size_of::<KlogEntry>() == 144);
+const _: () = assert!(core::mem::size_of::<KlogEntry>() == 176);
 
 impl KlogEntry {
     const EMPTY: KlogEntry = KlogEntry {
@@ -37,8 +51,12 @@ impl KlogEntry {
         time_us: 0,
         level: 0,
         len: 0,
+        origin: ORIGIN_KERNEL,
+        flags: 0,
+        koid: 0,
+        source: [0; SOURCE_MAX],
         text: [0; MSG_MAX],
-        reserved: [0; 6],
+        reserved: [0; 8],
     };
 
     pub fn text(&self) -> &[u8] {
@@ -60,10 +78,19 @@ impl Ring {
     }
 
     fn push(&mut self, level: u8, time_us: u64, text: &[u8]) {
-        let mut chunks = text.chunks(MSG_MAX);
+        self.push_from(level, time_us, None, 0, text);
+    }
+
+    /// One record per `MSG_MAX` bytes; `from`: (process koid, name) for program records.
+    /// `flags` go on the last record (the earlier ones continue into the next).
+    fn push_from(&mut self, level: u8, time_us: u64, from: Option<(u32, &[u8])>, flags: u8, text: &[u8]) {
+        let mut chunks = text.chunks(MSG_MAX).peekable();
         // An empty message still gets a record.
-        let first = chunks.next().unwrap_or(&[]);
-        for chunk in core::iter::once(first).chain(chunks) {
+        let empty: &[u8] = &[];
+        let mut first = true;
+        while first || chunks.peek().is_some() {
+            let chunk = chunks.next().unwrap_or(empty);
+            first = false;
             let seq = self.next_seq;
             let e = &mut self.slots[(seq % SLOTS as u64) as usize];
             e.seq = seq;
@@ -71,6 +98,21 @@ impl Ring {
             e.level = level;
             e.len = chunk.len() as u8; // chunk.len() <= MSG_MAX < 256
             e.text[..chunk.len()].copy_from_slice(chunk);
+            e.flags = if chunks.peek().is_some() { FLAG_CONTINUES } else { flags };
+            match from {
+                Some((koid, name)) => {
+                    e.origin = ORIGIN_PROGRAM;
+                    e.koid = koid;
+                    let n = name.len().min(SOURCE_MAX);
+                    e.source = [0; SOURCE_MAX];
+                    e.source[..n].copy_from_slice(&name[..n]);
+                }
+                None => {
+                    e.origin = ORIGIN_KERNEL;
+                    e.koid = 0;
+                    e.source = [0; SOURCE_MAX];
+                }
+            }
             self.next_seq = seq + 1;
         }
     }
@@ -181,6 +223,63 @@ pub fn write(level: c_int, text: &[u8]) {
             out.write_bytes(b"\n");
         });
     }
+}
+
+/// A program's text (`log_write`, `log_record`): one record per line, attributed to the
+/// process (koid and name, as the kernel knows them); a last line without a newline is marked
+/// `FLAG_CONTINUES`. Echoed to the console as written (debug records only in test builds), but
+/// not captured a second time.
+pub fn write_program(level: c_int, koid: u32, name: &[u8], text: &[u8]) {
+    let level = level.clamp(KLOG_ERROR, KLOG_DEBUG);
+    let time_us = ffi::now_ns() / 1000;
+    if let Some(mut r) = ring() {
+        let mut rest = text;
+        while !rest.is_empty() {
+            let (line, flags, next) = match rest.iter().position(|&c| c == b'\n') {
+                Some(i) => (&rest[..i], 0, &rest[i + 1..]),
+                None => (rest, FLAG_CONTINUES, &rest[rest.len()..]),
+            };
+            r.push_from(level as u8, time_us, Some((koid, name)), flags, line);
+            rest = next;
+        }
+    }
+    if level <= CONSOLE_LEVEL {
+        console::with_console(|| Raw.write_bytes(text));
+    }
+}
+
+/// Replace kernel addresses in `text` (runs of hex digits, with or without `0x`, whose value
+/// lies in the kernel half, 0xFFFF800000000000 and up) with `[kaddr]`: what a reader in user
+/// space gets, so the log never tells it where the kernel is (KASLR). Returns the new length.
+pub fn filter_kernel_addresses(text: &mut [u8; MSG_MAX], len: usize) -> usize {
+    const MARK: &[u8] = b"[kaddr]";
+    let src = *text;
+    let src = &src[..len.min(MSG_MAX)];
+    let mut out = 0;
+    let mut i = 0;
+    while i < src.len() {
+        let prefixed = src[i] == b'0' && src.get(i + 1).is_some_and(|&c| c == b'x' || c == b'X');
+        let start = if prefixed { i + 2 } else { i };
+        let digits = src[start.min(src.len())..].iter().take_while(|c| c.is_ascii_hexdigit()).count();
+        // A run starts a token: not in the middle of a longer word.
+        let at_boundary = i == 0 || !src[i - 1].is_ascii_alphanumeric();
+        if at_boundary && digits >= 9 {
+            let run = &src[start..start + digits];
+            // The value of the last 16 digits (longer runs are not addresses but may hide one).
+            let tail = &run[run.len().saturating_sub(16)..];
+            let v = tail.iter().fold(0u64, |a, &c| (a << 4) | u64::from((c as char).to_digit(16).unwrap_or(0)));
+            if digits >= 16 && v >= 0xFFFF_8000_0000_0000 || digits > 16 {
+                text[out..out + MARK.len()].copy_from_slice(MARK);
+                out += MARK.len();
+                i = start + digits;
+                continue;
+            }
+        }
+        text[out] = src[i];
+        out += 1;
+        i += 1;
+    }
+    out
 }
 
 /// Console text printed by kprintf/kprintln (already on screen): split into INFO records.

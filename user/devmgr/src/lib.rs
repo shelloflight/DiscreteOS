@@ -6,8 +6,8 @@
 //! When a driver dies it quiesces the device (decode and bus mastering off) and starts a new
 //! instance, at most `MAX_RESTARTS` times; the rest of the system keeps running.
 //!
-//! Input drivers send characters; the device manager assembles lines and prints them (a minimal
-//! console until there is a shell).
+//! Input drivers send characters; the device manager forwards each one to every client of its
+//! `input` endpoint (`proto::INPUT_KEY`; the console service is one). It echoes nothing itself.
 //!
 //! Block drivers (virtio-blk, AHCI, NVMe) announce their disks. For each one the
 //! device manager makes a channel, attaches one end to the driver (BLK_ATTACH) and hands the
@@ -17,8 +17,8 @@
 //!
 //! As a service (started by the service manager from its manifest), it gets the disks endpoint
 //! `storaged.disks` and a control channel: svc::CONNECT replaces the storage channel when the
-//! storage service was restarted (every known disk is handed over again), svc::SHUTDOWN stops the
-//! drivers and ends the device manager.
+//! storage service was restarted (every known disk is handed over again), svc::CONNECT "input"
+//! adds a client of its input endpoint, svc::SHUTDOWN stops the drivers and ends the device manager.
 //!
 //! Arguments: none (service: runs for ever), `rw` (the same with writable disks: storage tests), or
 //! `test` (the driver tests: device ABI rules, block I/O, crash + restart, DMA blocked by the IOMMU,
@@ -53,6 +53,7 @@ libd::entry!(ddrv_xhci, xhci::main);
 
 const MAX_DRIVERS: usize = 8;
 const MAX_DISKS: usize = 16;
+const MAX_INPUT_CLIENTS: usize = 8;
 /// Port key of the control channel from the service manager.
 const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
 
@@ -114,6 +115,8 @@ struct Mgr {
     mgr: Handle,
     /// SHUTDOWN received.
     stop: bool,
+    /// Clients of the input endpoint (the console service).
+    input: [Handle; MAX_INPUT_CLIENTS],
     /// Block drivers may write (argument `rw` or `test`); otherwise they start read-only.
     writable: bool,
 }
@@ -225,7 +228,7 @@ impl Mgr {
                         }
                         proto::KEY => {
                             let from = d.prog;
-                            self.key(h.a as u8, from);
+                            self.key(h.a as u8, from, i);
                         }
                         proto::DISK => {
                             let payload = &buf[HEADER..n as usize];
@@ -269,6 +272,22 @@ impl Mgr {
                             }
                             proto::send(self.storage, fs::DISKS_SETTLED, again, 0);
                             println!("devmgr: storage service reconnected: {} disk(s) handed over again", again);
+                        }
+                        Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"input" && handle != 0 => {
+                            // A dead client's slot is reused (its channel reports PEER_CLOSED).
+                            let slot = self.input.iter().position(|&c| c == 0 || sys::object_wait(c, sys::PEER_CLOSED, 0).is_ok());
+                            match slot {
+                                Some(s) => {
+                                    if self.input[s] != 0 {
+                                        sys::handle_close(self.input[s]);
+                                    }
+                                    self.input[s] = handle;
+                                }
+                                None => {
+                                    println!("devmgr: more than {} input clients: one refused", MAX_INPUT_CLIENTS);
+                                    sys::handle_close(handle);
+                                }
+                            }
                         }
                         Some(h) if h.op == svc::SHUTDOWN => {
                             if handle != 0 {
@@ -338,26 +357,29 @@ impl Mgr {
         }
     }
 
-    fn key(&mut self, c: u8, from: &'static str) {
+    /// A key from an input driver: to every client of the input endpoint. Lines are also
+    /// assembled here (silently) for the driver tests.
+    fn key(&mut self, c: u8, from: &'static str, dev: usize) {
+        let mut msg = [0u8; HEADER + 24];
+        Header { txid: 0, op: proto::INPUT_KEY, status: 0, a: u64::from(c), b: dev as u64 }.put(&mut msg);
+        let n = from.len().min(24);
+        msg[HEADER..HEADER + n].copy_from_slice(&from.as_bytes()[..n]);
+        for ch in self.input.iter().copied().filter(|&c| c != 0) {
+            sys::channel_write(ch, &msg[..HEADER + n]); // a full or closed client loses the key, never us
+        }
         match c {
             b'\n' => {
-                libd::print(format_args!("\n"));
                 let l = &self.line[..self.line_len];
-                println!("console: you typed: {} ({})", core::str::from_utf8(l).unwrap_or("?"), from);
                 self.last_line[..l.len()].copy_from_slice(l);
                 self.last_len = l.len();
                 self.last_from = from;
                 self.lines += 1;
                 self.line_len = 0;
             }
-            0x08 if self.line_len > 0 => {
-                self.line_len -= 1;
-                libd::print(format_args!("\x08 \x08")); // echo: erase the character
-            }
+            0x08 if self.line_len > 0 => self.line_len -= 1,
             b' '..=b'~' if self.line_len < self.line.len() => {
                 self.line[self.line_len] = c;
                 self.line_len += 1;
-                libd::print(format_args!("{}", c as char)); // echo as typed
             }
             _ => {}
         }
@@ -461,6 +483,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
         known: [None; MAX_DISKS],
         mgr: libd::startup_handle(proto::TAG_CONTROL),
         stop: false,
+        input: [0; MAX_INPUT_CLIENTS],
         writable,
     };
     if !writable {
@@ -518,7 +541,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
     if m.storage != 0 {
         proto::send(m.storage, fs::DISKS_SETTLED, u64::from(m.disks), 0);
     }
-    println!("devmgr: running (drivers are restarted when they fail); typed lines are echoed (Enter ends a line)");
+    println!("devmgr: running (drivers are restarted when they fail); keyboard input on the devmgr.input endpoint");
     while !m.stop {
         m.pump(sys::WAIT_FOREVER);
     }
@@ -702,6 +725,11 @@ fn tests(m: &mut Mgr) -> bool {
     }
     check!(m.lines > 0, "no line typed");
     check!(m.last_from == "virtio-input", "the line came from {}", m.last_from);
+    println!(
+        "devmgr: test: keyboard: '{}' typed on {}",
+        core::str::from_utf8(&m.last_line[..m.last_len]).unwrap_or("?"),
+        m.last_from
+    );
     let irqs = m.call(inp, proto::STATS, 0, 0, &[], &mut out).map(|(h, _)| h.a).unwrap_or(0);
     check!(irqs > 0, "no virtio-input interrupt");
     println!("devmgr: test: interrupt delivery: virtio-input {} MSI-X interrupts", irqs);

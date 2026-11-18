@@ -1,0 +1,37 @@
+# The log service: every kernel log record (kernel lines and program output, attributed by the
+# kernel) gathered into one stream of records with per-service levels, served to readers on the
+# log.read endpoint. Started by the service manager from its manifest (docs/services.md).
+[package]
+name = "log"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = true
+debug-assertions = false
+incremental = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

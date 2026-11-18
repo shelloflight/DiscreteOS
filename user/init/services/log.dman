@@ -1,0 +1,24 @@
+# The log service: every kernel log record, kernel lines and program output (attributed by the
+# kernel), kept as records with per-service levels and served to readers. Started first, so it
+# sees the whole boot.
+name = "log"
+image = "log.dx"
+group = "system"
+description = "the system log"
+
+[provides]
+endpoints = ["read"]   # readers: log.read
+
+[grants]
+log = true
+kernel-log = true      # the kernel log reader (kernel addresses filtered by the kernel)
+
+[quota]
+memory = "4M"
+handles = 128
+threads = 2
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

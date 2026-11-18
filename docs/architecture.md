@@ -64,6 +64,7 @@ installer yet); `init` gets a read-only VMO for each one ([services.md](services
 | `user/lib/fs/`, `user/lib/crypto/` | Rust | `dosfs` (GPT, FAT32, DFS, BLAKE3); `doscrypt` (SHA-2, Ed25519, `.dsig`, attestation) |
 | `user/init/`, `user/lib/dman/` | Rust | first process and service manager, its manifests; the manifest parser ([services.md](services.md)) |
 | `user/devmgr/`, `user/storaged/` | Rust | device manager + drivers, storage service |
+| `user/log/`, `user/clock/`, `user/console/` | Rust | log service, clock service, console (keyboard input) ([services.md](services.md)) |
 | `user/dcmpl/`, `compat/` | Rust, C | D-CMPL and its Windows/Linux proof programs ([compat.md](compat.md)) |
 | `user/utest/`, `user/fstest/`, `user/ltest/`, `user/ctest/`, `user/hello/` | C, Rust | ring-3 test programs |
 | `tools/dosimg/` | Rust | host tool: disk images, signing, fsck, attestation verifier |

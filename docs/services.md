@@ -20,6 +20,7 @@ image = "devmgr.dx"         # an embedded program
 args = ""
 group = "system"            # system: started at boot; test: only by the test run
 after = ["storaged"]        # started once these run (or have finished)
+log-level = "info"          # error | warn | info (default) | debug: lower records are not kept
 
 [provides]
 endpoints = ["disks"]       # others connect to "<name>.disks"
@@ -27,12 +28,14 @@ volumes = false             # announces volumes (the storage service)
 
 [grants]
 log = true
-devices = ["all"]           # "all", "pci:CC", "pci:CCSS", "pci:CCSSPP", "platform:<name>"
+devices = ["pci", "platform:ps2"]   # "all", "pci", "pci:CC[SS[PP]]", "platform:<name>"
 programs = ["*.ddrv"]       # program images, by name or "*.dx" / "*.ddrv"
 connect = ["storaged.disks"]
 namespace = ["/system=system:r"]   # /<path>=<volume>:r | rw | rwa
 vmex = false
 power = false
+kernel-log = false          # the kernel log reader (the log service)
+boot-time = false           # the firmware's time at boot (the clock service)
 
 [quota]
 memory = "96M"              # bytes, or K / M / G; 64K .. 1G (default 32M)
@@ -76,6 +79,8 @@ was configured to grant ([attestation.md](attestation.md)).
 | `connect` | one channel per endpoint (`TAG_ENDPOINT + i`, names in the `TAG_ENDPOINT_NAMES` VMO; `libd::svc::endpoint`) |
 | `namespace` | each volume's root, narrowed to the rights granted, at its path ([storage.md](storage.md)) |
 | `vmex`, `power` | the VMEX / POWER resource |
+| `kernel-log` | the KLOG resource (`klog_read`); the manager also sends it every service's `log-level` |
+| `boot-time` | the boot-time record (UEFI only) |
 
 `[quota]` becomes the process's quota. Only init holds MEASURE and the manifests.
 
@@ -97,20 +102,51 @@ was configured to grant ([attestation.md](attestation.md)).
 | `CONNECT` (300) | manager -> service | carries a channel; payload: the endpoint (`disks` to a provider, `storaged.disks` to a client) |
 | `SHUTDOWN` (301) | manager -> service | make everything durable, exit 0 |
 | `SYNC` (302) | manager -> volume provider, call | make every volume durable; reply when done |
+| `LOG_LEVEL` (303) | manager -> kernel-log holder | a service's level: `a` = level, payload = its name |
 | `VOLUME`, `VOLUMES_DONE` | storage service -> manager | a mounted volume (carries its root); the boot-time set is complete |
 
 ## Shutdown
 
 1. Every volume provider is asked to `SYNC`, while the drivers under it still run.
-2. Services stop in the reverse order of their starts (`SHUTDOWN`, 5 s, then they are ended).
+2. Each service stops after every running service that depends on it (`after` or `connect`),
+   the last started first among those free to stop (`SHUTDOWN`, 5 s, then it is ended).
 3. Then `system_power`.
 
 ## The system today
 
 | Service | Gets | Provides |
 |---|---|---|
-| `storaged` | log | endpoint `disks`, volumes |
-| `devmgr` | log, every device, the `*.ddrv` drivers, `storaged.disks` | |
+| `log` | log, kernel log | `log.read` |
+| `clock` | log, the `rtc` device, boot time | `clock.time` |
+| `storaged` | log, `clock.time` (file times) | `storaged.disks`, volumes |
+| `devmgr` | log, every PCI device and `ps2`, the `*.ddrv` drivers, `storaged.disks` | `devmgr.input` |
+| `console` | log, `devmgr.input` | |
+
+### The log service
+
+Every record of the kernel log (kernel lines, and each program's output, named by the kernel after
+the process that wrote it) goes into one stream with its own sequence numbers. A program's records
+below its service's `log-level` are not kept; other processes (drivers, programs run by hand) keep
+info and above. Programs write levels with `libd::log_warn!` and friends (`println` is info).
+Readers call `libd::log::read` on `log.read`: records from a sequence number, how many were lost
+before them, optionally waiting for the next. Records, not text lines: each has a time, a level, an
+origin and a source. Kernel addresses never reach the service (the kernel filters them). It reads
+the kernel ring every 50 ms: the kernel cannot wake a reader from where it logs (interrupts).
+
+### The clock service
+
+Wall-clock time, UTC, as `libd::time::Time`: nanoseconds since 2000-01-01 00:00:00 UTC (0 =
+unknown). Source: the UEFI boot-time record, else the CMOS RTC, read once at start; afterwards that
+reading plus the monotonic clock (no drift correction yet). `TIME_BASE` on `clock.time` answers
+(wall-clock time, the monotonic time it was): a client adds the time elapsed since, no call per
+reading (`libd::time::query`, `set_base`, `now`). The storage service stamps file times with
+it.
+
+### Keyboard input
+
+The device manager sends every key from any keyboard driver to each client of `devmgr.input`
+(`proto::INPUT_KEY`: the character and the driver's name). The console service echoes them and
+reports each line; it will become the terminal.
 
 ## Tests
 
@@ -120,12 +156,20 @@ was configured to grant ([attestation.md](attestation.md)).
   channel, PCI class 01 devices only, `/system` read-only: create refused); `ltest svc-quota` has
   the manifest's quota and is refused memory beyond it; `svc-crash` restarted twice with backoff,
   then given up; storaged killed (devmgr linked again, I/O works), devmgr killed (disks handed over
-  again, I/O works); shutdown order checked on the host; power-off.
+  again, I/O works); `ltest svc-log` reads the whole log back (kernel and storaged records, in
+  order, no kernel address: the one the kernel planted arrives as `[kaddr]`; its own info and
+  debug lines dropped by its `warn` level); shutdown order checked on the host; power-off.
+- `time`, `time-uefi` (init `time test`): the clock from the CMOS RTC (BIOS) or UEFI GetTime;
+  `ltest svc-time` records the time in a file on DFS and on FAT32, the host boots the same disks
+  again, and the second boot finds a later time and both files' modification times kept; both
+  boots' clocks agree with the host's.
 - `manifest-host`: the parser's schema tests and a mutation fuzzer (100 000 manifests, every
   truncation of every seed; nothing panics, whatever is accepted satisfies the schema).
 
 ## Limitations
 
 - Manifests on disk are read from the boot volume only, once, at boot.
-- No per-service log levels or log service yet; output goes to the shared debug log.
+- The log service polls the kernel ring (50 ms); records are kept in memory only (2048).
+- The clock is read once per boot; there is no time zone, no network time and no way to set it.
+- The CMOS RTC device gives the clock service the whole CMOS (ports 0x70-0x71), not just the clock.
 - A client of the storage service started before a restart keeps its old namespace (no re-grant).

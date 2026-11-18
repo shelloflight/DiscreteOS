@@ -35,7 +35,7 @@ use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
 use libd::svc;
 use libd::sys::{self, Handle, MsgHandle};
 use libd::{Port, Startup, println};
-use dosfs::dev::{BlockDev, CutDev, Part, SharedCut};
+use dosfs::dev::{BlockDev, CacheDev, CutDev, Part, SharedCut};
 use dosfs::dfs::Dfs;
 use dosfs::fat::Fat;
 use dosfs::{Error, FileSystem, Ino, Kind, gpt};
@@ -86,7 +86,53 @@ struct Remote {
     rep: Vec<u8>,
 }
 
+/// Requests queued at a driver at once (a read longer than one request).
+const QUEUE_DEPTH: usize = 4;
+/// Our own request ids for queued reads (kernel call ids have the top bit set).
+const QTXID: u32 = 0x4000_0000;
+
 impl Remote {
+    /// A long read as several requests queued at the driver at once, so it never waits for us
+    /// between them. False if anything went wrong: the caller reads again one request at a time
+    /// (with the reconnect logic of `call`).
+    fn read_queued(&mut self, lba: u64, buf: &mut [u8]) -> bool {
+        let chunk = MAX_SECTORS as usize * SECTOR;
+        let total = buf.len().div_ceil(chunk);
+        let mut sent = 0;
+        let mut done = 0;
+        let mut req = [0u8; HEADER];
+        while done < total {
+            while sent < total && sent - done < QUEUE_DEPTH {
+                let n = ((buf.len() - sent * chunk).min(chunk) / SECTOR) as u64;
+                Header { txid: QTXID | sent as u32, op: proto::BLK_READ, status: 0, a: lba + (sent as u64) * MAX_SECTORS, b: n }.put(&mut req);
+                if sys::channel_write(self.ch, &req) != 0 {
+                    return false;
+                }
+                sent += 1;
+            }
+            if sys::object_wait(self.ch, sys::READABLE | sys::PEER_CLOSED, 10 * SEC).is_err() {
+                return false;
+            }
+            let n = match sys::channel_read(self.ch, &mut self.rep, 0) {
+                Ok(n) => n as usize,
+                Err(sys::ERR_SHOULD_WAIT) => continue,
+                Err(_) => return false,
+            };
+            let Some(h) = Header::get(&self.rep[..n]) else { continue };
+            let i = (h.txid & !QTXID) as usize;
+            if h.txid & QTXID == 0 || i != done {
+                continue; // a stale reply (an earlier queued read that gave up): not ours
+            }
+            let len = (buf.len() - i * chunk).min(chunk);
+            if h.status != 0 || n != HEADER + len {
+                return false;
+            }
+            buf[i * chunk..i * chunk + len].copy_from_slice(&self.rep[HEADER..n]);
+            done += 1;
+        }
+        true
+    }
+
     /// The driver went away: wait (up to 10 s) for the device manager to bring the disk back
     /// under the same name; anything else it sends meanwhile is kept for the main loop.
     fn reconnect(&mut self) -> bool {
@@ -159,6 +205,9 @@ impl BlockDev for Remote {
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> dosfs::Result<()> {
         if !buf.len().is_multiple_of(SECTOR) || lba.checked_add((buf.len() / SECTOR) as u64).is_none_or(|e| e > self.sectors) {
             return Err(Error::Io);
+        }
+        if buf.len() > MAX_SECTORS as usize * SECTOR && self.read_queued(lba, buf) {
+            return Ok(());
         }
         for (i, c) in buf.chunks_mut(MAX_SECTORS as usize * SECTOR).enumerate() {
             let at = lba + (i as u64) * MAX_SECTORS;
@@ -246,6 +295,29 @@ struct Volume {
 
 struct Disk {
     remote: Rc<RefCell<Remote>>,
+    cache: Rc<RefCell<CacheDev<RemoteDev>>>,
+}
+
+/// The read cache per disk: 8 MiB (`dosfs::dev::CacheDev`: 4 KiB blocks, read-ahead up to
+/// 128 KiB for sequential reads, write-through).
+const CACHE_BYTES: usize = 8 << 20;
+
+/// A disk's Remote, shared with the cache above it (`probe_write` and reattaching use it directly).
+struct RemoteDev(Rc<RefCell<Remote>>);
+
+impl BlockDev for RemoteDev {
+    fn sectors(&self) -> u64 {
+        self.0.borrow().sectors()
+    }
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> dosfs::Result<()> {
+        self.0.borrow_mut().read(lba, buf)
+    }
+    fn write(&mut self, lba: u64, buf: &[u8]) -> dosfs::Result<()> {
+        self.0.borrow_mut().write(lba, buf)
+    }
+    fn flush(&mut self) -> dosfs::Result<()> {
+        self.0.borrow_mut().flush()
+    }
 }
 
 struct Conn {
@@ -334,7 +406,8 @@ impl Svc {
             req: vec![0u8; HEADER + MAX_SECTORS as usize * SECTOR],
             rep: vec![0u8; HEADER + MAX_SECTORS as usize * SECTOR],
         }));
-        self.disks.push(Disk { remote: remote.clone() });
+        let cache = Rc::new(RefCell::new(CacheDev::new(RemoteDev(remote.clone()), CACHE_BYTES)));
+        self.disks.push(Disk { remote: remote.clone(), cache: cache.clone() });
         if self.rocheck {
             let st = remote.borrow_mut().probe_write(0);
             if st == sys::ERR_ACCESS_DENIED {
@@ -343,7 +416,7 @@ impl Svc {
                 println!("storaged: read-only check FAILED: {}: a raw write returned {}", name, fp::status(st));
             }
         }
-        let parts = gpt::read(&mut *remote.borrow_mut());
+        let parts = gpt::read(&mut *cache.borrow_mut());
         let (parts, primary) = match parts {
             Ok(p) => p,
             Err(Error::NotFound) => {
@@ -370,7 +443,7 @@ impl Svc {
             } else {
                 continue;
             };
-            let shared: dosfs::dev::Shared = remote.clone();
+            let shared: dosfs::dev::Shared = cache.clone();
             let part = Part { disk: shared, start: p.first, len: p.sectors() };
             let (dev, cut): (Box<dyn BlockDev>, _) = if self.test {
                 let c = Rc::new(RefCell::new(CutDev::new(part)));
@@ -384,7 +457,7 @@ impl Svc {
             // reporting a failed FAT32 mount (found on the first real-hardware boot).
             if kind == fp::KIND_FAT32 {
                 let mut bs = [0u8; SECTOR];
-                let pdisk: dosfs::dev::Shared = remote.clone();
+                let pdisk: dosfs::dev::Shared = cache.clone();
                 let mut probe = Part { disk: pdisk, start: p.first, len: p.sectors() };
                 if probe.read(0, &mut bs).is_ok() {
                     let other = match &bs[3..11] {
@@ -483,6 +556,14 @@ impl Svc {
                     if key == KEY_DISKS {
                         self.disks_message(&buf[..n], handle);
                     } else if let Some(h) = h
+                        && h.op == svc::CONNECT
+                        && &buf[HEADER..n] == b"clock.time"
+                        && handle != 0
+                    {
+                        // The clock service was restarted: take its time again.
+                        use_clock(handle);
+                        sys::handle_close(handle);
+                    } else if let Some(h) = h
                         && (h.op == fp::DISKS_LINK || (h.op == svc::CONNECT && &buf[HEADER..n] == b"disks"))
                         && handle != 0
                     {
@@ -579,6 +660,11 @@ impl Svc {
     fn handle(&mut self, vi: usize, ino: Ino, kind: Kind, rights: u64, h: &Header, p: &[u8], out: &mut [u8]) -> Result<Reply, i64> {
         let need = |r: u64| if rights & r == r { Ok(()) } else { Err(sys::ERR_ACCESS_DENIED) };
         let test = self.test;
+        // Whatever this request creates or changes is stamped with the current time.
+        let now = libd::time::now().0;
+        if let Some(f) = self.vols.get_mut(vi).and_then(|v| v.fs.as_mut()) {
+            f.fs().set_time(now);
+        }
         let vkind = self.vols.get(vi).map_or(0, |v| v.kind);
         match h.op {
             fp::OPEN => {
@@ -652,7 +738,52 @@ impl Svc {
             }
             fp::STAT => {
                 let st = self.fs(vi)?.stat(ino).map_err(status)?;
-                Ok(Reply { a: st.size, b: kind_code(st.kind) | rights << 8, len: 0, handle: None })
+                out[0..8].copy_from_slice(&st.created.to_le_bytes());
+                out[8..16].copy_from_slice(&st.modified.to_le_bytes());
+                Ok(Reply { a: st.size, b: kind_code(st.kind) | rights << 8, len: 16, handle: None })
+            }
+            fp::RENAME => {
+                need(R_WRITE)?;
+                if kind != Kind::Dir {
+                    return Err(fp::ERR_NOT_DIR);
+                }
+                let at = p.iter().position(|&c| c == 0).ok_or(sys::ERR_INVALID_ARGS)?;
+                let from: Vec<&[u8]> = fp::components(&p[..at]).ok_or(fp::ERR_BAD_NAME)?.collect();
+                let to: Vec<&[u8]> = fp::components(&p[at + 1..]).ok_or(fp::ERR_BAD_NAME)?.collect();
+                let fs = self.fs(vi)?;
+                // The parents, walking down from this directory; 	o's chain is kept to refuse
+                // moving a directory into itself.
+                let walk = |fs: &mut dyn FileSystem, comps: &[&[u8]]| -> Result<(Ino, Vec<Ino>), i64> {
+                    let mut cur = ino;
+                    let mut chain = alloc::vec![ino];
+                    for c in comps {
+                        cur = fs.lookup(cur, c).map_err(status)?;
+                        if fs.stat(cur).map_err(status)?.kind != Kind::Dir {
+                            return Err(fp::ERR_NOT_DIR);
+                        }
+                        chain.push(cur);
+                    }
+                    Ok((cur, chain))
+                };
+                let (fp_ino, _) = walk(fs, &from[..from.len() - 1])?;
+                let (tp_ino, chain) = walk(fs, &to[..to.len() - 1])?;
+                let (fl, tl) = (from[from.len() - 1], to[to.len() - 1]);
+                let moved = fs.lookup(fp_ino, fl).map_err(status)?;
+                if chain.contains(&moved) {
+                    return Err(sys::ERR_INVALID_ARGS); // a directory into itself
+                }
+                fs.rename(fp_ino, fl, tp_ino, tl, h.a & fp::RENAME_REPLACE != 0).map_err(status)?;
+                // FAT names a node by its directory entry, which moved: open channels follow it.
+                let now_at = fs.lookup(tp_ino, tl).map_err(status)?;
+                if now_at != moved {
+                    for c in self.conns.iter_mut().flatten() {
+                        if c.vol == vi && c.ino == moved {
+                            c.ino = now_at;
+                        }
+                    }
+                }
+                self.touch(vi, true);
+                Ok(Reply::none())
             }
             fp::READDIR => {
                 need(R_READ)?;
@@ -875,6 +1006,17 @@ fn mount(kind: u64, dev: Box<dyn BlockDev>) -> Result<VolFs, Error> {
     }
 }
 
+/// Take the wall-clock time from the clock service (file times); without it they stay unknown.
+fn use_clock(ch: Handle) {
+    match libd::time::query(ch) {
+        Some(b) => {
+            libd::time::set_base(&b);
+            println!("storaged: file times from the clock service ({})", b.now());
+        }
+        None => println!("storaged: no wall-clock time: file times are left unknown"),
+    }
+}
+
 fn main(s: *const Startup) -> i32 {
     // SAFETY: `s` is the startup block pointer the kernel passed to the entry point.
     if !unsafe { libd::init(s, "storaged") } {
@@ -911,6 +1053,10 @@ fn main(s: *const Startup) -> i32 {
         svc.port.arm(ctl, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
     }
     println!("storaged: running{}", if test { " (test hooks on)" } else { " (read-only: volumes are never written)" });
+    let clock = svc::endpoint(b"clock.time");
+    if clock != 0 {
+        use_clock(clock);
+    }
     loop {
         // Messages the block layer set aside while a disk was coming back.
         let pending: Vec<Pending> = core::mem::take(&mut *svc.pending.borrow_mut());
@@ -933,7 +1079,12 @@ fn main(s: *const Startup) -> i32 {
         }
         if svc.stop {
             let n = svc.sync_all();
-            println!("storaged: shutdown: {} volume(s) durable, stopping", n);
+            let (mut hits, mut misses, mut reqs) = (0, 0, 0);
+            for d in &svc.disks {
+                let s = d.cache.borrow().stats;
+                (hits, misses, reqs) = (hits + s.hits, misses + s.misses, reqs + s.requests);
+            }
+            println!("storaged: shutdown: {} volume(s) durable, stopping (read cache: {} hits, {} misses, {} disk reads)", n, hits, misses, reqs);
             return 0;
         }
     }

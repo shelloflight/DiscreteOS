@@ -119,6 +119,9 @@ impl RawKtimer {
 pub type KtimerFn = extern "C" fn(t: *mut RawKtimer, ctx: *mut c_void);
 
 unsafe extern "C" {
+    // bootinfo.h: the wall-clock time the UEFI loader captured (32-byte record), if any
+    pub fn boot_time_record(out: *mut u8) -> bool;
+
     // spinlock.h
     pub fn spin_lock_irqsave(l: *mut RawSpinlock) -> u64;
     pub fn spin_unlock_irqrestore(l: *mut RawSpinlock, flags: u64);

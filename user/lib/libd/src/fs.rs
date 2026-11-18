@@ -49,7 +49,8 @@ pub const OPEN: u32 = 200;
 pub const READ: u32 = 201;
 /// `a` = offset; payload = data (<= MAX_IO). Reply `a` = bytes written.
 pub const WRITE: u32 = 202;
-/// Reply: `a` = size, `b` = kind | rights << 8.
+/// Reply: `a` = size, `b` = kind | rights << 8; payload = {created i64, modified i64} (D-OS
+/// times, `libd::time`; 0 = unknown).
 pub const STAT: u32 = 203;
 /// `a` = cookie (0 = start). Reply payload = entries {kind u8, len u8, name}; `a` = next cookie,
 /// `b` = 1 when the directory has no more entries.
@@ -70,6 +71,11 @@ pub const SNAPSHOT: u32 = 210;
 pub const SNAPSHOT_OPEN: u32 = 211;
 /// Volume root with R_ADMIN (DFS): payload = name; delete the snapshot and free its space.
 pub const SNAPSHOT_DELETE: u32 = 212;
+/// Directory with R_WRITE: payload = `from\0to`, two paths below this directory (so a move stays
+/// inside what the caller was given). `a` = `RENAME_REPLACE` to replace an existing file `to`;
+/// otherwise an existing `to` is refused (`ERR_EXISTS`). A directory cannot move into itself.
+pub const RENAME: u32 = 213;
+pub const RENAME_REPLACE: u64 = 1;
 /// Test hooks (only when storaged runs with `test`; R_ADMIN): `a` = TEST_*, `b` = argument.
 pub const TEST: u32 = 250;
 
@@ -148,6 +154,9 @@ pub struct Stat {
     pub size: u64,
     pub kind: u64,
     pub rights: u64,
+    /// D-OS times (`libd::time::Time`; 0 = unknown).
+    pub created: i64,
+    pub modified: i64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -235,8 +244,23 @@ impl Node {
     }
 
     pub fn stat(&self) -> Res<Stat> {
-        let (h, _, _) = self.call(STAT, 0, 0, &[], &mut [])?;
-        Ok(Stat { size: h.a, kind: h.b & 0xFF, rights: h.b >> 8 })
+        let mut t = [0u8; 16];
+        let (h, n, _) = self.call(STAT, 0, 0, &[], &mut t)?;
+        let at = |i: usize| if n >= i + 8 { i64::from_le_bytes(t[i..i + 8].try_into().unwrap_or([0; 8])) } else { 0 };
+        Ok(Stat { size: h.a, kind: h.b & 0xFF, rights: h.b >> 8, created: at(0), modified: at(8) })
+    }
+
+    /// Move `from` to `to`, both paths below this directory (R_WRITE). `replace`: an existing
+    /// file `to` is replaced (atomically on DFS); otherwise it is refused (`ERR_EXISTS`).
+    pub fn rename(&self, from: &[u8], to: &[u8], replace: bool) -> Res<()> {
+        let mut p = [0u8; 2 * MAX_PATH + 1];
+        if from.len() > MAX_PATH || to.len() > MAX_PATH {
+            return Err(ERR_BAD_NAME);
+        }
+        p[..from.len()].copy_from_slice(from);
+        p[from.len() + 1..from.len() + 1 + to.len()].copy_from_slice(to);
+        let n = from.len() + 1 + to.len();
+        self.call(RENAME, if replace { RENAME_REPLACE } else { 0 }, 0, &p[..n], &mut []).map(|_| ())
     }
 
     /// Entries from `cookie` on: `f(name, kind)` for each. Returns the next cookie, or None at

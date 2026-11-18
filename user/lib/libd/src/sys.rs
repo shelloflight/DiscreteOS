@@ -73,9 +73,13 @@ pub const TAG_DEVICE: u32 = 7;
 pub const TAG_POWER: u32 = 8;
 pub const TAG_MEASURE: u32 = 9;
 pub const TAG_MANIFEST: u32 = 10;
+/// The KLOG resource (ABI v8): read the kernel log (init; the log service).
+pub const TAG_KLOG: u32 = 11;
+/// The boot-time record (ABI v8): a 32-byte VMO, `BootTime` (UEFI only).
+pub const TAG_BOOT_TIME: u32 = 12;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 8;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -166,8 +170,10 @@ pub mod nr {
     pub const ATTEST: u64 = 62;
     pub const SYSTEM_POWER: u64 = 63;
     pub const MEASURE: u64 = 64;
+    pub const KLOG_READ: u64 = 65;
+    pub const LOG_RECORD: u64 = 66;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 65;
+    pub const COUNT: u64 = 67;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -700,6 +706,91 @@ pub fn measure(res: Handle, digest: &[u8; 32], text: &[u8]) -> i64 {
     sc(nr::MEASURE, u64::from(res), digest.as_ptr() as u64, text.as_ptr() as u64, text.len() as u64, 0, 0)
 }
 pub const MEASURE_TEXT: usize = 52;
+
+/// Log levels (ABI v8): `log_record`; `log_write` is `LOG_INFO`.
+pub const LOG_ERROR: u32 = 0;
+pub const LOG_WARN: u32 = 1;
+pub const LOG_INFO: u32 = 2;
+pub const LOG_DEBUG: u32 = 3;
+
+/// ABI v8: `log_write` with a level.
+pub fn log_record(log: Handle, level: u32, s: &[u8]) -> i64 {
+    sc(nr::LOG_RECORD, u64::from(log), u64::from(level), s.as_ptr() as u64, s.len() as u64, 0, 0)
+}
+
+pub const KLOG_TEXT: usize = 120;
+pub const KLOG_SOURCE: usize = 24;
+pub const KLOG_ORIGIN_KERNEL: u8 = 0;
+pub const KLOG_ORIGIN_PROGRAM: u8 = 1;
+/// `KlogEntry::flags`: the text did not end with a newline.
+pub const KLOG_CONTINUES: u8 = 1;
+
+/// A kernel log record (`struct dos_klog_entry`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct KlogEntry {
+    pub seq: u64,
+    /// Monotonic, since kernel entry.
+    pub time_us: u64,
+    pub level: u8,
+    pub len: u8,
+    pub origin: u8,
+    pub flags: u8,
+    /// Program records: the writing process.
+    pub koid: u32,
+    /// Program records: its name, set by the kernel.
+    pub source: [u8; KLOG_SOURCE],
+    pub text: [u8; KLOG_TEXT],
+    pub reserved: [u8; 8],
+}
+const _: () = assert!(core::mem::size_of::<KlogEntry>() == 176);
+
+impl Default for KlogEntry {
+    fn default() -> Self {
+        KlogEntry { seq: 0, time_us: 0, level: 0, len: 0, origin: 0, flags: 0, koid: 0, source: [0; KLOG_SOURCE], text: [0; KLOG_TEXT], reserved: [0; 8] }
+    }
+}
+
+impl KlogEntry {
+    pub fn text(&self) -> &[u8] {
+        &self.text[..usize::from(self.len).min(KLOG_TEXT)]
+    }
+    pub fn source(&self) -> &[u8] {
+        let n = self.source.iter().position(|&c| c == 0).unwrap_or(KLOG_SOURCE);
+        &self.source[..n]
+    }
+}
+
+/// ABI v8, with the KLOG resource: records with sequence >= `seq` (at most `out.len()`, at
+/// most 64). Kernel addresses in the text read `[kaddr]`.
+pub fn klog_read(res: Handle, seq: u64, out: &mut [KlogEntry]) -> Result<usize, i64> {
+    let r = sc(nr::KLOG_READ, u64::from(res), seq, out.as_mut_ptr() as u64, core::mem::size_of_val(out) as u64, 0, 0);
+    if r < 0 { Err(r) } else { Ok(r as usize) }
+}
+
+/// The boot-time record (`TAG_BOOT_TIME`, `struct dos_boot_time`).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct BootTime {
+    pub magic: u32,
+    /// 1: UEFI GetTime.
+    pub source: u32,
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+    pub pad: u8,
+    pub nanosecond: u32,
+    /// Minutes from UTC; 2047: unspecified.
+    pub time_zone: i16,
+    pub pad2: u16,
+    /// The monotonic clock at that moment (negative: before the kernel started).
+    pub mono_ns: i64,
+}
+const _: () = assert!(core::mem::size_of::<BootTime>() == 32);
+pub const BOOT_TIME_MAGIC: u32 = 0x4D49_5444;
 /// `POWER_OFF` or `POWER_REBOOT` with the POWER resource; returns only on failure.
 pub fn system_power(power: Handle, action: u64) -> i64 {
     sc(nr::SYSTEM_POWER, u64::from(power), action, 0, 0, 0, 0)

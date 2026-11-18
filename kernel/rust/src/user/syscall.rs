@@ -21,7 +21,7 @@ use super::uaccess::{self, Pod};
 use crate::ffi;
 use crate::object::exception::{Action, Regs};
 use crate::object::quota::Limits;
-use crate::object::resource::{KIND_MEASURE, KIND_POWER, KIND_VMEX};
+use crate::object::resource::{KIND_KLOG, KIND_MEASURE, KIND_POWER, KIND_VMEX};
 use crate::object::{Handle, KResult, ObjType, Object, Rights, Status, default_rights, log::MAX_WRITE};
 
 pub mod nr {
@@ -96,7 +96,10 @@ pub mod nr {
     pub const SYSTEM_POWER: u64 = 63;
     // ABI v7: service manager decisions in the measurement log
     pub const MEASURE: u64 = 64;
-    pub const COUNT: u64 = 65;
+    // ABI v8: the log service
+    pub const KLOG_READ: u64 = 65;
+    pub const LOG_RECORD: u64 = 66;
+    pub const COUNT: u64 = 67;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -378,20 +381,65 @@ fn name_str(b: &[u8]) -> &str {
 }
 
 fn log_write(u: &UserThread, lh: u64, ptr: u64, len: u64) -> KResult<i64> {
+    log_record(u, lh, crate::ffi::KLOG_INFO as u64, ptr, len)
+}
+
+/// log_record (ABI v8): `log_write` with a level (0 error .. 3 debug). Every record is attributed
+/// to the calling process by the kernel (its koid and name).
+fn log_record(u: &UserThread, lh: u64, level: u64, ptr: u64, len: u64) -> KResult<i64> {
     let (log, _) = u.proc.get_log(h(lh), Rights::WRITE)?;
-    if len > 64 * 1024 {
+    if len > 64 * 1024 || level > crate::ffi::KLOG_DEBUG as u64 {
         return Err(Status::InvalidArgs);
     }
     uaccess::check(ptr, len)?;
+    let koid = u.proc.header.koid as u32;
+    let name = u.proc.name().as_bytes();
     let mut buf = [0u8; MAX_WRITE];
     let mut done = 0;
     while done < len {
         let n = (len - done).min(MAX_WRITE as u64) as usize;
         uaccess::copy_from_user(&mut buf[..n], ptr + done)?;
-        log.write(&mut buf[..n]);
+        log.write(level as core::ffi::c_int, koid, name, &mut buf[..n]);
         done += n as u64;
     }
     ok(len)
+}
+
+/// Records one `klog_read` returns at most.
+const KLOG_READ_MAX: usize = 64;
+
+/// klog_read (ABI v8): with the KLOG authority (the log service), copy kernel log records with
+/// sequence >= `seq` into `buf` (`struct dos_klog_entry`, 176 bytes each; at most `cap`
+/// bytes, at most 64 records). Returns how many. Kernel addresses in the text are replaced by
+/// `[kaddr]` before anything leaves the kernel. A reader that fell behind gets the oldest record
+/// still kept: the gap in sequence numbers is what it missed.
+fn klog_read(u: &UserThread, rh: u64, seq: u64, buf: u64, cap: u64) -> KResult<i64> {
+    use crate::klog::{self, KlogEntry};
+    let (res, _) = u.proc.get_resource(Handle(rh as u32), Rights::MANAGE)?;
+    if res.kind != KIND_KLOG {
+        return Err(Status::AccessDenied);
+    }
+    const SZ: usize = core::mem::size_of::<KlogEntry>();
+    let max = ((cap as usize) / SZ).min(KLOG_READ_MAX);
+    if max == 0 {
+        return Err(Status::BufferTooSmall);
+    }
+    uaccess::check(buf, (max * SZ) as u64)?;
+    let mut at = seq;
+    let mut n = 0;
+    while n < max {
+        let Some(mut e) = klog::read(at) else { break };
+        at = e.seq + 1;
+        e.len = klog::filter_kernel_addresses(&mut e.text, usize::from(e.len)) as u8;
+        e.text[usize::from(e.len)..].fill(0);
+        e.reserved = [0; 8];
+        // SAFETY: KlogEntry is repr(C) plain data without padding (asserted size, all fields bytes
+        // or naturally aligned integers): viewing it as bytes is sound.
+        let bytes = unsafe { core::slice::from_raw_parts((&raw const e).cast::<u8>(), SZ) };
+        uaccess::copy_to_user(buf + (n * SZ) as u64, bytes)?;
+        n += 1;
+    }
+    ok(n as u64)
 }
 
 fn object_name(u: &UserThread, hv: u64, ptr: u64, len: u64) -> KResult<i64> {
@@ -917,6 +965,8 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
         nr::ATTEST => attest(a[0], a[1], a[2]),
         nr::SYSTEM_POWER => system_power(u, a[0], a[1]),
         nr::MEASURE => measure(u, a[0], a[1], a[2], a[3]),
+        nr::KLOG_READ => klog_read(u, a[0], a[1], a[2], a[3]),
+        nr::LOG_RECORD => log_record(u, a[0], a[1], a[2], a[3]),
         #[cfg(ktest)]
         nr::KTEST_SMAP => {
             // SAFETY: test builds only: makes the kernel fault on purpose (SMAP).

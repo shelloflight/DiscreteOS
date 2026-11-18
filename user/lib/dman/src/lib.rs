@@ -72,6 +72,8 @@ pub enum Policy {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceSel {
     All,
+    /// Every PCI function (`pci`).
+    AllPci,
     /// A PCI class, optionally narrowed to a subclass and programming interface.
     Pci { class: u8, sub: Option<u8>, prog: Option<u8> },
     /// A platform device by name (e.g. `ps2`).
@@ -84,6 +86,7 @@ impl DeviceSel {
     pub fn matches(&self, pci: bool, class: u8, sub: u8, prog: u8, name: &str) -> bool {
         match self {
             DeviceSel::All => true,
+            DeviceSel::AllPci => pci,
             DeviceSel::Pci { class: c, sub: s, prog: p } => {
                 pci && *c == class && s.is_none_or(|s| s == sub) && p.is_none_or(|p| p == prog)
             }
@@ -146,6 +149,8 @@ pub struct Manifest {
     pub description: String,
     pub group: Group,
     pub after: Vec<String>,
+    /// Lowest level of this service's log records the log service keeps (`LEVEL_*`).
+    pub log_level: u8,
     // [provides]
     pub endpoints: Vec<String>,
     pub volumes: bool,
@@ -157,9 +162,19 @@ pub struct Manifest {
     pub namespace: Vec<NsGrant>,
     pub vmex: bool,
     pub power: bool,
+    /// The kernel log reader (the log service).
+    pub kernel_log: bool,
+    /// The boot-time record (wall clock captured by the loader; the clock service).
+    pub boot_time: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
+
+/// Log levels (the kernel's: 0 error .. 3 debug).
+pub const LEVEL_ERROR: u8 = 0;
+pub const LEVEL_WARN: u8 = 1;
+pub const LEVEL_INFO: u8 = 2;
+pub const LEVEL_DEBUG: u8 = 3;
 
 pub const DEFAULT_QUOTA: Quota = Quota { memory: 32 << 20, handles: 512, threads: 16 };
 pub const DEFAULT_RESTART: Restart = Restart { policy: Policy::OnFailure, limit: 3, backoff_ms: 100 };
@@ -202,6 +217,9 @@ fn parse_size(s: &str) -> Option<u64> {
 fn parse_device(s: &str) -> Option<DeviceSel> {
     if s == "all" {
         return Some(DeviceSel::All);
+    }
+    if s == "pci" {
+        return Some(DeviceSel::AllPci);
     }
     if let Some(n) = s.strip_prefix("platform:") {
         return valid_name(n).then(|| DeviceSel::Platform(n.to_string()));
@@ -252,6 +270,7 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("", "description", Want::Str),
     ("", "group", Want::Str),
     ("", "after", Want::Strings),
+    ("", "log-level", Want::Str),
     ("provides", "endpoints", Want::Strings),
     ("provides", "volumes", Want::Bool),
     ("grants", "log", Want::Bool),
@@ -261,6 +280,8 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "namespace", Want::Strings),
     ("grants", "vmex", Want::Bool),
     ("grants", "power", Want::Bool),
+    ("grants", "kernel-log", Want::Bool),
+    ("grants", "boot-time", Want::Bool),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -297,6 +318,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         description: String::new(),
         group: Group::System,
         after: Vec::new(),
+        log_level: LEVEL_INFO,
         endpoints: Vec::new(),
         volumes: false,
         log: false,
@@ -306,6 +328,8 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         namespace: Vec::new(),
         vmex: false,
         power: false,
+        kernel_log: false,
+        boot_time: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -327,6 +351,15 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                 "image" => m.image = s.clone(),
                 "args" => m.args = s.clone(),
                 "description" => m.description = s.clone(),
+                "log-level" => {
+                    m.log_level = match s.as_str() {
+                        "error" => LEVEL_ERROR,
+                        "warn" => LEVEL_WARN,
+                        "info" => LEVEL_INFO,
+                        "debug" => LEVEL_DEBUG,
+                        _ => return Err(invalid("unknown level (error, warn, info, debug)", s)),
+                    }
+                }
                 "group" => {
                     m.group = match s.as_str() {
                         "system" => Group::System,
@@ -351,6 +384,8 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                 "grants.log" => m.log = *b,
                 "grants.vmex" => m.vmex = *b,
                 "grants.power" => m.power = *b,
+                "grants.kernel-log" => m.kernel_log = *b,
+                "grants.boot-time" => m.boot_time = *b,
                 _ => return Err(bad("known")),
             },
             (Want::Bool, v) => return Err(bad(&format!("true or false, not {}", v.type_name()))),
@@ -404,7 +439,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                     }
                     "grants.devices" => {
                         for s in &list {
-                            m.devices.push(parse_device(s).ok_or_else(|| invalid("not a device selector (all, pci:CC[SS[PP]], platform:<name>)", s))?);
+                            m.devices.push(parse_device(s).ok_or_else(|| invalid("not a device selector (all, pci, pci:CC[SS[PP]], platform:<name>)", s))?);
                         }
                     }
                     "grants.programs" => {
@@ -485,6 +520,12 @@ pub fn summary(m: &Manifest) -> String {
     }
     if m.power {
         add("POWER");
+    }
+    if m.kernel_log {
+        add("kernel log");
+    }
+    if m.boot_time {
+        add("boot time");
     }
     if s.is_empty() {
         s.push_str("nothing");

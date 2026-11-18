@@ -44,6 +44,7 @@
  *   KTEST_SERVICES  - the service manager (init runs "services test": manifests embedded and
  *                     signed on disk, refusals, exact grants, quotas, restarts with backoff, storaged
  *                     and devmgr killed and restarted with I/O working again, clean shutdown)
+ *   KTEST_TIME      - the wall-clock time across a reboot (init "time test"; the host boots twice)
  *   KTEST_OBJECTS   - kernel objects, handles, rights, quotas (Rust), and out-of-memory paths
  *                     proven by fault injection (C threads/heap and the whole object layer)
  * KTEST_SELFTEST also covers locks, the clock, timers, the kernel log, threads and blocking
@@ -60,6 +61,7 @@
 #include "rust.h"
 #include "string.h"
 #include "compiler.h"
+#include "klog.h"
 
 const BootInfo *ktest_bootinfo;
 
@@ -99,7 +101,11 @@ const char *ktest_init_args(void)
 #elif defined(KTEST_STORAGE)
     return "storage test";
 #elif defined(KTEST_SERVICES)
+    /* A kernel address in the log: the log service's readers must only ever see it filtered. */
+    klog_info("KTEST services: kernel text at %p (readers of the log see [kaddr])", (void *)ktest_init_args);
     return "services test";
+#elif defined(KTEST_TIME)
+    return "time test";
 #elif defined(KTEST_FUZZ)
     return "run utest fuzz 200000";
 #elif defined(KTEST_ATTEST)
@@ -1234,11 +1240,24 @@ void ktest_run(void)
 #include "ktime.h"
 #include "mm.h"
 #include "rust.h"
+#include "spec.h"
 #include "spinlock.h"
 #include "thread.h"
 #include "wait.h"
 
 static void b_kmalloc32(void *ctx) { (void)ctx; kfree(kmalloc(32)); }
+
+/* The parts of a switch between two processes (a cross-process call makes two): what each costs
+ * on this CPU, to see where a call's time goes. */
+static uint8_t b_fpu_area[16384] __attribute__((aligned(64)));
+static void b_ibpb(void *ctx) { (void)ctx; spec_ibpb(); }
+static void b_cr3(void *ctx)
+{
+    (void)ctx;
+    uint64_t v;
+    __asm__ volatile("mov %%cr3, %0\n\tmov %0, %%cr3" : "=r"(v) : : "memory");   /* drops every non-global TLB entry */
+}
+static void b_fpu(void *ctx) { (void)ctx; fpu_save(b_fpu_area); fpu_restore(b_fpu_area); }
 static void b_kmalloc8k(void *ctx) { (void)ctx; kfree(kmalloc(8192)); }
 static void b_pmm(void *ctx) { (void)ctx; pmm_free(pmm_alloc()); }
 static void b_time(void *ctx) { *(volatile uint64_t *)ctx = time_ns(); }
@@ -1313,6 +1332,18 @@ void ktest_run(void)
 #endif
 
     bench_run("kmutex lock+unlock (uncontended)", b_mutex, NULL, 20000);
+    /* A process switch: CR3 (with the TLB refills after it), the user FPU state, and IBPB where
+     * the mitigation is on. Each cross-process call does two switches. */
+    bench_run("switch part: CR3 reload (non-global TLB flush)", b_cr3, NULL, 20000);
+    if (cpu.fpu_size <= sizeof(b_fpu_area)) {
+        char what[96];
+        ksnprintf(what, sizeof(what), "switch part: FPU state save+restore (%u bytes)", cpu.fpu_size);
+        bench_run(what, b_fpu, NULL, 20000);
+    }
+    if (spec.mitig & MIT_IBPB)
+        bench_run("switch part: IBPB (between processes)", b_ibpb, NULL, 20000);
+    else
+        kprintf("BENCH switch part: IBPB (between processes): off on this CPU\n");
     partner_stop = 0;
     struct thread *y = thread_create("bench.yield", yielder, NULL, THREAD_PRIO_NORMAL);
     bench_run("thread_yield round trip (2 context switches)", b_yield, NULL, 20000);
@@ -2238,7 +2269,8 @@ void ktest_after_init(int code)
     kprintf("KTEST drivers: %s\n", same && code == 0 ? "PASSED" : "FAILED");
 }
 
-#elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES)
+#elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES) || \
+    defined(KTEST_TIME)
 
 /* Ring-3 tests: init runs utest (ktest_init_args); nothing to do in the kernel first. */
 void ktest_run(void) {}

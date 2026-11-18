@@ -88,6 +88,20 @@ typedef struct {
     void *table;
 } efi_configuration_table;
 
+/* EFI_TIME and the start of EFI_RUNTIME_SERVICES (only GetTime is used, before ExitBootServices). */
+typedef struct {
+    uint16_t year;          /* 1900 - 9999 */
+    uint8_t  month, day, hour, minute, second, pad1;
+    uint32_t nanosecond;
+    int16_t  time_zone;     /* minutes from UTC, or 2047: unspecified (local time) */
+    uint8_t  daylight, pad2;
+} efi_time;
+
+typedef struct {
+    efi_table_header hdr;
+    efi_status (*get_time)(efi_time *time, void *capabilities);
+} efi_runtime_services;
+
 typedef struct {
     efi_table_header hdr;
     char16 *firmware_vendor;
@@ -98,7 +112,7 @@ typedef struct {
     efi_text_output *con_out;
     efi_handle std_err_handle;
     efi_text_output *std_err;
-    void *runtime_services;
+    efi_runtime_services *runtime_services;
     efi_boot_services *boot_services;
     uint64_t table_count;
     efi_configuration_table *tables;

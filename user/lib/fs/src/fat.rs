@@ -25,8 +25,6 @@ const ATTR_DIR: u8 = 0x10;
 const ATTR_ARCHIVE: u8 = 0x20;
 const ATTR_LFN: u8 = 0x0F;
 const MIN_CLUSTERS: u64 = 65525;
-/// 2026-01-01 00:00 (no wall clock yet: every timestamp is this date).
-const DATE: u16 = ((2026 - 1980) << 9) | (1 << 5) | 1;
 const ROOT: Ino = 0;
 
 pub struct Fat<D: BlockDev> {
@@ -44,6 +42,8 @@ pub struct Fat<D: BlockDev> {
     free: u32,
     hint: u32,
     dcache: BTreeMap<u64, [u8; SECTOR]>,
+    /// The wall-clock time (D-OS time) new and written entries get; 0: unknown (FAT date 0).
+    now: i64,
 }
 
 fn le16(b: &[u8], o: usize) -> u16 {
@@ -305,6 +305,7 @@ impl<D: BlockDev> Fat<D> {
             free,
             hint: 2,
             dcache: BTreeMap::new(),
+            now: 0,
         })
     }
 
@@ -575,13 +576,17 @@ impl<D: BlockDev> Fat<D> {
         self.dev.write(l, &z)
     }
 
-    fn short_entry(name: &[u8; 11], attr: u8, cluster: u32, size: u32) -> [u8; 32] {
+    fn short_entry(name: &[u8; 11], attr: u8, cluster: u32, size: u32, now: i64) -> [u8; 32] {
         let mut e = [0u8; 32];
         e[..11].copy_from_slice(name);
         e[11] = attr;
-        e[16..18].copy_from_slice(&DATE.to_le_bytes());
-        e[18..20].copy_from_slice(&DATE.to_le_bytes());
-        e[24..26].copy_from_slice(&DATE.to_le_bytes());
+        if let Some((date, time)) = crate::time::to_fat(now) {
+            e[14..16].copy_from_slice(&time.to_le_bytes()); // created
+            e[16..18].copy_from_slice(&date.to_le_bytes());
+            e[18..20].copy_from_slice(&date.to_le_bytes()); // last access (date only)
+            e[22..24].copy_from_slice(&time.to_le_bytes()); // last write
+            e[24..26].copy_from_slice(&date.to_le_bytes());
+        }
         e[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
         e[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
         e[28..32].copy_from_slice(&size.to_le_bytes());
@@ -687,24 +692,29 @@ impl<D: BlockDev> Fat<D> {
     }
 }
 
-impl<D: BlockDev> FileSystem for Fat<D> {
-    fn root(&self) -> Ino {
-        ROOT
+impl<D: BlockDev> Fat<D> {
+    /// Record the current time as an entry's last write (and access) time. False if unknown.
+    fn stamp(&self, e: &mut [u8; 32]) -> bool {
+        let Some((date, time)) = crate::time::to_fat(self.now) else { return false };
+        e[18..20].copy_from_slice(&date.to_le_bytes());
+        e[22..24].copy_from_slice(&time.to_le_bytes());
+        e[24..26].copy_from_slice(&date.to_le_bytes());
+        true
     }
 
-    fn lookup(&mut self, dir: Ino, name: &[u8]) -> Result<Ino> {
-        let (secs, f) = self.find(dir, name)?;
-        Ok(Self::slot_ino(&secs, f.slot))
-    }
-
-    fn create(&mut self, dir: Ino, name: &[u8], kind: Kind) -> Result<Ino> {
-        let u = fat_name(name)?;
-        match self.find(dir, name) {
-            Ok(_) => return Err(Error::Exists),
-            Err(Error::NotFound) => {}
-            Err(e) => return Err(e),
+    fn remove_slots(&mut self, secs: &[u64], first: usize, last: usize) -> Result<()> {
+        for s in first..=last {
+            let mut e = self.slot(secs, s)?;
+            e[0] = 0xE5;
+            self.write_slot(secs, s, &e)?;
         }
-        let first = self.dir_cluster(dir)?;
+        Ok(())
+    }
+
+    /// Write a new directory entry named `name` (`u`: its UTF-16 form) in the directory whose
+    /// first cluster is `first`: long-name entries if needed and the short entry, which is
+    /// `tmpl` with the short name filled in. Returns the new entry's node.
+    fn insert_entry(&mut self, first: u32, name: &[u8], u: &[u16], tmpl: &[u8; 32]) -> Result<Ino> {
         let mut secs = self.dir_sectors(first)?;
         // Short names in use, to pick a unique one.
         let mut shorts = BTreeSet::new();
@@ -760,22 +770,6 @@ impl<D: BlockDev> FileSystem for Fat<D> {
             self.set(last, c);
             secs = self.dir_sectors(first)?;
         };
-        let cluster = match kind {
-            Kind::Dir => {
-                let c = self.alloc()?;
-                self.zero_cluster(c)?;
-                let mut s = [0u8; SECTOR];
-                let dot = Self::short_entry(b".          ", ATTR_DIR, c, 0);
-                let parent = if dir == ROOT { 0 } else { first };
-                let dotdot = Self::short_entry(b"..         ", ATTR_DIR, parent, 0);
-                s[..32].copy_from_slice(&dot);
-                s[32..64].copy_from_slice(&dotdot);
-                let l = self.lba(c);
-                self.put_sector(l, &s)?;
-                c
-            }
-            Kind::File => 0,
-        };
         let sum = lfn_sum(&short);
         for i in 0..nlfn {
             let ord = (nlfn - i) as u8;
@@ -794,16 +788,142 @@ impl<D: BlockDev> FileSystem for Fat<D> {
             }
             self.write_slot(&secs, at + i, &e)?;
         }
-        let attr = if kind == Kind::Dir { ATTR_DIR } else { ATTR_ARCHIVE };
-        let e = Self::short_entry(&short, attr, cluster, 0);
+        let mut e = *tmpl;
+        e[..11].copy_from_slice(&short);
         self.write_slot(&secs, at + nlfn, &e)?;
-        self.flush_fat()?;
         Ok(Self::slot_ino(&secs, at + nlfn))
+    }
+}
+
+impl<D: BlockDev> FileSystem for Fat<D> {
+    fn root(&self) -> Ino {
+        ROOT
+    }
+
+    fn lookup(&mut self, dir: Ino, name: &[u8]) -> Result<Ino> {
+        let (secs, f) = self.find(dir, name)?;
+        Ok(Self::slot_ino(&secs, f.slot))
+    }
+
+    fn create(&mut self, dir: Ino, name: &[u8], kind: Kind) -> Result<Ino> {
+        let u = fat_name(name)?;
+        match self.find(dir, name) {
+            Ok(_) => return Err(Error::Exists),
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        let first = self.dir_cluster(dir)?;
+        let cluster = match kind {
+            Kind::Dir => {
+                let c = self.alloc()?;
+                self.zero_cluster(c)?;
+                let mut s = [0u8; SECTOR];
+                let dot = Self::short_entry(b".          ", ATTR_DIR, c, 0, self.now);
+                let parent = if dir == ROOT { 0 } else { first };
+                let dotdot = Self::short_entry(b"..         ", ATTR_DIR, parent, 0, self.now);
+                s[..32].copy_from_slice(&dot);
+                s[32..64].copy_from_slice(&dotdot);
+                let l = self.lba(c);
+                self.put_sector(l, &s)?;
+                c
+            }
+            Kind::File => 0,
+        };
+        let attr = if kind == Kind::Dir { ATTR_DIR } else { ATTR_ARCHIVE };
+        let tmpl = Self::short_entry(&[b' '; 11], attr, cluster, 0, self.now);
+        match self.insert_entry(first, name, &u, &tmpl) {
+            Ok(ino) => {
+                self.flush_fat()?;
+                Ok(ino)
+            }
+            Err(e) => {
+                if cluster != 0 {
+                    self.free_chain(cluster)?;
+                }
+                Err(e)
+            }
+        }
     }
 
     fn stat(&mut self, ino: Ino) -> Result<Stat> {
         let (kind, _, size) = self.node(ino)?;
-        Ok(Stat { kind, size })
+        let (created, modified) = if ino == ROOT {
+            (0, 0)
+        } else {
+            let e = self.dirent(ino)?;
+            (crate::time::from_fat(le16(&e, 16), le16(&e, 14)), crate::time::from_fat(le16(&e, 24), le16(&e, 22)))
+        };
+        Ok(Stat { kind, size, created, modified })
+    }
+
+    fn set_time(&mut self, now: i64) {
+        self.now = now;
+    }
+
+    /// The new name's entries are written before the old ones are removed: after a power cut
+    /// in between, both names lead to the same data (never neither); a replaced file's clusters
+    /// are freed last.
+    fn rename(&mut self, from_dir: Ino, from: &[u8], to_dir: Ino, to: &[u8], replace: bool) -> Result<()> {
+        let u = fat_name(to)?;
+        let (src_secs, src) = self.find(from_dir, from)?;
+        let src_ino = Self::slot_ino(&src_secs, src.slot);
+        let to_first = self.dir_cluster(to_dir)?;
+        let from_first = self.dir_cluster(from_dir)?;
+        let mut replaced: Option<u32> = None;
+        let mut case_only = false;
+        match self.find(to_dir, to) {
+            // The same entry (a change of case, or the same name): rewrite it under the new name.
+            Ok((secs, d)) if Self::slot_ino(&secs, d.slot) == src_ino => case_only = true,
+            Ok((secs, d)) => {
+                if !replace {
+                    return Err(Error::Exists);
+                }
+                if d.kind() == Kind::Dir || src.kind() == Kind::Dir {
+                    return Err(if d.kind() == Kind::Dir { Error::IsDir } else { Error::NotDir });
+                }
+                // Take the old target's name away (its clusters are freed at the end).
+                for s in d.first_slot..=d.slot {
+                    let mut e = self.slot(&secs, s)?;
+                    e[0] = 0xE5;
+                    self.write_slot(&secs, s, &e)?;
+                }
+                replaced = Some(Self::first_cluster(&d.short));
+            }
+            Err(Error::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        let mut tmpl = src.short;
+        tmpl[12] = 0; // case flags belonged to the old short name
+        if let Some((date, _)) = crate::time::to_fat(self.now) {
+            tmpl[18..20].copy_from_slice(&date.to_le_bytes());
+        }
+        if case_only {
+            // Only the case changes: the old entries go first (their short name may be reused).
+            self.remove_slots(&src_secs, src.first_slot, src.slot)?;
+            self.insert_entry(to_first, to, &u, &tmpl)?;
+        } else {
+            self.insert_entry(to_first, to, &u, &tmpl)?;
+            let (secs, now_src) = self.find(from_dir, from)?;
+            self.remove_slots(&secs, now_src.first_slot, now_src.slot)?;
+        }
+        // A directory that moved: its .. names the new parent.
+        let first = Self::first_cluster(&src.short);
+        if src.kind() == Kind::Dir && from_first != to_first && first != 0 {
+            let l = self.lba(first);
+            let mut s = self.sector(l)?;
+            if &s[32..43] == b"..         " {
+                let p = if to_dir == ROOT { 0 } else { to_first };
+                s[32 + 20..32 + 22].copy_from_slice(&((p >> 16) as u16).to_le_bytes());
+                s[32 + 26..32 + 28].copy_from_slice(&(p as u16).to_le_bytes());
+                self.put_sector(l, &s)?;
+            }
+        }
+        if let Some(c) = replaced
+            && c != 0
+        {
+            self.free_chain(c)?;
+        }
+        self.flush_fat()
     }
 
     fn read(&mut self, ino: Ino, off: u64, buf: &mut [u8]) -> Result<usize> {
@@ -845,8 +965,11 @@ impl<D: BlockDev> FileSystem for Fat<D> {
             self.zero_range(&chain, size, off)?;
         }
         self.chain_io(&chain, off, &mut [], Some(data))?;
+        let stamped = self.stamp(&mut e);
         if end > size {
             e[28..32].copy_from_slice(&(end as u32).to_le_bytes());
+        }
+        if end > size || stamped {
             self.put_dirent(ino, &e)?;
         }
         self.flush_fat()?;
@@ -862,6 +985,7 @@ impl<D: BlockDev> FileSystem for Fat<D> {
             return Err(Error::IsDir);
         }
         let old = u64::from(le32(&e, 28));
+        self.stamp(&mut e);
         if size > old {
             if size > 0xFFFF_FFFF {
                 return Err(Error::TooBig);
@@ -964,6 +1088,116 @@ mod tests {
         let mut d = MemDev::new(80 * 2048); // 40 MiB
         format(&mut d, &Format { label: b"TEST", serial: 1, hidden: 0 }).unwrap();
         Fat::mount(d).unwrap()
+    }
+
+    #[test]
+    fn rename_and_times() {
+        let mut f = fresh();
+        let r = f.root();
+        let t = crate::time::from_civil(2026, 11, 18, 10, 20, 30);
+        f.set_time(t);
+        let a = f.create(r, b"Docs", Kind::Dir).unwrap();
+        let b = f.create(r, b"Archive", Kind::Dir).unwrap();
+        let x = f.create(a, b"report draft.txt", Kind::File).unwrap();
+        f.write(x, 0, b"contents").unwrap();
+        let st = f.stat(x).unwrap();
+        assert_eq!((st.created, st.modified), (t, t));
+        f.set_time(t + 60_000_000_000);
+        f.write(x, 8, b"!").unwrap();
+        assert_eq!(f.stat(x).unwrap().modified, t + 60_000_000_000);
+        // Across directories, with a long name; the old name is gone.
+        f.rename(a, b"report draft.txt", b, b"Final report.txt", false).unwrap();
+        assert_eq!(f.lookup(a, b"report draft.txt"), Err(Error::NotFound));
+        let y = f.lookup(b, b"final REPORT.txt").unwrap();
+        let mut buf = [0u8; 9];
+        f.read(y, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"contents!");
+        assert_eq!(f.stat(y).unwrap().created, t);
+        // A change of case only.
+        f.rename(b, b"final report.txt", b, b"FINAL REPORT.TXT", false).unwrap();
+        let (names, _) = f.readdir(b, 0, 10).unwrap();
+        assert_eq!(names.iter().map(|e| e.name.as_slice()).collect::<Vec<_>>(), [&b"FINAL REPORT.TXT"[..]]);
+        // Existing names: refused unless replacing a file.
+        let z = f.create(b, b"old.txt", Kind::File).unwrap();
+        f.write(z, 0, &[7u8; 20000]).unwrap();
+        let free = f.info().free_blocks;
+        assert_eq!(f.rename(b, b"FINAL REPORT.TXT", b, b"old.txt", false), Err(Error::Exists));
+        f.rename(b, b"FINAL REPORT.TXT", b, b"old.txt", true).unwrap();
+        assert!(f.info().free_blocks > free); // the replaced file's clusters are free
+        let o = f.lookup(b, b"old.txt").unwrap();
+        f.read(o, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"contents!");
+        // A directory moved into another: its .. follows.
+        f.rename(r, b"Archive", a, b"Archive", false).unwrap();
+        f.sync().unwrap();
+        let mut f = Fat::mount(f.dev).unwrap();
+        let r = f.root();
+        let a = f.lookup(r, b"Docs").unwrap();
+        let b = f.lookup(a, b"Archive").unwrap();
+        assert!(f.lookup(b, b"old.txt").is_ok());
+        let bc = f.dir_cluster(b).unwrap();
+        let s = f.sector(f.lba(bc)).unwrap();
+        assert_eq!(Fat::<MemDev>::first_cluster(&s[32..64]), f.dir_cluster(a).unwrap());
+    }
+
+    /// A rename cut at every sector: the file keeps at least one of its names, intact, and the
+    /// tables stay readable (FAT has no transactions: both names may survive, pointing at the same
+    /// clusters, never neither).
+    #[test]
+    fn rename_power_cut_sweep() {
+        use crate::dev::{CutDev, SharedCut};
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+        let cut = Rc::new(RefCell::new(CutDev::new(MemDev::new(80 * 2048))));
+        {
+            let mut d = SharedCut(cut.clone());
+            format(&mut d, &Format { label: b"CUT", serial: 2, hidden: 0 }).unwrap();
+            let mut f = Fat::mount(SharedCut(cut.clone())).unwrap();
+            let r = f.root();
+            let a = f.create(r, b"from", Kind::Dir).unwrap();
+            f.create(r, b"to", Kind::Dir).unwrap();
+            let x = f.create(a, b"a long document name.txt", Kind::File).unwrap();
+            f.write(x, 0, &[0x5A; 6000]).unwrap();
+            f.sync().unwrap();
+        }
+        let base = cut.borrow().inner.data.clone();
+        let w0 = cut.borrow().writes;
+        {
+            let mut f = Fat::mount(SharedCut(cut.clone())).unwrap();
+            let r = f.root();
+            let (a, b) = (f.lookup(r, b"from").unwrap(), f.lookup(r, b"to").unwrap());
+            f.rename(a, b"a long document name.txt", b, b"renamed document.txt", false).unwrap();
+            f.sync().unwrap();
+        }
+        let total = cut.borrow().writes - w0;
+        let mut both = 0;
+        for n in 0..=total {
+            {
+                let mut c = cut.borrow_mut();
+                c.inner.data.copy_from_slice(&base);
+                c.restore();
+                c.arm(n, 77 + n);
+            }
+            if let Ok(mut f) = Fat::mount(SharedCut(cut.clone())) {
+                let r = f.root();
+                let (a, b) = (f.lookup(r, b"from").unwrap(), f.lookup(r, b"to").unwrap());
+                let _ = f.rename(a, b"a long document name.txt", b, b"renamed document.txt", false).and_then(|_| f.sync());
+            }
+            cut.borrow_mut().restore();
+            let mut f = Fat::mount(SharedCut(cut.clone())).unwrap();
+            let r = f.root();
+            let (a, b) = (f.lookup(r, b"from").unwrap(), f.lookup(r, b"to").unwrap());
+            let old = f.lookup(a, b"a long document name.txt").ok();
+            let new = f.lookup(b, b"renamed document.txt").ok();
+            assert!(old.is_some() || new.is_some(), "cut after {} writes: the file has no name", n);
+            both += usize::from(old.is_some() && new.is_some());
+            for x in [old, new].into_iter().flatten() {
+                let mut g = vec![0u8; 6000];
+                assert_eq!(f.read(x, 0, &mut g).unwrap(), 6000);
+                assert!(g.iter().all(|&c| c == 0x5A), "cut after {} writes: content", n);
+            }
+        }
+        std::println!("fat rename power cut sweep: {} cut points, never nameless ({} left both names)", total + 1, both);
     }
 
     #[test]

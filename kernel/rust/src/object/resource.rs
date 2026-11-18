@@ -4,7 +4,9 @@
 //!   user-space program loaders need (D-CMPL's PE loader, later the `.dlib` loader);
 //! - `POWER` (ABI v6): the right to switch the machine off or reset it (`system_power`);
 //! - `MEASURE` (ABI v7): the right to record a decision in the measurement log (PCR 10,
-//!   `measure`): the service manager records each manifest it accepts or refuses.
+//!   `measure`): the service manager records each manifest it accepts or refuses;
+//! - `KLOG` (ABI v8): the right to read the kernel log (`klog_read`; kernel addresses filtered),
+//!   which the service manager grants to the log service.
 //!
 //! The kernel gives them to `init` only; init passes them on deliberately.
 
@@ -13,6 +15,7 @@ use super::{Header, KRef, KResult, ObjType, Status};
 pub const KIND_VMEX: u32 = 1;
 pub const KIND_POWER: u32 = 2;
 pub const KIND_MEASURE: u32 = 3;
+pub const KIND_KLOG: u32 = 4;
 
 pub struct ResourceObj {
     pub header: Header,

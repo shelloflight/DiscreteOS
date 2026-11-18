@@ -11,6 +11,7 @@ volumes = true          # announces the volumes it mounts
 
 [grants]
 log = true
+connect = ["clock.time"]   # file times
 
 [quota]
 memory = "96M"
