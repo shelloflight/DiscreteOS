@@ -422,7 +422,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
     if m.storage != 0 {
         proto::send(m.storage, fs::DISKS_SETTLED, u64::from(m.disks), 0);
     }
-    println!("devmgr: running (drivers are restarted when they fail); type in the QEMU window, Enter ends a line");
+    println!("devmgr: running (drivers are restarted when they fail); typed lines are echoed (Enter ends a line)");
     loop {
         m.pump(sys::WAIT_FOREVER);
     }

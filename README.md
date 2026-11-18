@@ -20,7 +20,8 @@ measured**. Where standards cost nothing, D-OS uses them: ELF, UEFI, ACPI, GPT, 
 
 ## Where it stands
 
-**D-KRNL 0.13.8.** It boots in QEMU and on real PCs (BIOS and UEFI) to user space. There is no
+**D-KRNL 1.0.** The kernel is complete (stable SMP, a versioned ABI, every protection proven by a
+test, fuzzers and sanitizers clean). It boots in QEMU and on real PCs (BIOS and UEFI) to user space. There is no
 shell or GUI yet.
 
 - Own BIOS and UEFI loaders with verified boot (Ed25519) and KASLR; one GPT image for both

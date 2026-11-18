@@ -3,7 +3,7 @@
 # no_std, vendored, MIT/Apache/BSD/Zlib licensed, and checked with cargo-deny + cargo-vet.
 [package]
 name = "dkrnl"
-version = "0.13.8"
+version = "1.0.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 publish = false

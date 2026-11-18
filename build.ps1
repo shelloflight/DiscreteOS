@@ -192,7 +192,7 @@ function Get-ManyDeviceArgs([int]$Count) {
     return ,$a
 }
 
-$KernelStages = @('D-KRNL 0.', 'BootInfo OK',
+$KernelStages = @('D-KRNL 1.', 'BootInfo OK',
                 'GDT/TSS/IDT loaded', 'PMM:', 'VMM: kernel W^X', 'NULL page unmapped', 'KASLR: image 17 bits, direct map', 'Heap:', 'Speculation: Meltdown ', 'Speculation: MDS/TAA ',
                 'APIC timer:', 'Interrupts enabled, timer OK', 'Scheduler: preemptive', 'SMP: ', 'Rust: dkrnl', 'Objects: handles',
                 'PCI: ECAM at', 'IOMMU: DMA remapping on for every device', 'Devices: ', 'Verified boot: kernel signature valid (Ed25519', 'Measured boot: PCR 8 = kernel', 'Summary: ', 'Summary: KASLR image 17 bits', 'Summary: KPTI ',
@@ -343,8 +343,8 @@ $TestCases = [ordered]@{
                      Forbid = @('KERNEL PANIC', 'cannot start init', 'left out', 'FAIL', 'not used: the limit') }
     'storage-host' = @{ Host = 'Test-DosfsHost' }
     'crypto-host' = @{ Host = 'Test-CryptoHost' }
-    'uefi-badsig' = @{ Define = $null;       Uefi = $true; Tamper = $true; Timeout = 60; Expect = @('D-OS: UEFI loader', 'D-OS: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 0.', 'kernel signature valid') }
-    'bios-badsig' = @{ Define = $null;       Tamper = $true; Expect = @('D-OS: stage2 OK', 'D-OS: stage3: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 0.', 'kernel signature valid') }
+    'uefi-badsig' = @{ Define = $null;       Uefi = $true; Tamper = $true; Timeout = 60; Expect = @('D-OS: UEFI loader', 'D-OS: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 1.', 'kernel signature valid') }
+    'bios-badsig' = @{ Define = $null;       Tamper = $true; Expect = @('D-OS: stage2 OK', 'D-OS: stage3: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 1.', 'kernel signature valid') }
     kaslr       = @{ Define = 'KASLR';       Expect = @('D-OS: stage3: kernel relocated (KASLR', 'KTEST kaslr: layout image 0xffffff', 'KTEST kaslr: PASSED', 'D-KRNL: ready'); Forbid = @('KERNEL PANIC', 'FAIL'); Post = 'Test-KaslrReboots' }
     'kaslr-host' = @{ Host = 'Test-KaslrHost' }
     # Static analysis: clang's analyzer over every C file (kernel in its release and
