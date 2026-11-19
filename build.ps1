@@ -1375,6 +1375,9 @@ function Test-UsbDiskUnchanged([string]$DiskDir, [string]$Image, [string]$Log) {
 function Test-TimeBoots([string]$DiskDir, [string]$Image, [string]$Log, [bool]$Uefi) {
     $log2 = Join-Path (Split-Path $Image -Parent) ("serial-time-second" + $(if ($Uefi) { "-uefi" } else { "" }) + ".log")
     $expect = @('svc-time: second boot: PASSED', 'init: time test: second boot PASSED', 'Power: switching off')
+    # The CMOS clock counts whole seconds: a second boot in the same second as the first would see
+    # the clock stand still, and the check that it moved forward would fail.
+    Start-Sleep -Milliseconds 1100
     $r = Invoke-QemuCapture $Image $log2 $expect @('KERNEL PANIC', 'svc FAIL', 'PANIC', 'FAILED') 180 -Devices -DiskDir $DiskDir -Uefi:$Uefi -MustExit
     $ok = @($expect | Where-Object { -not $r.Log.Contains($_) }).Count -eq 0
     $line = ($r.Log -split "`n" | Where-Object { $_ -match 'svc-time: second boot' } | Select-Object -First 1)
