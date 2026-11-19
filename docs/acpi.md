@@ -101,7 +101,9 @@ bits) and wakes the thread, which:
 
 The thread also runs the **TPM start method** for the TPM driver: firmware TPMs whose ACPI `TPM2`
 table names start method 2 or 8 (AMD's) start each command through the TPM device's `_DSM`
-(MSFT0101, UUID 6BBF6CAB-5463-4714-B7CD-F0203C0368D4, function 1).
+(MSFT0101, UUID 6BBF6CAB-5463-4714-B7CD-F0203C0368D4, function 1). The CRB start register is
+set as well: the `_DSM` only signals the firmware, which clears the register once the response is
+ready.
 
 GPEs listed in a `_PRW` (wake events) are not enabled at run time. Hardware-reduced ACPI (no SCI,
 GPIO events) is not supported yet.

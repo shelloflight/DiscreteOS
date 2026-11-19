@@ -1,6 +1,6 @@
 # Booting D-OS on a real PC
 
-D-OS boots to its kernel and services and shows the boot log. There is no shell yet. This page
+D-OS boots to its kernel and services, then a shell (`log` there shows the whole boot log). This page
 explains how to try it on your own machine safely and what to report.
 
 ## Safety: D-OS never writes your disks
@@ -87,4 +87,4 @@ Open an issue with photos of the boot log, the board model and firmware version,
 
 | Machine | Result |
 |---|---|
-| Gigabyte B650 AORUS ELITE AX, Ryzen 9 9900X, RX 9070, 32 GiB, NVMe; UEFI | boots to user space; verified + measured boot (firmware TPM via TCG2); NVMe read; EFI partition mounted read-only. The kernel drives the firmware TPM through CRB with the ACPI start method (`_DSM`; first hardware run pending) |
+| Gigabyte B650 AORUS ELITE AX, Ryzen 9 9900X, RX 9070, 32 GiB, NVMe; UEFI | boots to user space; verified + measured boot (firmware TPM via TCG2); NVMe read; EFI partition mounted read-only. The kernel drives the firmware TPM through CRB with the ACPI start method (`_DSM`); the first run read a stale response (the start register was not set), fixed, rerun pending. USB: keyboards, a mouse, the boot stick as a disk at SuperSpeed (port 5), USB 2 and USB 3 hubs (0bda:5411, 0bda:0411) |

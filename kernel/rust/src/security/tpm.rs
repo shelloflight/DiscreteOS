@@ -512,7 +512,10 @@ impl Transport for Tis {
 enum CrbStart {
     /// Method 7: the start register.
     Register,
-    /// Method 2: the ACPI `_DSM` only; the firmware TPM has no locality or idle states to drive.
+    /// Method 2: the ACPI `_DSM`; the firmware TPM has no locality or idle states to drive. The
+    /// start register is still set (as Linux does for MSFT0101 devices): the `_DSM` only signals
+    /// the firmware, which runs the command afterwards and clears the register when the response
+    /// is ready. Without it there is nothing to wait for and the response read is stale.
     Acpi,
     /// Method 8: the start register, then the `_DSM`.
     Both,
@@ -595,9 +598,7 @@ impl Transport for Crb {
             self.cmd.w8(i, *b);
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        if self.start != CrbStart::Acpi {
-            c.w32(CRB_CTRL_START, 1);
-        }
+        c.w32(CRB_CTRL_START, 1);
         if self.start != CrbStart::Register {
             crate::dev::acpi::tpm_start().map_err(Error::Protocol)?;
         }
