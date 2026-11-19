@@ -212,6 +212,12 @@ static void set_mode(void)
     }
 }
 
+void lapic_resume_bsp(void)
+{
+    lapic_setup();
+    set_mode();
+}
+
 void timer_init(void)
 {
     KASSERT(ready && tsc_hz);
@@ -372,6 +378,20 @@ void ioapic_reroute(void)
                 kprintf("IOAPIC: %u pin %u could not be remapped: masked\n", ioapics[i].id, pin);
             }
         }
+}
+
+void ioapic_resume(void)
+{
+    uint64_t f = spin_lock_irqsave(&ioapic_lk);
+    for (uint32_t i = 0; i < ioapic_n; i++) {
+        struct ioapic *io = &ioapics[i];
+        for (uint32_t pin = 0; pin < io->count; pin++) {
+            ioapic_write(io, IOAPIC_REDTBL + 2 * pin, LVT_MASKED);
+            ioapic_write(io, IOAPIC_REDTBL + 2 * pin + 1, 0);
+        }
+    }
+    spin_unlock_irqrestore(&ioapic_lk, f);
+    ioapic_reroute();
 }
 
 /* The ids of the I/O APICs in use (for interrupt remapping). */

@@ -358,9 +358,15 @@ fn power(sh: &Shell, what: Option<&str>) -> Res {
     let action = match what {
         Some("off") => sys::POWER_OFF,
         Some("restart" | "reboot") => sys::POWER_REBOOT,
-        _ => return Err(String::from("power: usage: power off | restart")),
+        Some("sleep" | "suspend") => sys::POWER_SUSPEND,
+        _ => return Err(String::from("power: usage: power off | restart | sleep")),
     };
     manager(sh, svc::MGR_POWER, action, &[]).map_err(|e| format!("power: {}", e))?;
-    sh.write(&show::ok_line(if action == sys::POWER_OFF { "switching off: every service stops first" } else { "restarting: every service stops first" }));
+    let msg = match action {
+        sys::POWER_OFF => "switching off: every service stops first",
+        sys::POWER_REBOOT => "restarting: every service stops first",
+        _ => "entering sleep: syncing volumes and quiescing drivers",
+    };
+    sh.write(&show::ok_line(msg));
     Ok(Vec::new())
 }

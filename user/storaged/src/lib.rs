@@ -32,6 +32,7 @@ use core::cell::{Cell, RefCell};
 
 use libd::fs::{self as fp, R_ADMIN, R_ALL, R_READ, R_WRITE};
 use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
+use libd::ring::{IoRing, Sqe};
 use libd::svc;
 use libd::sys::{self, Handle, MsgHandle};
 use libd::{Port, Startup, println};
@@ -75,6 +76,9 @@ struct Pending {
     handle: Handle,
 }
 
+/// Zero-copy shared-memory ring buffer size per disk (256 KiB = 512 sectors per doorbell).
+const RING_DATA_BYTES: u32 = 256 * 1024;
+
 /// A disk served by a driver process, reached over the channel the device manager attached.
 struct Remote {
     name: String,
@@ -84,6 +88,8 @@ struct Remote {
     pending: Rc<RefCell<Vec<Pending>>>,
     req: Vec<u8>,
     rep: Vec<u8>,
+    ring: Option<IoRing>,
+    next_id: u32,
 }
 
 /// Requests queued at a driver at once (a read longer than one request).
@@ -92,6 +98,96 @@ const QUEUE_DEPTH: usize = 4;
 const QTXID: u32 = 0x4000_0000;
 
 impl Remote {
+    /// Negotiate a shared-memory `IoRing` with the driver. Falls back cleanly to channel I/O if
+    /// the driver does not support rings (e.g., USB mass storage).
+    fn setup_ring(&mut self) {
+        self.ring = None;
+        let Ok(ring) = IoRing::create(16, RING_DATA_BYTES) else { return };
+        let Ok(dup) = sys::handle_duplicate(ring.vmo(), sys::RIGHTS_SAME) else { return };
+        let mut req = [0u8; HEADER];
+        Header { txid: 0, op: proto::BLK_RING_SETUP, status: 0, a: 0, b: 0 }.put(&mut req);
+        let hs = [MsgHandle { handle: dup, rights: sys::RIGHTS_SAME }];
+        let mut hbuf = [0 as Handle; 1];
+        if let Ok((n, nh)) = sys::channel_call_h(self.ch, &req, &hs, &mut self.rep, &mut hbuf, 5 * SEC) {
+            for &h in &hbuf[..nh] {
+                sys::handle_close(h);
+            }
+            if Header::get(&self.rep[..n]).is_some_and(|h| h.status == 0) {
+                self.ring = Some(ring);
+            }
+        }
+    }
+
+    /// Zero-copy read or write through the shared ring (up to 256 KiB per doorbell).
+    /// Returns `None` if no ring is attached (caller falls back to channel messages).
+    fn ring_io(&mut self, op: u32, lba: u64, data: Option<&[u8]>, mut out: Option<&mut [u8]>) -> Option<dosfs::Result<()>> {
+        self.ring.as_ref()?;
+        let total_len = data.map_or_else(|| out.as_ref().map_or(0, |o| o.len()), |d| d.len());
+        let max_chunk = RING_DATA_BYTES as usize;
+        let mut off = 0usize;
+        while off < total_len {
+            let chunk_len = (total_len - off).min(max_chunk);
+            let cur_lba = lba + (off / SECTOR) as u64;
+            let cur_sectors = (chunk_len / SECTOR) as u64;
+            let mut ok = false;
+            for attempt in 0..2 {
+                let id = self.next_id.wrapping_add(1);
+                self.next_id = id;
+                {
+                    let ring = self.ring.as_mut()?;
+                    if let Some(d) = data {
+                        let Some(dst) = ring.data_mut(0, chunk_len as u32) else { return Some(Err(Error::Io)) };
+                        dst.copy_from_slice(&d[off..off + chunk_len]);
+                    }
+                    let sqe = Sqe { id, op, a: cur_lba, b: cur_sectors, buf_off: 0, buf_len: chunk_len as u32 };
+                    if !ring.push_sq(sqe) {
+                        return Some(Err(Error::Io));
+                    }
+                }
+                let mut bell = [0u8; HEADER];
+                Header { txid: 0, op: proto::BLK_RING_DOORBELL, status: 0, a: 0, b: 0 }.put(&mut bell);
+                match sys::channel_call(self.ch, &bell, &mut self.rep, 10 * SEC) {
+                    Ok(n) => {
+                        let Some(h) = Header::get(&self.rep[..n as usize]) else { return Some(Err(Error::Io)) };
+                        if h.status != 0 {
+                            return Some(Err(Error::Io));
+                        }
+                        let ring = self.ring.as_ref()?;
+                        let mut found = None;
+                        while let Some(cqe) = ring.pop_cq() {
+                            if cqe.id == id {
+                                found = Some(cqe);
+                                break;
+                            }
+                        }
+                        let Some(cqe) = found else { return Some(Err(Error::Io)) };
+                        if cqe.status != 0 {
+                            return Some(Err(Error::Io));
+                        }
+                        if let Some(ref mut o) = out {
+                            let Some(src) = ring.data(0, chunk_len as u32) else { return Some(Err(Error::Io)) };
+                            o[off..off + chunk_len].copy_from_slice(src);
+                        }
+                        ok = true;
+                        break;
+                    }
+                    Err(sys::ERR_PEER_CLOSED | sys::ERR_BAD_HANDLE | sys::ERR_TIMED_OUT) if attempt == 0 => {
+                        if !self.reconnect() {
+                            return Some(Err(Error::Io));
+                        }
+                        self.ring.as_ref()?;
+                    }
+                    Err(_) => return Some(Err(Error::Io)),
+                }
+            }
+            if !ok {
+                return Some(Err(Error::Io));
+            }
+            off += chunk_len;
+        }
+        Some(Ok(()))
+    }
+
     /// A long read as several requests queued at the driver at once, so it never waits for us
     /// between them. False if anything went wrong: the caller reads again one request at a time
     /// (with the reconnect logic of `call`).
@@ -153,6 +249,7 @@ impl Remote {
                     {
                         sys::handle_close(self.ch);
                         self.ch = handle;
+                        self.setup_ring();
                         println!("storaged: {}: driver back, retrying", self.name);
                         return true;
                     }
@@ -206,6 +303,9 @@ impl BlockDev for Remote {
         if !buf.len().is_multiple_of(SECTOR) || lba.checked_add((buf.len() / SECTOR) as u64).is_none_or(|e| e > self.sectors) {
             return Err(Error::Io);
         }
+        if let Some(res) = self.ring_io(proto::BLK_READ, lba, None, Some(buf)) {
+            return res;
+        }
         if buf.len() > MAX_SECTORS as usize * SECTOR && self.read_queued(lba, buf) {
             return Ok(());
         }
@@ -219,6 +319,9 @@ impl BlockDev for Remote {
     fn write(&mut self, lba: u64, buf: &[u8]) -> dosfs::Result<()> {
         if !buf.len().is_multiple_of(SECTOR) || lba.checked_add((buf.len() / SECTOR) as u64).is_none_or(|e| e > self.sectors) {
             return Err(Error::Io);
+        }
+        if let Some(res) = self.ring_io(proto::BLK_WRITE, lba, Some(buf), None) {
+            return res;
         }
         for (i, c) in buf.chunks(MAX_SECTORS as usize * SECTOR).enumerate() {
             let at = lba + (i as u64) * MAX_SECTORS;
@@ -393,11 +496,12 @@ impl Svc {
             let mut r = d.remote.borrow_mut();
             sys::handle_close(r.ch);
             r.ch = ch;
+            r.setup_ring();
             println!("storaged: {}: reattached", name);
             return;
         }
         let _ = key;
-        let remote = Rc::new(RefCell::new(Remote {
+        let mut rem = Remote {
             name: name.clone(),
             ch,
             sectors,
@@ -405,7 +509,11 @@ impl Svc {
             pending: self.pending.clone(),
             req: vec![0u8; HEADER + MAX_SECTORS as usize * SECTOR],
             rep: vec![0u8; HEADER + MAX_SECTORS as usize * SECTOR],
-        }));
+            ring: None,
+            next_id: 0,
+        };
+        rem.setup_ring();
+        let remote = Rc::new(RefCell::new(rem));
         let cache = Rc::new(RefCell::new(CacheDev::new(RemoteDev(remote.clone()), CACHE_BYTES)));
         self.disks.push(Disk { remote: remote.clone(), cache: cache.clone() });
         if self.rocheck {
@@ -445,11 +553,15 @@ impl Svc {
             };
             let shared: dosfs::dev::Shared = cache.clone();
             let part = Part { disk: shared, start: p.first, len: p.sectors() };
-            let (dev, cut): (Box<dyn BlockDev>, _) = if self.test {
+            // The signed system image partition (`sys`) is always mounted immutable read-only,
+            // even in writable test modes.
+            let immutable_sys = kind == fp::KIND_DFS && p.name == "sys";
+            let vol_writable = self.writable && !immutable_sys;
+            let (dev, cut): (Box<dyn BlockDev>, _) = if !vol_writable {
+                (Box::new(RoDev(part)), None)
+            } else if self.test {
                 let c = Rc::new(RefCell::new(CutDev::new(part)));
                 (Box::new(SharedCut(c.clone())), Some(c))
-            } else if !self.writable {
-                (Box::new(RoDev(part)), None)
             } else {
                 (Box::new(part), None)
             };
@@ -499,13 +611,13 @@ impl Svc {
                 (info.total_blocks * info.block_size) >> 20,
                 (info.free_blocks * info.block_size) >> 20,
                 extra,
-                if self.writable { "" } else { ", read-only" }
+                if vol_writable { "" } else { ", read-only" }
             );
             let vi = self.vols.len();
             let root = v.fs.as_mut().map_or(0, |f| f.fs().root());
             let vname = v.name.clone();
             self.vols.push(v);
-            let rights = if self.writable { R_ALL } else { R_READ };   // read-only: no write or admin rights at all
+            let rights = if vol_writable { R_ALL } else { R_READ };   // read-only: no write or admin rights at all
             match self.add_conn(vi, root, Kind::Dir, rights) {
                 Ok(h) => {
                     let mut m = [0u8; HEADER + 32];

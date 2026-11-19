@@ -454,6 +454,14 @@ bool cpupm_set_policy(enum cpupm_policy p)
     return perf.cpus_ok > 0;
 }
 
+void cpupm_resume(void)
+{
+    if (perf.kind == PERF_NONE)
+        return;
+    struct perf_job j = { .enable = true, .policy = perf.policy };
+    perf_run(&j);
+}
+
 void cpupm_configure(const struct cpupm_desc *d)
 {
     if (d) {

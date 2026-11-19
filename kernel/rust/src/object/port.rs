@@ -140,6 +140,7 @@ impl PortObj {
         let cq_off = sq_off + u64::from(entries) * SQE_SIZE;
         let size = cq_off + 2 * u64::from(entries) * CQE_SIZE;
         let vmo = Vmo::create_named(acct, size, "port")?;
+        vmo.commit_all()?;
         let ring = Vmo::write_ref(&vmo)?;
         vmo.atomic_u32(H_SQ_MASK).store(entries - 1, Ordering::Relaxed);
         vmo.atomic_u32(H_CQ_MASK).store(2 * entries - 1, Ordering::Relaxed);

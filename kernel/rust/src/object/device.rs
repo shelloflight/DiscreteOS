@@ -408,6 +408,25 @@ impl DeviceObj {
                     core::ptr::write_volatile((t + 8) as *mut u32, data);
                     core::ptr::write_volatile((t + 12) as *mut u32, 0); // unmask
                 }
+                // Re-enable MSI-X in PCI config if a device reset or S3 sleep cleared it.
+                if let Some(m) = f.msix {
+                    let c = pci::read(f.bdf, u16::from(m.cap) + 2, 2) as u16;
+                    if c & (1 << 15) == 0 || c & (1 << 14) != 0 {
+                        for e in 0..u64::from(m.count) {
+                            if e != u64::from(i) && (e >= 64 || st.msix_bound & (1 << e) == 0) {
+                                // SAFETY: entry `e` of the mapped MSI-X table.
+                                unsafe { core::ptr::write_volatile((st.msix_table + e * 16 + 12) as *mut u32, 1) };
+                            }
+                        }
+                        if let Some(msi) = f.msi {
+                            let mc = pci::read(f.bdf, u16::from(msi.cap) + 2, 2);
+                            pci::write(f.bdf, u16::from(msi.cap) + 2, 2, mc & !1);
+                        }
+                        let cmd = pci::read(f.bdf, 0x04, 2) as u16;
+                        pci::write(f.bdf, 0x04, 2, u32::from(cmd | pci::CMD_INTX_DISABLE));
+                        pci::write(f.bdf, u16::from(m.cap) + 2, 2, u32::from((c | 1 << 15) & !(1 << 14)));
+                    }
+                }
             }
             (Src::Msi, Kind::Pci(f)) => {
                 let (addr, data) = iommu::msi_message(f.bdf, vector)?;
@@ -514,9 +533,9 @@ impl DeviceObj {
         // A device that writes is a writer: sealed (code) VMOs can never be DMA targets.
         let writer = if dev_write { Some(Vmo::write_ref(&vmo)?) } else { None };
         let pages = len / PAGE;
-        let first = (off / PAGE) as usize;
         addrs.try_reserve_exact(pages as usize).map_err(|_| Status::NoMemory)?;
-        let frames = &vmo.frames()[first..first + pages as usize];
+        let mut frames = Vec::new();
+        vmo.commit_range(off, len, &mut frames)?;
         let iova = if iommu::enabled() {
             let mut st = this.st.lock();
             if st.domain.is_none() {
@@ -530,7 +549,7 @@ impl DeviceObj {
             let at = Self::iova_alloc(&mut st, pages, limit)?;
             let State { domain, iova, .. } = &mut *st;
             let d = domain.as_mut().ok_or(Status::BadState)?;
-            if let Err(e) = iommu::map(d, at, frames, dev_write) {
+            if let Err(e) = iommu::map(d, at, &frames, dev_write) {
                 iova.retain(|&(s, _)| s != at);
                 return Err(e);
             }
@@ -541,7 +560,7 @@ impl DeviceObj {
             at
         } else {
             this.st.lock().pins += 1;
-            addrs.extend_from_slice(frames); // capacity reserved: no IOMMU, physical addresses
+            addrs.extend_from_slice(&frames); // capacity reserved: no IOMMU, physical addresses
             0
         };
         let pin = PinObj {

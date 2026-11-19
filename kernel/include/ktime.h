@@ -28,6 +28,9 @@ void     time_init(void);       /* after tsc_init(): sets up the cycles -> ns co
 uint64_t time_ns(void);
 uint64_t time_us(void);
 uint64_t time_cycles_to_ns(uint64_t cycles);
+void     time_suspend(void);    /* S3: snapshot monotonic clock before TSC resets */
+void     time_resume(void);     /* S3: continue monotonic clock from the new TSC epoch */
+void     time_resume_cpu(void); /* S3: re-program this CPU's LAPIC timer from its timer list */
 
 #include "spinlock.h"
 

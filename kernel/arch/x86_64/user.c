@@ -69,8 +69,18 @@ bool user_copy_fixup_try(struct interrupt_frame *f)
 {
     if (f->vector != 14 || (f->cs & 3) || f->rip != (uint64_t)(uintptr_t)user_copy_fault)
         return false;
-    if (read_cr2() >= USER_TOP)
+    uint64_t cr2 = read_cr2();
+    if (cr2 >= USER_TOP)
         return false;                 /* a kernel address: the caller's check failed; a real bug */
+    /* A not-present fault inside user space with interrupts enabled may be a demand-paged VMO
+     * page: commit and map it so REP MOVSB resumes transparently. */
+    if (!(f->error & 1) && cr2 >= USER_BASE && (f->rflags & (1ull << 9))) {
+        cpu_sti();
+        bool ok = dkrnl_demand_page(cr2, f->error);
+        cpu_cli();
+        if (ok)
+            return true;
+    }
     f->r8 = f->rcx;                   /* bytes left (syscall.asm: user_copy) */
     f->rcx = 0;                       /* the REP MOVSB resumes and stops at once */
     return true;
@@ -114,6 +124,12 @@ void user_fault(struct interrupt_frame *f)
 {
     uint64_t cr2 = read_cr2();        /* before anything can fault again */
     cpu_sti();
+    if (f->vector == 14 && !(f->error & 1) && !(f->error & (1ull << 6)) && cr2 >= USER_BASE && cr2 < USER_TOP) {
+        if (dkrnl_demand_page(cr2, f->error)) {
+            cpu_cli();
+            return;
+        }
+    }
     if (dkrnl_user_exception(f, cr2)) {
         cpu_cli();                    /* the interrupt exit path runs with interrupts off */
         return;

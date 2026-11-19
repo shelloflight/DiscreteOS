@@ -79,6 +79,7 @@ pub struct Vmar {
     base: u64,
     size: u64,
     hint: u64, // offset where `Any` placements start (random for root regions, else 0)
+    is_root: bool,
     aspace: KRef<AddressSpace>,
     inner: SpinLock<Inner>,
 }
@@ -112,15 +113,18 @@ impl Vmar {
         // A 2 MiB-aligned hint that leaves at least 1 TiB above it before wrapping around.
         let slots = (size - (1 << 40)) / (2 << 20);
         let hint = (random() % slots) * (2 << 20);
-        Self::create(USER_BASE, size, hint, aspace)
+        let root = Self::create(USER_BASE, size, hint, true, aspace)?;
+        root.aspace.set_root(KRef::value_addr(&root));
+        Ok(root)
     }
 
-    fn create(base: u64, size: u64, hint: u64, aspace: KRef<AddressSpace>) -> KResult<KRef<Vmar>> {
+    fn create(base: u64, size: u64, hint: u64, is_root: bool, aspace: KRef<AddressSpace>) -> KResult<KRef<Vmar>> {
         KRef::try_new(Vmar {
             header: Header::new(ObjType::Vmar),
             base,
             size,
             hint,
+            is_root,
             aspace,
             inner: SpinLock::new(
                 c"vmar",
@@ -132,6 +136,10 @@ impl Vmar {
             ),
         })
         .map_err(|_| Status::NoMemory)
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.is_root
     }
 
     pub fn base(&self) -> u64 {
@@ -259,6 +267,10 @@ impl Vmar {
         }
         // Taken before the lock: a sealed VMO cannot be mapped writable.
         let writer = if perms.contains(Rights::WRITE) { Some(Vmo::write_ref(&vmo)?) } else { None };
+        // CET shadow stacks are committed and mapped eagerly (never demand-faulted).
+        if extra & ffi::VMM_SHSTK != 0 {
+            vmo.commit_all()?;
+        }
         let mut g = self.inner.lock();
         if g.dead {
             return Err(Status::BadState);
@@ -266,13 +278,43 @@ impl Vmar {
         let (start, pos) = self.place(&g, offset.into(), len)?;
         g.entries.try_reserve(1).map_err(|_| Status::NoMemory)?;
         let first = (vmo_off / PAGE) as usize;
-        let frames = &vmo.frames()[first..first + (len / PAGE) as usize];
+        let pages = (len / PAGE) as usize;
         let uc = match (vmo.is_device(), vmo.is_write_combining()) {
             (true, true) => ffi::VMM_WC,
             (true, false) => ffi::VMM_UC,
             _ => 0,
         };
-        self.aspace.map(start, frames, vmm_flags(perms) | uc | extra)?;
+        let map_flags = vmm_flags(perms) | uc | extra;
+        // Map any pages that are already committed (device BARs, shadow stacks, ports, ELF
+        // code/data); uncommitted RAM pages fault in on demand via `fault`.
+        let mut buf = [0u64; 64];
+        let mut i = 0usize;
+        let mut mapped_end = start;
+        while i < pages {
+            if vmo.frame_at(first + i) == 0 {
+                i += 1;
+                continue;
+            }
+            let run_start = i;
+            let mut n = 0usize;
+            while i < pages && n < buf.len() {
+                let pa = vmo.frame_at(first + i);
+                if pa == 0 {
+                    break;
+                }
+                buf[n] = pa;
+                n += 1;
+                i += 1;
+            }
+            let run_va = start + (run_start as u64) * PAGE;
+            if let Err(e) = self.aspace.map(run_va, &buf[..n], map_flags) {
+                if mapped_end > start {
+                    self.aspace.unmap(start, mapped_end - start);
+                }
+                return Err(e);
+            }
+            mapped_end = run_va + (n as u64) * PAGE;
+        }
         g.entries.insert(
             pos,
             Entry {
@@ -300,7 +342,7 @@ impl Vmar {
         }
         let (start, _) = self.place(&g, at, len)?;
         drop(g);
-        let child = Vmar::create(start, len, 0, self.aspace.clone())?;
+        let child = Vmar::create(start, len, 0, false, self.aspace.clone())?;
         let mut g = self.inner.lock();
         // Re-check: the range may have been taken meanwhile.
         let fits = !g.dead && Self::fits(&g, start, len).is_some();
@@ -395,12 +437,78 @@ impl Vmar {
 
     /// Remove everything (recursively) and refuse further changes (process kill / region destroy).
     pub fn destroy(&self) {
+        let _ = self.destroy_once();
+    }
+
+    /// Like `destroy`, returning `false` if this region was already destroyed.
+    pub fn destroy_once(&self) -> bool {
         let entries = {
             let mut g = self.inner.lock();
+            if g.dead {
+                return false;
+            }
             g.dead = true;
             core::mem::take(&mut g.entries)
         };
         self.release(entries);
+        true
+    }
+
+    /// Remove the destroyed descendant region `target` from its parent without nesting locks.
+    pub fn remove_descendant(&self, target: &KRef<Vmar>) -> bool {
+        let tbase = target.base();
+        let tend = tbase + target.size();
+        let child = {
+            let mut g = self.inner.lock();
+            let pos = g.entries.iter().position(|e| {
+                tbase >= e.start && tend <= e.start + e.len && matches!(e.kind, Kind::Child(_))
+            });
+            let Some(i) = pos else { return false };
+            if let Kind::Child(c) = &g.entries[i].kind {
+                if KRef::ptr_eq(c, target) {
+                    let e = g.entries.remove(i);
+                    drop(g);
+                    drop(e);
+                    return true;
+                }
+                c.clone()
+            } else {
+                return false;
+            }
+        };
+        child.remove_descendant(target)
+    }
+
+    /// Resolve a not-present page fault at `addr` by committing and mapping the backing VMO page.
+    /// Returns `true` if mapped (caller may resume), `false` if unmapped, disallowed, or OOM.
+    pub fn fault(&self, addr: u64, write: bool, exec: bool) -> bool {
+        let child = {
+            let g = self.inner.lock();
+            if g.dead {
+                return false;
+            }
+            let Some(e) = g.entries.iter().find(|e| addr >= e.start && addr < e.start + e.len) else {
+                return false;
+            };
+            match &e.kind {
+                Kind::Mapping { vmo, perms, .. } => {
+                    if (write && !perms.contains(Rights::WRITE))
+                        || (exec && !perms.contains(Rights::EXECUTE))
+                        || vmo.is_device()
+                    {
+                        return false;
+                    }
+                    let page_va = addr & !(PAGE - 1);
+                    let vmo_page = ((e.vmo_off + (page_va - e.start)) / PAGE) as usize;
+                    let Ok(pa) = vmo.ensure_page(vmo_page) else {
+                        return false;
+                    };
+                    return self.aspace.map_page(page_va, pa, vmm_flags(*perms)).is_ok();
+                }
+                Kind::Child(c) => c.clone(),
+            }
+        };
+        child.fault(addr, write, exec)
     }
 
     /// (mappings, child regions) directly in this region.
@@ -459,6 +567,9 @@ impl Drop for Vmar {
     /// A region dropped without being destroyed (its last handle closed): its mappings still
     /// leave the page tables before their VMOs can go.
     fn drop(&mut self) {
+        if self.is_root {
+            self.aspace.clear_root();
+        }
         let entries = core::mem::take(&mut self.inner.lock().entries);
         self.release(entries);
     }

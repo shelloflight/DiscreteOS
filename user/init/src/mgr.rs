@@ -89,7 +89,7 @@ enum OnExit {
 /// An accepted tool manifest: what it says, and its VMO (handed to holders of `grants.tools`).
 pub struct ToolEntry {
     pub t: dman::tool::Tool,
-    vmo: Handle,
+    vmo: Owned,
 }
 
 /// A volume a provider announced: name and a channel to its root with every right.
@@ -109,6 +109,10 @@ pub struct Mgr {
     pub standalone: bool,
     pub refused: u32,
     pub tools: Vec<ToolEntry>,
+    /// Verified read-only program VMOs loaded from the immutable `sys` volume (`/bin`).
+    pub disk_programs: Vec<(String, Owned)>,
+    pub sys_loaded: bool,
+    embedded_seen: Vec<Handle>,
     /// A manager channel asked for the power (`MGR_POWER`): a clean shutdown, then this action.
     pub power_request: Option<u64>,
 }
@@ -179,8 +183,19 @@ impl Mgr {
             standalone: false,
             refused: 0,
             tools: Vec::new(),
+            disk_programs: Vec::new(),
+            sys_loaded: false,
+            embedded_seen: Vec::new(),
             power_request: None,
         })
+    }
+
+    /// Look up a program image by name: embedded bootstrap VMOs first, then verified VMOs from `sys:/bin`.
+    pub fn find_program(&self, name: &str) -> Option<Handle> {
+        if let Some(h) = libd::find_program(name.as_bytes()) {
+            return Some(h);
+        }
+        self.disk_programs.iter().find(|(n, _)| n == name).map(|(_, h)| h.raw())
     }
 
     pub fn find(&self, name: &str) -> Option<usize> {
@@ -210,8 +225,8 @@ impl Mgr {
             self.refuse(source, &digest, &format!("a service named '{}' already exists", m.name));
             return false;
         }
-        if libd::find_program(m.image.as_bytes()).is_none() {
-            self.refuse(source, &digest, &format!("image {} is not an embedded program", m.image));
+        if self.find_program(&m.image).is_none() {
+            self.refuse(source, &digest, &format!("image {} is not available", m.image));
             return false;
         }
         self.svcs.push(Service {
@@ -233,38 +248,59 @@ impl Mgr {
         true
     }
 
-    /// A tool manifest (`kind = "tool"`): accepted if it parses, its image is an embedded program
+    /// A tool manifest (`kind = "tool"`): accepted if it parses, its image is available
     /// and neither its name nor an alias is taken; measured either way.
-    fn offer_tool(&mut self, source: &str, bytes: &[u8], vmo: Handle) {
+    fn offer_tool(&mut self, source: &str, bytes: &[u8], vmo: Owned) -> bool {
         let digest = sha256(bytes);
         let t = match dman::tool::parse(bytes) {
             Ok(t) => t,
-            Err(e) => return self.refuse(source, &digest, &e.to_string()),
+            Err(e) => {
+                self.refuse(source, &digest, &e.to_string());
+                return false;
+            }
         };
-        if libd::find_program(t.image.as_bytes()).is_none() {
-            return self.refuse(source, &digest, &format!("image {} is not an embedded program", t.image));
+        if self.find_program(&t.image).is_none() {
+            self.refuse(source, &digest, &format!("image {} is not available", t.image));
+            return false;
         }
         let names = |x: &dman::tool::Tool| -> Vec<String> { core::iter::once(x.name.clone()).chain(x.aliases.iter().cloned()).collect() };
         let mine = names(&t);
         if let Some(n) = self.tools.iter().flat_map(|e| names(&e.t)).find(|n| mine.contains(n)) {
-            return self.refuse(source, &digest, &format!("the name '{}' is taken by another tool", n));
+            self.refuse(source, &digest, &format!("the name '{}' is taken by another tool", n));
+            return false;
         }
         measure(&digest, &format!("tool {}", t.name));
         println!("init: tool {} accepted ({}): {}", t.name, source, t.usage());
         self.tools.push(ToolEntry { t, vmo });
+        true
     }
 
     /// The embedded manifests (startup tag MANIFEST), of the given groups.
     pub fn load_embedded(&mut self, groups: &[Group]) {
         let hs: Vec<Handle> = libd::startup_handles().filter(|&(_, t)| t == sys::TAG_MANIFEST).map(|(h, _)| h).collect();
         for h in hs {
+            if self.embedded_seen.contains(&h) {
+                continue;
+            }
             let name = object_name(h);
             match vmo_bytes(h, dman::toml::MAX_SIZE) {
-                Some(b) if dman::tool::is_tool(&b) => self.offer_tool(&name, &b, h),
-                Some(b) => {
-                    self.offer(&name, &b, groups);
+                Some(b) if dman::tool::is_tool(&b) => {
+                    self.embedded_seen.push(h);
+                    if let Some(d) = dup(h) {
+                        self.offer_tool(&name, &b, Owned::from_raw(d));
+                    }
                 }
-                None => self.refuse(&name, &[0; 32], "unreadable or larger than 16 KiB"),
+                Some(b) => {
+                    let before = self.refused;
+                    let accepted = self.offer(&name, &b, groups);
+                    if accepted || self.refused > before {
+                        self.embedded_seen.push(h);
+                    }
+                }
+                None => {
+                    self.embedded_seen.push(h);
+                    self.refuse(&name, &[0; 32], "unreadable or larger than 16 KiB");
+                }
             }
         }
     }
@@ -361,7 +397,7 @@ impl Mgr {
     }
 
     fn start(&mut self, i: usize) -> Result<(), String> {
-        let image = libd::find_program(self.svcs[i].m.image.as_bytes()).ok_or("image missing")?;
+        let image = self.find_program(&self.svcs[i].m.image).ok_or("image missing")?;
         let m = self.svcs[i].m.clone();
         let mut hs: Vec<SpawnHandle> = Vec::new();
         let give = |hs: &mut Vec<SpawnHandle>, h: Handle, tag: u32| hs.push(SpawnHandle { handle: h, rights: sys::RIGHTS_SAME, tag, reserved: 0 });
@@ -397,10 +433,10 @@ impl Mgr {
         // The tools: their manifests (read-only) and their program images.
         if m.tools {
             for e in &self.tools {
-                if let Ok(h) = sys::handle_duplicate(e.vmo, sys::RIGHT_READ | sys::RIGHT_TRANSFER) {
+                if let Ok(h) = sys::handle_duplicate(e.vmo.raw(), sys::RIGHT_READ | sys::RIGHT_TRANSFER) {
                     give(&mut hs, h, tool::TAG_TOOL_MANIFEST);
                 }
-                if let Some(h) = libd::find_program(e.t.image.as_bytes()).and_then(dup) {
+                if let Some(h) = self.find_program(&e.t.image).and_then(dup) {
                     give(&mut hs, h, sys::TAG_PROGRAM);
                 }
             }
@@ -437,6 +473,21 @@ impl Mgr {
             if let Some(d) = dup(h) {
                 give(&mut hs, d, tag);
                 ndev += usize::from(tag == sys::TAG_DEVICE);
+            }
+        }
+        // Also grant verified disk programs matching `grants.programs` (not already embedded).
+        if !m.programs.is_empty() {
+            for (n, vmo) in &self.disk_programs {
+                if !m.programs.iter().any(|p| dman::program_matches(p, n)) {
+                    continue;
+                }
+                if hs.len() + 2 + m.connect.len() + m.namespace.len() >= sys_spawn_max() {
+                    left_out += 1;
+                    continue;
+                }
+                if let Some(d) = dup(vmo.raw()) {
+                    give(&mut hs, d, sys::TAG_PROGRAM);
+                }
             }
         }
         if left_out > 0 {
@@ -787,8 +838,13 @@ impl Mgr {
                     _ => refuse(sys::ERR_BAD_STATE, "it is not running"),
                 }
             }
-            svc::MGR_POWER if power && (h.a == sys::POWER_OFF || h.a == sys::POWER_REBOOT) => {
-                println!("init: {} asked to {}", who, if h.a == sys::POWER_OFF { "switch off" } else { "restart the machine" });
+            svc::MGR_POWER if power && matches!(h.a, sys::POWER_OFF | sys::POWER_REBOOT | sys::POWER_SUSPEND) => {
+                let act = match h.a {
+                    sys::POWER_OFF => "switch off",
+                    sys::POWER_REBOOT => "restart the machine",
+                    _ => "suspend the machine",
+                };
+                println!("init: {} asked to {}", who, act);
                 self.power_request = Some(h.a);
                 (0, Vec::new())
             }
@@ -882,7 +938,148 @@ impl Mgr {
         println!("init: shutdown: every service stopped");
     }
 
+    /// Suspend to ACPI S3: sync volumes, stop/quiesce drivers via `devmgr`, enter S3, then
+    /// restart drivers on wake so storage and input recover transparently.
+    pub fn suspend(&mut self, power_res: Handle) -> i64 {
+        for s in self.svcs.iter().filter(|s| s.state == State::Running && s.m.volumes) {
+            println!("init: syncing {}", s.m.name);
+            let mut req = [0u8; HEADER];
+            Header { txid: 0, op: svc::SYNC, status: 0, a: 0, b: 0 }.put(&mut req);
+            let mut rep = [0u8; HEADER];
+            if sys::channel_call(s.ctl.raw(), &req, &mut rep, 10 * SEC).is_err() {
+                println!("init: {} did not confirm its volumes are durable", s.m.name);
+            }
+        }
+        let devmgr_ctl = self
+            .find("devmgr")
+            .filter(|&i| self.svcs[i].state == State::Running)
+            .map(|i| self.svcs[i].ctl.raw())
+            .unwrap_or(0);
+        if devmgr_ctl != 0 {
+            let mut req = [0u8; HEADER];
+            Header { txid: 0, op: svc::SUSPEND, status: 0, a: 0, b: 0 }.put(&mut req);
+            let mut rep = [0u8; HEADER];
+            if sys::channel_call(devmgr_ctl, &req, &mut rep, 15 * SEC).is_err() {
+                println!("init: devmgr did not confirm driver suspend");
+            }
+        }
+        let r = sys::system_power(power_res, sys::POWER_SUSPEND);
+        if devmgr_ctl != 0 {
+            let mut req = [0u8; HEADER];
+            Header { txid: 0, op: svc::RESUME, status: 0, a: 0, b: 0 }.put(&mut req);
+            let mut rep = [0u8; HEADER];
+            if sys::channel_call(devmgr_ctl, &req, &mut rep, 15 * SEC).is_err() {
+                println!("init: devmgr did not confirm driver resume");
+            }
+        }
+        r
+    }
+
     // ---- manifests from disk --------------------------------------------------------------------
+
+    /// Load signed programs (`/bin`), tools (`/tools`) and services (`/services`) from the
+    /// immutable `sys` volume. Every file is verified with its `.dsig` via `vmo_verify` (Ed25519).
+    pub fn load_sys_volume(&mut self, groups: &[Group]) -> u32 {
+        if self.sys_loaded {
+            return 0;
+        }
+        let Some(root) = self.volumes.iter().find(|v| v.name == "sys").and_then(|v| v.root.clone_with(fp::R_READ).ok()) else {
+            return 0;
+        };
+        self.sys_loaded = true;
+        let mut progs = 0u32;
+        if let Ok((dir, _, _)) = root.open(b"bin", fp::O_DIRECTORY, fp::R_READ) {
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            let _ = dir.list(|n, kind| {
+                if kind == fp::KIND_FILE && !n.ends_with(b".dsig") {
+                    names.push(n.to_vec());
+                }
+            });
+            names.sort();
+            for n in names {
+                let file = String::from_utf8_lossy(&n).into_owned();
+                if self.find_program(&file).is_some() {
+                    continue;
+                }
+                let mut sig_name = n.clone();
+                sig_name.extend_from_slice(b".dsig");
+                match load_verified_program(&dir, &n, &sig_name, &file) {
+                    Ok(vmo) => {
+                        self.disk_programs.push((file, vmo));
+                        progs += 1;
+                    }
+                    Err(why) => println!("init: sys:/bin/{} refused: {}", file, why),
+                }
+            }
+        }
+        let mut tools = 0u32;
+        if let Ok((dir, _, _)) = root.open(b"tools", fp::O_DIRECTORY, fp::R_READ) {
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            let _ = dir.list(|n, kind| {
+                if kind == fp::KIND_FILE && n.len() > 5 && n[n.len() - 5..].eq_ignore_ascii_case(b".dman") {
+                    names.push(n.to_vec());
+                }
+            });
+            names.sort();
+            for n in names {
+                let file = String::from_utf8_lossy(&n).into_owned();
+                let source = format!("sys:/tools/{}", file);
+                let mut sig_name = n[..n.len() - 5].to_vec();
+                sig_name.extend_from_slice(b".dsig");
+                let Some(bytes) = read_small(&dir, &n) else {
+                    self.refuse(&source, &[0; 32], "unreadable or larger than 16 KiB");
+                    continue;
+                };
+                let digest = sha256(&bytes);
+                let Some(sig) = read_small(&dir, &sig_name) else {
+                    self.refuse(&source, &digest, "not signed (no .dsig next to it)");
+                    continue;
+                };
+                match verify_signed(&bytes, &sig, &file) {
+                    Ok(vmo) => {
+                        if self.offer_tool(&source, &bytes, vmo) {
+                            tools += 1;
+                        }
+                    }
+                    Err(why) => self.refuse(&source, &digest, &why),
+                }
+            }
+        }
+        let mut svcs = 0u32;
+        if let Ok((dir, _, _)) = root.open(b"services", fp::O_DIRECTORY, fp::R_READ) {
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            let _ = dir.list(|n, kind| {
+                if kind == fp::KIND_FILE && n.len() > 5 && n[n.len() - 5..].eq_ignore_ascii_case(b".dman") {
+                    names.push(n.to_vec());
+                }
+            });
+            names.sort();
+            for n in names {
+                let file = String::from_utf8_lossy(&n).into_owned();
+                let source = format!("sys:/services/{}", file);
+                let mut sig_name = n[..n.len() - 5].to_vec();
+                sig_name.extend_from_slice(b".dsig");
+                let Some(bytes) = read_small(&dir, &n) else {
+                    self.refuse(&source, &[0; 32], "unreadable or larger than 16 KiB");
+                    continue;
+                };
+                let digest = sha256(&bytes);
+                let Some(sig) = read_small(&dir, &sig_name) else {
+                    self.refuse(&source, &digest, "not signed (no .dsig next to it)");
+                    continue;
+                };
+                if let Err(why) = verify_signed(&bytes, &sig, &file) {
+                    self.refuse(&source, &digest, &why);
+                    continue;
+                }
+                if self.offer(&source, &bytes, groups) {
+                    svcs += 1;
+                }
+            }
+        }
+        println!("init: sys volume: {} program(s), {} service(s), {} tool(s) verified (Ed25519)", progs, svcs, tools);
+        svcs + tools
+    }
 
     /// Signed manifests in `DOS/SERVICES` of volume `vol`: `<NAME>.DMAN` with `<NAME>.DSIG` (a
     /// `.dsig` of kind manifest, by the D-OS key, for this name). Anything else is refused.
@@ -900,24 +1097,14 @@ impl Mgr {
         for n in names {
             let file = String::from_utf8_lossy(&n).into_owned();
             let source = format!("{}:/DOS/SERVICES/{}", vol, file);
-            let read = |name: &[u8]| -> Option<Vec<u8>> {
-                let (f, _, size) = dir.open(name, 0, fp::R_READ).ok()?;
-                if size as usize > dman::toml::MAX_SIZE {
-                    return None;
-                }
-                let mut b = alloc::vec![0u8; size as usize];
-                let got = f.read(0, &mut b).ok()?;
-                b.truncate(got);
-                Some(b)
-            };
-            let Some(bytes) = read(&n) else {
+            let Some(bytes) = read_small(&dir, &n) else {
                 self.refuse(&source, &[0; 32], "unreadable or larger than 16 KiB");
                 continue;
             };
             let digest = sha256(&bytes);
             let mut sig_name = n[..n.len() - 5].to_vec();
             sig_name.extend_from_slice(if n[n.len() - 4].is_ascii_uppercase() { b".DSIG" } else { b".dsig" });
-            let Some(sig) = read(&sig_name) else {
+            let Some(sig) = read_small(&dir, &sig_name) else {
                 self.refuse(&source, &digest, "not signed (no .dsig next to it)");
                 continue;
             };
@@ -933,9 +1120,70 @@ impl Mgr {
     }
 }
 
+fn read_small(dir: &Node, name: &[u8]) -> Option<Vec<u8>> {
+    let (f, _, size) = dir.open(name, 0, fp::R_READ).ok()?;
+    if size as usize > dman::toml::MAX_SIZE {
+        return None;
+    }
+    let mut b = alloc::vec![0u8; size as usize];
+    let got = f.read(0, &mut b).ok()?;
+    b.truncate(got);
+    Some(b)
+}
+
+/// Read a signed program from `dir` into a sealed, verified read-only VMO (`vmo_verify`).
+fn load_verified_program(dir: &Node, name: &[u8], sig_name: &[u8], file: &str) -> Result<Owned, String> {
+    use doscrypt::dsig;
+    let sig = read_small(dir, sig_name).ok_or_else(|| String::from("not signed (no .dsig next to it)"))?;
+    if sig.len() != dsig::SIZE {
+        return Err("the .dsig is not a signature".into());
+    }
+    let h = dsig::parse(&sig).map_err(|_| String::from("the .dsig is not a signature"))?;
+    if h.kind != dsig::KIND_PROGRAM && h.kind != dsig::KIND_DRIVER {
+        return Err(format!("the .dsig is not for a program (kind {})", h.kind));
+    }
+    if !h.name_str().eq_ignore_ascii_case(file) {
+        return Err(format!("the .dsig is for '{}', not this file", h.name_str()));
+    }
+    let (f, _, size) = dir.open(name, 0, fp::R_READ).map_err(|e| format!("cannot open: {}", fp::status(e)))?;
+    if size == 0 || size > 16 << 20 {
+        return Err("invalid program size".into());
+    }
+    let v = Owned::from_raw(sys::vmo_create(size).map_err(|e| format!("no memory: {}", sys::status(e)))?);
+    let mut buf = alloc::vec![0u8; fp::MAX_IO];
+    let mut off = 0u64;
+    while off < size {
+        let want = ((size - off) as usize).min(buf.len());
+        let got = f.read(off, &mut buf[..want]).map_err(|e| format!("read failed: {}", fp::status(e)))?;
+        if got == 0 {
+            return Err("unexpected end of file".into());
+        }
+        if sys::vmo_write(v.raw(), off, &buf[..got]) != 0 {
+            return Err("cannot write VMO".into());
+        }
+        off += got as u64;
+    }
+    let d = Owned::from_raw(sys::vmo_create(sig.len() as u64).map_err(|e| format!("no memory: {}", sys::status(e)))?);
+    if sys::vmo_write(d.raw(), 0, &sig) != 0 {
+        return Err("cannot copy .dsig".into());
+    }
+    match sys::vmo_verify(v.raw(), d.raw()) {
+        0 => {
+            // Drop WRITE right on the handle we keep/duplicate (VMO is already sealed).
+            let ro = sys::handle_replace(
+                v.into_raw(),
+                sys::RIGHT_READ | sys::RIGHT_MAP | sys::RIGHT_DUPLICATE | sys::RIGHT_TRANSFER | sys::RIGHT_INSPECT,
+            )
+            .map_err(|e| format!("replace failed: {}", sys::status(e)))?;
+            Ok(Owned::from_raw(ro))
+        }
+        e => Err(format!("signature check failed ({})", sys::status(e))),
+    }
+}
+
 /// The kernel checks a signed manifest (`vmo_verify`: seals it, checks the `.dsig` against the
 /// D-OS key, measures it); the `.dsig` must also be of kind manifest and name this file.
-fn verify_signed(bytes: &[u8], sig: &[u8], file: &str) -> Result<(), String> {
+fn verify_signed(bytes: &[u8], sig: &[u8], file: &str) -> Result<Owned, String> {
     use doscrypt::dsig;
     if sig.len() != dsig::SIZE {
         return Err("the .dsig is not a signature".into());
@@ -954,7 +1202,7 @@ fn verify_signed(bytes: &[u8], sig: &[u8], file: &str) -> Result<(), String> {
         return Err("cannot copy it".into());
     }
     match sys::vmo_verify(v.raw(), d.raw()) {
-        0 => Ok(()),
+        0 => Ok(v),
         e => Err(format!("signature check failed ({})", sys::status(e))),
     }
 }

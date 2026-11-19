@@ -390,6 +390,40 @@ fn lifetimes(t: &mut T) {
     check!(t, r.counts() == (0, 0)); // root VMAR emptied
     let _ = cvmo;
     check!(t, vmo::committed_frames() == frames0);
+
+    // Lazy VMO commit (demand paging) and child vmar_destroy.
+    let (ch2, cvmar2) = p.process_create(me, "lazy", Limits::DEFAULT).unwrap();
+    let lz = p.vmo_create(8 * 4096).unwrap();
+    check!(t, vmo::committed_frames() == frames0); // 0 frames committed on creation
+    let mut zbuf = [0xAAu8; 32];
+    check!(t, p.vmo_read(lz, 5 * 4096, &mut zbuf).is_ok() && zbuf == [0; 32]);
+    check!(t, vmo::committed_frames() == frames0); // reading zeros commits nothing
+    check!(t, p.vmo_write(lz, 3 * 4096, b"lazy").is_ok());
+    check!(t, vmo::committed_frames() == frames0 + 1); // only page 3 committed
+    let (sub2, sub2_base) = p.vmar_allocate(cvmar2, Some(0x20_0000), 16 * 4096, Rights::SAME).unwrap();
+    let lva = p.vmar_map(sub2, Some(0), lz, 0, 8 * 4096, R | W).unwrap();
+    let (r2, _) = p.get_vmar(cvmar2, Rights::NONE).unwrap();
+    check!(t, r2.aspace().translate(lva).is_none()); // page 0 not committed yet
+    check!(t, r2.aspace().translate(lva + 3 * 4096).is_some()); // page 3 eagerly mapped
+    check!(t, r2.fault(lva + 5 * 4096, true, false)); // demand-fault page 5
+    check!(t, r2.aspace().translate(lva + 5 * 4096).is_some());
+    check!(t, vmo::committed_frames() == frames0 + 2);
+    check!(t, !r2.fault(lva + 6 * 4096, false, true)); // exec fault on RW mapping refused
+    check!(t, !r2.fault(lva + 10 * 4096, false, false)); // unmapped gap refused
+    check!(t, p.vmar_destroy(cvmar2) == Err(Status::InvalidArgs)); // root VMAR cannot be destroyed
+    check!(t, p.vmar_destroy(sub2).is_ok());
+    check!(t, p.vmar_destroy(sub2) == Err(Status::BadState)); // double destroy refused
+    check!(t, p.vmar_map(sub2, None, lz, 0, 4096, R) == Err(Status::BadState));
+    // Address range freed by vmar_destroy can be re-allocated immediately at the exact same offset.
+    let (sub3, sub3_base) = p.vmar_allocate(cvmar2, Some(0x20_0000), 16 * 4096, Rights::SAME).unwrap();
+    check!(t, sub3_base == sub2_base);
+    check!(t, p.vmar_destroy(sub3).is_ok());
+    p.handle_close(sub2).unwrap();
+    p.handle_close(sub3).unwrap();
+    p.handle_close(lz).unwrap();
+    check!(t, vmo::committed_frames() == frames0);
+    p.process_kill(ch2).unwrap();
+    drop(r2);
     // Granting into a dead process is refused (and consumes the handle).
     let e = p.event_create().unwrap();
     check!(t, p.handle_grant(e, Rights::SAME, ch) == Err(Status::BadState));
@@ -435,6 +469,7 @@ fn scenario(k: &Process) -> KResult<()> {
     k.vmar_map(vmar, None, v, 0, 2 * 4096, R | W)?;
     let (sub, _) = k.vmar_allocate(vmar, None, 0x8000, Rights::SAME)?;
     k.vmar_map(sub, None, v, 4096, 4096, R)?;
+    k.vmar_destroy(sub)?;
     let e = k.event_create()?;
     let e2 = k.handle_duplicate(e, Rights::WAIT | Rights::TRANSFER)?;
     k.handle_grant(e2, Rights::SAME, ch)?;

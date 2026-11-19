@@ -112,8 +112,9 @@ fn run(cmd: &str, vols: Option<&mut Vec<mgr::Volume>>) -> i32 {
 }
 
 /// The system services, with argument overrides (test modes), until the volumes present at boot
-/// are announced (or 30 s).
-fn start_system(overrides: &[(&str, &str)], groups: &[Group]) -> Option<Mgr> {
+/// are announced (or 30 s). When `load_sys` is true, loads signed programs, tools, and services
+/// from the immutable `sys` volume (plus any embedded `Group::Test` manifests) once volumes are up.
+fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) -> Option<Mgr> {
     let mut m = match Mgr::new() {
         Ok(m) => m,
         Err(e) => {
@@ -121,7 +122,8 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group]) -> Option<Mgr> {
             return None;
         }
     };
-    m.load_embedded(groups);
+    // Bootstrap: embedded system services (clock, storaged, devmgr) to bring up disks.
+    m.load_embedded(&[Group::System]);
     m.check_set();
     for (name, args) in overrides {
         if let Some(i) = m.find(name) {
@@ -131,6 +133,23 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group]) -> Option<Mgr> {
     let providers = m.svcs.iter().any(|s| s.m.volumes);
     if providers && !m.run_until(30 * SEC, |m| m.volumes_done) {
         println!("init: storaged did not report its volumes in time");
+    }
+    // System volume: load signed services, tools, and programs from the immutable `sys` volume,
+    // plus any embedded test manifests (which may connect to services loaded from `sys`, like `log`).
+    if load_sys {
+        let mut added = m.load_sys_volume(groups);
+        if groups.contains(&Group::Test) {
+            m.load_embedded(&[Group::Test]);
+            added += 1;
+        }
+        if added > 0 {
+            for (name, args) in overrides {
+                if let Some(i) = m.find(name) {
+                    m.svcs[i].args = Some(String::from(*args));
+                }
+            }
+            m.check_set();
+        }
     }
     Some(m)
 }
@@ -216,7 +235,7 @@ fn main(s: *const Startup) -> i32 {
                 "storage readonly" => ("rocheck", ""),
                 _ => ("", ""),
             };
-            let Some(mut m) = start_system(&[("storaged", sargs), ("devmgr", dargs)], &[Group::System]) else { return 1 };
+            let Some(mut m) = start_system(&[("storaged", sargs), ("devmgr", dargs)], &[Group::System], false) else { return 1 };
             return match a {
                 "storage test" => run("fstest", Some(&mut m.volumes)),
                 "storage readonly" => run("fstest readonly", Some(&mut m.volumes)),
@@ -233,13 +252,20 @@ fn main(s: *const Startup) -> i32 {
         "shell test" => {
             // The system with writable disks and the terminal mirrored to the log: the host types
             // a session and reads it back on serial (a power-off typed in the shell ends it).
-            let Some(mut m) = start_system(&[("storaged", "test"), ("devmgr", "rw"), ("terminal", "mirror")], &[Group::System]) else { return 1 };
+            let Some(mut m) = start_system(&[("storaged", "test"), ("devmgr", "rw"), ("terminal", "mirror")], &[Group::System], true) else { return 1 };
             loop {
                 m.pump(sys::WAIT_FOREVER);
                 if let Some(action) = m.power_request.take() {
-                    m.shutdown();
-                    let r = sys::system_power(startup(sys::TAG_POWER), action);
-                    println!("init: power: system_power returned {}", r);
+                    if action == sys::POWER_SUSPEND {
+                        let r = m.suspend(startup(sys::TAG_POWER));
+                        if r != 0 {
+                            println!("init: power: suspend failed ({})", sys::status(r));
+                        }
+                    } else {
+                        m.shutdown();
+                        let r = sys::system_power(startup(sys::TAG_POWER), action);
+                        println!("init: power: system_power returned {}", r);
+                    }
                 }
             }
         }
@@ -248,7 +274,7 @@ fn main(s: *const Startup) -> i32 {
     }
 
     list_programs();
-    let Some(mut m) = start_system(&[], &[Group::System]) else { return 1 };
+    let Some(mut m) = start_system(&[], &[Group::System], true) else { return 1 };
     if m.load_from_volume("esp", &[Group::System]) > 0 {
         m.check_set();
     }
@@ -257,9 +283,16 @@ fn main(s: *const Startup) -> i32 {
         // The shell (or another holder of `grants.manager = ["power"]`) asked for the power: every
         // service stops cleanly first, volumes made durable.
         if let Some(action) = m.power_request.take() {
-            m.shutdown();
-            let r = sys::system_power(startup(sys::TAG_POWER), action);
-            println!("init: power: system_power returned {}", r);
+            if action == sys::POWER_SUSPEND {
+                let r = m.suspend(startup(sys::TAG_POWER));
+                if r != 0 {
+                    println!("init: power: suspend failed ({})", sys::status(r));
+                }
+            } else {
+                m.shutdown();
+                let r = sys::system_power(startup(sys::TAG_POWER), action);
+                println!("init: power: system_power returned {}", r);
+            }
         }
     }
 }
@@ -310,7 +343,7 @@ fn state(m: &Mgr, name: &str) -> Option<State> {
 /// power-off; the host boots the same disks again for the second part.
 fn time_test() -> i32 {
     let groups = [Group::System, Group::Test];
-    let Some(mut m) = start_system(&[("storaged", "test"), ("devmgr", "rw")], &groups) else { return 1 };
+    let Some(mut m) = start_system(&[("storaged", "test"), ("devmgr", "rw")], &groups, true) else { return 1 };
     let ok = m.run_until(60 * SEC, |m| matches!(state(m, "svc-time"), Some(State::Done(_) | State::Failed)));
     check!(ok, "svc-time did not finish");
     let code = match state(&m, "svc-time") {
@@ -330,7 +363,7 @@ fn time_test() -> i32 {
 
 fn services_test() -> i32 {
     let groups = [Group::System, Group::Test];
-    let Some(mut m) = start_system(&[], &groups) else { return 1 };
+    let Some(mut m) = start_system(&[], &groups, true) else { return 1 };
     check!(m.volumes_done, "no volumes");
     // Two embedded manifests are bad on purpose: an unknown key, an endpoint nobody provides.
     check!(m.refused == 2, "{} embedded manifest(s) refused, expected 2", m.refused);

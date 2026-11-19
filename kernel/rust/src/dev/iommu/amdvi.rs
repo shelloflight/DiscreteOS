@@ -809,6 +809,48 @@ pub fn unmap(d: &mut Domain, iova: u64, pages: u64) {
     u.sync();
 }
 
+/// Re-program every AMD-Vi unit after ACPI S3 sleep (interrupts off, no allocation).
+pub fn resume() {
+    let mut g = STATE.lock();
+    let Some(st) = g.as_mut() else { return };
+    let v = FAULT_VECTOR.load(Ordering::Acquire);
+    let devtab = st.devtab;
+    let ir = st.ir;
+    for u in &mut st.units {
+        u.w64(CONTROL, 0);
+        u.tail = 0;
+        u.seq = 0;
+        // SAFETY: this unit's completion-wait word in the direct map.
+        unsafe { core::ptr::write_volatile(table(u.wait), 0) };
+        u.w64(DEV_TABLE, devtab | (DEVTAB_PAGES - 1));
+        u.w64(CMD_BASE, u.cmd | RING_LEN_CODE << 56);
+        u.w64(CMD_HEAD, 0);
+        u.w64(CMD_TAIL, 0);
+        u.w64(STATUS, ST_EVT_OVERFLOW | ST_EVT_INT | ST_COMP_INT);
+        u.w64(EVT_BASE, u.evt | RING_LEN_CODE << 56);
+        u.w64(EVT_HEAD, 0);
+        u.w64(EVT_TAIL, 0);
+        let msi_ok = v != 0 && setup_msi(u.func, v as u32);
+        let int = if msi_ok { CTL_EVT_INT } else { 0 };
+        u.w64(CONTROL, CTL_EN | CTL_CMD_BUF | CTL_EVT_LOG | int);
+        if u.efr & EFR_IA != 0 {
+            u.push(CMD_INVAL_ALL, 0);
+            u.sync();
+        } else {
+            for id in 0..=u16::MAX {
+                u.inval_devtab(id);
+                if ir {
+                    u.inval_inttab(id);
+                }
+                if id % 64 == 63 {
+                    u.sync();
+                }
+            }
+            u.sync();
+        }
+    }
+}
+
 /// The event-log vector fired: report every logged event and clear it (interrupt context).
 pub fn fault_irq(vector: u32) -> bool {
     if FAULT_VECTOR.load(Ordering::Acquire) != u64::from(vector) || vector == 0 {

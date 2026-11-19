@@ -8,6 +8,7 @@
 
 void     lapic_init(void);        /* boot CPU: map, enable, pick x2APIC/xAPIC */
 void     lapic_init_ap(void);     /* AP: enable its own LAPIC in the same mode */
+void     lapic_resume_bsp(void);  /* S3: restore BSP's LAPIC and timer mode */
 void     lapic_eoi(void);
 uint32_t lapic_id(void);
 bool     lapic_x2apic(void);
@@ -34,6 +35,7 @@ bool     ioapic_route_isa_irq(uint8_t irq, uint8_t vector);
 bool     ioapic_route_sci(uint8_t irq, uint8_t vector);   /* level/low unless the MADT overrides */
 void     ioapic_mask_isa_irq(uint8_t irq);
 void     ioapic_reroute(void);                            /* interrupt remapping just turned on */
+void     ioapic_resume(void);                             /* S3: mask all pins, then restore routed pins */
 uint32_t ioapic_ids(uint8_t *out, uint32_t max);         /* ids of the I/O APICs in use */
 uint32_t ioapic_routed(uint8_t id, uint16_t *out, uint32_t max); /* routed pins: vector | level << 8 */
 /* APIC id device interrupts (MSI, I/O APIC) are sent to: the boot CPU. */

@@ -229,14 +229,15 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "log | where source = shell | take 1",
         "objects | where type = channel | count",
         "delete notes/readme.txt notes",
-        "go /sy<tab>",
+        "go /syst<tab>",
         "time",
         "power off",
     ]);
 
     let mut shell_expect: Vec<&str> = vec![
         "terminal: display 80x25 VGA text",
-        "shell: ready: 4 place(s): /boot (read-write), /data (read-write), /esp (read-write), /system (read-write); 6 tool(s)",
+        "init: sys volume:",
+        "shell: ready: 5 place(s): /boot (read-write), /data (read-write), /esp (read-write), /sys (read), /system (read-write); 6 tool(s)",
         "terminal| / > places",
         "terminal|  place",
         "terminal| data > make notes",
@@ -262,7 +263,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "terminal| x unknown command 'lst' - did you mean 'list'?",
         "terminal|   usage: copy <from> <to>",
         "terminal|  count",
-        "shell: ready: 4 place(s)",
+        "shell: ready: 5 place(s)",
         "terminal| v deleted /data/notes/readme.txt",
         "terminal| v deleted /data/notes",
         "terminal| system > time",
@@ -332,8 +333,10 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "devmgr: disks are read-only",
                 "storaged: volume 'system': DFS",
                 "MiB free, generation 2, 0 snapshot(s), read-only",
-                "init: 4 volume(s)",
+                "init: 5 volume(s)",
+                "init: sys volume:",
                 "devmgr: running",
+                "shell: ready",
             ])
             .forbid(&[
                 "KERNEL PANIC", "FAIL", "OFF (unsupported)", "did not start", "warning",
@@ -357,7 +360,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "devmgr: nvme.ddrv ready",
                 "devmgr: disks are read-only",
                 "storaged: volume 'system': DFS",
-                "init: 4 volume(s)",
+                "init: 5 volume(s)",
+                "init: sys volume:",
                 "devmgr: running",
             ])
             .forbid(&[
@@ -388,7 +392,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "devmgr: nvme.ddrv ready",
                 "devmgr: disks are read-only",
                 "storaged: volume 'system': DFS",
-                "init: 4 volume(s)",
+                "init: 5 volume(s)",
+                "init: sys volume:",
                 "devmgr: running",
                 "terminal: ready: framebuffer",
                 "shell: ready",
@@ -420,7 +425,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::boot("keyboard")
             .expect(&["ps2: keyboard ready", "terminal: line from ps2: Disc OS"])
             .forbid(&["KERNEL PANIC"])
-            .keys(&["shift-d", "i", "s", "c", "spc", "shift-o", "shift-s", "ret"], "devmgr: ps2.ddrv ready"),
+            .keys(&["shift-d", "i", "s", "c", "spc", "shift-o", "shift-s", "ret"], "terminal: ready"),
 
         TestCase::boot("usbkbd")
             .qemu(&["-device", "qemu-xhci,id=xhci", "-device", "usb-tablet,bus=xhci.0", "-device", "usb-kbd,bus=xhci.0"])
@@ -434,7 +439,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             ])
             .forbid(&["KERNEL PANIC", "exited with code", "blocked DMA", "FAIL"])
             .timeout(60)
-            .keys(&["shift-u", "s", "b", "spc", "shift-k", "b", "d", "ret"], "devmgr: xhci.ddrv ready"),
+            .keys(&["shift-u", "s", "b", "spc", "shift-k", "b", "d", "ret"], "terminal: ready"),
 
         TestCase::boot("usbnokbd")
             .qemu(&["-device", "qemu-xhci,id=xhci", "-device", "usb-tablet,bus=xhci.0", "-device", "usb-mouse,bus=xhci.0"])
@@ -454,7 +459,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                     "shift-d", "i", "s", "c", "spc", "shift-o", "shift-s", "ret",
                     "~300", "!mouse_move 20 -10", "~200", "!mouse_button 1", "~100", "!mouse_button 0",
                 ],
-                "devmgr: xhci.ddrv ready",
+                "terminal: ready",
             )
             .post(PostCheck::UsbProbedOnce),
 
@@ -470,7 +475,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             .timeout(60)
             .keys(
                 &["shift-r", "!sendkey a 900", "~1100", "ret", "caps_lock", "c", "a", "p", "s", "caps_lock", "ret"],
-                "devmgr: xhci.ddrv ready",
+                "terminal: ready",
             ),
 
         TestCase::boot("usbhold")
@@ -495,7 +500,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                     "!device_del k2", "~1500",
                     "shift-t", "w", "o", "ret",
                 ],
-                "devmgr: xhci.ddrv ready",
+                "terminal: ready",
             ),
 
         TestCase::boot("usbstorage")
@@ -548,7 +553,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                     "!device_add usb-kbd,bus=xhci.0,port=1.4,id=kbd", "~2500",
                     "shift-p", "l", "u", "g", "ret",
                 ],
-                "devmgr: xhci.ddrv ready",
+                "terminal: ready",
             )
             .post(PostCheck::UsbPlugOnce),
 
@@ -568,7 +573,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             ])
             .forbid(&["KERNEL PANIC", "exited with code", "blocked DMA", "FAIL", "not set up"])
             .timeout(60)
-            .keys(&["shift-t", "w", "o", "ret"], ": keyboard ready on port 6.1 ("),
+            .keys(&["~600", "shift-t", "w", "o", "ret"], "terminal: ready"),
 
         TestCase::boot("usbhub")
             .qemu(&[
@@ -589,7 +594,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             ])
             .forbid(&["KERNEL PANIC", "exited with code", "blocked DMA", "FAIL", "not set up", "stopped answering"])
             .timeout(60)
-            .keys(&["shift-u", "s", "b", "spc", "shift-h", "u", "b", "ret"], ": keyboard ready on port "),
+            .keys(&["~800", "shift-u", "s", "b", "spc", "shift-h", "u", "b", "ret"], "terminal: ready"),
 
         TestCase::boot("selftest")
             .def("SELFTEST")
@@ -619,7 +624,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::boot("cet")
             .bochs("tigerlake")
             .timeout(300)
-            .expect(&["CET: supervisor shadow stacks on", "CET shadow stacks on, IBT", "shell: ready"])
+            .expect(&["CET: supervisor shadow stacks on", "CET shadow stacks on, IBT", "devmgr: running"])
             .forbid(&["KERNEL PANIC", "user fault", "exited with code", "FAIL"]),
 
         TestCase::boot("cet-cp")
@@ -1098,7 +1103,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "storaged: volume 'system': DFS",
                 "storaged: volume 'data': DFS",
                 "partition 2 ('Basic data partition'): NTFS, not supported (left alone)",
-                "init: 4 volume(s)",
+                "init: 5 volume(s)",
                 "fstest: fat32:",
                 "fstest: dfs:",
                 "BENCH storage: DFS write 1 MiB",
@@ -1215,6 +1220,43 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             ])
             .forbid(&["KERNEL PANIC", "PANIC", "did not switch off", "system_power returned", "did not finish"]),
 
+        TestCase::boot("s3")
+            .def("SHELL")
+            .devices()
+            .qemu(&["-global", "ICH9-LPC.disable_s3=0"])
+            .timeout(120)
+            .must_exit()
+            .keys_vec(
+                {
+                    let mut k = convert_to_qemu_keys(&["power sleep"], 3000);
+                    k.push("!system_wakeup".into());
+                    k.push("~4000".into());
+                    k.extend(convert_to_qemu_keys(&["show /boot/README.TXT", "power off"], 1500));
+                    k
+                },
+                "shell: ready",
+            )
+            .expect(&[
+                "shell: ready",
+                "devmgr: suspended:",
+                "Power: entering ACPI S3",
+                "Power: resumed from ACPI S3 (4 CPU(s) online)",
+                "devmgr: resumed:",
+                "D-OS boot volume (FAT32)",
+                "Power: switching off (ACPI S5)",
+            ])
+            .forbid(&[
+                "KERNEL PANIC",
+                "PANIC",
+                "FAIL",
+                "user fault",
+                "watchdog:",
+                "did not enter sleep",
+                "suspend failed",
+                "blocked DMA",
+                "blocked interrupt",
+            ]),
+
         TestCase::boot("poweroff")
             .def("POWEROFF")
             .timeout(30)
@@ -1261,7 +1303,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "BENCH user: channel call round trip",
                 "BENCH fs: /esp: sequential read of /DOS/KERNEL.BIN",
                 "BENCH fs: /esp: random 4 KiB reads",
-                "fstest: bench: 4 volume(s) measured",
+                "fstest: bench: 5 volume(s) measured",
                 "D-OS hardware benchmark results",
                 "Results:",
                 "KTEST hwbench: DONE",
@@ -1280,11 +1322,12 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "storaged: read-only check: ahci:pci-00:1f.2:1: the driver refused a raw write",
                 "storaged: read-only check: nvme:pci-00:04.0:0: the driver refused a raw write",
                 "storaged: read-only check: virtio-blk:pci-00:02.0:0: the driver refused a raw write",
-                "init: 4 volume(s)",
+                "init: 5 volume(s)",
                 "fstest: readonly: /boot:",
                 "fstest: readonly: /system:",
                 "fstest: readonly: /data:",
                 "fstest: readonly: /esp:",
+                "fstest: readonly: /sys:",
                 "fstest: readonly PASSED",
                 "init: fstest readonly exited with code 0",
             ])
@@ -1302,7 +1345,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "User: init started in ring 3",
                 "init: started devmgr with 70 devices",
                 "devmgr: 70 devices, 2 with a driver",
-                "init: 1 volume(s)",
+                "init: 2 volume(s)",
+                "init: sys volume:",
                 "devmgr: running",
             ])
             .forbid(&["KERNEL PANIC", "cannot start init", "left out", "FAIL", "not used: the limit"]),
@@ -2075,13 +2119,13 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32) {
 fn post_services_order(log: &str) -> bool {
     let seq = [
         "init: syncing storaged",
-        "storaged: sync: 4 volume(s) durable",
+        "storaged: sync: 5 volume(s) durable",
         "init: stopping shell",
         "init: stopping terminal",
         "init: stopping devmgr",
         "devmgr: shutdown:",
         "init: stopping storaged",
-        "storaged: shutdown: 4 volume(s) durable",
+        "storaged: shutdown: 5 volume(s) durable",
         "init: shutdown: every service stopped",
         "Power: switch-off requested by process init",
     ];

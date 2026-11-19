@@ -73,4 +73,12 @@ bool     smp_nmi(struct interrupt_frame *f);
 /* Fault reports: "double-fault stack of CPU 2" etc. for AP IST guard pages. */
 const char *smp_guard_name(uint64_t va, uint32_t *cpu_out);
 
+/* S3 suspend/resume helpers (smp.c). */
+bool     smp_low_ram_ok(void);                    /* true if 0x8000-0xBFFF is usable low RAM */
+uint32_t smp_setup_s3_trampoline(uint64_t entry); /* copy real-mode wake trampoline; returns phys addr */
+void     smp_clear_s3_trampoline(void);           /* zero 0x8000-0xBFFF after wake */
+bool     smp_suspend(void);                       /* park all APs and stop BSP watchdog */
+void     smp_resume(void);                        /* bring parked APs back online and restart watchdog */
+NORETURN void smp_ap_park(struct percpu *pc);     /* called from idle_loop on APs during S3 freeze */
+
 #endif

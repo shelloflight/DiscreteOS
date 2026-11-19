@@ -57,6 +57,35 @@ static ECAM_BUSES: AtomicU32 = AtomicU32::new(0); // start | end << 8
 static ECAM_MAPPED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static LEGACY: SpinLock<()> = SpinLock::new(c"pci.cf8", rank::PCI, ());
 
+struct SavedFunc {
+    bdf: Bdf,
+    regs: [u32; 16],
+}
+
+struct SavedState {
+    funcs: Vec<SavedFunc>,
+    q35_pciexbar: (u32, u32),
+    ich9_pm: (u32, u32),
+}
+
+static SAVED: SpinLock<SavedState> = SpinLock::new(
+    c"pci.saved",
+    rank::DEVICE,
+    SavedState { funcs: Vec::new(), q35_pciexbar: (0, 0), ich9_pm: (0, 0) },
+);
+
+fn legacy_read32(bdf: Bdf, off: u16) -> u32 {
+    let _g = LEGACY.lock();
+    outl(0xCF8, 0x8000_0000 | u32::from(bdf.0) << 8 | u32::from(off & 0xFC));
+    inl(0xCFC)
+}
+
+fn legacy_write32(bdf: Bdf, off: u16, val: u32) {
+    let _g = LEGACY.lock();
+    outl(0xCF8, 0x8000_0000 | u32::from(bdf.0) << 8 | u32::from(off & 0xFC));
+    outl(0xCFC, val);
+}
+
 /// The configuration space size of every function: 4096 with ECAM, 256 without.
 pub fn config_size() -> u16 {
     if ECAM_PHYS.load(Ordering::Acquire) != 0 { 4096 } else { 256 }
@@ -449,5 +478,62 @@ pub fn enumerate() -> (Vec<Function>, &'static str, u64, u8, u8) {
     let mut out = Vec::new();
     let mut seen = [0u64; 4];
     scan_bus(start, &mut seen, &mut out);
+    // Record every enumerated function for S3 config-space save/restore.
+    let mut saved = Vec::new();
+    for f in &out {
+        if saved.try_reserve(1).is_ok() {
+            saved.push(SavedFunc { bdf: f.bdf, regs: [0; 16] });
+        }
+    }
+    SAVED.lock().funcs = saved;
     (out, method, base, start, end)
+}
+
+/// Save every enumerated PCI function's standard 64-byte config header before ACPI S3 sleep.
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_pci_suspend() {
+    let mut g = SAVED.lock();
+    // On Intel Q35 (8086:29c0), save PCIEXBAR (0x60..0x68) in case firmware does not restore ECAM.
+    if legacy_read32(Bdf(0), 0x00) == 0x29C0_8086 {
+        g.q35_pciexbar = (legacy_read32(Bdf(0), 0x60), legacy_read32(Bdf(0), 0x64));
+    }
+    // On Intel ICH9 LPC (8086:2918 at 00:1f.0), save PMBASE (0x40) and ACPI_CNTL (0x44).
+    let lpc = Bdf::new(0, 0x1F, 0);
+    if legacy_read32(lpc, 0x00) == 0x2918_8086 {
+        g.ich9_pm = (legacy_read32(lpc, 0x40), legacy_read32(lpc, 0x44));
+    }
+    for f in &mut g.funcs {
+        for i in 0..16u16 {
+            f.regs[usize::from(i)] = read(f.bdf, i * 4, 4);
+        }
+    }
+}
+
+/// Restore PCI configuration headers after ACPI S3 wake (interrupts off, no allocation).
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_pci_resume() {
+    let g = SAVED.lock();
+    // Re-enable Q35 ECAM if firmware reset PCIEXBAR during S3.
+    if g.q35_pciexbar != (0, 0)
+        && (legacy_read32(Bdf(0), 0x60) != g.q35_pciexbar.0 || legacy_read32(Bdf(0), 0x64) != g.q35_pciexbar.1)
+    {
+        legacy_write32(Bdf(0), 0x64, g.q35_pciexbar.1);
+        legacy_write32(Bdf(0), 0x60, g.q35_pciexbar.0);
+    }
+    // Re-enable ICH9 ACPI PM I/O decode (PM1/GPE registers) if firmware reset it during S3.
+    let lpc = Bdf::new(0, 0x1F, 0);
+    if g.ich9_pm != (0, 0)
+        && (legacy_read32(lpc, 0x40) != g.ich9_pm.0 || legacy_read32(lpc, 0x44) != g.ich9_pm.1)
+    {
+        legacy_write32(lpc, 0x40, g.ich9_pm.0);
+        legacy_write32(lpc, 0x44, g.ich9_pm.1);
+    }
+    // Enumeration order visits parent bridges before downstream devices.
+    for f in &g.funcs {
+        write(f.bdf, 0x04, 2, 0);
+        for off in [0x0Cu16, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28, 0x30, 0x3C] {
+            write(f.bdf, off, 4, f.regs[usize::from(off / 4)]);
+        }
+        write(f.bdf, 0x04, 2, f.regs[1] & 0xFFFF);
+    }
 }

@@ -91,8 +91,8 @@ trampoline_end:
 ; Interrupts are off; the IDT is still the real-mode one until ap_main loads the kernel's.
 ; -----------------------------------------------------------------------------
 section .text
-global ap_entry64
-extern ap_main
+global ap_entry64, ap_resume_entry64
+extern ap_main, ap_resume_main
 
 ap_entry64:
     mov cr3, rbx                            ; kernel page tables (drops the temporary identity map)
@@ -103,6 +103,20 @@ ap_entry64:
     wrmsr
     xor ebp, ebp                            ; end of backtraces
     call ap_main                            ; never returns
+.hang:
+    cli
+    hlt
+    jmp .hang
+
+ap_resume_entry64:
+    mov cr3, rbx
+    mov rax, rdi
+    mov rdx, rdi
+    shr rdx, 32
+    mov ecx, 0xC0000101                     ; IA32_GS_BASE
+    wrmsr
+    xor ebp, ebp
+    call ap_resume_main                     ; never returns
 .hang:
     cli
     hlt

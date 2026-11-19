@@ -90,6 +90,34 @@ void cet_cpu_enabled(struct percpu *pc)
     pc->mitig |= MIT_SHSTK;
 }
 
+uint64_t cet_bsp_wake_token(uint64_t ssp)
+{
+    struct percpu *pc = &bsp_percpu;
+    uint64_t tok_va = ssp - 8;
+    uint64_t pa = vmm_translate(tok_va & ~(uint64_t)(PAGE_SIZE - 1));
+    if (pa == VMM_NOT_MAPPED)
+        panic("CET: BSP shadow stack not mapped on S3 resume");
+    uint64_t *alias = (uint64_t *)((uint8_t *)phys_to_virt(pa) + (tok_va & (PAGE_SIZE - 1)));
+    *alias = tok_va;                       /* supervisor restore token (bit 0 = 0, not busy) */
+    wrmsr(MSR_ISST, (uint64_t)(uintptr_t)pc->ssp_table);
+    wrmsr(MSR_PL0_SSP, pc->ss_token);
+    wrmsr(MSR_U_CET, pc->u_cet);
+    wrmsr(MSR_PL3_SSP, pc->current ? pc->current->ussp : 0);
+    return tok_va;
+}
+
+void cet_ap_reset(struct thread *idle)
+{
+    if (!cet_ss || !idle || !idle->ss_token)
+        return;
+    idle->ssp = idle->ss_token - 16;
+    uint64_t pa = vmm_translate(idle->ssp & ~(uint64_t)(PAGE_SIZE - 1));
+    if (pa != VMM_NOT_MAPPED) {
+        uint64_t *alias = (uint64_t *)((uint8_t *)phys_to_virt(pa) + (idle->ssp & (PAGE_SIZE - 1)));
+        *alias = idle->ssp;
+    }
+}
+
 void cet_print(void)
 {
     if (cet_ss)

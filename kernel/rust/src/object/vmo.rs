@@ -1,10 +1,10 @@
 //! Virtual memory object (VMO): a set of physical pages that can be read, written and mapped.
 //!
-//! Pages are committed when the VMO is created (eager), zeroed, and charged to the creating
-//! process's memory quota; they go back to the PMM and the quota when the last reference
-//! (handle or mapping) is dropped. Trade-off: eager commit costs memory up front but makes
-//! accounting exact and keeps page faults out of the kernel for now; lazy commit can come with
-//! demand paging.
+//! Virtual capacity is charged to the creating process's memory quota upfront (so quotas stay
+//! exact and cannot be oversubscribed), while physical RAM frames are allocated lazily on first
+//! write, DMA pin, port/shadow-stack commit, or user-mode demand page fault. Uncommitted pages
+//! read as zero without consuming physical memory; committed frames return to the PMM when the
+//! last reference (handle or mapping) is dropped.
 //!
 //! W^X across aliases: a VMO counts its *writers* (writable mappings, writes in
 //! progress, kernel users such as a port's rings). Sealing (`seal`) succeeds only with no writer
@@ -19,15 +19,55 @@
 //! driver must not reach (the MSI-X table, which the kernel owns) are backed by a private zero page.
 
 use alloc::vec::Vec;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::quota::{Account, Charge, Res};
 use super::{Header, KRef, KResult, Name, ObjType, Status};
 use crate::ffi;
 
+/// Lock-free write-once name (0 = empty, 1 = writing, 2 = initialized).
+struct OnceName {
+    state: AtomicU8,
+    value: UnsafeCell<Name>,
+}
+
+// SAFETY: `value` is only mutated during the exclusive 0 -> 1 transition and only read after
+// observing state == 2 with Acquire ordering.
+unsafe impl Sync for OnceName {}
+
+impl OnceName {
+    fn new(s: &str) -> Self {
+        let init = if s.is_empty() { 0 } else { 2 };
+        OnceName { state: AtomicU8::new(init), value: UnsafeCell::new(Name::new(s)) }
+    }
+
+    fn as_str(&self) -> &str {
+        if self.state.load(Ordering::Acquire) != 2 {
+            return "";
+        }
+        // SAFETY: state == 2 with Acquire guarantees `value` is initialized and never mutated again.
+        unsafe { (*self.value.get()).as_str() }
+    }
+
+    fn set_once(&self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        if self.state.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            // SAFETY: exclusive writer for the 0 -> 1 -> 2 transition.
+            unsafe { *self.value.get() = Name::new(s) };
+            self.state.store(2, Ordering::Release);
+        }
+    }
+}
+
 /// Upper bound for one VMO (1 GiB): keeps the frame list allocation bounded.
 pub const MAX_SIZE: u64 = 1 << 30;
 const PAGE: u64 = 4096;
+
+/// Shared read-only zero page for reading uncommitted VMO pages without allocating RAM.
+static ZERO_PAGE: [u8; PAGE as usize] = [0; PAGE as usize];
 
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -39,13 +79,15 @@ pub fn committed_frames() -> u64 {
 pub struct Vmo {
     pub header: Header,
     size: u64,
-    frames: Vec<u64>, // fixed after creation, so reads need no lock
+    /// Physical address of each page, or `0` if not yet committed. Populated monotonically via
+    /// atomic CAS (once non-zero, a frame stays owned until `Vmo::drop`), so reads need no lock.
+    frames: Vec<AtomicU64>,
     executable: AtomicBool,
     /// Why it may run as a program (`security::Trust`); set once, after sealing.
     trust: AtomicU8,
     /// `SEALED` bit + number of writers (see the module comment).
     wstate: AtomicU64,
-    name: Name,
+    name: OnceName,
     /// Device memory (MMIO): `frames` are not RAM and are not owned, except `dummy`.
     device: bool,
     /// Device memory mapped write-combining (the display) instead of uncached.
@@ -71,28 +113,22 @@ impl Vmo {
         frames
             .try_reserve_exact(pages as usize)
             .map_err(|_| Status::NoMemory)?;
-        let mut vmo = Vmo {
+        for _ in 0..pages {
+            frames.push(AtomicU64::new(0));
+        }
+        let vmo = Vmo {
             header: Header::new(ObjType::Vmo),
             size: pages * PAGE,
             frames,
             executable: AtomicBool::new(false),
             trust: AtomicU8::new(0),
             wstate: AtomicU64::new(0),
-            name: Name::new(name),
+            name: OnceName::new(name),
             device: false,
             wc: false,
             dummy: 0,
             _charge: charge,
         };
-        for _ in 0..pages {
-            // SAFETY: plain PMM call; 0 means out of memory.
-            let pa = unsafe { ffi::pmm_alloc_zeroed() };
-            if pa == 0 {
-                return Err(Status::NoMemory); // `vmo` drops: frees what it has and the charge
-            }
-            vmo.frames.push(pa); // capacity reserved above
-            FRAMES.fetch_add(1, Ordering::Relaxed);
-        }
         KRef::try_new(vmo).map_err(|_| Status::NoMemory)
     }
 
@@ -113,7 +149,7 @@ impl Vmo {
             executable: AtomicBool::new(false),
             trust: AtomicU8::new(0),
             wstate: AtomicU64::new(0),
-            name: Name::new(name),
+            name: OnceName::new(name),
             device: true,
             wc,
             dummy: 0,
@@ -128,9 +164,9 @@ impl Vmo {
                         return Err(Status::NoMemory);
                     }
                 }
-                vmo.frames.push(vmo.dummy);
+                vmo.frames.push(AtomicU64::new(vmo.dummy));
             } else {
-                vmo.frames.push(phys + i * PAGE);
+                vmo.frames.push(AtomicU64::new(phys + i * PAGE));
             }
         }
         KRef::try_new(vmo).map_err(|_| Status::NoMemory)
@@ -218,10 +254,11 @@ impl Vmo {
     }
 
     /// Shared-memory word at `off` (4-aligned, inside the VMO), reached through the direct map.
-    /// For the rings of a port, which the kernel and user space both access.
+    /// For the rings of a port, which commits all pages eagerly.
     pub fn atomic_u32(&self, off: u64) -> &AtomicU32 {
         crate::kassert!(off.is_multiple_of(4) && off + 4 <= self.size);
-        let pa = self.frames[(off / PAGE) as usize];
+        let pa = self.frames[(off / PAGE) as usize].load(Ordering::Acquire);
+        crate::kassert!(pa != 0);
         let va = (ffi::physmap_base() + pa + off % PAGE) as *const AtomicU32;
         // SAFETY: an aligned word inside a frame this VMO owns (it lives as long as `self`); the
         // page is never freed while the VMO exists. Concurrent access from user space is fine
@@ -232,7 +269,8 @@ impl Vmo {
     /// Shared-memory u64 at `off` (8-aligned), see `atomic_u32`.
     pub fn atomic_u64(&self, off: u64) -> &AtomicU64 {
         crate::kassert!(off.is_multiple_of(8) && off + 8 <= self.size);
-        let pa = self.frames[(off / PAGE) as usize];
+        let pa = self.frames[(off / PAGE) as usize].load(Ordering::Acquire);
+        crate::kassert!(pa != 0);
         let va = (ffi::physmap_base() + pa + off % PAGE) as *const AtomicU64;
         // SAFETY: as in `atomic_u32`.
         unsafe { &*va }
@@ -242,8 +280,59 @@ impl Vmo {
         self.name.as_str()
     }
 
-    pub fn frames(&self) -> &[u64] {
-        &self.frames
+    /// Record a verified name (code signing, `vmo_verify`) if the VMO was created unnamed.
+    pub(crate) fn set_name_once(&self, s: &str) {
+        self.name.set_once(s);
+    }
+
+    /// Physical address of page `idx`, or `0` if not yet committed.
+    pub fn frame_at(&self, idx: usize) -> u64 {
+        self.frames[idx].load(Ordering::Acquire)
+    }
+
+    /// Commit page `idx` if not already backed by RAM, returning its physical address.
+    pub fn ensure_page(&self, idx: usize) -> KResult<u64> {
+        let pa = self.frames[idx].load(Ordering::Acquire);
+        if pa != 0 {
+            return Ok(pa);
+        }
+        crate::kassert!(!self.device);
+        // SAFETY: plain PMM call; 0 means out of memory.
+        let fresh = unsafe { ffi::pmm_alloc_zeroed() };
+        if fresh == 0 {
+            return Err(Status::NoMemory);
+        }
+        match self.frames[idx].compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                FRAMES.fetch_add(1, Ordering::Relaxed);
+                Ok(fresh)
+            }
+            Err(existing) => {
+                // SAFETY: `fresh` was just allocated by us and never published.
+                unsafe { ffi::pmm_free(fresh) };
+                Ok(existing)
+            }
+        }
+    }
+
+    /// Commit all pages in `[off, off + len)` (page-aligned) and append their physical addresses
+    /// to `out`.
+    pub fn commit_range(&self, off: u64, len: u64, out: &mut Vec<u64>) -> KResult<()> {
+        let first = (off / PAGE) as usize;
+        let count = (len / PAGE) as usize;
+        out.try_reserve_exact(count).map_err(|_| Status::NoMemory)?;
+        for i in 0..count {
+            out.push(self.ensure_page(first + i)?);
+        }
+        Ok(())
+    }
+
+    /// Commit every page of this VMO eagerly (ports, shadow stacks).
+    pub fn commit_all(&self) -> KResult<()> {
+        for i in 0..self.frames.len() {
+            self.ensure_page(i)?;
+        }
+        Ok(())
     }
 
     fn check(&self, off: u64, len: usize) -> KResult<()> {
@@ -257,27 +346,49 @@ impl Vmo {
         Ok(())
     }
 
-    /// Visit the pages covering [off, off+len) as (kernel pointer, chunk length, buffer offset).
-    fn chunks(&self, off: u64, len: usize, mut f: impl FnMut(*mut u8, usize, usize)) {
+    /// Visit the pages covering [off, off+len) for reading: `Some(ptr)` for a committed page,
+    /// `None` for an uncommitted (zero) page.
+    fn read_chunks(&self, off: u64, len: usize, mut f: impl FnMut(Option<*const u8>, usize, usize)) {
         let mut done = 0usize;
         while done < len {
             let pos = off + done as u64;
             let in_page = (pos % PAGE) as usize;
             let n = (PAGE as usize - in_page).min(len - done);
-            let pa = self.frames[(pos / PAGE) as usize];
-            let va = (ffi::physmap_base() + pa) as *mut u8;
-            f(va.wrapping_add(in_page), n, done);
+            let pa = self.frames[(pos / PAGE) as usize].load(Ordering::Acquire);
+            let ptr = if pa != 0 {
+                Some(((ffi::physmap_base() + pa) as *const u8).wrapping_add(in_page))
+            } else {
+                None
+            };
+            f(ptr, n, done);
             done += n;
         }
+    }
+
+    /// Visit the pages covering [off, off+len) for writing, committing each touched page on demand.
+    fn write_chunks(&self, off: u64, len: usize, mut f: impl FnMut(*mut u8, usize, usize) -> KResult<()>) -> KResult<()> {
+        let mut done = 0usize;
+        while done < len {
+            let pos = off + done as u64;
+            let in_page = (pos % PAGE) as usize;
+            let n = (PAGE as usize - in_page).min(len - done);
+            let pa = self.ensure_page((pos / PAGE) as usize)?;
+            let va = ((ffi::physmap_base() + pa) as *mut u8).wrapping_add(in_page);
+            f(va, n, done)?;
+            done += n;
+        }
+        Ok(())
     }
 
     pub fn read(&self, off: u64, buf: &mut [u8]) -> KResult<()> {
         self.check(off, buf.len())?;
         let dst = buf.as_mut_ptr();
-        self.chunks(off, buf.len(), |src, n, at| {
+        self.read_chunks(off, buf.len(), |src, n, at| match src {
             // SAFETY: `src..src+n` lies inside one frame owned by this VMO (bounds checked above),
             // reached through the direct map; `dst+at..+n` lies inside `buf`.
-            unsafe { core::ptr::copy_nonoverlapping(src, dst.add(at), n) }
+            Some(s) => unsafe { core::ptr::copy_nonoverlapping(s, dst.add(at), n) },
+            // SAFETY: `dst+at..+n` lies inside `buf`.
+            None => unsafe { core::ptr::write_bytes(dst.add(at), 0, n) },
         });
         Ok(())
     }
@@ -286,11 +397,11 @@ impl Vmo {
         self.check(off, data.len())?;
         let _w = WriteGuard::new(self)?;
         let src = data.as_ptr();
-        self.chunks(off, data.len(), |dst, n, at| {
-            // SAFETY: as in `read`, with the direction reversed.
-            unsafe { core::ptr::copy_nonoverlapping(src.add(at), dst, n) }
-        });
-        Ok(())
+        self.write_chunks(off, data.len(), |dst, n, at| {
+            // SAFETY: `dst..dst+n` lies inside one committed frame of this VMO; `src+at..+n` in `data`.
+            unsafe { core::ptr::copy_nonoverlapping(src.add(at), dst, n) };
+            Ok(())
+        })
     }
 }
 
@@ -301,11 +412,12 @@ impl Vmo {
         self.check(off, n)?;
         crate::user::uaccess::check(user, len)?;
         let mut res = Ok(());
-        self.chunks(off, n, |src, c, at| {
+        self.read_chunks(off, n, |src, c, at| {
             if res.is_ok() {
-                // SAFETY: `src..src+c` lies in a frame of this VMO (bounds checked above); the
-                // user range was checked to lie below USER_TOP, and user_copy survives faults.
-                res = unsafe { crate::user::uaccess::copy_to_user_raw(user + at as u64, src, c) };
+                let s = src.unwrap_or(ZERO_PAGE.as_ptr());
+                // SAFETY: `s..s+c` lies in a frame of this VMO or `ZERO_PAGE` (`c <= PAGE`);
+                // the user range was checked to lie below USER_TOP, and user_copy survives faults.
+                res = unsafe { crate::user::uaccess::copy_to_user_raw(user + at as u64, s, c) };
             }
         });
         res
@@ -317,14 +429,10 @@ impl Vmo {
         self.check(off, n)?;
         crate::user::uaccess::check(user, len)?;
         let _w = WriteGuard::new(self)?;
-        let mut res = Ok(());
-        self.chunks(off, n, |dst, c, at| {
-            if res.is_ok() {
-                // SAFETY: as in `read_to_user`, with the direction reversed.
-                res = unsafe { crate::user::uaccess::copy_from_user_raw(dst, user + at as u64, c) };
-            }
-        });
-        res
+        self.write_chunks(off, n, |dst, c, at| {
+            // SAFETY: as in `read_to_user`, with the direction reversed.
+            unsafe { crate::user::uaccess::copy_from_user_raw(dst, user + at as u64, c) }
+        })
     }
 }
 
@@ -370,11 +478,18 @@ impl Drop for Vmo {
             }
             return; // the other frames are device memory, not ours
         }
-        for &pa in &self.frames {
-            // SAFETY: each frame was allocated for this VMO and nothing else refers to it now
-            // (mappings hold a reference to the VMO, so they are gone too).
-            unsafe { ffi::pmm_free(pa) };
+        let mut freed = 0u64;
+        for slot in &mut self.frames {
+            let pa = *slot.get_mut();
+            if pa != 0 {
+                // SAFETY: each committed frame was allocated for this VMO and nothing else refers
+                // to it now (mappings hold a reference to the VMO, so they are gone too).
+                unsafe { ffi::pmm_free(pa) };
+                freed += 1;
+            }
         }
-        FRAMES.fetch_sub(self.frames.len() as u64, Ordering::Relaxed);
+        if freed != 0 {
+            FRAMES.fetch_sub(freed, Ordering::Relaxed);
+        }
     }
 }

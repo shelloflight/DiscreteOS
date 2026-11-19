@@ -501,6 +501,23 @@ impl Process {
         self.get_vmar(vmar, Rights::MAP)?.0.unmap(addr, len)
     }
 
+    /// Destroy a child VMAR, unmapping all its mappings and subregions and releasing its address
+    /// range back to its parent. Refuses the root VMAR (`InvalidArgs`) or an already-destroyed
+    /// region (`BadState`). Needs `MAP`.
+    pub fn vmar_destroy(&self, vmar: Handle) -> KResult<()> {
+        let (r, _) = self.get_vmar(vmar, Rights::MAP)?;
+        if r.is_root() {
+            return Err(Status::InvalidArgs);
+        }
+        if !r.destroy_once() {
+            return Err(Status::BadState);
+        }
+        if let Some(root) = r.aspace().root_vmar() {
+            root.remove_descendant(&r);
+        }
+        Ok(())
+    }
+
     /// Carve out a child region; its handle gets `rights` (a subset of the parent handle's).
     /// Returns (handle, base address). Needs `MAP`.
     pub fn vmar_allocate(&self, vmar: Handle, offset: Option<u64>, len: u64, rights: Rights) -> KResult<(Handle, u64)> {

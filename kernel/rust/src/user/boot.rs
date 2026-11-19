@@ -125,7 +125,7 @@ fn start(args: &[u8]) -> Result<KRef<Process>, Status> {
         name: "init",
         args,
         handles,
-        limits: Limits { memory: 128 << 20, handles: 4096, threads: 64 },
+        limits: Limits { memory: 512 << 20, handles: 4096, threads: 128 },
         exception_channel: false,
         forward: false,
         start_exception: false,

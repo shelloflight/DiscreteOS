@@ -63,6 +63,12 @@ pub const BLK_FLUSH: u32 = 13;
 pub const DISK: u32 = 3;
 /// Manager -> block driver: serve unit `a` on the channel this message carries (no reply).
 pub const BLK_ATTACH: u32 = 14;
+/// Client -> block driver (attached channel): attach a shared-memory `libd::ring::IoRing` VMO
+/// carried by this message for zero-copy transfers; reply `status` = 0 on success.
+pub const BLK_RING_SETUP: u32 = 15;
+/// Client -> block driver (attached channel): drain pending SQEs in the attached ring, post CQEs,
+/// and reply with `a` = completions posted.
+pub const BLK_RING_DOORBELL: u32 = 16;
 /// Manager -> driver (tests): fault on purpose (restart test).
 pub const TEST_CRASH: u32 = 20;
 /// Manager -> block driver (tests): point a request at memory the device was not given (the

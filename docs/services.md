@@ -54,7 +54,8 @@ backoff = 100               # ms before the first restart, doubled each time, at
 
 | Source | Trusted because |
 |---|---|
-| Embedded in the kernel image (`user/init/services/*.dman`) | the loader verified the kernel's signature; the kernel hands them to init as MANIFEST VMOs (never runnable) |
+| Embedded in the kernel image (`clock.dman`, `storaged.dman`, `devmgr.dman`) | the loader verified the kernel's signature; only the minimal bootstrap chain is embedded in `kernel.bin` |
+| `sys:/services/*.dman`, `sys:/tools/*.dman`, `sys:/bin/*` on the immutable `sys` volume | each file has a `.dsig` next to it, Ed25519-verified by the kernel (`vmo_verify`) before loading |
 | `DOS/SERVICES/<NAME>.DMAN` on the boot volume (`esp`) | a `<NAME>.DSIG` next to it: a `.dsig` of kind manifest (5) for this name, by the D-OS key, checked by the kernel (`vmo_verify`) |
 
 Anything else is refused: no `.dsig`, a signature that does not match, a `.dsig` of another kind or
@@ -107,18 +108,24 @@ was configured to grant ([attestation.md](attestation.md)).
 | `SHUTDOWN` (301) | manager -> service | make everything durable, exit 0 |
 | `SYNC` (302) | manager -> volume provider, call | make every volume durable; reply when done |
 | `LOG_LEVEL` (303) | manager -> kernel-log holder | a service's level: `a` = level, payload = its name |
+| `SUSPEND` (304) | manager -> device manager, call | quiesce PCI devices and stop every driver before ACPI S3 sleep |
+| `RESUME` (305) | manager -> device manager, call | restart every driver after ACPI S3 wake and wait until ready |
 | `VOLUME`, `VOLUMES_DONE` | storage service -> manager | a mounted volume (carries its root); the boot-time set is complete |
 
-## Shutdown
+## Shutdown and sleep
 
-A shutdown starts when a holder of `manager = ["power"]` sends `MGR_POWER` (the shell's
-`power off`), or when the machine's power button is pressed (init waits on the kernel's
-power-button event, startup tag `POWER_BUTTON`; [acpi.md](acpi.md)).
+A shutdown starts when a holder of `manager = ["power"]` sends `MGR_POWER` (`POWER_OFF` or
+`POWER_REBOOT`, e.g. the shell's `power off`), or when the machine's power button is pressed (init
+waits on the kernel's power-button event, startup tag `POWER_BUTTON`; [acpi.md](acpi.md)).
 
 1. Every volume provider is asked to `SYNC`, while the drivers under it still run.
 2. Each service stops after every running service that depends on it (`after` or `connect`),
    the last started first among those free to stop (`SHUTDOWN`, 5 s, then it is ended).
 3. Then `system_power`.
+
+For ACPI S3 sleep (`MGR_POWER` with `POWER_SUSPEND`, e.g. `power sleep`), init sends `SYNC` to
+every volume provider, sends `SUSPEND` to `devmgr` to quiesce and stop drivers, calls
+`system_power(..., POWER_SUSPEND)`, and sends `RESUME` to `devmgr` upon wake.
 
 ## The system today
 

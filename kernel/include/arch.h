@@ -55,6 +55,7 @@ _Static_assert(sizeof(struct tss) == 104, "TSS layout");
 struct percpu;
 void gdt_init(void);                                         /* boot CPU */
 void gdt_init_cpu(struct percpu *pc, const uint64_t ist_top[IST_COUNT]);   /* load this CPU's GDT + TSS */
+void gdt_resume_cpu(struct percpu *pc);                      /* S3: reload GDT, clear TSS busy, reload LTR + SYSCALL */
 void idt_init(void);
 void idt_load(void);                                         /* APs: load the shared IDT */
 void backtrace_print(uint64_t rip, uint64_t rbp);             /* frame-pointer backtrace (exceptions.c) */

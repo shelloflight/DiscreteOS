@@ -118,6 +118,8 @@ struct Mgr {
     mgr: Handle,
     /// SHUTDOWN received.
     stop: bool,
+    /// SUSPEND active (do not auto-restart drivers while suspended).
+    suspended: bool,
     /// Clients of the input endpoint (the console service).
     input: [Handle; MAX_INPUT_CLIENTS],
     /// Block drivers may write (argument `rw` or `test`); otherwise they start read-only.
@@ -317,6 +319,24 @@ impl Mgr {
                                 }
                             }
                         }
+                        Some(h) if h.op == svc::SUSPEND => {
+                            if handle != 0 {
+                                sys::handle_close(handle);
+                            }
+                            let n = self.suspend_drivers();
+                            let mut rep = [0u8; HEADER];
+                            Header { txid: h.txid, op: svc::SUSPEND, status: 0, a: n, b: 0 }.put(&mut rep);
+                            sys::channel_write(self.mgr, &rep);
+                        }
+                        Some(h) if h.op == svc::RESUME => {
+                            if handle != 0 {
+                                sys::handle_close(handle);
+                            }
+                            let ready = self.resume_drivers();
+                            let mut rep = [0u8; HEADER];
+                            Header { txid: h.txid, op: svc::RESUME, status: 0, a: ready, b: 0 }.put(&mut rep);
+                            sys::channel_write(self.mgr, &rep);
+                        }
                         Some(h) if h.op == svc::SHUTDOWN => {
                             if handle != 0 {
                                 sys::handle_close(handle);
@@ -436,7 +456,58 @@ impl Mgr {
         }
     }
 
+    fn suspend_drivers(&mut self) -> u64 {
+        self.suspended = true;
+        let mut n = 0u64;
+        for i in 0..MAX_DRIVERS {
+            let Some(d) = self.drv[i].as_mut() else { continue };
+            // Quiesce PCI bus mastering before killing the driver so no DMA races with unpinning.
+            if d.info.kind == sys::DEV_KIND_PCI {
+                let _ = sys::config_write(d.dev, 0x04, 2, 0);
+            }
+            if d.proc != 0 {
+                sys::process_kill(d.proc);
+                let _ = sys::object_wait(d.proc, sys::TERMINATED, 2 * SEC);
+                sys::handle_close(d.proc);
+                sys::handle_close(d.ch);
+                d.proc = 0;
+                d.ch = 0;
+                n += 1;
+            }
+            d.ready = false;
+            d.disks_due = 0;
+            d.starts = 0;
+            d.gave_up = false;
+            self.trust.driver_gone(i);
+            self.pointer_seen &= !(1u64 << i);
+        }
+        println!("devmgr: suspended: {} driver(s) stopped", n);
+        n
+    }
+
+    fn resume_drivers(&mut self) -> u64 {
+        self.suspended = false;
+        for i in 0..MAX_DRIVERS {
+            if self.drv[i].as_ref().is_some_and(|d| d.proc == 0) {
+                self.start(i);
+            }
+        }
+        let deadline = sys::clock_ns() + 10 * SEC;
+        while sys::clock_ns() < deadline
+            && !self.drv.iter().flatten().all(|d| (d.ready && d.disks_due == 0) || d.gave_up)
+        {
+            self.pump(deadline.saturating_sub(sys::clock_ns()).max(1));
+        }
+        while self.pump(0) {}
+        let ready = self.drv.iter().flatten().filter(|d| d.ready).count() as u64;
+        println!("devmgr: resumed: {} driver(s) ready", ready);
+        ready
+    }
+
     fn died(&mut self, i: usize) {
+        if self.suspended {
+            return;
+        }
         let Some(d) = self.drv[i].as_mut() else { return };
         if d.proc == 0 {
             return;
@@ -538,6 +609,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
         known: [None; MAX_DISKS],
         mgr: libd::startup_handle(proto::TAG_CONTROL),
         stop: false,
+        suspended: false,
         input: [0; MAX_INPUT_CLIENTS],
         writable,
         trust: trust::Trust::new(),
@@ -604,6 +676,9 @@ fn devmgr_main(s: *const Startup) -> i32 {
     }
     let mut n = 0;
     for d in m.drv.iter_mut().flatten() {
+        if d.info.kind == sys::DEV_KIND_PCI {
+            let _ = sys::config_write(d.dev, 0x04, 2, 0);
+        }
         if d.proc != 0 {
             sys::process_kill(d.proc);
             let _ = sys::object_wait(d.proc, sys::TERMINATED, 2 * SEC);

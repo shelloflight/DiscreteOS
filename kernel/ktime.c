@@ -20,11 +20,16 @@
 #include "spinlock.h"
 
 static uint64_t mult;        /* 0 until time_init(): time_ns() returns 0 */
+static uint64_t time_base_ns;
+static uint64_t time_tsc_epoch;
+static uint64_t saved_suspend_ns;
 
 void time_init(void)
 {
     KASSERT(tsc_hz);
     mult = (NS_PER_S << 32) / tsc_hz;
+    time_tsc_epoch = kernel_entry_tsc;
+    time_base_ns = 0;
 }
 
 uint64_t time_cycles_to_ns(uint64_t cycles)
@@ -34,7 +39,20 @@ uint64_t time_cycles_to_ns(uint64_t cycles)
 
 uint64_t time_ns(void)
 {
-    return time_cycles_to_ns(rdtsc() - kernel_entry_tsc);
+    if (!mult)
+        return 0;
+    return time_base_ns + time_cycles_to_ns(rdtsc() - time_tsc_epoch);
+}
+
+void time_suspend(void)
+{
+    saved_suspend_ns = time_ns();
+}
+
+void time_resume(void)
+{
+    time_tsc_epoch = rdtsc();
+    time_base_ns = saved_suspend_ns;
 }
 
 uint64_t time_us(void) { return time_ns() / NS_PER_US; }
@@ -163,4 +181,12 @@ void time_tick(void)
     }
     rearm(b, true);                               /* the hardware event was consumed */
     spin_unlock(&b->lock);
+}
+
+void time_resume_cpu(void)
+{
+    struct timer_base *b = &percpu()->timers;
+    uint64_t f = spin_lock_irqsave(&b->lock);
+    rearm(b, true);
+    spin_unlock_irqrestore(&b->lock, f);
 }

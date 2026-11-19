@@ -1,4 +1,4 @@
-# User ABI (version 11)
+# User ABI (version 13)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **12**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **13**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -34,6 +34,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 10 | D-CMPL's Linux server (69-70): `process_vmar`, `thread_create_stopped`; `exception_resume` can end one thread (`EXIT_THREAD`) |
 | 11 | the POWER_BUTTON startup handle: an event the kernel signals on each power-button press ([acpi.md](acpi.md)) |
 | 12 | hardware-rooted attestation (71): `attest_activate`; reports carry TPM evidence (format 2) |
+| 13 | demand paging (lazy VMO physical frame commit with upfront quota), `vmar_destroy` (72), and `system_power` action 3 (`POWER_SUSPEND`, ACPI S3) |
 
 ## Calling convention (x86-64)
 
@@ -140,7 +141,7 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 60 | vmo_verify | vmo, dsig vmo | 0 (sealed; a program or driver is trusted to run, a manifest is only known genuine) | READ on both |
 | 61 | vmo_allow_unsigned | vmo, VMEX resource | 0 (sealed, trusted as unsigned code) | READ; MANAGE on resource |
 | 62 | attest | nonce (32 bytes), buf, cap | report length | |
-| 63 | system_power | POWER resource, action (1 off, 2 reset) | does not return, or `NOT_SUPPORTED` | MANAGE on resource |
+| 63 | system_power | POWER resource, action (1 off, 2 reset, 3 suspend) | 0 after S3 wake, does not return for off/reset, or `NOT_SUPPORTED` | MANAGE on resource |
 | 64 | measure | MEASURE resource, digest (32 bytes), text, len (<= 52, printable ASCII) | 0 (PCR 10 extended, logged as `svc <text>`) | MANAGE on resource |
 | 65 | klog_read | KLOG resource, seq, buf, cap | records copied (`struct dos_klog_entry`, 176 bytes; at most 64), kernel addresses replaced by `[kaddr]` | MANAGE on resource |
 | 66 | log_record | log, level (0 error .. 3 debug), text, len | len (`log_write` is level 2, info) | WRITE |
@@ -149,6 +150,7 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 69 | process_vmar | process | its root VMAR handle | MANAGE |
 | 70 | thread_create_stopped | process, entry, stack top, arg | thread handle; it stops with a `START` exception before its first instruction (`BAD_STATE` without an exception channel) | MANAGE |
 | 71 | attest_activate | challenge (328 bytes), out (32 bytes) | 32; `NOT_SUPPORTED` without a TPM, `ACCESS_DENIED` if the TPM refuses | |
+| 72 | vmar_destroy | vmar (non-root) | 0 (unmaps all mappings/descendants and reclaims address space; `INVALID_ARGS` on root, `BAD_STATE` if already destroyed) | MAP |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.
@@ -198,6 +200,10 @@ everything is released.
   is `BAD_ADDRESS`, never a crash. SMAP and SMEP are on.
 - Each process gets random bases for its mappings, image and stack. Page tables count against its
   memory quota.
+- Anonymous VMOs charge their full size to the process memory quota upfront, but commit physical
+  frames lazily on first touch (demand paging in both ring-3 page faults and kernel `user_copy`).
+  Port rings, DMA pins, and CET shadow stacks commit eagerly. `vmar_destroy` releases a child VMAR's
+  address space and unmaps its mappings.
 
 ## CPU state
 

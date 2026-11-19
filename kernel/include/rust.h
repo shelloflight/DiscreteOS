@@ -14,6 +14,15 @@ void dkrnl_init(void);            /* after heap + time: verifies the allocator, 
 /* ACPI (kernel/rust/src/dev/acpi.rs): run \_TTS(state) and \_PTS(state) before sleeping or switching
  * off, when the AML namespace is loaded and the caller may block; otherwise nothing. */
 void dkrnl_acpi_prepare_sleep(uint32_t state);
+/* ACPI wake (dev/acpi.rs): run \_PIC(1), \_WAK(state), \_TTS(0) and re-enable SCI events. */
+void dkrnl_acpi_wake(uint32_t state);
+/* PCI suspend/resume (dev/pci.rs): save and restore PCI configuration headers across S3. */
+void dkrnl_pci_suspend(void);
+void dkrnl_pci_resume(void);
+/* IOMMU resume (dev/iommu): restore VT-d / AMD-Vi DMA + interrupt remapping after S3 wake. */
+void dkrnl_iommu_resume(void);
+/* TPM resume (security/measure.rs): issue TPM2_Startup(TPM_SU_STATE) if a TPM is attached. */
+void dkrnl_tpm_resume(void);
 void dkrnl_objects_print(void);   /* live kernel objects per type (inspection) */
 /* Verified-boot report, PCR 8 measurement, TPM discovery (after dkrnl_init: needs ACPI) */
 void dkrnl_security_init(uint32_t firmware, uint32_t flags, const uint8_t *kernel_dsig);
@@ -26,6 +35,8 @@ void dkrnl_user_print_current(void);                    /* "user fault: process 
 void dkrnl_user_kill_current(int code);                 /* kill the current thread's process */
 /* Hand a ring-3 fault to the thread's handler or the supervisor; true = resume. */
 bool dkrnl_user_exception(struct interrupt_frame *f, uint64_t cr2);
+/* Resolve a not-present fault on a demand-paged user mapping; true = page mapped, resume. */
+bool dkrnl_demand_page(uint64_t cr2, uint64_t error);
 
 #ifdef KTEST
 uint32_t rust_selftest(void);     /* KTEST_SELFTEST: returns the number of failures */

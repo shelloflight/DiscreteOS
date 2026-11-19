@@ -49,13 +49,17 @@ struct trampoline_params {                /* layout: trampoline.asm */
 };
 
 extern const char trampoline_start[], trampoline_end[], trampoline_params[];
-extern char ap_entry64[];
+extern char ap_entry64[], ap_resume_entry64[];
 
-NORETURN void ap_main(struct percpu *pc);   /* from trampoline.asm */
+NORETURN void ap_main(struct percpu *pc);        /* from trampoline.asm */
+NORETURN void ap_resume_main(struct percpu *pc); /* from trampoline.asm (S3 resume) */
 
 static uint64_t   online_mask = 1;        /* CPU 0 (boot CPU) */
 static uint32_t   online_count = 1;
 static uint64_t   bsp_cr0, bsp_cr4, bsp_efer_nx;
+static bool       low_ram_ok;             /* true if 0x8000-0xBFFF is usable low RAM */
+static uint64_t   suspended_ap_mask;      /* APs parked for S3, to restart on resume */
+static volatile uint32_t aps_parked;
 static uint64_t   start_tsc;              /* TSC just before a SIPI: the AP's TSC must not be behind it */
 static uint64_t   bringup_us;
 
@@ -355,6 +359,148 @@ void ap_main(struct percpu *pc)
     sched_start_ap();
 }
 
+void ap_resume_main(struct percpu *pc)
+{
+    write_cr0(bsp_cr0);
+    write_cr4(bsp_cr4);
+    wrmsr(MSR_EFER, rdmsr(MSR_EFER) | bsp_efer_nx);
+    cpu_init_pat();
+    gdt_resume_cpu(pc);
+    idt_load();
+    if (cet_ss) {
+        cet_ap_reset(pc->idle);
+        cet_cpu_enable(pc, pc->idle);
+    }
+    lapic_init_ap();
+    timer_init_ap();
+    time_resume_cpu();
+
+    uint64_t f = spin_lock_irqsave(&tlb_lk);
+    __atomic_fetch_or(&online_mask, THREAD_CPU(pc->cpu_id), __ATOMIC_RELEASE);
+    __atomic_add_fetch(&online_count, 1, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&tlb_lk, f);
+    tlb_flush_all();
+    watchdog_start(pc);
+    __atomic_store_n(&pc->online, true, __ATOMIC_RELEASE);
+    sched_start_ap();
+}
+
+static struct trampoline_params *install_trampoline(uint64_t entry)
+{
+    size_t len = (size_t)((uintptr_t)trampoline_end - (uintptr_t)trampoline_start);
+    KASSERT(len <= TRAMP_PML4 - TRAMPOLINE_PHYS);
+    uint8_t *tr = vmm_map_phys(TRAMPOLINE_PHYS, TRAMP_END - TRAMPOLINE_PHYS, VMM_W);
+    memset(tr, 0, TRAMP_END - TRAMPOLINE_PHYS);
+    memcpy(tr, trampoline_start, len);
+    uint64_t *pml4 = (uint64_t *)(tr + (TRAMP_PML4 - TRAMPOLINE_PHYS));
+    uint64_t *pdpt = (uint64_t *)(tr + (TRAMP_PDPT - TRAMPOLINE_PHYS));
+    uint64_t *pd   = (uint64_t *)(tr + (TRAMP_PD - TRAMPOLINE_PHYS));
+    pml4[0] = TRAMP_PDPT | PTE_P | PTE_W;
+    pdpt[0] = TRAMP_PD | PTE_P | PTE_W;
+    pd[0]   = PTE_P | PTE_W | PTE_PS;
+    const uint64_t *kpml4 = phys_to_virt(vmm_kernel_pml4());
+    for (int i = 256; i < 512; i++)
+        pml4[i] = kpml4[i];
+    struct trampoline_params *prm = (struct trampoline_params *)(tr + (trampoline_params - trampoline_start));
+    prm->tramp_cr3 = TRAMP_PML4;
+    prm->kernel_cr3 = vmm_kernel_pml4();
+    prm->efer = EFER_LME | bsp_efer_nx;
+    prm->stack = TRAMP_END;
+    prm->percpu = (uint64_t)(uintptr_t)&bsp_percpu;
+    prm->entry = entry;
+    return prm;
+}
+
+bool smp_low_ram_ok(void) { return low_ram_ok; }
+
+uint32_t smp_setup_s3_trampoline(uint64_t entry)
+{
+    KASSERT(low_ram_ok);
+    (void)install_trampoline(entry);
+    __asm__ volatile("mfence" ::: "memory");
+    return (uint32_t)TRAMPOLINE_PHYS;
+}
+
+void smp_clear_s3_trampoline(void)
+{
+    if (!low_ram_ok)
+        return;
+    uint8_t *tr = vmm_map_phys(TRAMPOLINE_PHYS, TRAMP_END - TRAMPOLINE_PHYS, VMM_W);
+    memset(tr, 0, TRAMP_END - TRAMPOLINE_PHYS);
+}
+
+NORETURN void smp_ap_park(struct percpu *pc)
+{
+    cpu_cli();
+    timer_cancel(&pc->wd_timer);
+    timer_cancel(&pc->slice_timer);
+    timer_program(TIMER_NONE);
+    uint64_t f = spin_lock_irqsave(&tlb_lk);
+    __atomic_fetch_and(&online_mask, ~THREAD_CPU(pc->cpu_id), __ATOMIC_RELEASE);
+    __atomic_sub_fetch(&online_count, 1, __ATOMIC_RELEASE);
+    spin_unlock_irqrestore(&tlb_lk, f);
+    __atomic_store_n(&pc->online, false, __ATOMIC_RELEASE);
+    __asm__ volatile("wbinvd" ::: "memory");
+    __atomic_add_fetch(&aps_parked, 1, __ATOMIC_RELEASE);
+    for (;;) {
+        cpu_cli();
+        __asm__ volatile("hlt");
+    }
+}
+
+bool smp_suspend(void)
+{
+    timer_cancel(&bsp_percpu.wd_timer);
+    uint64_t mask = smp_online_mask() & ~1ull;
+    suspended_ap_mask = mask;
+    if (!mask)
+        return true;
+
+    __atomic_store_n(&aps_parked, 0u, __ATOMIC_RELEASE);
+    sched_freeze_aps(true);
+    uint32_t expected = 0;
+    for (uint64_t m = mask; m; m &= m - 1) {
+        uint32_t c = (uint32_t)__builtin_ctzll(m);
+        __atomic_store_n(&cpus[c]->need_resched, 1u, __ATOMIC_RELEASE);
+        smp_send(c, IPI_RESCHED);
+        expected++;
+    }
+    uint64_t start = rdtsc(), limit = tsc_hz * 5;
+    while (__atomic_load_n(&aps_parked, __ATOMIC_ACQUIRE) < expected) {
+        if (rdtsc() - start > limit) {
+            kprintf("SMP: S3 suspend: only %u of %u AP(s) parked\n",
+                    __atomic_load_n(&aps_parked, __ATOMIC_RELAXED), expected);
+            sched_freeze_aps(false);
+            return false;
+        }
+        cpu_pause();
+        smp_poll();
+    }
+    for (uint64_t m = mask; m; m &= m - 1)
+        sched_drain_ap((uint32_t)__builtin_ctzll(m));
+    return true;
+}
+
+static bool start_ap(struct percpu *pc, struct trampoline_params *prm);
+
+void smp_resume(void)
+{
+    sched_freeze_aps(false);
+    uint64_t mask = suspended_ap_mask;
+    suspended_ap_mask = 0;
+    if (mask && low_ram_ok) {
+        struct trampoline_params *prm = install_trampoline((uint64_t)(uintptr_t)ap_resume_entry64);
+        for (uint64_t m = mask; m; m &= m - 1)
+            lapic_send_init(cpus[__builtin_ctzll(m)]->apic_id);
+        tsc_delay_us(INIT_WAIT_US);
+        for (uint64_t m = mask; m; m &= m - 1)
+            start_ap(cpus[__builtin_ctzll(m)], prm);
+        smp_clear_s3_trampoline();
+    }
+    if (smp_active())
+        watchdog_start(&bsp_percpu);
+}
+
 static struct percpu *ap_alloc(uint32_t apic_id)
 {
     uint64_t pa = pmm_alloc_zeroed();
@@ -418,41 +564,21 @@ static bool low_ram_usable(const BootInfo *bi, uint64_t start, uint64_t end)
 void smp_init(const BootInfo *bi)
 {
     interrupt_register(VEC_IPI, ipi_irq);
+    bsp_cr0 = read_cr0();
+    bsp_cr4 = read_cr4();
+    bsp_efer_nx = rdmsr(MSR_EFER) & EFER_NXE;
+    low_ram_ok = low_ram_usable(bi, TRAMPOLINE_PHYS, TRAMP_END);
     if (!acpi.madt || acpi.cpu_count < 2) {
         kprintf("SMP: 1 CPU (%s)\n", acpi.madt ? "the only one in the MADT" : "no ACPI MADT");
         return;
     }
-    if (!low_ram_usable(bi, TRAMPOLINE_PHYS, TRAMP_END)) {
+    if (!low_ram_ok) {
         kprintf("SMP: memory %#llx-%#llx for the AP trampoline is not usable RAM; using 1 CPU\n",
                 TRAMPOLINE_PHYS, TRAMP_END - 1);
         return;
     }
     uint64_t t0 = rdtsc();
-    bsp_cr0 = read_cr0();
-    bsp_cr4 = read_cr4();
-    bsp_efer_nx = rdmsr(MSR_EFER) & EFER_NXE;
-
-    /* Trampoline code and its temporary page tables: identity map of the first 2 MiB (where the
-     * trampoline runs while paging comes on) + the kernel's upper half (where it jumps next). */
-    size_t len = (size_t)((uintptr_t)trampoline_end - (uintptr_t)trampoline_start);   /* linker symbols */
-    KASSERT(len <= TRAMP_PML4 - TRAMPOLINE_PHYS);
-    uint8_t *tr = vmm_map_phys(TRAMPOLINE_PHYS, TRAMP_END - TRAMPOLINE_PHYS, VMM_W);
-    memset(tr, 0, TRAMP_END - TRAMPOLINE_PHYS);
-    memcpy(tr, trampoline_start, len);
-    uint64_t *pml4 = (uint64_t *)(tr + (TRAMP_PML4 - TRAMPOLINE_PHYS));
-    uint64_t *pdpt = (uint64_t *)(tr + (TRAMP_PDPT - TRAMPOLINE_PHYS));
-    uint64_t *pd   = (uint64_t *)(tr + (TRAMP_PD - TRAMPOLINE_PHYS));
-    pml4[0] = TRAMP_PDPT | PTE_P | PTE_W;
-    pdpt[0] = TRAMP_PD | PTE_P | PTE_W;
-    pd[0]   = PTE_P | PTE_W | PTE_PS;
-    const uint64_t *kpml4 = phys_to_virt(vmm_kernel_pml4());
-    for (int i = 256; i < 512; i++)
-        pml4[i] = kpml4[i];
-    struct trampoline_params *prm = (struct trampoline_params *)(tr + (trampoline_params - trampoline_start));
-    prm->tramp_cr3 = TRAMP_PML4;
-    prm->kernel_cr3 = vmm_kernel_pml4();
-    prm->efer = EFER_LME | bsp_efer_nx;
-    prm->entry = (uint64_t)(uintptr_t)ap_entry64;
+    struct trampoline_params *prm = install_trampoline((uint64_t)(uintptr_t)ap_entry64);
 
     /* Per-CPU blocks, IST stacks and idle threads first, then INIT for all APs at once. */
     uint32_t first = cpu_slots;
@@ -466,13 +592,14 @@ void smp_init(const BootInfo *bi)
         }
         cpus[cpu_slots++] = pc;
     }
-    for (uint32_t c = first; c < cpu_slots; c++)
+    uint32_t count = cpu_slots < MAX_CPUS ? cpu_slots : MAX_CPUS;
+    for (uint32_t c = first; c < count; c++)
         lapic_send_init(cpus[c]->apic_id);
     tsc_delay_us(INIT_WAIT_US);
-    for (uint32_t c = first; c < cpu_slots; c++)
+    for (uint32_t c = first; c < count; c++)
         start_ap(cpus[c], prm);
 
-    memset(tr, 0, TRAMP_END - TRAMPOLINE_PHYS);               /* nothing executable left in low memory */
+    smp_clear_s3_trampoline();                               /* nothing executable left in low memory */
     bringup_us = tsc_to_us(rdtsc() - t0);
     if (smp_active())
         watchdog_start(&bsp_percpu);

@@ -431,6 +431,68 @@ fn test_ctest() -> bool {
     true
 }
 
+fn test_ring() -> bool {
+    use libd::ring::{Cqe, IoRing, Sqe};
+    check!(IoRing::create(0, 4096).is_err(), "ring: 0 entries refused");
+    check!(IoRing::create(3, 4096).is_err(), "ring: non-power-of-two refused");
+    check!(IoRing::create(16, 0).is_err(), "ring: 0 data_len refused");
+    let mut producer = match IoRing::create(8, 128 * 1024) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("ltest: FAIL: IoRing::create returned {}", e);
+            return false;
+        }
+    };
+    let dup = match sys::handle_duplicate(producer.vmo(), sys::RIGHTS_SAME) {
+        Ok(h) => h,
+        Err(e) => {
+            println!("ltest: FAIL: duplicate ring vmo returned {}", e);
+            return false;
+        }
+    };
+    let mut consumer = match IoRing::attach(dup) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("ltest: FAIL: IoRing::attach returned {}", e);
+            return false;
+        }
+    };
+    check!(consumer.data_len() == 128 * 1024, "ring data_len");
+    check!(consumer.data(128 * 1024, 1).is_none(), "ring data bounds");
+    // Fill SQ to capacity (8), verify 9th is refused, drain and wrap around twice.
+    for round in 0..3u32 {
+        for i in 0..8u32 {
+            let off = i * 8192;
+            let pat = (round * 16 + i) as u8;
+            producer.data_mut(off, 4096).unwrap().fill(pat);
+            check!(
+                producer.push_sq(Sqe { id: round * 100 + i, op: 1, a: u64::from(i), b: 8, buf_off: off, buf_len: 4096 }),
+                "push_sq"
+            );
+        }
+        check!(!producer.push_sq(Sqe::default()), "SQ full refused");
+        for i in 0..8u32 {
+            let sqe = consumer.pop_sq().unwrap();
+            let pat = (round * 16 + i) as u8;
+            check!(sqe.id == round * 100 + i && consumer.data(sqe.buf_off, 1).unwrap()[0] == pat, "sqe + zero-copy data");
+            consumer.data_mut(sqe.buf_off, 1).unwrap()[0] = pat ^ 0xFF;
+            check!(consumer.push_cq(Cqe { id: sqe.id, status: 0, a: sqe.b }), "push_cq");
+        }
+        check!(consumer.pop_sq().is_none(), "SQ empty");
+        for i in 0..8u32 {
+            let cqe = producer.pop_cq().unwrap();
+            let pat = (round * 16 + i) as u8;
+            check!(cqe.id == round * 100 + i && cqe.status == 0 && producer.data(i * 8192, 1).unwrap()[0] == (pat ^ 0xFF), "cqe + reply data");
+        }
+        check!(producer.pop_cq().is_none(), "CQ empty");
+    }
+    // Hostile header: invalid magic/size rejected by attach.
+    let bad = sys::vmo_create(8192).unwrap();
+    check!(matches!(IoRing::attach(bad), Err(sys::ERR_INVALID_ARGS)), "hostile ring VMO rejected");
+    println!("ltest: ring: shared-memory SQ/CQ wrap-around, 128 KiB zero-copy buffer, hostile VMO rejected");
+    true
+}
+
 fn bench() {
     const SPAWNS: u64 = 200;
     let t0 = sys::clock_ns();
@@ -485,6 +547,7 @@ fn main(s: *const Startup) -> i32 {
         && test_mutex()
         && test_once_detached()
         && test_channels()
+        && test_ring()
         && test_guard()
         && test_ctest();
     if !ok {

@@ -156,6 +156,7 @@ pub fn verify_vmo(v: &Vmo, d: &[u8]) -> Result<dsig::Header, Status> {
         off += n as u64;
     }
     let h = dsig::verify_hashed(d, trusted_key(), h.size, &s.finish()).map_err(sig_status)?;
+    v.set_name_once(h.name_str());
     if h.kind != dsig::KIND_MANIFEST {
         v.set_trust(Trust::Signed);
     }

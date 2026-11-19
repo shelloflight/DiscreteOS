@@ -418,3 +418,13 @@ pub fn fault_irq(vector: u32) -> bool {
 pub fn kernel_owned(bdf: Bdf) -> bool {
     amdvi::kernel_owned(bdf)
 }
+
+/// Re-program the active IOMMU backend after ACPI S3 sleep (called with interrupts off).
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_iommu_resume() {
+    match BACKEND.load(Ordering::Acquire) {
+        1 => vtd::resume(),
+        2 => amdvi::resume(),
+        _ => {}
+    }
+}

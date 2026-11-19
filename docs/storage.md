@@ -17,13 +17,19 @@ Storage is entirely in user space: disk drivers, a storage service and filesyste
  app ── node channels (OPEN, READ, WRITE, ...) ──┘
 ```
 
-- **Drivers** serve `BLK_READ`, `BLK_WRITE`, `BLK_FLUSH` (protocol in `user/lib/libd/src/proto.rs`)
-  through the shared loop in `blkserve.rs`. Each disk gets its own channel straight to storaged;
-  block I/O never passes through the device manager.
+- **Drivers** serve `BLK_READ`, `BLK_WRITE`, `BLK_FLUSH`, and shared-memory I/O ring transfers
+  (`BLK_RING_SETUP`, `BLK_RING_DOORBELL`, protocol in `user/lib/libd/src/proto.rs`) through the
+  shared loop in `blkserve.rs`. Each disk gets its own channel straight to storaged; block I/O
+  never passes through the device manager.
+- **Zero-copy I/O rings**: on disk attach (and reconnect), `storaged` negotiates a 256 KiB shared
+  `libd::ring::IoRing` VMO with each block driver (`ahci`, `nvme`, `virtio-blk`), transferring up
+  to 256 KiB per doorbell directly in shared memory with automatic channel fallback for drivers
+  without ring support (e.g., USB mass storage).
 - **Driver restart**: a restarted driver announces its disks again and storaged retries the
   interrupted request; filesystems do not notice.
 - **storaged** reads each GPT (falls back to the backup table), mounts FAT32 and DFS partitions, and
-  announces each volume to init. NTFS/exFAT partitions are named and left alone.
+  announces each volume to init. NTFS/exFAT partitions are named and left alone. The `sys` DFS
+  system volume is always mounted immutable read-only, even in writable test modes.
 - **Service restarts** ([services.md](services.md)): a restarted device manager reaches storaged
   through a new `disks` channel and its disks come back under the same names; a restarted storaged
   gets every known disk again from the device manager and announces its volumes anew. At shutdown,
@@ -114,9 +120,9 @@ are refused. FAT has no crash consistency; use DFS for data that must survive a 
 
 ## Limitations
 
-- storaged is single-threaded; only long reads queue several requests at a driver.
-- A driver request carries at most 32 KiB (one channel message): sequential reads of 32 KiB and
-  more gain nothing from the cache.
+- storaged is single-threaded.
+- Channel-only block drivers (USB mass storage) carry at most 32 KiB per channel message; ring-capable
+  block drivers (`ahci`, `nvme`, `virtio-blk`) transfer up to 256 KiB per doorbell.
 - No hard links. Files written by the host image tool have unknown (0) times (reproducible images).
 - FAT32 times are UTC with 2-second steps; a FAT32 file renamed while open keeps working, a DFS one
   always does.

@@ -44,8 +44,10 @@ static STACK_MIN_LEFT: AtomicU64 = AtomicU64::new(u64::MAX);
 static READY: Event = Event::new(c"acpi.ready", false);
 static WORK: Event = Event::new(c"acpi.work", true);
 static DONE: Event = Event::new(c"acpi.done", true);
+static WAKE_DONE: Event = Event::new(c"acpi.wake", true);
 static LOADED: AtomicBool = AtomicBool::new(false);
 static SLEEP_REQ: AtomicU32 = AtomicU32::new(0);
+static WAKE_REQ: AtomicU32 = AtomicU32::new(0);
 /// TPM start requests (`tpm_start`): 1 = asked, then the answer: 2 done, 3 refused.
 static TPM_REQ: AtomicU32 = AtomicU32::new(0);
 static TPM_DONE: Event = Event::new(c"acpi.tpm", true);
@@ -445,6 +447,22 @@ pub extern "C" fn dkrnl_acpi_prepare_sleep(state: u32) {
     }
 }
 
+/// `dkrnl_acpi_wake`: `\_PIC(1)`, `\_WAK(state)`, `\_TTS(0)` and SCI re-enable on the ACPI thread.
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_acpi_wake(state: u32) {
+    let rflags: u64;
+    // SAFETY: reads RFLAGS.
+    unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) rflags) };
+    if !LOADED.load(Ordering::Acquire) || ffi::panicking() || rflags & (1 << 9) == 0 {
+        return;
+    }
+    WAKE_REQ.store(state.min(5) + 1, Ordering::Release);
+    WORK.signal();
+    if !WAKE_DONE.wait_timeout(5_000_000_000) {
+        kprintln!("ACPI: \\_WAK({}) did not finish in 5 s", state);
+    }
+}
+
 /// Start the command in the TPM's CRB buffer the ACPI way (TPM2 table start method 2 or 8): the
 /// TPM device's `_DSM` (UUID 6BBF6CAB-5463-4714-B7CD-F0203C0368D4, revision 1, function 1), run
 /// on the ACPI thread. Returns when the method has returned (it waits for the firmware TPM).
@@ -525,6 +543,7 @@ struct Gpe {
 struct State {
     aml: Interpreter<Kernel>,
     gpes: Vec<Gpe>,
+    enabled_gpes: Vec<usize>,
     pm1: Vec<(u16, u16)>,
     /// Power-button devices (PNP0C0C) by path.
     buttons: Vec<String>,
@@ -666,6 +685,43 @@ impl State {
         }
         self.handle_notifies();
     }
+
+    fn wake(&mut self, s: u32) {
+        if self.aml.find("\\_PIC").is_some()
+            && let Err(e) = self.aml.evaluate("\\_PIC", alloc::vec![Object::Integer(1)])
+        {
+            kprintln!("ACPI: \\_PIC(1) on wake: {}", e);
+        }
+        if self.aml.find("\\_WAK").is_some()
+            && let Err(e) = self.aml.evaluate("\\_WAK", alloc::vec![Object::Integer(u64::from(s))])
+        {
+            kprintln!("ACPI: \\_WAK({}): {}", s, e);
+        }
+        if self.aml.find("\\_TTS").is_some()
+            && let Err(e) = self.aml.evaluate("\\_TTS", alloc::vec![Object::Integer(0)])
+        {
+            kprintln!("ACPI: \\_TTS(0): {}", e);
+        }
+        self.handle_notifies();
+        // Clear stale status bits and re-enable SCI sources (PM1 fixed power button + GPEs).
+        for &(port, half) in &self.pm1 {
+            outw(port, 0xFFFF);
+            let en = if self.fixed_button { PWRBTN as u16 } else { 0 };
+            outw(port + half, en);
+        }
+        for g in &self.gpes {
+            for i in 0..g.half {
+                outb(g.port + g.half + i, 0);
+                outb(g.port + i, 0xFF);
+            }
+        }
+        for i in 0..self.enabled_gpes.len() {
+            let n = self.enabled_gpes[i];
+            if n < self.counts.len() && !self.counts[n].1 {
+                self.set_gpe_enable(n, true);
+            }
+        }
+    }
 }
 
 /// GPE numbers named in `_PRW` (wake events): not enabled at run time.
@@ -765,6 +821,10 @@ extern "C" fn worker() {
         Some((a, b)) => unsafe { ffi::power_set_s5(a, b) },
         None => kprintln!("ACPI: no \\_S5 in the namespace"),
     }
+    if let Some((a, b)) = aml.sleep_type(3) {
+        // SAFETY: plain call.
+        unsafe { ffi::power_set_s3(a, b) };
+    }
     super::cpupm::configure(&mut aml); // idle states and performance control (every CPU)
 
     let flags = rd::<4>(fadt, F_FLAGS) as u32;
@@ -772,6 +832,7 @@ extern "C" fn worker() {
     let mut st = State {
         aml,
         gpes: Vec::new(),
+        enabled_gpes: Vec::new(),
         pm1: Vec::new(),
         buttons,
         fixed_button: flags & FLAG_PWR_BUTTON == 0 && flags & FLAG_HW_REDUCED == 0,
@@ -790,6 +851,9 @@ fn idle() -> ! {
         WORK.wait();
         if SLEEP_REQ.swap(0, Ordering::AcqRel) != 0 {
             DONE.signal();
+        }
+        if WAKE_REQ.swap(0, Ordering::AcqRel) != 0 {
+            WAKE_DONE.signal();
         }
         if TPM_REQ.compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
             TPM_DONE.signal();
@@ -838,6 +902,7 @@ fn sci_setup(st: &mut State, fadt: &[u8], flags: u32) {
     for n in 0..st.counts.len() {
         if st.gpe_method(n).is_some() && !wake.contains(&(n as u64)) {
             st.set_gpe_enable(n, true);
+            st.enabled_gpes.push(n);
             enabled += 1;
         }
     }
@@ -877,6 +942,11 @@ fn serve(mut st: State) -> ! {
         if s != 0 {
             st.prepare_sleep(s - 1);
             DONE.signal();
+        }
+        let w = WAKE_REQ.swap(0, Ordering::AcqRel);
+        if w != 0 {
+            st.wake(w - 1);
+            WAKE_DONE.signal();
         }
         if TPM_REQ.load(Ordering::Acquire) == 1 {
             let ok = st.tpm_start();

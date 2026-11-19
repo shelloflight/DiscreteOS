@@ -33,6 +33,7 @@ pub mod log;
 pub mod proto;
 #[cfg(feature = "alloc")]
 pub mod rec;
+pub mod ring;
 pub mod svc;
 pub mod sync;
 pub mod sys;

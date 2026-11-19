@@ -69,6 +69,7 @@ void cpupm_configure(const struct cpupm_desc *d);
 /* Energy-performance preference for every CPU (CPPC/HWP), or the P-state (_PSS). May block.
  * False when the CPU has no performance control the kernel drives. */
 bool cpupm_set_policy(enum cpupm_policy p);
+void cpupm_resume(void);                        /* S3: re-enable CPPC/HWP/P-states on all CPUs */
 void cpupm_print(void);                         /* idle and performance state (kdb) */
 #ifdef KTEST
 extern bool cpupm_test_force_deep;              /* use deep _CST states even under a hypervisor */

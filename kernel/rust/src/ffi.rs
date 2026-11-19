@@ -200,6 +200,13 @@ unsafe extern "C" {
         flags: u32,
         new_tables: *mut u64,
     ) -> bool;
+    pub fn uspace_map_page(
+        a: *mut RawUspace,
+        va: u64,
+        pa: u64,
+        flags: u32,
+        new_tables: *mut u64,
+    ) -> bool;
     pub fn uspace_unmap(a: *mut RawUspace, va: u64, pages: u64);
     pub fn uspace_translate(a: *mut RawUspace, va: u64) -> u64;
     pub fn uspace_tables_needed(va: u64, pages: u64) -> u64;
@@ -249,6 +256,7 @@ unsafe extern "C" {
     pub fn acpi_mmio_map(pa: u64, len: u32) -> *mut u8;
     pub fn ioapic_route_sci(irq: u8, vector: u8) -> bool;
     pub fn power_set_s5(typ_a: u8, typ_b: u8);
+    pub fn power_set_s3(typ_a: u8, typ_b: u8);
     /// `struct cpupm_desc` (dev/cpupm.rs) or NULL; copied before it returns (cpupm.h).
     pub fn cpupm_configure(d: *const c_void);
     pub fn vmm_map_phys(pa: u64, size: u64, flags: u32) -> *mut u8;
@@ -381,6 +389,8 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub fn power_off_supported() -> bool;
     pub fn power_off();
+    pub fn power_suspend_supported() -> bool;
+    pub fn power_suspend() -> c_int;
     pub fn power_reboot() -> !;
 }
 

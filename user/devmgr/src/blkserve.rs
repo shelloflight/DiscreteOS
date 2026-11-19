@@ -11,6 +11,7 @@
 //! whatever the layers above do.
 
 use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
+use libd::ring::{Cqe, IoRing, Sqe};
 use libd::sys::{self, Handle};
 use libd::{Port, println};
 
@@ -73,6 +74,46 @@ pub fn block_op(d: &mut impl Disk, ch: Handle, unit: usize, h: &Header, msg: &[u
     }
 }
 
+fn ring_op(d: &mut impl Disk, unit: usize, sqe: &Sqe, ring: &mut IoRing, writable: bool) -> i32 {
+    let cap = d.capacity(unit);
+    if !writable && matches!(sqe.op, proto::BLK_WRITE | proto::BLK_FLUSH) {
+        return sys::ERR_ACCESS_DENIED as i32;
+    }
+    match sqe.op {
+        proto::BLK_READ | proto::BLK_WRITE => {
+            let lba = sqe.a;
+            let count = sqe.b;
+            let Some(bytes) = count.checked_mul(SECTOR as u64).and_then(|n| u32::try_from(n).ok()) else {
+                return sys::ERR_INVALID_ARGS as i32;
+            };
+            if count == 0 || bytes != sqe.buf_len || lba.checked_add(count).is_none_or(|e| e > cap) {
+                return sys::ERR_INVALID_ARGS as i32;
+            }
+            let Some(buf) = ring.data_mut(sqe.buf_off, sqe.buf_len) else {
+                return sys::ERR_INVALID_ARGS as i32;
+            };
+            let mut done = 0u64;
+            while done < count {
+                let n = (count - done).min(MAX_SECTORS);
+                let off = (done as usize) * SECTOR;
+                let len = (n as usize) * SECTOR;
+                let r = if sqe.op == proto::BLK_READ {
+                    d.read(unit, lba + done, n, &mut buf[off..off + len])
+                } else {
+                    d.write(unit, lba + done, n, &buf[off..off + len])
+                };
+                if let Err(e) = r {
+                    return e;
+                }
+                done += n;
+            }
+            0
+        }
+        proto::BLK_FLUSH => d.flush(unit).err().unwrap_or(0),
+        _ => sys::ERR_INVALID_ARGS as i32,
+    }
+}
+
 /// Announce the disks, then serve requests until the device manager goes away (exit 0) or the
 /// driver must end (`control` returned an exit code).
 pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
@@ -94,6 +135,7 @@ pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
         return 2;
     };
     let mut attached: [Handle; MAX_UNITS] = [0; MAX_UNITS];
+    let mut rings: [Option<IoRing>; MAX_UNITS] = [const { None }; MAX_UNITS];
     port.arm(ctl, sys::READABLE | sys::PEER_CLOSED, 0);
     let mut msg = [0u8; HEADER + MAX_SECTORS as usize * SECTOR];
     let mut data = [0u8; MAX_SECTORS as usize * SECTOR];
@@ -116,16 +158,23 @@ pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
                 Err(_) => {
                     sys::handle_close(ch); // the storage service closed this disk
                     attached[unit] = 0;
+                    rings[unit] = None;
                     break;
                 }
             };
-            let Some(h) = Header::get(&msg[..n]) else { continue };
+            let Some(h) = Header::get(&msg[..n]) else {
+                if nh > 0 {
+                    sys::handle_close(hs[0]);
+                }
+                continue;
+            };
             if key == 0 && h.op == proto::BLK_ATTACH {
                 let u = h.a as usize;
                 if nh == 1 && u < units {
                     if attached[u] != 0 {
                         sys::handle_close(attached[u]);
                     }
+                    rings[u] = None;
                     attached[u] = hs[0];
                     port.arm(hs[0], sys::READABLE | sys::PEER_CLOSED, u as u64 + 1);
                 } else if nh == 1 {
@@ -133,8 +182,41 @@ pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
                 }
                 continue;
             }
+            if key != 0 && h.op == proto::BLK_RING_SETUP {
+                if nh == 1 && unit < units {
+                    match IoRing::attach(hs[0]) {
+                        Ok(r) => {
+                            rings[unit] = Some(r);
+                            reply(ch, &h, 0, 0, 0, &[]);
+                        }
+                        Err(e) => reply(ch, &h, e as i32, 0, 0, &[]),
+                    }
+                } else {
+                    if nh > 0 {
+                        sys::handle_close(hs[0]);
+                    }
+                    reply(ch, &h, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
+                }
+                continue;
+            }
             if nh > 0 {
-                sys::handle_close(hs[0]); // requests carry no handles
+                sys::handle_close(hs[0]); // other requests carry no handles
+            }
+            if key != 0 && h.op == proto::BLK_RING_DOORBELL {
+                if let Some(ring) = rings[unit].as_mut() {
+                    let mut done = 0u64;
+                    while let Some(sqe) = ring.pop_sq() {
+                        let st = ring_op(d, unit, &sqe, ring, writable);
+                        if !ring.push_cq(Cqe { id: sqe.id, status: st, a: sqe.b }) {
+                            break;
+                        }
+                        done += 1;
+                    }
+                    reply(ch, &h, 0, done, 0, &[]);
+                } else {
+                    reply(ch, &h, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
+                }
+                continue;
             }
             if key == 0 && !matches!(h.op, proto::BLK_READ | proto::BLK_WRITE | proto::BLK_FLUSH | proto::STATS) {
                 if let Some(code) = d.control(ch, &h) {

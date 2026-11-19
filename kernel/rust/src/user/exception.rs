@@ -193,6 +193,16 @@ fn info_for(u: &UserThread, kind: u32, vector: u32, error: u64, cr2: u64) -> Inf
     Info { kind, vector, error, cr2, pid: u.proc.header.koid, tid: u.obj.header.koid }
 }
 
+/// Resolve a not-present page fault on a demand-paged user mapping (user.c, interrupts on).
+/// Returns `true` when the page was committed and mapped so the faulting instruction can resume.
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_demand_page(cr2: u64, error: u64) -> bool {
+    let Some(u) = current() else { return false };
+    let write = (error & 2) != 0;
+    let exec = (error & 16) != 0;
+    u.proc.root_vmar().fault(cr2, write, exec)
+}
+
 /// A fault in ring 3 (user.c, interrupts on). True: resume (the frame was updated); false: the
 /// caller reports the fault and kills the process.
 ///

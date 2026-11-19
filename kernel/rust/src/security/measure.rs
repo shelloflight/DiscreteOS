@@ -164,6 +164,18 @@ pub fn tpm_present() -> bool {
     LOG.lock().tpm.is_some()
 }
 
+/// `dkrnl_tpm_resume`: restore TPM state after ACPI S3 sleep (`TPM2_Startup(TPM_SU_STATE)`).
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_tpm_resume() {
+    let mut l = LOG.lock();
+    if let Some(t) = l.tpm.as_mut()
+        && let Err(e) = t.startup_state()
+    {
+        l.tpm_errors += 1;
+        kprintln!("TPM: Startup(STATE) after S3 failed ({:?})", e);
+    }
+}
+
 /// Test builds: drop the TPM (the selftest attaches a simulator and must leave no trace).
 #[cfg(ktest)]
 pub fn detach_tpm() {

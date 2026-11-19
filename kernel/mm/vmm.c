@@ -359,6 +359,37 @@ void *vmm_map_phys_exact(uint64_t pa, uint64_t size, uint32_t flags)
     return ok ? p : NULL;
 }
 
+void *vmm_map_phys_rw(uint64_t pa, uint64_t size)
+{
+    if (size == 0 || pa + size < pa || pa + size > PHYSMAP_SIZE)
+        return NULL;
+    uint64_t start = pa & ~(PAGE_SIZE - 1);
+    uint64_t end = (pa + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    uint64_t f = spin_lock_irqsave(&vmm_lk);
+    bool changed = false;
+    for (uint64_t p = start; p < end; p += PAGE_SIZE) {
+        uint64_t va = PHYSMAP_BASE + p;
+        if (vmm_translate_nolock(va) == VMM_NOT_MAPPED) {
+            if (!map_page_nolock(va, p, VMM_W))
+                panic("VMM: out of memory for page tables");
+        } else {
+            bool oom = false;
+            uint64_t *e = walk_in(pml4_pa, va, 1, false, &oom, &stat_tables, PTE_P | PTE_W);
+            if (e && (*e & PTE_P) && !(*e & PTE_W)) {
+                *e |= PTE_W;
+                changed = true;
+            }
+        }
+    }
+    spin_unlock_irqrestore(&vmm_lk, f);
+    if (changed) {
+        uint64_t pages = (end - start) / PAGE_SIZE;
+        tlb_flush_local(PHYSMAP_BASE + start, pages);
+        tlb_shootdown(PHYSMAP_BASE + start, pages);
+    }
+    return (void *)(uintptr_t)(PHYSMAP_BASE + pa);
+}
+
 /* ---- guard pages ------------------------------------------------------------------------ */
 
 static bool is_guard(uint64_t va)
@@ -603,6 +634,44 @@ bool uspace_map(struct uspace *as, uint64_t va, const uint64_t *frames, uint64_t
             panic("VMM: user page %#llx is already mapped", (unsigned long long)a);
         KASSERT(!(frames[i] & ~PTE_ADDR) && frames[i]);
         *e = frames[i] | leaf;
+    }
+    *new_tables = as->tables - before;
+    spin_unlock_irqrestore(&as->lock, f);
+    return true;
+}
+
+bool uspace_map_page(struct uspace *as, uint64_t va, uint64_t pa, uint32_t flags, uint64_t *new_tables)
+{
+    check_wx(va, flags);
+    KASSERT(user_range_ok(va, 1));
+    KASSERT(!(pa & ~PTE_ADDR) && pa);
+    uint64_t leaf = PTE_P | PTE_U;
+    if (flags & VMM_W)
+        leaf |= PTE_W;
+    if (!(flags & VMM_X))
+        leaf |= nx_bit;
+    if (flags & VMM_UC)
+        leaf |= PTE_PCD | PTE_PWT;
+    if (flags & VMM_SHSTK)
+        leaf |= PTE_D;
+    uint64_t f = spin_lock_irqsave(&as->lock);
+    uint64_t before = as->tables;
+    bool oom = false;
+    uint64_t *e = walk_in(as->pml4, va, 1, true, &oom, &as->tables, PTE_P | PTE_W | PTE_U);
+    if (as->upml4 && !(table(as->upml4)[idx(va, 4)] & PTE_P))
+        kpti_user_pml4_sync(as->pml4, as->upml4, idx(va, 4), idx(va, 4));
+    if (!e) {
+        KASSERT(oom);
+        *new_tables = as->tables - before;
+        spin_unlock_irqrestore(&as->lock, f);
+        return false;
+    }
+    if (*e & PTE_P) {
+        if ((*e & PTE_ADDR) != pa)
+            panic("VMM: user page %#llx already mapped to %#llx (wanted %#llx)",
+                  (unsigned long long)va, (unsigned long long)(*e & PTE_ADDR), (unsigned long long)pa);
+    } else {
+        *e = pa | leaf;
     }
     *new_tables = as->tables - before;
     spin_unlock_irqrestore(&as->lock, f);

@@ -200,6 +200,16 @@ impl Tpm {
         self.t.name()
     }
 
+    /// Re-initialise the TPM after ACPI S3 sleep, restoring saved state (`TPM_SU_STATE`).
+    pub fn startup_state(&mut self) -> Result<(), Error> {
+        let mut c = Cmd::new(ST_NO_SESSIONS, CC_STARTUP);
+        c.u16(1); // TPM_SU_STATE
+        match self.command(c.done()) {
+            Ok(_) | Err(Error::Tpm(RC_INITIALIZE)) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// One command; checks the response header. Returns the response.
     fn command(&mut self, cmd: Vec<u8>) -> Result<Vec<u8>, Error> {
         let mut rsp = vec![0u8; RSP_MAX];

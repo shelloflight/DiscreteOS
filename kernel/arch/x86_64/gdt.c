@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include "arch.h"
 #include "compiler.h"
+#include "cpu.h"
 #include "mm.h"
 #include "percpu.h"
 #include "spec.h"
@@ -81,6 +82,38 @@ void gdt_init_cpu(struct percpu *pc, const uint64_t ist_top[IST_COUNT])
 
     /* Loading GS above may clear its base: re-install this CPU's per-CPU block. */
     percpu_install(pc);
+    user_cpu_init();
+}
+
+void gdt_resume_cpu(struct percpu *pc)
+{
+    uint64_t fs_base = rdmsr(MSR_FS_BASE);
+    uint64_t kgs_base = rdmsr(MSR_KERNEL_GS_BASE);
+    /* Clear the 64-bit TSS busy bit (type 0xB -> 0x9) before reloading TR. */
+    pc->gdt[5] &= ~(1ull << 41);
+    struct dtr gdtr = { GDT_ENTRIES * 8 - 1, (uint64_t)(uintptr_t)pc->gdt };
+    __asm__ volatile(
+        "lgdt %0\n\t"
+        "pushq %1\n\t"
+        "leaq 1f(%%rip), %%rax\n\t"
+        "pushq %%rax\n\t"
+        "lretq\n"
+        "1:\n\t"
+        "movw %2, %%ax\n\t"
+        "movw %%ax, %%ds\n\t"
+        "movw %%ax, %%es\n\t"
+        "movw %%ax, %%ss\n\t"
+        "xorw %%ax, %%ax\n\t"
+        "movw %%ax, %%fs\n\t"
+        "movw %%ax, %%gs\n\t"
+        "movw %3, %%ax\n\t"
+        "ltr %%ax"
+        :
+        : "m"(gdtr), "i"(GDT_KCODE), "i"(GDT_KDATA), "i"(GDT_TSS)
+        : "rax", "memory");
+    percpu_install(pc);
+    wrmsr(MSR_FS_BASE, fs_base);
+    wrmsr(MSR_KERNEL_GS_BASE, kgs_base);
     user_cpu_init();
 }
 

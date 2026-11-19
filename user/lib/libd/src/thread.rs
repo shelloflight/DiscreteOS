@@ -100,6 +100,9 @@ impl Stack {
     }
 }
 
+/// Cap on cached empty stack regions; any excess (or on OOM) is destroyed with `vmar_destroy`.
+const MAX_CACHED_STACKS: usize = 16;
+
 /// Empty reserved regions of finished threads, for reuse.
 static FREE_STACKS: Mutex<Vec<Stack>> = Mutex::new(Vec::new());
 
@@ -134,16 +137,20 @@ fn stack_new(size: u64) -> Result<Stack, i64> {
     }
 }
 
-/// Unmap the stack (its memory goes back) and keep the empty region for the next thread.
+/// Unmap the stack (its memory goes back) and keep up to `MAX_CACHED_STACKS` empty regions for
+/// reuse; excess regions are destroyed with `vmar_destroy` so virtual address space is reclaimed.
 fn stack_free(mut s: Stack) {
     if s.mapped {
         sys::vmar_unmap(s.region.raw(), s.lo(), s.size);
         s.mapped = false;
     }
     let mut free = FREE_STACKS.lock();
-    if free.try_reserve(1).is_ok() {
+    if free.len() < MAX_CACHED_STACKS && free.try_reserve(1).is_ok() {
         free.push(s);
-    } // else (out of memory): the region handle closes; the range stays reserved, unused
+    } else {
+        drop(free);
+        sys::vmar_destroy(s.region.raw());
+    }
 }
 
 // ---- spawn and join ---------------------------------------------------------------------------------

@@ -107,7 +107,9 @@ pub mod nr {
     pub const THREAD_CREATE_STOPPED: u64 = 70;
     // ABI v12: hardware-rooted attestation
     pub const ATTEST_ACTIVATE: u64 = 71;
-    pub const COUNT: u64 = 72;
+    // ABI v13: demand paging and child VMAR destruction
+    pub const VMAR_DESTROY: u64 = 72;
+    pub const COUNT: u64 = 73;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -751,9 +753,10 @@ fn vmo_verify(u: &UserThread, vh: u64, sh: u64) -> KResult<i64> {
     crate::security::verify_vmo(&v, &d).map(|_| 0)
 }
 
-/// system_power (ABI v6): with the POWER authority, switch the machine off (1) or reset it (2).
-/// Power-off returns NOT_SUPPORTED when the machine has no usable ACPI S5 (or it did not work);
-/// a reset does not return. Nothing is flushed here: services sync their volumes first.
+/// system_power (ABI v6+): with the POWER authority, switch the machine off (1), reset it (2),
+/// or suspend it to ACPI S3 (3). Power-off and suspend return NOT_SUPPORTED when the machine has
+/// no usable ACPI support (or it did not work); a reset does not return. Nothing is flushed here:
+/// services sync their volumes and quiesce drivers first.
 fn system_power(u: &UserThread, rh: u64, action: u64) -> KResult<i64> {
     let (res, _) = u.proc.get_resource(Handle(rh as u32), Rights::MANAGE)?;
     if res.kind != KIND_POWER {
@@ -774,6 +777,19 @@ fn system_power(u: &UserThread, rh: u64, action: u64) -> KResult<i64> {
             crate::kprintln!("Power: reset requested by process {}", u.proc.name());
             // SAFETY: as above; never returns.
             unsafe { ffi::power_reboot() }
+        }
+        3 => {
+            // SAFETY: plain calls into the power code.
+            if !unsafe { ffi::power_suspend_supported() } {
+                return Err(Status::NotSupported);
+            }
+            crate::kprintln!("Power: suspend requested by process {}", u.proc.name());
+            // SAFETY: as above; returns 0 after resuming from S3, non-zero if sleep failed.
+            if unsafe { ffi::power_suspend() } == 0 {
+                Ok(0)
+            } else {
+                Err(Status::NotSupported)
+            }
         }
         _ => Err(Status::InvalidArgs),
     }
@@ -951,6 +967,7 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
             }
             Ok(i64::from(hv.0))
         }
+        nr::VMAR_DESTROY => p.vmar_destroy(h(a[0])).map(|_| 0),
         nr::PROCESS_CREATE => {
             let (name, n) = read_name(a[1], a[2])?;
             let limits = read_limits(a[3])?;

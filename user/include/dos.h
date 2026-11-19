@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 12
+#define DOS_ABI_VERSION 13
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -118,6 +118,8 @@ enum {
     DOS_SYS_PROCESS_VMAR, DOS_SYS_THREAD_CREATE_STOPPED,
     /* ABI v12: hardware-rooted attestation */
     DOS_SYS_ATTEST_ACTIVATE,
+    /* ABI v13: demand paging and child VMAR destruction */
+    DOS_SYS_VMAR_DESTROY,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -297,6 +299,8 @@ static inline int64_t dos_vmar_map(dos_handle_t vmar, uint64_t offset, dos_handl
 static inline int64_t dos_vmar_unmap(dos_handle_t vmar, uint64_t addr, uint64_t len) { return DOS_SC(DOS_SYS_VMAR_UNMAP, vmar, addr, len, 0, 0, 0); }
 static inline int64_t dos_vmar_allocate(dos_handle_t vmar, uint64_t offset, uint64_t len, uint32_t rights, uint64_t *base)
 { return DOS_SC(DOS_SYS_VMAR_ALLOCATE, vmar, offset, len, rights, base, 0); }
+static inline int64_t dos_vmar_destroy(dos_handle_t vmar)
+{ return DOS_SC(DOS_SYS_VMAR_DESTROY, vmar, 0, 0, 0, 0, 0); }
 static inline int64_t dos_process_create(dos_handle_t parent, const char *name, size_t n, const struct dos_limits *l, dos_handle_t *vmar)
 { return DOS_SC(DOS_SYS_PROCESS_CREATE, parent, name, n, l, vmar, 0); }
 static inline int64_t dos_process_kill(dos_handle_t h) { return DOS_SC(DOS_SYS_PROCESS_KILL, h, 0, 0, 0, 0, 0); }
@@ -377,9 +381,10 @@ static inline int64_t dos_vmo_allow_unsigned(dos_handle_t vmo, dos_handle_t vmex
 #define DOS_ATTEST_CHALLENGE 328u /* a TPM credential challenge: blob (70 bytes), then secret (258) */
 /* A signed report of what this machine runs, for a remote party's 32-byte nonce. Returns its
  * length, or DOS_ERR_BUFFER_TOO_SMALL (cap < length; nothing written). */
-#define DOS_POWER_OFF    1
-#define DOS_POWER_REBOOT 2
-/* With the POWER resource: switch off (returns DOS_ERR_NOT_SUPPORTED if the machine cannot) or reset. */
+#define DOS_POWER_OFF     1
+#define DOS_POWER_REBOOT  2
+#define DOS_POWER_SUSPEND 3
+/* With the POWER resource: switch off, reset, or suspend to ACPI S3 (returns DOS_ERR_NOT_SUPPORTED if unavailable). */
 static inline int64_t dos_system_power(dos_handle_t power, uint64_t action) { return DOS_SC(DOS_SYS_SYSTEM_POWER, power, action, 0, 0, 0, 0); }
 /* ABI v7, with the MEASURE resource: extend PCR 10 with digest, logged as "svc <text>" (printable
  * ASCII, at most 52 bytes). */

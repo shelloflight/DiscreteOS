@@ -26,6 +26,12 @@ pub const SYNC: u32 = 302;
 /// processes. Payload: the service's name; `a` = its level (`sys::LOG_*`): records below are
 /// not kept.
 pub const LOG_LEVEL: u32 = 303;
+/// Manager -> device manager (a call): stop and quiesce every driver before ACPI S3 sleep.
+/// Reply: the same op, `a` = drivers stopped.
+pub const SUSPEND: u32 = 304;
+/// Manager -> device manager (a call): restart every driver after ACPI S3 wake and wait until
+/// ready. Reply: the same op, `a` = drivers ready.
+pub const RESUME: u32 = 305;
 
 pub const TAG_ENDPOINT_NAMES: u32 = sys::TAG_USER + 0x1FF;
 pub const TAG_ENDPOINT: u32 = sys::TAG_USER + 0x200;

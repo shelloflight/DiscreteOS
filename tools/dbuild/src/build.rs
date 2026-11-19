@@ -24,7 +24,109 @@ pub struct SharedArtifacts {
     pub stage3_bin: PathBuf,
     pub efi_bin: PathBuf,
     pub hello_dsig: PathBuf,
+    pub sys_files: Vec<(String, PathBuf)>,
     pub kernel_asm_objs: Vec<PathBuf>,
+}
+
+/// Programs that stay embedded in `kernel.bin` to bootstrap storage and early input.
+const BOOTSTRAP_PROGS: &[&str] = &[
+    "init.dx",
+    "clock.dx",
+    "storaged.dx",
+    "devmgr.dx",
+    "ahci.ddrv",
+    "nvme.ddrv",
+    "virtio-blk.ddrv",
+    "xhci.ddrv",
+    "ps2.ddrv",
+    "virtio-input.ddrv",
+];
+
+/// Service manifests that stay embedded in `kernel.bin` to mount `sys:`.
+const BOOTSTRAP_MANIFESTS: &[&str] = &["clock.dman", "storaged.dman", "devmgr.dman"];
+
+/// Non-bootstrap programs placed (with `.dsig` signatures) on the immutable `sys` DFS volume.
+const SYS_BIN_PROGS: &[&str] = &[
+    "log.dx",
+    "terminal.dx",
+    "shell.dx",
+    "dcmpl.dx",
+    "hello.dx",
+    "list.dx",
+    "show.dx",
+    "copy.dx",
+    "move.dx",
+    "delete.dx",
+    "make.dx",
+];
+
+fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
+    match ktest {
+        Some("USER" | "SPEC" | "PROFILE" | "FUZZ" | "ATTEST" | "ATTESTTPM" | "SMAP" | "SMEP" | "CETUSER") => {
+            name == "utest.dx"
+        }
+        Some("COMPAT") => matches!(
+            name,
+            "utest.dx" | "dcmpl.dx" | "w1.exe" | "w1_32.exe" | "w1fault.exe" | "w1bad.exe" | "l1" | "w2.exe" | "l2"
+        ),
+        Some("LIBD") => matches!(name, "ltest.dx" | "ctest.dx"),
+        Some("SERVICES" | "TIME") => name == "ltest.dx",
+        Some("STORAGE" | "READONLY") => name == "fstest.dx",
+        Some("HWBENCH") => matches!(name, "utest.dx" | "fstest.dx"),
+        _ => false,
+    }
+}
+
+fn build_sys_files(
+    env: &Env,
+    out_dir: &Path,
+    seed: &Path,
+    user_programs: &[ProgramEntry],
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let sig_dir = out_dir.join("sys-sigs");
+    fs::create_dir_all(&sig_dir).map_err(|e| format!("mkdir {}: {e}", sig_dir.display()))?;
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+
+    for &name in SYS_BIN_PROGS {
+        let p = user_programs
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| format!("sys image: missing program '{name}'"))?;
+        let sig = sig_dir.join(format!("{name}.dsig"));
+        img::sign_file(seed, "program", name, &p.path, &sig)?;
+        files.push((format!("bin/{name}"), p.path.clone()));
+        files.push((format!("bin/{name}.dsig"), sig));
+    }
+
+    let man_dir = env.root.join("user").join("init").join("services");
+    for m in collect_files(&man_dir, "dman", false) {
+        let fname = m.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        if BOOTSTRAP_MANIFESTS.contains(&fname.as_str()) {
+            continue;
+        }
+        let stem = fname.strip_suffix(".dman").unwrap_or(&fname);
+        let sig = sig_dir.join(format!("svc_{stem}.dsig"));
+        img::sign_file(seed, "manifest", &fname, &m, &sig)?;
+        let dst = format!("services/{fname}");
+        let sig_dst = format!("services/{stem}.dsig");
+        files.push((dst, m));
+        files.push((sig_dst, sig));
+    }
+
+    let tool_dir = env.root.join("user").join("tools").join("manifests");
+    for m in collect_files(&tool_dir, "dman", false) {
+        let fname = m.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let stem = fname.strip_suffix(".dman").unwrap_or(&fname);
+        let sig = sig_dir.join(format!("tool_{stem}.dsig"));
+        img::sign_file(seed, "manifest", &fname, &m, &sig)?;
+        let dst = format!("tools/{fname}");
+        let sig_dst = format!("tools/{stem}.dsig");
+        files.push((dst, m));
+        files.push((sig_dst, sig));
+    }
+
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +218,7 @@ pub fn build_shared(env: &Env, out_dir: &Path, quiet: bool) -> Result<SharedArti
         .ok_or_else(|| "hello.dx missing from user build".to_string())?;
     let hello_dsig = out_dir.join("hello.dsig");
     img::sign_file(&key.seed, "program", "hello.dx", &hello.path, &hello_dsig)?;
+    let sys_files = build_sys_files(env, out_dir, &key.seed, &user_programs)?;
 
     Ok(SharedArtifacts {
         user_programs,
@@ -123,6 +226,7 @@ pub fn build_shared(env: &Env, out_dir: &Path, quiet: bool) -> Result<SharedArti
         stage3_bin,
         efi_bin,
         hello_dsig,
+        sys_files,
         kernel_asm_objs,
     })
 }
@@ -314,18 +418,30 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
     let rust_lib = build_kernel_rust(env, out_dir, opts.kernel_test.as_deref(), opts.quiet)?;
 
     // --- User programs & manifests --------------------------------------------
-    let (mut programs, _has_w2) = match &opts.shared {
+    let (all_programs, _has_w2) = match &opts.shared {
         Some(s) => (s.user_programs.clone(), s.has_w2),
         None => build_user_all(env, out_dir, opts.quiet)?,
     };
 
+    // Only the minimal bootstrap chain (and test-specific binaries for KTEST_* builds) is embedded
+    // in kernel.bin; everything else lives signed on the immutable `sys` DFS volume.
+    let mut embedded: Vec<ProgramEntry> = all_programs
+        .iter()
+        .filter(|p| {
+            BOOTSTRAP_PROGS.contains(&p.name.as_str())
+                || extra_embedded_for_test(opts.kernel_test.as_deref(), &p.name)
+        })
+        .cloned()
+        .collect();
+
     let man_dir = env.root.join("user").join("init").join("services");
-    let mut manifests = collect_files(&man_dir, "dman", false);
-    manifests.extend(collect_files(
-        &env.root.join("user").join("tools").join("manifests"),
-        "dman",
-        false,
-    ));
+    let mut manifests: Vec<PathBuf> = collect_files(&man_dir, "dman", false)
+        .into_iter()
+        .filter(|m| {
+            let name = m.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            BOOTSTRAP_MANIFESTS.contains(&name)
+        })
+        .collect();
     if let Some(sub) = match opts.kernel_test.as_deref() {
         Some("SERVICES") => Some("test"),
         Some("TIME") => Some("time"),
@@ -339,13 +455,13 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
             .and_then(|n| n.to_str())
             .ok_or_else(|| format!("bad manifest path {}", m.display()))?
             .to_string();
-        programs.push(ProgramEntry { name, path: m });
+        embedded.push(ProgramEntry { name, path: m });
     }
 
     let prog_asm = obj_dir.join("programs.asm");
     let prog_obj = obj_dir.join("programs.o");
-    write_programs_asm(&prog_asm, &programs)?;
-    let newest_prog = programs
+    write_programs_asm(&prog_asm, &embedded)?;
+    let newest_prog = embedded
         .iter()
         .filter_map(|p| mtime_of(&p.path))
         .chain(mtime_of(&prog_asm))
@@ -500,23 +616,24 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
     }
 
     // --- Stage 3 & UEFI loader ------------------------------------------------
-    let (stage3_bin, efi_bin, hello_dsig) = match &opts.shared {
-        Some(s) => (s.stage3_bin.clone(), s.efi_bin.clone(), s.hello_dsig.clone()),
+    let (stage3_bin, efi_bin, hello_dsig, sys_files) = match &opts.shared {
+        Some(s) => (s.stage3_bin.clone(), s.efi_bin.clone(), s.hello_dsig.clone(), s.sys_files.clone()),
         None => {
             let s3 = build_stage3(env, out_dir, &trust_c, opts.quiet)?;
             let efi = build_uefi(env, out_dir, &trust_c, opts.quiet)?;
-            let hello = programs
+            let hello = all_programs
                 .iter()
                 .find(|p| p.name == "hello.dx")
                 .ok_or_else(|| "hello.dx missing".to_string())?;
             let hsig = out_dir.join("hello.dsig");
             img::sign_file(&key.seed, "program", "hello.dx", &hello.path, &hsig)?;
-            (s3, efi, hsig)
+            let sf = build_sys_files(env, out_dir, &key.seed, &all_programs)?;
+            (s3, efi, hsig, sf)
         }
     };
 
     // --- Extra ESP files ------------------------------------------------------
-    let hello = programs
+    let hello = all_programs
         .iter()
         .find(|p| p.name == "hello.dx")
         .ok_or_else(|| "hello.dx missing".to_string())?;
@@ -526,10 +643,10 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
     ];
 
     if opts.kernel_test.as_deref() == Some("SHELL") {
-        if let Some(w2) = programs.iter().find(|p| p.name == "w2.exe") {
+        if let Some(w2) = all_programs.iter().find(|p| p.name == "w2.exe") {
             extra_files.push(("DOS/APPS/W2.EXE".into(), w2.path.clone()));
         }
-        if let Some(l2) = programs.iter().find(|p| p.name == "l2") {
+        if let Some(l2) = all_programs.iter().find(|p| p.name == "l2") {
             extra_files.push(("DOS/APPS/L2".into(), l2.path.clone()));
         }
     }
@@ -572,6 +689,7 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         &kernel_sig,
         &efi_bin,
         &extra_files,
+        &sys_files,
     )?;
 
     let shipped = [

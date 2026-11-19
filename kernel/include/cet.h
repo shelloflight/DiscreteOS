@@ -59,5 +59,9 @@ static inline __attribute__((always_inline)) void cet_cpu_enable(struct percpu *
 uint64_t shstk_new(struct thread *t, uint64_t slot, uint64_t first_ret);
 
 void cet_print(void);
+/* S3 resume: write a restore token below `ssp`, restore CET MSRs on BSP, and return token VA. */
+uint64_t cet_bsp_wake_token(uint64_t ssp);
+/* S3 resume: reset an AP idle thread's shadow stack restore token before `cet_cpu_enable`. */
+void cet_ap_reset(struct thread *idle);
 
 #endif

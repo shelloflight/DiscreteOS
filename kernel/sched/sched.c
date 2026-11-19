@@ -289,8 +289,36 @@ static void update_slice(struct percpu *pc, uint64_t now)
 
 /* ---- placement ------------------------------------------------------------------------------ */
 
+static volatile bool aps_freezing;
+
+void sched_freeze_aps(bool on)
+{
+    __atomic_store_n(&aps_freezing, on, __ATOMIC_SEQ_CST);
+}
+
+void sched_drain_ap(uint32_t cpu_id)
+{
+    if (cpu_id == 0 || cpu_id >= cpu_slots || !cpus[cpu_id])
+        return;
+    struct percpu *ap = cpus[cpu_id];
+    struct percpu *bsp = &bsp_percpu;
+    for (;;) {
+        uint64_t f = spin_lock_irqsave(&ap->rq.lock);
+        struct thread *t = rq_pop(&ap->rq);
+        spin_unlock_irqrestore(&ap->rq.lock, f);
+        if (!t)
+            break;
+        t->cpu = 0;
+        f = spin_lock_irqsave(&bsp->rq.lock);
+        rq_push(&bsp->rq, t);
+        spin_unlock_irqrestore(&bsp->rq.lock, f);
+    }
+}
+
 static inline uint64_t allowed_cpus(const struct thread *t)
 {
+    if (__atomic_load_n(&aps_freezing, __ATOMIC_ACQUIRE))
+        return THREAD_CPU(0);
     uint64_t m = t->affinity & smp_online_mask();
     return m ? m : THREAD_CPU(0);                 /* affinity is validated when set; never empty */
 }
@@ -521,11 +549,16 @@ static void switch_locked(struct percpu *pc)
         rq_push(&pc->rq, prev);        /* round robin: back of its priority's queue */
         requeued = true;
     }
-    struct thread *next = rq_pop(&pc->rq);
-    if (!next && cpu_slots > 1)
-        next = steal(pc);
-    if (!next)
+    struct thread *next;
+    if (__atomic_load_n(&aps_freezing, __ATOMIC_ACQUIRE) && pc->cpu_id != 0) {
         next = pc->idle;
+    } else {
+        next = rq_pop(&pc->rq);
+        if (!next && cpu_slots > 1)
+            next = steal(pc);
+        if (!next)
+            next = pc->idle;
+    }
     set_state(next, THREAD_RUNNING);
     next->handoff_until = 0;
     pc->need_resched = 0;
@@ -1052,6 +1085,8 @@ static NORETURN void idle_loop(void)
     for (;;) {
         cpu_cli();
         struct percpu *pc = percpu();   /* the idle thread never migrates */
+        if (__atomic_load_n(&aps_freezing, __ATOMIC_ACQUIRE) && pc->cpu_id != 0)
+            smp_ap_park(pc);            /* never returns; AP wakes via INIT-SIPI on resume */
         if (pc->need_resched) {         /* e.g. a kick from another CPU, or work queued here */
             cpu_sti();
             schedule();

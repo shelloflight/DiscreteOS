@@ -222,14 +222,39 @@ static void test_memory(void)
     dos_handle_close((dos_handle_t)ro);
     EXPECT(dos_vmar_unmap(self_vmar, (uint64_t)a2, len), 1);
     EXPECT(dos_vmar_unmap(self_vmar, (uint64_t)(uintptr_t)a, len), 1);
-    /* Sub-regions. */
+    /* Sub-regions and vmar_destroy. */
     uint64_t base = 0;
     int64_t sub = dos_vmar_allocate(self_vmar, DOS_ANY, 1u << 20, DOS_RIGHT_MAP | DOS_RIGHT_READ, &base);
     CHECK(sub > 0 && base >= 0x200000);
     EXPECT(dos_vmar_map((dos_handle_t)sub, 0, vmo, 0, 4096, DOS_RIGHT_READ | DOS_RIGHT_WRITE), DOS_ERR_ACCESS_DENIED);
     EXPECT(dos_vmar_map((dos_handle_t)sub, 0, vmo, 0, 4096, DOS_RIGHT_READ), (int64_t)base);
+    EXPECT(dos_vmar_destroy(self_vmar), DOS_ERR_INVALID_ARGS);
+    EXPECT(dos_vmar_destroy((dos_handle_t)sub), 0);
+    EXPECT(dos_vmar_destroy((dos_handle_t)sub), DOS_ERR_BAD_STATE);
+    EXPECT(dos_vmar_map((dos_handle_t)sub, 0, vmo, 0, 4096, DOS_RIGHT_READ), DOS_ERR_BAD_STATE);
+    uint64_t base2 = 0;
+    int64_t sub2 = dos_vmar_allocate(self_vmar, base - 0x200000, 1u << 20, DOS_RIGHT_MAP | DOS_RIGHT_READ, &base2);
+    CHECK(sub2 > 0 && base2 == base);
+    EXPECT(dos_vmar_destroy((dos_handle_t)sub2), 0);
+    dos_handle_close((dos_handle_t)sub2);
     dos_handle_close((dos_handle_t)sub);
     dos_handle_close(vmo);
+    /* Demand paging: sparse 256 KiB VMO faulted from ring 3 and via kernel user_copy. */
+    int64_t lv = dos_vmo_create(64u * 4096);
+    CHECK(lv > 0);
+    int64_t lmap = dos_vmar_map(self_vmar, DOS_ANY, (dos_handle_t)lv, 0, 64u * 4096, DOS_RIGHT_READ | DOS_RIGHT_WRITE);
+    CHECK(lmap > 0);
+    volatile uint8_t *lp = (volatile uint8_t *)(uintptr_t)lmap;
+    CHECK(lp[0] == 0 && lp[63u * 4096] == 0); /* demand-paged zero reads */
+    lp[17u * 4096 + 9] = 0x5A;
+    CHECK(lp[17u * 4096 + 9] == 0x5A);
+    /* Kernel user_copy into an untouched demand-paged page (page 40). */
+    static const char tag[] = "demand-copy";
+    EXPECT(dos_vmo_write((dos_handle_t)lv, 128, tag, sizeof(tag)), 0);
+    EXPECT(dos_vmo_read((dos_handle_t)lv, 128, (void *)(uintptr_t)(lmap + 40u * 4096), sizeof(tag)), 0);
+    CHECK(memcmp((const void *)(uintptr_t)(lmap + 40u * 4096), tag, sizeof(tag)) == 0);
+    EXPECT(dos_vmar_unmap(self_vmar, (uint64_t)lmap, 64u * 4096), 1);
+    dos_handle_close((dos_handle_t)lv);
     /* Quota: a child limited to 1 MiB cannot get more. */
     struct dos_limits small = { 1u << 20, 64, 4 };
     EXPECT(wait_exit(spawn_self("quota", &small, 1), DOS_WAIT_FOREVER), 0);

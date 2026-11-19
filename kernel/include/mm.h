@@ -121,6 +121,9 @@ void    *vmm_map_phys(uint64_t pa, uint64_t size, uint32_t flags);
 /* Like vmm_map_phys, but NULL (nothing changed) if a page was already mapped with other write or
  * cache attributes (a firmware table page mapped read-only, for example). */
 void    *vmm_map_phys_exact(uint64_t pa, uint64_t size, uint32_t flags);
+/* Map physical memory writable into the direct map, upgrading existing read-only 4 KiB pages
+ * (e.g. an ACPI FACS sharing a page with read-only firmware tables). */
+void    *vmm_map_phys_rw(uint64_t pa, uint64_t size);
 
 /* Guard pages: never mapped; faults on them are reported by name. */
 void        vmm_add_guard(const void *page, const char *name);
@@ -152,6 +155,8 @@ uint64_t uspace_free_tables(struct uspace *as);
 /* Map `pages` frames at va (VMM_W / VMM_X, never both). False when out of memory (nothing mapped). */
 bool     uspace_map(struct uspace *as, uint64_t va, const uint64_t *frames, uint64_t pages, uint32_t flags,
                     uint64_t *new_tables);   /* page tables this call allocated (also on failure) */
+/* Map one demand-faulted page at va. Idempotent if another thread already mapped the same frame. */
+bool     uspace_map_page(struct uspace *as, uint64_t va, uint64_t pa, uint32_t flags, uint64_t *new_tables);
 void     uspace_unmap(struct uspace *as, uint64_t va, uint64_t pages);
 uint64_t uspace_translate(struct uspace *as, uint64_t va);   /* physical address, or VMM_NOT_MAPPED */
 /* Page tables a mapping of [va, va + pages) could need at most (quota reservation). */

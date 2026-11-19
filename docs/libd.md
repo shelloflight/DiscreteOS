@@ -18,8 +18,9 @@ C programs use the same code through `user/include/libd.h`.
 | `thread` | `spawn`, `Builder`, `JoinHandle`, `current_id`, `reap` (feature `alloc`) |
 | `heap` | the global allocator and its statistics (feature `alloc`) |
 | `Port`, `Mapping`, `Dma` | async waits on many objects; VMOs mapped here; DMA pins |
+| `ring` | `IoRing`: shared-memory VMO submission/completion ring with a zero-copy data arena (hostile-peer validated, used by `storaged` and block drivers) |
 | `fs`, `proto` | files as handles and namespaces ([storage.md](storage.md)); the driver protocol |
-| `svc` | the service manager's protocol (`CONNECT`, `SYNC`, `SHUTDOWN`, `LOG_LEVEL`) and `endpoint(name)` ([services.md](services.md)) |
+| `svc` | the service manager's protocol (`CONNECT`, `SYNC`, `SHUTDOWN`, `LOG_LEVEL`, `SUSPEND`, `RESUME`) and `endpoint(name)` ([services.md](services.md)) |
 | `rec`, `term`, `tool` | typed records (what shell commands exchange; `Out` for a program's output); the terminal's session protocol; how the shell starts a tool or a foreign program (`TAG_IMAGE`, `TAG_TIME_BASE`) ([shell.md](shell.md)) |
 | `log`, `time` | the log service's records and reader; wall-clock time (`Time`, ns since 2000-01-01 UTC) and the clock service's client; levels: `log_warn!`, `log_error!`, `log_debug!` |
 | `capi` | the C binding (feature `capi`) |
@@ -49,9 +50,8 @@ threads are libd threads (FS stays the thread control block; the foreign program
   `thread_exit`. A dropped `JoinHandle` detaches the thread; ended detached threads are reclaimed
   on the next `spawn` or `reap`.
 - All allocations are fallible: a failed spawn is an `Err`.
-- The kernel cannot release a reserved region, so an ended thread's stack pages are unmapped and
-  the empty region is kept for the next thread with that stack size. Address space stays bounded
-  by the peak number of threads.
+- Up to 16 freed thread-stack regions are cached for fast reuse; excess or OOM regions are
+  reclaimed cleanly with `vmar_destroy`. Stack pages commit on demand on first touch.
 
 ## Mutex
 

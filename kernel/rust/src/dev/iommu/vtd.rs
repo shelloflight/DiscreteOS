@@ -232,9 +232,10 @@ impl Unit {
 struct State {
     units: Vec<Unit>,
     /// Interrupt remapping: the shared table (0: off), the destination field every entry uses,
-    /// and the I/O APICs' source ids (id, requester id).
+    /// extended interrupt mode flag, and the I/O APICs' source ids (id, requester id).
     irt: u64,
     dest: u64,
+    eime: bool,
     ioapics: [(u8, u16); 8],
     nioapic: usize,
 }
@@ -461,7 +462,7 @@ pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
     }
     let n = units.len();
     let levels = units[0].levels;
-    let mut st = State { units, irt: 0, dest: 0, ioapics: [(0, 0); 8], nioapic: 0 };
+    let mut st = State { units, irt: 0, dest: 0, eime: false, ioapics: [(0, 0); 8], nioapic: 0 };
     let ir = ir_enable(&mut st, &drhds, intr_remap);
     *STATE.lock() = Some(st);
     set_backend(Backend::Vtd);
@@ -506,6 +507,7 @@ fn ir_enable(st: &mut State, drhds: &[Drhd], intr_remap: bool) -> Result<&'stati
         return Err("the boot CPU's APIC id needs the extended (x2APIC) format");
     }
     st.dest = if eime { u64::from(apic) << 32 } else { u64::from(apic & 0xFF) << 40 };
+    st.eime = eime;
     // Every page first, so a shortage leaves every unit as it was (register-based, IR off).
     let mut pages = [0u64; 1 + 2 * 16];
     let need = 1 + 2 * st.units.len();
@@ -765,6 +767,50 @@ pub fn unmap(d: &mut Domain, iova: u64, pages: u64) {
     let u = &st.units[d.unit];
     clear(d, u, iova, pages);
     u.invalidate_iotlb(Some(d.did));
+}
+
+/// Re-program every VT-d unit after ACPI S3 sleep (interrupts off, no allocation).
+pub fn resume() {
+    let g = STATE.lock();
+    let Some(st) = g.as_ref() else { return };
+    let v = FAULT_VECTOR.load(Ordering::Acquire);
+    for u in &st.units {
+        if u.r32(GSTS) & GSTS_TES != 0 {
+            u.command(GCMD_TE, GSTS_TES, false);
+        }
+        if u.r32(GSTS) & GSTS_IRES != 0 {
+            u.command(GCMD_IRE, GSTS_IRES, false);
+        }
+        if u.r32(GSTS) & GSTS_QIES != 0 {
+            u.command(GCMD_QIE, GSTS_QIES, false);
+        }
+        if u.qi != 0 {
+            u.qtail.store(0, Ordering::Relaxed);
+            u.qseq.store(0, Ordering::Relaxed);
+            // SAFETY: this unit's wait-status word in the direct map.
+            unsafe { core::ptr::write_volatile(table(u.qwait) as *mut u32, 0) };
+            u.w64(IQT, 0);
+            u.w64(IQA, u.qi);
+            u.command(GCMD_QIE, GSTS_QIES, true);
+        }
+        u.w64(RTADDR, u.root);
+        u.command(GCMD_SRTP, GSTS_RTPS, true);
+        u.invalidate_context();
+        u.invalidate_iotlb(None);
+        if v != 0 {
+            setup_faults(u, v as u32);
+        }
+        u.command(GCMD_TE, GSTS_TES, true);
+        if st.irt != 0 {
+            u.w64(IRTA, st.irt | u64::from(st.eime) << 11 | 7);
+            u.command(GCMD_SIRTP, GSTS_IRTPS, true);
+            u.invalidate_iec(None);
+            if u.r32(GSTS) & GSTS_CFIS != 0 {
+                u.command(GCMD_CFI, GSTS_CFIS, false);
+            }
+            u.command(GCMD_IRE, GSTS_IRES, true);
+        }
+    }
 }
 
 /// The fault vector fired: report and clear every recorded fault (interrupt context).

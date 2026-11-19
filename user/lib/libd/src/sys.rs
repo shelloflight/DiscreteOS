@@ -81,7 +81,7 @@ pub const TAG_BOOT_TIME: u32 = 12;
 pub const TAG_POWER_BUTTON: u32 = 13;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 12;
+pub const ABI_VERSION: u32 = 13;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -107,6 +107,7 @@ pub const BASE_GS: u32 = 1;
 
 pub const POWER_OFF: u64 = 1;
 pub const POWER_REBOOT: u64 = 2;
+pub const POWER_SUSPEND: u64 = 3;
 
 pub mod nr {
     pub const ABI_VERSION: u64 = 0;
@@ -181,8 +182,9 @@ pub mod nr {
     pub const PROCESS_VMAR: u64 = 69;
     pub const THREAD_CREATE_STOPPED: u64 = 70;
     pub const ATTEST_ACTIVATE: u64 = 71;
+    pub const VMAR_DESTROY: u64 = 72;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 72;
+    pub const COUNT: u64 = 73;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -247,6 +249,9 @@ pub fn vmo_size(h: Handle) -> R {
 }
 pub fn vmar_unmap(vmar: Handle, addr: u64, len: u64) -> i64 {
     sc(nr::VMAR_UNMAP, u64::from(vmar), addr, len, 0, 0, 0)
+}
+pub fn vmar_destroy(vmar: Handle) -> i64 {
+    sc(nr::VMAR_DESTROY, u64::from(vmar), 0, 0, 0, 0, 0)
 }
 pub fn vmar_map(vmar: Handle, offset: u64, vmo: Handle, vmo_off: u64, len: u64, perms: u32) -> R {
     res(sc(nr::VMAR_MAP, u64::from(vmar), offset, u64::from(vmo), vmo_off, len, u64::from(perms)))
@@ -862,7 +867,7 @@ pub struct BootTime {
 }
 const _: () = assert!(core::mem::size_of::<BootTime>() == 32);
 pub const BOOT_TIME_MAGIC: u32 = 0x4D49_5444;
-/// `POWER_OFF` or `POWER_REBOOT` with the POWER resource; returns only on failure.
+/// `POWER_OFF`, `POWER_REBOOT`, or `POWER_SUSPEND` with the POWER resource.
 pub fn system_power(power: Handle, action: u64) -> i64 {
     sc(nr::SYSTEM_POWER, u64::from(power), action, 0, 0, 0, 0)
 }

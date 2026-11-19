@@ -1,14 +1,16 @@
 # Power control
 
-D-KRNL can switch the machine off (ACPI S5) and reset it, puts idle CPUs into the deepest idle
-state worth it, and lets CPUs choose their own speed (CPPC/HWP) where the hardware can.
+D-KRNL can switch the machine off (ACPI S5), suspend to RAM and resume (ACPI S3), and reset it,
+puts idle CPUs into the deepest idle state worth it, and lets CPUs choose their own speed
+(CPPC/HWP) where the hardware can.
 
-Power-off needs nothing from AML on most machines; when the AML namespace is loaded
-([acpi.md](acpi.md)) it supplies `\_S5` (also as a method) and `\_TTS`/`\_PTS` run first.
+Power-off and S3 sleep need nothing from AML on most machines; when the AML namespace is loaded
+([acpi.md](acpi.md)) it supplies `\_S5`/`\_S3` (also as methods) and `\_TTS`/`\_PTS`/`\_WAK` run
+around transitions.
 
-**Code:** `kernel/arch/x86_64/power.c`, `kernel/include/power.h`; syscall `system_power`
-([abi.md](abi.md)). Idle states and performance: `kernel/arch/x86_64/cpupm.c`, `kernel/include/cpupm.h`,
-`kernel/rust/src/dev/cpupm.rs`, `kernel/aml/src/processor.rs`.
+**Code:** `kernel/arch/x86_64/power.c`, `kernel/arch/x86_64/s3.asm`, `kernel/include/power.h`;
+syscall `system_power` ([abi.md](abi.md)). Idle states and performance: `kernel/arch/x86_64/cpupm.c`,
+`kernel/include/cpupm.h`, `kernel/rust/src/dev/cpupm.rs`, `kernel/aml/src/processor.rs`.
 
 ## At boot
 
@@ -31,6 +33,28 @@ reported as unavailable; reset still works.
 caller may block), enables ACPI mode if needed, writes `SLP_TYP | SLP_EN` to PM1b then PM1a (or the
 hardware-reduced sleep register), and if the machine is still running 2 s later, says so and returns
 (`NOT_SUPPORTED` to user space).
+
+## Suspending and resuming (ACPI S3)
+
+`power_suspend` (via `system_power(..., DOS_POWER_SUSPEND)` or `power sleep` in the shell):
+
+1. User space (`init`) syncs every volume provider (`svc::SYNC`) and asks `devmgr` (`svc::SUSPEND`)
+   to quiesce PCI bus mastering and stop every user-space driver before entering S3.
+2. The kernel pins the caller to the BSP (CPU 0), runs `\_TTS(3)` and `\_PTS(3)` on the ACPI thread,
+   parks all APs in `cli; hlt` (draining their run queues and stopping the watchdog), and saves PCI
+   configuration headers (`dkrnl_pci_suspend`).
+3. A real-mode waking trampoline is installed in low RAM and its address written to the FADT's FACS
+   32-bit waking vector; `WAK_STS` is cleared, `time_suspend` snapshots the monotonic clock, and
+   `s3_enter` saves BSP GPRs, control registers, EFER, segment bases, and CET SSP, flushes caches
+   (`wbinvd`), and writes `SLP_TYP | SLP_EN` to PM1b/PM1a.
+4. On wake, firmware jumps to the real-mode trampoline, which re-enters long mode on the BSP and
+   restores CPU state (PAT, GDT/TSS/IDT, SYSCALL, CET, monotonic TSC, LAPIC), PCI config space,
+   VT-d/AMD-Vi IOMMU DMA and interrupt remapping, and IOAPIC routes.
+5. Interrupts are re-enabled, APs are restarted via INIT-SIPI-SIPI through `ap_resume_entry64`
+   (restoring per-CPU GDT/TSS/IDT/CET/XSAVE/speculation state and timers), CPPC/HWP is re-applied,
+   ACPI `\_PIC(1)`, `\_WAK(3)`, `\_TTS(0)` and SCI sources are restored, and `TPM2_Startup(STATE)`
+   is issued if a TPM is present.
+6. `init` asks `devmgr` (`svc::RESUME`) to restart every driver and re-attach disks transparently.
 
 ## Resetting
 
@@ -99,7 +123,9 @@ Performance: ACPI CPPC (_CPC), autonomous, balanced (EPP 0x80); highest <h>, nom
 ## Tests
 
 `poweroff` (VMEX resource refused; with POWER, QEMU must actually exit), `poweroff-uefi`, `reboot`,
-`powerbutton`, and the `\_S5` scanner fuzzed in `fuzz`.
+`powerbutton`, `s3` (QEMU q35 with S3 enabled: `power sleep` in the shell, `system_wakeup`, full
+4-CPU + VT-d + PCI + driver resume, post-wake keyboard and disk read, then `power off`), and the
+`\_S5` scanner fuzzed in `fuzz`.
 
 `cpupm`: a firmware description with an I/O-port C2 (port 0x80) and CPPC is installed (deep states
 forced on under QEMU); every CPU sleeps and wakes 200 times and enters the C2; `cpupm-bochs` does
@@ -109,8 +135,8 @@ missing MSRs are refused without a panic, CPPC and HWP are refused cleanly. `aml
 
 ## Limitations
 
-- S3 sleep is not supported. Devices are not quiesced before S5 beyond what `\_PTS` does and the
-  services' own shutdown.
+- S3 requires a 32-bit FACS waking vector and usable low RAM below 1 MiB (hardware-reduced ACPI /
+  S0ix modern standby is not implemented).
 - Idle and performance use the first present processor's objects for every CPU; `_LPI`, `_CSD`
   and `_PSD` (dependency domains) are not used.
 - `_CPC` registers in system memory or PCC (platform communication channel) are not reached.

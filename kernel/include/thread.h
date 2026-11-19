@@ -157,6 +157,8 @@ void sched_dump_cpus(void);              /* per-CPU state (kdb, crash dump) */
  * entry into the scheduler (runs the idle loop). */
 struct thread *sched_alloc_idle(uint32_t cpu_id);
 NORETURN void  sched_start_ap(void);
+void           sched_freeze_aps(bool on);         /* S3: stop scheduling threads on APs */
+void           sched_drain_ap(uint32_t cpu_id);   /* S3: move queued threads from parked AP to BSP */
 /* A fresh guarded kernel stack (guard page + KSTACK_SIZE) for IST stacks; 0 when out of memory. */
 uint64_t       kstack_new(uint64_t *guard);
 #ifdef KTEST

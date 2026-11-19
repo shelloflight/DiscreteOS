@@ -16,6 +16,7 @@ use crate::tools::{random_seed_32, to_hex};
 pub const SECTOR_SIZE: u64 = 512;
 pub const BOOT_IMAGE_MIB: u64 = 64;
 pub const BIOS_PART_SECTORS: u64 = 8 * 2048;
+pub const ESP_PART_SECTORS: u64 = 36 * 2048;
 pub const STAGE2_LBA: u64 = 2048;
 pub const STAGE2_SECTORS: u64 = 32;
 pub const STAGE3_LBA: u64 = STAGE2_LBA + STAGE2_SECTORS;
@@ -257,6 +258,7 @@ pub fn make_boot(
     ksig: &Path,
     efi: &Path,
     extra: &[(String, std::path::PathBuf)],
+    sys_files: &[(String, std::path::PathBuf)],
 ) -> Result<(), String> {
     let (s1, s2, s3) = (read_file(stage1)?, read_file(stage2)?, read_file(stage3)?);
     let (k, ks, e) = (read_file(kernel)?, read_file(ksig)?, read_file(efi)?);
@@ -283,7 +285,8 @@ pub fn make_boot(
     let disk = open(out, Some(BOOT_IMAGE_MIB))?;
     let parts = [
         gpt::NewPart { type_guid: gpt::TYPE_BIOS_BOOT, name: "bios-boot", sectors: BIOS_PART_SECTORS },
-        gpt::NewPart { type_guid: gpt::TYPE_ESP, name: "esp", sectors: 0 },
+        gpt::NewPart { type_guid: gpt::TYPE_ESP, name: "esp", sectors: ESP_PART_SECTORS },
+        gpt::NewPart { type_guid: gpt::TYPE_DFS, name: "sys", sectors: 0 },
     ];
     let made = ok(gpt::write(&mut *disk.borrow_mut(), &parts, *b"D-OS-BOOT-DISK-0"), "gpt")?;
     if made[0].first != STAGE2_LBA {
@@ -326,6 +329,16 @@ pub fn make_boot(
         put(&mut f, dst, &read_file(src)?)?;
     }
     ok(f.sync(), "fat sync")?;
+    drop(f);
+    let sp = Part { disk: disk.clone(), start: made[2].first, len: made[2].sectors() };
+    let mut sys_fs = ok(
+        Dfs::format(Box::new(sp), &FormatOpts { label: b"sys", uuid: *b"D-OS-DFS-SYS-000", time: 0 }),
+        "sys dfs format",
+    )?;
+    for (dst, src) in sys_files {
+        put(&mut sys_fs, dst, &read_file(src)?)?;
+    }
+    ok(sys_fs.sync(), "sys dfs sync")?;
     Ok(())
 }
 
@@ -503,6 +516,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
                 Path::new(a(6)?),
                 Path::new(a(7)?),
                 &extra,
+                &[],
             )
         }
         "pubkey" => {

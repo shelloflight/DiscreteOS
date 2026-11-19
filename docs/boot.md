@@ -17,6 +17,12 @@ contract); `kernel/bootinfo.c` (validation); `kernel/mm/kaslr.c`; `kernel/driver
 | LBA 1-33 | GPT (backup at the end of the disk) |
 | Partition 1 (LBA 2048) | BIOS boot partition: stage 2, stage 3, the kernel's `.dsig`, then `kernel.bin` |
 | Partition 2 `esp` | FAT32 EFI System Partition: `\EFI\BOOT\BOOTX64.EFI`, `\DOS\KERNEL.BIN` |
+| Partition 3 `sys` | Immutable DFS system volume: signed `/bin/*.dx` + `.dsig`, `/services/*.dman` + `.dsig`, `/tools/*.dman` + `.dsig` |
+
+`kernel.bin` embeds only the minimal bootstrap chain (`init.dx`, `clock.dx`, `storaged.dx`,
+`devmgr.dx`, `*.ddrv`, and the bootstrap manifests) needed to mount the `sys` volume. Once `sys` is
+mounted read-only, `init` loads and Ed25519-verifies all remaining services, tools, and programs
+from it (`vmo_verify`).
 
 The image is deterministic (fixed GUIDs and timestamps), so the reproducible-build check covers it.
 The LBA constants live in `tools/dbuild/src/img.rs` and are passed to stage 1 and stage 2 as NASM defines.
