@@ -80,8 +80,8 @@ log and PCRs.
 ## Limitations
 
 - The loader is not signed for UEFI Secure Boot; BIOS has no hardware root of trust at all.
-- TPM: TIS/CRB are only exercised on real hardware; TPMs that need an ACPI start method (AML) are
-  not supported yet.
+- TPM: TIS/CRB are only exercised on real hardware; TPMs that need the ACPI start method (an AML
+  `_DSM`, AMD firmware TPMs) are not supported yet.
 - One compiled-in key; no revocation or rotation yet.
 - Verification is not constant-time (it handles public data only). Ed25519 signing is (the kernel signs
   attestation reports with its per-boot key).

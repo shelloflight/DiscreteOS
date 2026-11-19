@@ -1,0 +1,24 @@
+# `aml`: the D-OS ACPI Machine Language interpreter, used by the kernel (kernel/rust). Loads the
+# DSDT and SSDTs into one namespace and evaluates control methods; all hardware access goes through
+# the `Handler` trait, so the whole interpreter runs on the host under `cargo test` (simulated
+# hardware, real firmware tables when present). no_std + alloc, no unsafe, no dependencies
+# (CONTRIBUTING.md, "Dependencies"). Reference: docs/acpi.md.
+[package]
+name = "aml"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"

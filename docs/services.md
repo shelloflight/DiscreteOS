@@ -111,6 +111,10 @@ was configured to grant ([attestation.md](attestation.md)).
 
 ## Shutdown
 
+A shutdown starts when a holder of `manager = ["power"]` sends `MGR_POWER` (the shell's
+`power off`), or when the machine's power button is pressed (init waits on the kernel's
+power-button event, startup tag `POWER_BUTTON`; [acpi.md](acpi.md)).
+
 1. Every volume provider is asked to `SYNC`, while the drivers under it still run.
 2. Each service stops after every running service that depends on it (`after` or `connect`),
    the last started first among those free to stop (`SHUTDOWN`, 5 s, then it is ended).

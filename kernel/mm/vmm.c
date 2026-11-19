@@ -322,6 +322,38 @@ void *vmm_map_phys(uint64_t pa, uint64_t size, uint32_t flags)
     return (void *)(uintptr_t)(PHYSMAP_BASE + pa);
 }
 
+/* The leaf entry mapping va (any level), or 0. Caller holds vmm_lk. */
+static uint64_t leaf_nolock(uint64_t va)
+{
+    uint64_t *t = table(pml4_pa);
+    for (int l = 4; l >= 1; l--) {
+        uint64_t e = t[idx(va, l)];
+        if (!(e & PTE_P))
+            return 0;
+        if (l == 1 || (l <= 3 && (e & PTE_PS)))
+            return e;
+        t = table(e & PTE_ADDR);
+    }
+    return 0;
+}
+
+void *vmm_map_phys_exact(uint64_t pa, uint64_t size, uint32_t flags)
+{
+    if (size == 0 || pa + size < pa || pa + size > PHYSMAP_SIZE)
+        return NULL;
+    void *p = vmm_map_phys(pa, size, flags);
+    uint64_t start = pa & ~(PAGE_SIZE - 1);
+    uint64_t end = (pa + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    bool ok = true;
+    uint64_t f = spin_lock_irqsave(&vmm_lk);
+    for (uint64_t a = start; a < end && ok; a += PAGE_SIZE) {
+        uint64_t e = leaf_nolock(PHYSMAP_BASE + a);
+        ok = e != 0 && !!(e & PTE_W) == !!(flags & VMM_W) && !!(e & PTE_PCD) == !!(flags & VMM_UC);
+    }
+    spin_unlock_irqrestore(&vmm_lk, f);
+    return ok ? p : NULL;
+}
+
 /* ---- guard pages ------------------------------------------------------------------------ */
 
 static bool is_guard(uint64_t va)

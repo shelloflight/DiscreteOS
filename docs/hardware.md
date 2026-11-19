@@ -81,4 +81,4 @@ Open an issue with photos of the boot log, the board model and firmware version,
 
 | Machine | Result |
 |---|---|
-| Gigabyte B650 AORUS ELITE AX, Ryzen 9 9900X, RX 9070, 32 GiB, NVMe; UEFI | boots to user space; verified + measured boot (firmware TPM via TCG2); NVMe read; EFI partition mounted read-only. Kernel TPM use needs AML (not yet) |
+| Gigabyte B650 AORUS ELITE AX, Ryzen 9 9900X, RX 9070, 32 GiB, NVMe; UEFI | boots to user space; verified + measured boot (firmware TPM via TCG2); NVMe read; EFI partition mounted read-only. Kernel TPM use needs the TPM start method 2 (`_DSM`, not yet) |

@@ -70,7 +70,7 @@ Main groups:
 | Kernel | `selftest`, `sched`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
 | User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `storage`, `readonly`, `services`, `shell`, `time`, `time-uefi`, `attest`, `poweroff`, `reboot` |
-| Host | `storage-host`, `crypto-host`, `manifest-host`, `kaslr-host`, `static` |
+| Host | `storage-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |
 
 ## Adding a test
 

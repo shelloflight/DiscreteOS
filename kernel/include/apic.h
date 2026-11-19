@@ -31,6 +31,7 @@ uint64_t    timer_irqs(void);                      /* timer interrupts so far, a
 void     ioapic_init(void);
 /* Route ISA IRQ `irq` (honouring ACPI overrides) to `vector` on the boot CPU, or mask it again. */
 bool     ioapic_route_isa_irq(uint8_t irq, uint8_t vector);
+bool     ioapic_route_sci(uint8_t irq, uint8_t vector);   /* level/low unless the MADT overrides */
 void     ioapic_mask_isa_irq(uint8_t irq);
 /* APIC id device interrupts (MSI, I/O APIC) are sent to: the boot CPU. */
 uint32_t irq_target_apic(void);

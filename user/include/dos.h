@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 10
+#define DOS_ABI_VERSION 11
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -211,6 +211,7 @@ struct dos_exception_msg {
 #define DOS_TAG_MANIFEST    10            /* ABI v7: an embedded service manifest <name>.dman (init) */
 #define DOS_TAG_KLOG        11            /* resource (ABI v8): may read the kernel log (init; the log service) */
 #define DOS_TAG_BOOT_TIME   12            /* ABI v8: the wall-clock time the loader read (32-byte VMO; UEFI only) */
+#define DOS_TAG_POWER_BUTTON 13           /* ABI v11: event signaled on each power-button press (init) */
 #define DOS_TAG_USER        0x10000       /* first tag for handles a spawner passes */
 
 struct dos_startup_handle { dos_handle_t handle; uint32_t tag; };

@@ -61,8 +61,8 @@ The verifier side of a TPM quote is in `doscrypt`:
   (`TPMS_ATTEST`), the `TPM_GENERATED` magic and quote type, the signer's Name, the nonce, the
   exact PCR selection (SHA-256 bank) and the PCR digest against the expected values.
 
-Still to do: TPM2_CreatePrimary and TPM2_Quote in the kernel's TPM driver (some TPMs need AML to
-start commands), and proving the attestation key belongs to a real TPM (certification through the
+Still to do: TPM2_CreatePrimary and TPM2_Quote in the kernel's TPM driver (some TPMs, such as AMD
+firmware TPMs, start commands through an ACPI `_DSM`: the AML interpreter can now run it), and proving the attestation key belongs to a real TPM (certification through the
 endorsement key and the vendor's EK certificate).
 
 ## Tests

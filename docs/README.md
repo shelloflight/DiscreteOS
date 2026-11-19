@@ -19,6 +19,7 @@ that cover it.
 | [signing.md](signing.md) | Verified boot, measured boot, code signing, `.dsig` format |
 | [attestation.md](attestation.md) | Remote attestation reports |
 | [hardening.md](hardening.md) | Compiler/linker hardening, speculation mitigations, fuzzing, static analysis |
+| [acpi.md](acpi.md) | The AML interpreter, the SCI, GPEs and the power button |
 | [power.md](power.md) | ACPI power-off and reset |
 | [hardware.md](hardware.md) | Booting D-OS safely on a real PC |
 | [benchmarks.md](benchmarks.md) | The hardware benchmark image and how to compare results |

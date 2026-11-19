@@ -77,9 +77,11 @@ pub const TAG_MANIFEST: u32 = 10;
 pub const TAG_KLOG: u32 = 11;
 /// The boot-time record (ABI v8): a 32-byte VMO, `BootTime` (UEFI only).
 pub const TAG_BOOT_TIME: u32 = 12;
+/// The power-button event (ABI v11): signaled on each press; init clears it.
+pub const TAG_POWER_BUTTON: u32 = 13;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 10;
+pub const ABI_VERSION: u32 = 11;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;

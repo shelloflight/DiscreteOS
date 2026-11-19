@@ -54,6 +54,10 @@
       storage-host dosfs unit tests on the host (cargo test): BLAKE3 vectors, GPT, FAT32, DFS,
                    power-cut sweep over every sector of a workload
       manifest-host the service manifest parser on the host: schema tests and a mutation fuzzer
+      aml-host     the AML interpreter on the host: unit tests, a mutation fuzzer, and this
+                   machine's own DSDT/SSDTs (Windows: dumped from the registry to build\host\acpi,
+                   never committed) loaded, initialised and every method run against simulated
+                   hardware
       time         the wall-clock time across a reboot (clock service from the CMOS RTC, file times
                    on DFS and FAT32; the host boots the same disks twice); time-uefi: the same with
                    the UEFI boot-time record
@@ -80,6 +84,8 @@
       poweroff     init switches the machine off through system_power (the POWER resource; ACPI S5
                    from the DSDT's \_S5); a process without the resource is refused; QEMU must stop
       reboot       the same for a reset (FADT reset register); QEMU must leave on reset
+      powerbutton  the machine's power button (QEMU system_powerdown: ACPI fixed event, SCI): init
+                   shuts every service down cleanly, then switches off
       poweroff-uefi the power-off on UEFI firmware (OVMF's tables)
       hwbench      the hardware benchmark image (bench target) in QEMU: kernel, user and storage
                    benchmarks, then the results screen; disks unchanged afterwards
@@ -233,9 +239,9 @@ $UefiStages = @('D-OS: UEFI loader', 'D-OS: kernel signature valid (Ed25519', 'D
                 'BootInfo OK (v5, UEFI', 'Console: framebuffer', 'write-combining on', '(RSDP from UEFI)') + $KernelStages
 $Halted = 'System halted.'
 $TestCases = [ordered]@{
-    boot        = @{ Define = $null;         Devices = $true; Expect = $BootStages + @('SMP: 4 CPUs online (x2APIC)', 'D-KRNL: ready', 'init: started devmgr', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'MiB free, generation 2, 0 snapshot(s), read-only', 'init: 4 volume(s)', 'devmgr: running'); Forbid = @('KERNEL PANIC', 'FAIL', 'OFF (unsupported)', 'did not start', 'warning', 'exited with code', 'NOT confined'); Post = 'Test-DisksUnchanged' }
+    boot        = @{ Define = $null;         Devices = $true; Expect = $BootStages + @('SMP: 4 CPUs online (x2APIC)', 'ACPI: AML: DSDT', '0 definition(s) skipped', ', 0 failed,', 'ACPI: SCI on IRQ 9; power button: fixed', 'D-KRNL: ready', 'init: started devmgr', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'MiB free, generation 2, 0 snapshot(s), read-only', 'init: 4 volume(s)', 'devmgr: running'); Forbid = @('KERNEL PANIC', 'FAIL', 'OFF (unsupported)', 'did not start', 'warning', 'exited with code', 'NOT confined'); Post = 'Test-DisksUnchanged' }
     'boot-amd'  = @{ Define = $null;         Devices = $true; Iommu = 'amd'; Expect = @('IOMMU: AMD-Vi, 1 unit(s)', 'IOMMU: DMA remapping on for every device', '(the IOMMU itself: kept by the kernel)', 'D-KRNL: ready', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'init: 4 volume(s)', 'devmgr: running'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not start', 'warning', 'exited with code', 'NOT confined', 'unusable', 'blocked DMA'); Post = 'Test-DisksUnchanged' }
-    uefi        = @{ Define = $null;         Devices = $true; Uefi = $true; Timeout = 90; Expect = $UefiStages + @('SMP: 4 CPUs online (x2APIC)', 'D-KRNL: ready', 'init: started devmgr', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'init: 4 volume(s)', 'devmgr: running', 'terminal: ready: framebuffer', 'shell: ready'); Forbid = @('KERNEL PANIC', 'FAIL', 'OFF (unsupported)', 'did not start', 'warning', 'exited with code', 'NOT confined', 'NOT confined', 'stage1'); Post = 'Test-DisksUnchanged' }
+    uefi        = @{ Define = $null;         Devices = $true; Uefi = $true; Timeout = 90; Expect = $UefiStages + @('SMP: 4 CPUs online (x2APIC)', 'ACPI: AML: DSDT', '0 definition(s) skipped', ', 0 failed,', 'ACPI: SCI on IRQ 9; power button: fixed', 'D-KRNL: ready', 'init: started devmgr', 'devmgr: ps2.ddrv ready', 'devmgr: virtio-blk.ddrv ready', 'devmgr: virtio-input.ddrv ready', 'devmgr: ahci.ddrv ready', 'devmgr: nvme.ddrv ready', 'devmgr: disks are read-only', 'storaged: volume ''system'': DFS', 'init: 4 volume(s)', 'devmgr: running', 'terminal: ready: framebuffer', 'shell: ready'); Forbid = @('KERNEL PANIC', 'FAIL', 'OFF (unsupported)', 'did not start', 'warning', 'exited with code', 'NOT confined', 'NOT confined', 'stage1'); Post = 'Test-DisksUnchanged' }
     'uefi-uniproc' = @{ Define = $null;       Uefi = $true; Smp = 1; Timeout = 60; Expect = $UefiStages + @('SMP: 1 CPU', 'D-KRNL: ready'); Forbid = @('KERNEL PANIC', 'FAIL') }
     'uefi-selftest' = @{ Define = 'SELFTEST';  Uefi = $true; Timeout = 60; Expect = $UefiStages + @('KTEST selftest: PASSED', 'KTEST rust selftest: PASSED', 'D-KRNL: ready'); Forbid = @('KERNEL PANIC', 'FAIL') }
     keyboard    = @{ Define = $null;         Expect = @('ps2: keyboard ready', 'terminal: line from ps2: Disc OS');  Forbid = @('KERNEL PANIC')
@@ -409,6 +415,12 @@ $TestCases = [ordered]@{
                                 'terminal|   usage: copy <from> <to>', 'terminal|  count', 'shell: ready: 4 place(s)', 'terminal| v deleted /data/notes/readme.txt', 'terminal| v deleted /data/notes',
                                 'terminal| system > time', ' UTC', 'init: shell asked to switch off', 'init: shutdown: every service stopped', 'Power: switching off')
                      Forbid = @('KERNEL PANIC', 'PANIC', 'user fault', 'crashed', 'cannot start') }
+    # The machine's power button (QEMU monitor system_powerdown: the ACPI fixed power-button event
+    # through the SCI): init shuts every service down cleanly, then switches off.
+    powerbutton = @{ Define = $null;         Devices = $true; Timeout = 90; MustExit = $true; KeysAfter = 'shell: ready'; Keys = @('~500', '!system_powerdown')
+                     Expect = @('ACPI: AML: DSDT', 'ACPI: SCI on IRQ 9; power button: fixed', 'shell: ready', 'ACPI: power button pressed (fixed)', 'init: power button pressed: shutting down',
+                                'init: shutdown: every service stopped', 'Power: switching off (ACPI S5)')
+                     Forbid = @('KERNEL PANIC', 'PANIC', 'did not switch off', 'system_power returned', 'did not finish') }
     poweroff    = @{ Define = 'POWEROFF';    Expect = @('Power: power-off by ACPI S5', 'init: power: the VMEX resource is refused (-5)', 'Power: switch-off requested by process init', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
     'poweroff-uefi' = @{ Define = 'POWEROFF'; Uefi = $true; Expect = @('Power: power-off by ACPI S5', 'Power: switching off (ACPI S5)'); Forbid = @('KERNEL PANIC', 'FAIL', 'did not switch off', 'system_power returned', 'exited with code'); Timeout = 60; MustExit = $true }
     reboot      = @{ Define = 'REBOOT';      Expect = @('reset by reset register', 'init: power: the VMEX resource is refused (-5)', 'Power: reset requested by process init', 'Power: resetting'); Forbid = @('KERNEL PANIC', 'FAIL', 'no reset method worked', 'system_power returned', 'exited with code'); Timeout = 30; MustExit = $true }
@@ -429,6 +441,7 @@ $TestCases = [ordered]@{
     'storage-host' = @{ Host = 'Test-DosfsHost' }
     'crypto-host' = @{ Host = 'Test-CryptoHost' }
     'manifest-host' = @{ Host = 'Test-ManifestHost' }
+    'aml-host'  = @{ Host = 'Test-AmlHost' }
     'uefi-badsig' = @{ Define = $null;       Uefi = $true; Tamper = $true; Timeout = 60; Expect = @('D-OS: UEFI loader', 'D-OS: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 1.', 'kernel signature valid') }
     'bios-badsig' = @{ Define = $null;       Tamper = $true; Expect = @('D-OS: stage2 OK', 'D-OS: stage3: kernel signature check failed: content does not match the signature', 'refusing to boot an unverified kernel'); Forbid = @('D-KRNL 1.', 'kernel signature valid') }
     kaslr       = @{ Define = 'KASLR';       Expect = @('D-OS: stage3: kernel relocated (KASLR', 'KTEST kaslr: layout image 0xffffff', 'KTEST kaslr: PASSED', 'D-KRNL: ready'); Forbid = @('KERNEL PANIC', 'FAIL'); Post = 'Test-KaslrReboots' }
@@ -1514,12 +1527,12 @@ function Test-StaticAnalysis {
         $findings += $n
     }
     $cargo = Initialize-Rust
-    $crates = @('kernel\rust', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\lib\dman', 'user\init', 'user\log', 'user\clock', 'user\terminal', 'user\shell', 'user\tools','user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
+    $crates = @('kernel\rust', 'kernel\aml', 'user\lib\crypto', 'user\lib\fs', 'user\lib\libd', 'user\lib\dman', 'user\init', 'user\log', 'user\clock', 'user\terminal', 'user\shell', 'user\tools','user\devmgr', 'user\storaged', 'user\fstest', 'user\ltest', 'user\dcmpl', 'tools\dosimg')
     foreach ($c in $crates) {
         Push-Location (Join-Path $Root $c)
         try {
             $allTargets = [string[]]@()      # (an if-expression would unwrap a one-element array)
-            if ((Test-Path 'src\main.rs') -or ($c -like 'user\lib\*')) { $allTargets = [string[]]@('--all-targets') }
+            if ((Test-Path 'src\main.rs') -or ($c -like 'user\lib\*') -or ($c -eq 'kernel\aml')) { $allTargets = [string[]]@('--all-targets') }
             if ($c -eq 'user\lib\libd') { $allTargets += @('--features', 'capi') }   # the C API too
             $out = & $cargo clippy --release --locked --quiet @allTargets --target-dir (Join-Path $Build 'clippy') -- -D warnings 2>&1 | Out-String
             $code = $LASTEXITCODE
@@ -1587,6 +1600,38 @@ function Test-KaslrHost {
     $same = $okList -and $ours.Count -gt 0 -and (($ours | Sort-Object) -join ',') -eq (($theirs | Sort-Object) -join ',')
     Write-Host "  host: kernel.bin RELR: $($ours.Count) relocations decoded, llvm-readobj lists $($theirs.Count): $(if ($same) { 'identical' } else { 'DIFFERENT' })"
     return $ok -and $same
+}
+
+# aml-host: the AML interpreter on the host. On Windows the machine's own ACPI tables are dumped
+# from HKLM\HARDWARE\ACPI (DSDT and every SSDT, as the firmware handed them to Windows) into
+# build\host\acpi first, so real firmware is loaded and run against simulated hardware; they stay
+# in build\ (firmware code, never committed). Without them the built tables and fuzzers still run.
+function Export-AcpiTables {
+    $dir = Join-Path $Build 'host\acpi'
+    if (-not (Test-Path 'HKLM:\HARDWARE\ACPI')) { return 0 }
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $n = 0
+    foreach ($k in Get-ChildItem 'HKLM:\HARDWARE\ACPI' -ErrorAction SilentlyContinue) {
+        if ($k.PSChildName -notmatch '^(DSDT|SSD.|SSDT)$') { continue }
+        $leaf = Get-ChildItem $k.PSPath -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Property -contains '00000000' } | Select-Object -First 1
+        if (-not $leaf) { continue }
+        $b = (Get-ItemProperty $leaf.PSPath).'00000000'
+        if ($b -is [byte[]] -and $b.Length -ge 36) { [IO.File]::WriteAllBytes((Join-Path $dir "$($k.PSChildName).aml"), $b); $n++ }
+    }
+    return $n
+}
+
+function Test-AmlHost {
+    $cargo = Initialize-Rust
+    $n = Export-AcpiTables
+    Write-Host "  host: $(if ($n) { "$n firmware AML table(s) of this machine in build\host\acpi" } else { 'no firmware tables (not Windows, or not readable): built tables only' })"
+    Push-Location (Join-Path $Root 'kernel\aml')
+    try {
+        $out = & $cargo test --release --locked --quiet --target-dir (Join-Path $Build 'host') -- --nocapture --test-threads 1 2>&1 | Out-String
+        $code = $LASTEXITCODE
+    } finally { Pop-Location }
+    Write-Host ($out.Trim() -split "`n" | Where-Object { $_ -match 'test result|FAILED|panicked|aml ' } | ForEach-Object { "  $($_.Trim())" } | Out-String).TrimEnd()
+    return $code -eq 0
 }
 
 # manifest-host: the service manifest parser on the host: schema tests and the mutation fuzzer.

@@ -34,6 +34,8 @@ const SEC: u64 = 1_000_000_000;
 const KEY_PROC: u64 = 1;
 const KEY_CTL: u64 = 2;
 const KEY_MGR: u64 = 3;
+/// The power-button event (startup tag POWER_BUTTON) fired.
+const KEY_BUTTON: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -162,9 +164,15 @@ fn measure(digest: &[u8; 32], text: &str) {
 
 impl Mgr {
     pub fn new() -> Result<Mgr, &'static str> {
+        let port = Port::new(256).map_err(|_| "cannot create a port")?;
+        // The machine's power button (ACPI): a press is a clean shutdown and power-off.
+        let button = startup(sys::TAG_POWER_BUTTON);
+        if button != 0 {
+            port.arm(button, sys::SIGNALED, KEY_BUTTON);
+        }
         Ok(Mgr {
             svcs: Vec::new(),
-            port: Port::new(256).map_err(|_| "cannot create a port")?,
+            port,
             volumes: Vec::new(),
             volumes_done: false,
             order: Vec::new(),
@@ -586,6 +594,17 @@ impl Mgr {
             self.start_ready();
             return due.is_some_and(|d| d <= timeout);
         };
+        if key == KEY_BUTTON {
+            let button = startup(sys::TAG_POWER_BUTTON);
+            sys::event_signal(button, sys::SIGNALED, 0);
+            self.port.arm(button, sys::SIGNALED, KEY_BUTTON);
+            if self.power_request.is_none() {
+                println!("init: power button pressed: shutting down");
+                self.power_request = Some(sys::POWER_OFF);
+            }
+            self.start_ready();
+            return true;
+        }
         let i = (key >> 8) as usize;
         if i < self.svcs.len() {
             match key & 0xFF {

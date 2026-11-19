@@ -116,6 +116,9 @@ uint64_t vmm_translate_nolock(uint64_t va);   /* fault/panic reports only (other
 /* Map a physical range (MMIO, firmware tables) into the direct map and return its permanent
  * virtual address. Pages that are already mapped are left as they are. */
 void    *vmm_map_phys(uint64_t pa, uint64_t size, uint32_t flags);
+/* Like vmm_map_phys, but NULL (nothing changed) if a page was already mapped with other write or
+ * cache attributes (a firmware table page mapped read-only, for example). */
+void    *vmm_map_phys_exact(uint64_t pa, uint64_t size, uint32_t flags);
 
 /* Guard pages: never mapped; faults on them are reported by name. */
 void        vmm_add_guard(const void *page, const char *name);

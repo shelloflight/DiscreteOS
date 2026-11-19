@@ -264,17 +264,22 @@ const void *acpi_table_at(uint64_t phys, uint32_t *len)
     return t;
 }
 
-const void *acpi_find_table(const char sig[4], uint32_t *len)
+const void *acpi_find_table_nth(const char sig[4], uint32_t n, uint32_t *len)
 {
     for (size_t i = 0; root_entries && i < root_count; i++) {
         uint64_t addr = 0;
         memcpy(&addr, root_entries + i * root_entry_size, root_entry_size);
         const struct sdt_header *t = table_get(addr);
-        if (t && memcmp(t->signature, sig, 4) == 0) {
+        if (t && memcmp(t->signature, sig, 4) == 0 && n-- == 0) {
             *len = t->length;
             return t;
         }
     }
     *len = 0;
     return NULL;
+}
+
+const void *acpi_find_table(const char sig[4], uint32_t *len)
+{
+    return acpi_find_table_nth(sig, 0, len);
 }

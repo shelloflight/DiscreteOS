@@ -1,5 +1,6 @@
 //! The request loop every block driver shares. A driver implements `Disk` for its
-//! hardware and calls `serve`: it announces its disks (READY, then DISK per unit), then serves
+//! hardware and calls `serve`: it announces its disks (READY with the number of units, then DISK
+//! per unit), then serves
 //! requests on its control channel (unit 0, for the device manager's tests) and on each channel
 //! attached to a unit (BLK_ATTACH, from the device manager; the storage service holds the other
 //! end). Requests are checked here before the hardware sees them: unit, range, size.
@@ -77,7 +78,9 @@ fn block_op(d: &mut impl Disk, ch: Handle, unit: usize, h: &Header, msg: &[u8], 
 pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
     let units = d.units().min(MAX_UNITS);
     let writable = libd::args() == b"rw";
-    proto::send(ctl, proto::READY, if units > 0 { d.capacity(0) } else { 0 }, 0);
+    // b: how many DISK messages follow (the device manager waits for them before it tells the
+    // storage service the disks present at boot are all known).
+    proto::send(ctl, proto::READY, if units > 0 { d.capacity(0) } else { 0 }, units as u64);
     for u in 0..units {
         let mut m = [0u8; HEADER + 40];
         Header { txid: 0, op: proto::DISK, status: 0, a: u as u64, b: d.capacity(u) }.put(&mut m);

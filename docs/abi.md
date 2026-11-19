@@ -1,4 +1,4 @@
-# User ABI (version 10)
+# User ABI (version 11)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **10**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **11**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -32,6 +32,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 8 | the log service (65-66): kernel log records name the writing process; KLOG and BOOT_TIME startup handles |
 | 9 | the terminal and the shell (67-68): the `display` device and `display_info`; `process_handles` |
 | 10 | D-CMPL's Linux server (69-70): `process_vmar`, `thread_create_stopped`; `exception_resume` can end one thread (`EXIT_THREAD`) |
+| 11 | the POWER_BUTTON startup handle: an event the kernel signals on each power-button press ([acpi.md](acpi.md)) |
 
 ## Calling convention (x86-64)
 
@@ -171,11 +172,12 @@ At the entry point, RDI points at `struct dos_startup`: magic `DOSS`, ABI versio
 bytes (<= 4096), the image base and the stack.
 
 Tags: `PROC_SELF` 1, `THREAD_SELF` 2, `VMAR_ROOT` 3, `LOG` 4, `PROGRAM` 5, `VMEX` 6, `DEVICE` 7,
-`POWER` 8, `MEASURE` 9, `MANIFEST` 10, `KLOG` 11, `BOOT_TIME` 12, and `DOS_TAG_USER` (0x10000) and
+`POWER` 8, `MEASURE` 9, `MANIFEST` 10, `KLOG` 11, `BOOT_TIME` 12, `POWER_BUTTON` 13, and `DOS_TAG_USER` (0x10000) and
 up for the spawner's own. `init` gets its own handles, the log, one read-only VMO per embedded program
 and per embedded service manifest (`*.dman`: data, never runnable), the VMEX, POWER, MEASURE and
 KLOG resources, the boot-time record (UEFI only: the firmware's time at boot and the monotonic
-time it corresponds to, `struct dos_boot_time`) and every device.
+time it corresponds to, `struct dos_boot_time`), the power-button event (`WAIT` and `SIGNAL`:
+init clears it after each press) and every device.
 Tags user space agrees on: the service manager's control channel and endpoints
 ([services.md](services.md)), namespaces ([storage.md](storage.md)).
 

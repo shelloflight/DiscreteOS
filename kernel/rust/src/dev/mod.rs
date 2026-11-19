@@ -5,12 +5,14 @@
 //!   capabilities;
 //! - `iommu`: DMA remapping (Intel VT-d or AMD-Vi), a domain per device, default deny;
 //! - `irq`: device vectors -> interrupt objects (MSI, MSI-X, ISA lines);
-//! - `object::device`: the Device, Interrupt and Pin objects drivers use.
+//! - `object::device`: the Device, Interrupt and Pin objects drivers use;
+//! - `acpi`: the AML namespace (`kernel/aml`), the SCI and the power button.
 //!
 //! At boot every PCI function (and the legacy PS/2 controller, as a platform device) becomes a
 //! `DeviceObj`. They all go to init (startup tag DEVICE) and nowhere else: init passes them to the
 //! device manager, which grants each to the driver it starts for it.
 
+pub mod acpi;
 #[cfg(ktest_fuzz)]
 pub mod acpi_fuzz;
 pub mod iommu;
@@ -154,4 +156,6 @@ pub fn init() {
     let leaked = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(devs));
     DEVICES.store(leaked, Ordering::Release);
     crate::kprintln!("Devices: {} for user-space drivers (handed to init)", n);
+    // The firmware's AML: device initialisation before any driver starts, then the SCI.
+    acpi::init();
 }

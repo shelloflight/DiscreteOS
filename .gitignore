@@ -20,6 +20,7 @@ Thumbs.db
 
 # Rust (cargo output goes to build/; the lock file is committed)
 kernel/rust/target/
+kernel/aml/target/
 user/*/target/
 user/lib/*/target/
 tools/*/target/

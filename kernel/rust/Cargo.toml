@@ -17,6 +17,8 @@ bench = false
 [dependencies]
 # In-tree only: the D-OS crypto crate (SHA-2, Ed25519, .dsig), shared with the host tools.
 doscrypt = { path = "../../user/lib/crypto" }
+# In-tree: the ACPI Machine Language interpreter (host-tested with `cargo test`).
+aml = { path = "../aml" }
 
 [profile.dev]
 panic = "abort"

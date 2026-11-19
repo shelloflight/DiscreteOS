@@ -2,16 +2,19 @@
  * Power control (see power.h, docs/power.md).
  *
  * Switching off needs two things from ACPI: where the PM1 control registers are (FADT) and which
- * SLP_TYP value means S5 on this chipset (the \_S5 package in the DSDT, written in AML). A full AML
- * interpreter is future work; \_S5 is a plain data package on practically every machine, so a
- * small scanner reads it: find the name, check it is a package, decode its first two integers.
- * Everything it reads is bounds-checked (the tables are firmware input), and it is fuzzed.
+ * SLP_TYP value means S5 on this chipset (\_S5 in the DSDT, written in AML). At power_init a small
+ * scanner reads \_S5 when it is a plain data package (practically every machine): find the name,
+ * check it is a package, decode its first two integers; bounds-checked and fuzzed. Once the AML
+ * interpreter has loaded the namespace (kernel/rust/src/dev/acpi.rs) it evaluates \_S5 properly
+ * (a method too) and hands the result over with power_set_s5; before switching off it runs
+ * \_TTS(5) and \_PTS(5).
  *
  * Resetting uses the FADT reset register when the firmware declares one, then the classic
  * fallbacks. Neither path needs AML.
  */
 
 #include "power.h"
+#include "rust.h"
 #include "acpi.h"
 #include "cpu.h"
 #include "ktime.h"
@@ -295,6 +298,24 @@ void power_init(void)
     kprintf("Power: %s; reset by %s\n", off, rst);
 }
 
+void power_set_s5(uint8_t typ_a, uint8_t typ_b)
+{
+    bool changed = !pw.s5 || pw.typ_a != (typ_a & 7) || pw.typ_b != (typ_b & 7);
+    pw.typ_a = typ_a & 7;
+    pw.typ_b = typ_b & 7;
+    pw.s5 = true;
+    if (changed)
+        kprintf("Power: \\_S5 from AML: SLP_TYP %u/%u%s\n", pw.typ_a, pw.typ_b,
+                power_off_supported() ? "; ACPI power-off available" : "");
+}
+
+void *acpi_mmio_map(uint64_t pa, uint32_t len)
+{
+    if (!pa || !len || len > PAGE_SIZE || pa >= PHYSMAP_SIZE - len || pmm_range_is_ram(pa, len))
+        return NULL;
+    return vmm_map_phys_exact(pa, len, VMM_W | VMM_UC);
+}
+
 bool power_off_supported(void)
 {
     return pw.s5 && (pw.hw_reduced ? pw.sleep_ctl.address != 0 : pw.pm1a.address != 0);
@@ -313,6 +334,7 @@ void power_off(void)
         kprintf("Power: ACPI power-off is not available on this machine\n");
         return;
     }
+    dkrnl_acpi_prepare_sleep(5);                /* \_TTS(5), \_PTS(5) once the namespace is loaded */
     kprintf("Power: switching off (ACPI S5)\n");
     if (pw.hw_reduced) {
         gas_write(&pw.sleep_ctl, (uint32_t)(pw.typ_a << 2) | HWR_SLP_EN, 1);

@@ -46,6 +46,8 @@ void acpi_set_boot_rsdp(const void *rsdp);
  * verified (its contents are still untrusted: the caller bounds-checks every field). NULL and
  * *len = 0 if absent. Used by the device framework (MCFG, DMAR). */
 const void *acpi_find_table(const char sig[4], uint32_t *len);
+/* The n-th table (from 0) with this signature, in root-table order (SSDTs). */
+const void *acpi_find_table_nth(const char sig[4], uint32_t n, uint32_t *len);
 
 /* A table by physical address (the FADT's DSDT pointer), validated like acpi_find_table. */
 const void *acpi_table_at(uint64_t phys, uint32_t *len);

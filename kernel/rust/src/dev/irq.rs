@@ -42,7 +42,7 @@ pub fn spurious() -> u64 {
 /// Called by the C dispatcher (idt.c) for every device vector, in interrupt context.
 #[unsafe(no_mangle)]
 pub extern "C" fn dkrnl_dev_irq(vector: u32) {
-    if super::iommu::fault_irq(vector) {
+    if super::iommu::fault_irq(vector) || super::acpi::sci_irq(vector) {
         return;
     }
     let v = vector as usize & 255;

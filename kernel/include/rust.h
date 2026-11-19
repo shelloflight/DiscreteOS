@@ -11,6 +11,9 @@
 struct interrupt_frame;
 
 void dkrnl_init(void);            /* after heap + time: verifies the allocator, sets up objects */
+/* ACPI (kernel/rust/src/dev/acpi.rs): run \_TTS(state) and \_PTS(state) before sleeping or switching
+ * off, when the AML namespace is loaded and the caller may block; otherwise nothing. */
+void dkrnl_acpi_prepare_sleep(uint32_t state);
 void dkrnl_objects_print(void);   /* live kernel objects per type (inspection) */
 /* Verified-boot report, PCR 8 measurement, TPM discovery (after dkrnl_init: needs ACPI) */
 void dkrnl_security_init(uint32_t firmware, uint32_t flags, const uint8_t *kernel_dsig);

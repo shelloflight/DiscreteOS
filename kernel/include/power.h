@@ -18,6 +18,12 @@
 
 void power_init(void);
 bool power_off_supported(void);
+/* The AML interpreter evaluated \_S5: use these SLP_TYP values (also when the scanner found none). */
+void power_set_s5(uint8_t typ_a, uint8_t typ_b);
+/* Map `len` bytes (at most a page) of physical memory for AML operation regions: writable and
+ * uncached, only outside usable RAM and inside the direct map, and not where the kernel already
+ * mapped the page differently (read-only firmware tables); NULL otherwise (the access is refused). */
+void *acpi_mmio_map(uint64_t pa, uint32_t len);
 void power_off(void);
 void power_reboot(void) __attribute__((noreturn));
 

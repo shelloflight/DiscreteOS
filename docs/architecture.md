@@ -56,7 +56,8 @@ installer yet); `init` gets a read-only VMO for each one ([services.md](services
 | `kernel/drivers/` | C | early console only: serial, VGA text, framebuffer |
 | `kernel/rust/src/object/` | Rust | kernel objects, handles, rights, quotas, IPC ([objects.md](objects.md)) |
 | `kernel/rust/src/user/` | Rust | syscalls, ELF loader, user threads, exceptions ([abi.md](abi.md)) |
-| `kernel/rust/src/dev/` | Rust | PCI, IOMMU (VT-d, AMD-Vi), interrupt delivery for user-space drivers |
+| `kernel/rust/src/dev/` | Rust | PCI, IOMMU (VT-d, AMD-Vi), interrupt delivery for user-space drivers, ACPI (SCI, power button) |
+| `kernel/aml/` | Rust | the AML interpreter (host-testable crate, [acpi.md](acpi.md)) |
 | `kernel/rust/src/security/` | Rust | verified/measured boot, TPM 2.0, attestation ([signing.md](signing.md)) |
 | `kernel/kdb.c`, `kernel/ktest.c` | C | serial kernel debugger; in-kernel tests |
 | `user/include/dos.h`, `user/lib/dos.c` | C | C binding of the ABI and a minimal runtime for C programs |

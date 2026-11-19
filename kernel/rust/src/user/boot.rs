@@ -9,7 +9,8 @@
 //!   trusted because the verified kernel image carries it, never runnable;
 //! - the VMEX resource (tag VMEX): the authority to make sealed VMOs executable, for user-space
 //!   program loaders. init hands it on only deliberately;
-//! - the POWER and MEASURE resources (switch off / reset; record decisions in PCR 10);
+//! - the POWER and MEASURE resources (switch off / reset; record decisions in PCR 10) and the
+//!   power-button event (ACPI, kernel/rust/src/dev/acpi.rs);
 //! - the KLOG resource (read the kernel log, kernel addresses filtered: for the log service);
 //! - the boot-time record (tag BOOT_TIME, a read-only VMO named "boot-time"): the wall-clock time
 //!   the UEFI loader read from the firmware, and the monotonic time it corresponds to (none under
@@ -78,7 +79,7 @@ fn start(args: &[u8]) -> Result<KRef<Process>, Status> {
     let mut handles = Vec::new();
     let n = programs().count();
     let devs = crate::dev::devices();
-    handles.try_reserve_exact(n + 6 + devs.len()).map_err(|_| Status::NoMemory)?;
+    handles.try_reserve_exact(n + 7 + devs.len()).map_err(|_| Status::NoMemory)?;
     handles.push((Object::Log(LogObj::create()?), default_rights(ObjType::Log), tag::LOG));
     let vmex = ResourceObj::new(KIND_VMEX)?;
     handles.push((Object::Resource(vmex), default_rights(ObjType::Resource), tag::VMEX));
@@ -95,6 +96,9 @@ fn start(args: &[u8]) -> Result<KRef<Process>, Status> {
         v.write(0, &rec)?;
         v.seal()?;
         handles.push((Object::Vmo(v), Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT, tag::BOOT_TIME));
+    }
+    if let Some(e) = crate::dev::acpi::power_button_event() {
+        handles.push((Object::Event(e), Rights::WAIT | Rights::SIGNAL | Rights::INSPECT, tag::POWER_BUTTON));
     }
     let prog_rights = Rights::READ | Rights::DUPLICATE | Rights::TRANSFER | Rights::INSPECT;
     for (name, data) in programs() {

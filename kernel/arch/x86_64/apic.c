@@ -332,10 +332,10 @@ void ioapic_init(void)
 /* REGSEL/WIN pairs must not interleave: routes change at run time (user-space drivers). */
 static spinlock_t ioapic_lk = SPINLOCK_INIT("ioapic", LOCK_RANK_LEAF);
 
-static bool ioapic_set_isa(uint8_t irq, uint8_t vector, bool masked)
+static bool ioapic_set_isa(uint8_t irq, uint8_t vector, bool masked, uint16_t dflt)
 {
     uint32_t gsi = irq;
-    uint16_t flags = 0;                      /* ISA default: active high, edge triggered */
+    uint16_t flags = dflt;                   /* without an override: ISA edge/high, the SCI level/low */
     for (uint32_t i = 0; i < acpi.iso_count; i++) {
         if (acpi.iso[i].irq == irq) {
             gsi = acpi.iso[i].gsi;
@@ -365,6 +365,8 @@ static bool ioapic_set_isa(uint8_t irq, uint8_t vector, bool masked)
     return false;
 }
 
-bool ioapic_route_isa_irq(uint8_t irq, uint8_t vector) { return ioapic_set_isa(irq, vector, false); }
-void ioapic_mask_isa_irq(uint8_t irq) { (void)ioapic_set_isa(irq, 0, true); }
+bool ioapic_route_isa_irq(uint8_t irq, uint8_t vector) { return ioapic_set_isa(irq, vector, false, 0); }
+/* The ACPI SCI: level triggered, active low unless the MADT overrides it (ACPI 6.5, 5.2.9). */
+bool ioapic_route_sci(uint8_t irq, uint8_t vector) { return ioapic_set_isa(irq, vector, false, 0xF); }
+void ioapic_mask_isa_irq(uint8_t irq) { (void)ioapic_set_isa(irq, 0, true, 0); }
 uint32_t irq_target_apic(void) { return bsp_percpu.apic_id; }

@@ -95,6 +95,8 @@ struct Driver {
     starts: u32,
     gave_up: bool,
     capacity: u64,
+    /// DISK messages announced by READY that have not arrived yet.
+    disks_due: u64,
 }
 
 struct Mgr {
@@ -178,6 +180,7 @@ impl Mgr {
                 d.proc = p;
                 d.ch = mine;
                 d.ready = false;
+                d.disks_due = 0;
                 d.starts += 1;
                 self.port.arm(p, sys::TERMINATED, key_proc(i));
                 self.port.arm(mine, sys::READABLE | sys::PEER_CLOSED, key_chan(i));
@@ -224,6 +227,7 @@ impl Mgr {
                         proto::READY => {
                             d.ready = true;
                             d.capacity = h.a;
+                            d.disks_due = h.b.min(64);
                             println!("devmgr: {}.ddrv ready on {} (start {})", d.prog, d.info.name(), d.starts);
                         }
                         proto::KEY => {
@@ -231,6 +235,7 @@ impl Mgr {
                             self.key(h.a as u32, from, i);
                         }
                         proto::DISK => {
+                            d.disks_due = d.disks_due.saturating_sub(1);
                             let payload = &buf[HEADER..n as usize];
                             self.disk(i, h.a, h.b, payload);
                         }
@@ -397,6 +402,7 @@ impl Mgr {
         d.proc = 0;
         d.ch = 0;
         d.ready = false;
+        d.disks_due = 0;
         println!("devmgr: {}.ddrv exited with code {}{}", d.prog, code, exit_text(code));
         // Quiesce: no decode, no bus mastering, until the next instance has reset the device.
         if d.info.kind == sys::DEV_KIND_PCI {
@@ -511,7 +517,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
             continue;
         };
         if n < MAX_DRIVERS {
-            m.drv[n] = Some(Driver { prog, image, dev: h, info, proc: 0, ch: 0, ready: false, starts: 0, gave_up: false, capacity: 0 });
+            m.drv[n] = Some(Driver { prog, image, dev: h, info, proc: 0, ch: 0, ready: false, starts: 0, gave_up: false, capacity: 0, disks_due: 0 });
             n += 1;
         }
     }
@@ -532,10 +538,10 @@ fn devmgr_main(s: *const Startup) -> i32 {
         println!("devmgr: test {}", if ok { "PASSED" } else { "FAILED" });
         return if ok { 0 } else { 1 };
     }
-    // Once every driver started at boot is ready (or has given up), its disks have been
-    // announced: tell the storage service, so it can report the volumes present at boot.
+    // Once every driver started at boot is ready with all the disks its READY announced (or has
+    // given up), tell the storage service, so it can report the volumes present at boot.
     let deadline = sys::clock_ns() + 10 * SEC;
-    while sys::clock_ns() < deadline && !m.drv.iter().flatten().all(|d| d.ready || d.gave_up) {
+    while sys::clock_ns() < deadline && !m.drv.iter().flatten().all(|d| (d.ready && d.disks_due == 0) || d.gave_up) {
         m.pump(deadline.saturating_sub(sys::clock_ns()).max(1));
     }
     while m.pump(0) {}

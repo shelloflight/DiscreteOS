@@ -239,6 +239,11 @@ unsafe extern "C" {
 
     // Device framework: acpi.h, mm.h, arch.h, apic.h
     pub fn acpi_find_table(sig: *const u8, len: *mut u32) -> *const u8;
+    pub fn acpi_find_table_nth(sig: *const u8, n: u32, len: *mut u32) -> *const u8;
+    pub fn acpi_table_at(phys: u64, len: *mut u32) -> *const u8;
+    pub fn acpi_mmio_map(pa: u64, len: u32) -> *mut u8;
+    pub fn ioapic_route_sci(irq: u8, vector: u8) -> bool;
+    pub fn power_set_s5(typ_a: u8, typ_b: u8);
     pub fn vmm_map_phys(pa: u64, size: u64, flags: u32) -> *mut u8;
     pub fn pmm_range_is_ram(pa: u64, len: u64) -> bool;
     pub fn irq_vector_alloc() -> c_int;
