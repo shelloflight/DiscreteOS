@@ -281,6 +281,8 @@ void timer_program(uint64_t deadline_ns)
 struct ioapic {
     volatile uint32_t *mmio;
     uint32_t gsi_base, count;
+    uint8_t id;
+    uint32_t routed[256];                    /* low dword of each unmasked pin (0: masked) */
 };
 
 static struct ioapic ioapics[ACPI_MAX_IOAPIC];
@@ -298,7 +300,7 @@ static void ioapic_write(const struct ioapic *io, uint32_t reg, uint32_t v)
     io->mmio[IOAPIC_WIN / 4] = v;
 }
 
-static void ioapic_add(uint64_t addr, uint32_t gsi_base)
+static void ioapic_add(uint64_t addr, uint32_t gsi_base, int id)
 {
     if (ioapic_n == ACPI_MAX_IOAPIC || addr >= PHYSMAP_SIZE) {
         kprintf("IOAPIC: cannot use I/O APIC at %#llx\n", (unsigned long long)addr);
@@ -308,6 +310,7 @@ static void ioapic_add(uint64_t addr, uint32_t gsi_base)
     io->mmio = vmm_map_phys(addr, 4096, VMM_W | VMM_UC);
     io->gsi_base = gsi_base;
     io->count = ((ioapic_read(io, IOAPIC_VER) >> 16) & 0xFF) + 1;
+    io->id = id >= 0 ? (uint8_t)id : (uint8_t)(ioapic_read(io, 0) >> 24); /* else its ID register */
 
     for (uint32_t i = 0; i < io->count; i++) {                /* start fully masked */
         ioapic_write(io, IOAPIC_REDTBL + 2 * i, LVT_MASKED);
@@ -321,9 +324,9 @@ void ioapic_init(void)
 {
     if (acpi.madt && acpi.ioapic_count) {
         for (uint32_t i = 0; i < acpi.ioapic_count; i++)
-            ioapic_add(acpi.ioapic[i].addr, acpi.ioapic[i].gsi_base);
+            ioapic_add(acpi.ioapic[i].addr, acpi.ioapic[i].gsi_base, acpi.ioapic[i].id);
     } else {
-        ioapic_add(IOAPIC_DEFAULT, 0);
+        ioapic_add(IOAPIC_DEFAULT, 0, -1);
     }
     if (!ioapic_n)
         panic("no usable I/O APIC");
@@ -331,6 +334,71 @@ void ioapic_init(void)
 
 /* REGSEL/WIN pairs must not interleave: routes change at run time (user-space drivers). */
 static spinlock_t ioapic_lk = SPINLOCK_INIT("ioapic", LOCK_RANK_LEAF);
+
+/* Interrupt remapping (dev/iommu, Rust): the RTE's high dword for (I/O APIC, vector), after
+ * installing its remapping entry; -1 when remapping is off (plain destination), -2 to refuse. */
+extern int64_t dkrnl_ir_ioapic(uint8_t ioapic_id, uint8_t vector, bool level);
+
+/* Write pin `pin` (unmasked: `low` holds vector, polarity and trigger). Called without ioapic_lk:
+ * the remapping hook takes the IOMMU's lock. */
+static bool ioapic_program(struct ioapic *io, uint32_t pin, uint32_t low, bool masked)
+{
+    uint32_t high = bsp_percpu.apic_id << 24;  /* always the boot CPU (irq_target_apic()) */
+    if (!masked) {
+        int64_t h = dkrnl_ir_ioapic(io->id, (uint8_t)low, (low >> 15) & 1);
+        if (h == -2)
+            return false;
+        if (h >= 0)
+            high = (uint32_t)h;
+    }
+    uint64_t f = spin_lock_irqsave(&ioapic_lk);
+    ioapic_write(io, IOAPIC_REDTBL + 2 * pin, LVT_MASKED);       /* never half updated */
+    ioapic_write(io, IOAPIC_REDTBL + 2 * pin + 1, high);
+    if (!masked)
+        ioapic_write(io, IOAPIC_REDTBL + 2 * pin, low);
+    io->routed[pin] = masked ? 0 : low | (1u << 31);
+    spin_unlock_irqrestore(&ioapic_lk, f);
+    return true;
+}
+
+/* Interrupt remapping was just switched on: write every routed pin again in the new format. */
+void ioapic_reroute(void)
+{
+    for (uint32_t i = 0; i < ioapic_n; i++)
+        for (uint32_t pin = 0; pin < ioapics[i].count; pin++) {
+            uint32_t r = ioapics[i].routed[pin];
+            if (r && !ioapic_program(&ioapics[i], pin, r & ~(1u << 31), false)) {
+                (void)ioapic_program(&ioapics[i], pin, 0, true);
+                kprintf("IOAPIC: %u pin %u could not be remapped: masked\n", ioapics[i].id, pin);
+            }
+        }
+}
+
+/* The ids of the I/O APICs in use (for interrupt remapping). */
+uint32_t ioapic_ids(uint8_t *out, uint32_t max)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ioapic_n && n < max; i++)
+        out[n++] = ioapics[i].id;
+    return n;
+}
+
+/* The pins of I/O APIC `id` routed so far, as (vector | level << 8): their remapping entries can
+ * be installed before remapping is switched on, so no interrupt is lost in between. */
+uint32_t ioapic_routed(uint8_t id, uint16_t *out, uint32_t max)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < ioapic_n; i++) {
+        if (ioapics[i].id != id)
+            continue;
+        for (uint32_t pin = 0; pin < ioapics[i].count && n < max; pin++) {
+            uint32_t r = ioapics[i].routed[pin];
+            if (r)
+                out[n++] = (uint16_t)((r & 0xFF) | ((r >> 15) & 1) << 8);
+        }
+    }
+    return n;
+}
 
 static bool ioapic_set_isa(uint8_t irq, uint8_t vector, bool masked, uint16_t dflt)
 {
@@ -353,14 +421,7 @@ static bool ioapic_set_isa(uint8_t irq, uint8_t vector, bool masked, uint16_t df
             low |= 1u << 13;                 /* active low */
         if (((flags >> 2) & 0x3) == 0x3)
             low |= 1u << 15;                 /* level triggered */
-        if (masked)
-            low = LVT_MASKED;
-        uint64_t f = spin_lock_irqsave(&ioapic_lk);
-        /* Always the boot CPU: device interrupts are handled there (irq_target_apic()). */
-        ioapic_write(io, IOAPIC_REDTBL + 2 * pin + 1, bsp_percpu.apic_id << 24);
-        ioapic_write(io, IOAPIC_REDTBL + 2 * pin, low);
-        spin_unlock_irqrestore(&ioapic_lk, f);
-        return true;
+        return ioapic_program(io, pin, low, masked);
     }
     return false;
 }

@@ -1,16 +1,23 @@
 //! Intel VT-d backend (see `iommu`): root table (one entry per bus) -> context tables (one entry
 //! per device/function: domain id, page-table root, address width) -> second-level page tables
-//! (x86-like, 3 or 4 levels, R/W bits). Register-based invalidation of the context cache and the
-//! IOTLB, globally or per domain, waited for synchronously.
+//! (x86-like, 3 or 4 levels, R/W bits). Invalidation of the context cache and the IOTLB, globally
+//! or per domain, waited for synchronously: through the registers, or through the invalidation
+//! queue once interrupt remapping is on (it needs the queue, and the two may not be mixed).
+//!
+//! Interrupt remapping: one table of 256 entries shared by every unit, indexed by vector (every
+//! device interrupt goes to the boot CPU and each vector has one owner). Each entry checks the
+//! requester id (source-id verification), so a device can only raise the vectors bound to it;
+//! compatibility-format interrupts (the plain MSI writes of before) are blocked. MSIs use the
+//! remappable format; I/O APIC pins too, with their source ids from the DMAR's I/O APIC scopes.
 //!
 //! The DMAR table is firmware data: every structure is bounds-checked. Units are matched to
 //! devices by their device scopes (single-level paths) or INCLUDE_PCI_ALL. RMRRs (endpoint scopes
 //! with single-level paths) become firmware-reserved ranges, read/write.
 
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use super::{Backend, Domain, PAGE, Reserved, alloc_table, report, set_backend, table};
+use super::{Backend, Domain, PAGE, Reserved, alloc_table, report, report_irq, set_backend, table};
 use crate::dev::pci::Bdf;
 use crate::ffi::{self, rank};
 use crate::object::{KResult, Status};
@@ -29,13 +36,34 @@ const FECTL: u64 = 0x38;
 const FEDATA: u64 = 0x3C;
 const FEADDR: u64 = 0x40;
 const FEUADDR: u64 = 0x44;
+const IQH: u64 = 0x80;
+const IQT: u64 = 0x88;
+const IQA: u64 = 0x90;
+const IRTA: u64 = 0xB8;
 
 const GCMD_TE: u32 = 1 << 31;
 const GCMD_SRTP: u32 = 1 << 30;
 const GCMD_WBF: u32 = 1 << 27;
+const GCMD_QIE: u32 = 1 << 26;
+const GCMD_IRE: u32 = 1 << 25;
+const GCMD_SIRTP: u32 = 1 << 24;
+const GCMD_CFI: u32 = 1 << 23;
 const GSTS_TES: u32 = 1 << 31;
 const GSTS_RTPS: u32 = 1 << 30;
 const GSTS_WBFS: u32 = 1 << 27;
+const GSTS_QIES: u32 = 1 << 26;
+const GSTS_IRES: u32 = 1 << 25;
+const GSTS_IRTPS: u32 = 1 << 24;
+const GSTS_CFIS: u32 = 1 << 23;
+
+const ECAP_QI: u64 = 1 << 1;
+const ECAP_IR: u64 = 1 << 3;
+const ECAP_EIM: u64 = 1 << 4;
+const FSTS_IQE: u32 = 1 << 4;
+
+/// Invalidation queue: one page of 256 descriptors (128-bit).
+const QI_LEN: u32 = 256;
+const IRTE_COUNT: usize = 256;
 /// GSTS bits that are one-shot commands, not state: never written back to GCMD.
 const GCMD_KEEP: u32 = 0x96FF_FFFF;
 
@@ -53,6 +81,10 @@ struct Unit {
     scopes: Vec<Bdf>,
     fault_regs: u64, // offset of the first fault recording register
     nfr: u32,
+    qi: u64,          // physical address of the invalidation queue (0: register-based)
+    qwait: u64,       // physical address of the queue's wait-status word
+    qtail: AtomicU32, // next free descriptor
+    qseq: AtomicU32,
 }
 
 impl Unit {
@@ -113,15 +145,75 @@ impl Unit {
         ((self.ecap >> 8) & 0x3FF) * 16 + 8
     }
 
+    /// Queue one descriptor (the queue is drained after every batch, so it never fills).
+    fn qi_push(&self, d0: u64, d1: u64) {
+        let t = self.qtail.load(Ordering::Relaxed);
+        let p = table(self.qi).wrapping_add(t as usize * 2);
+        // SAFETY: descriptor `t` of this unit's queue page; the hardware reads it only once the
+        // tail register moves past it.
+        unsafe {
+            core::ptr::write_volatile(p, d0);
+            core::ptr::write_volatile(p.wrapping_add(1), d1);
+        }
+        self.qtail.store((t + 1) % QI_LEN, Ordering::Relaxed);
+    }
+
+    /// Start the queued descriptors and wait until all of them have completed.
+    fn qi_sync(&self) {
+        let seq = self.qseq.load(Ordering::Relaxed).wrapping_add(1);
+        self.qseq.store(seq, Ordering::Relaxed);
+        // Invalidation wait: status write (SW) of `seq` to the wait word.
+        self.qi_push(0x5 | 1 << 5 | u64::from(seq) << 32, self.qwait);
+        core::sync::atomic::fence(Ordering::SeqCst); // table and descriptor writes before the tail
+        self.w64(IQT, u64::from(self.qtail.load(Ordering::Relaxed)) << 4);
+        let word = table(self.qwait) as *const u32;
+        for _ in 0..10_000_000u32 {
+            // SAFETY: the unit's wait-status word (direct map), written by the hardware.
+            if unsafe { core::ptr::read_volatile(word) } == seq {
+                return;
+            }
+            if self.r32(FSTS) & FSTS_IQE != 0 {
+                panic!("IOMMU: VT-d unit at {:#x} rejected an invalidation descriptor (head {:#x})", self.regs, self.r64(IQH));
+            }
+            core::hint::spin_loop();
+        }
+        panic!("IOMMU: VT-d unit at {:#x} did not complete its invalidation queue", self.regs);
+    }
+
     fn invalidate_context(&self) {
         self.flush_write_buffer();
+        if self.qi != 0 {
+            self.qi_push(0x1 | 1 << 4, 0); // context cache, global
+            self.qi_sync();
+            return;
+        }
         self.w64(CCMD, 1 << 63 | 1 << 61); // ICC, global
         self.wait("a context-cache invalidation", || self.r64(CCMD) & (1 << 63) == 0);
+    }
+
+    /// Interrupt entry cache: one entry, or all (`None`). Queue only.
+    fn invalidate_iec(&self, index: Option<u16>) {
+        let d0 = match index {
+            Some(i) => 0x4 | 1 << 4 | u64::from(i) << 32,
+            None => 0x4,
+        };
+        self.qi_push(d0, 0);
+        self.qi_sync();
     }
 
     /// IOTLB: per domain (`did`), or everything (`None`). Drains reads and writes if supported.
     fn invalidate_iotlb(&self, did: Option<u16>) {
         self.flush_write_buffer();
+        if self.qi != 0 {
+            let drain = (if self.cap & (1 << 55) != 0 { 1u64 << 7 } else { 0 }) | if self.cap & (1 << 54) != 0 { 1 << 6 } else { 0 };
+            let d0 = match did {
+                Some(d) => 0x2 | 2 << 4 | drain | u64::from(d) << 16,
+                None => 0x2 | 1 << 4 | drain,
+            };
+            self.qi_push(d0, 0);
+            self.qi_sync();
+            return;
+        }
         let drain = (if self.cap & (1 << 55) != 0 { 1u64 << 49 } else { 0 }) | if self.cap & (1 << 54) != 0 { 1 << 48 } else { 0 };
         let cmd = match did {
             Some(d) => 1u64 << 63 | 2 << 60 | u64::from(d) << 32 | drain,
@@ -139,6 +231,12 @@ impl Unit {
 
 struct State {
     units: Vec<Unit>,
+    /// Interrupt remapping: the shared table (0: off), the destination field every entry uses,
+    /// and the I/O APICs' source ids (id, requester id).
+    irt: u64,
+    dest: u64,
+    ioapics: [(u8, u16); 8],
+    nioapic: usize,
 }
 
 static STATE: SpinLock<Option<State>> = SpinLock::new(c"iommu.vtd", rank::IOMMU, None);
@@ -150,9 +248,17 @@ struct Drhd {
     base: u64,
     include_all: bool,
     scopes: Vec<Bdf>,
+    ioapics: Vec<(u8, Bdf)>, // I/O APIC scopes: (I/O APIC id, its requester id)
 }
 
-fn parse_dmar() -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
+struct Dmar {
+    haw: u8,
+    intr_remap: bool, // the firmware says interrupt remapping is supported (flags bit 0)
+    units: Vec<Drhd>,
+    rmrrs: Vec<Reserved>,
+}
+
+fn parse_dmar() -> Option<Dmar> {
     let mut len = 0u32;
     // SAFETY: the C side returns a validated, mapped table of `len` bytes or NULL.
     let t = unsafe { ffi::acpi_find_table(b"DMAR".as_ptr(), &mut len) };
@@ -166,12 +272,12 @@ fn parse_dmar() -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
 /// Fuzzing (ktest fuzz): parse `b` as a DMAR table and check what bring-up relies on. 0 = fine.
 #[cfg(ktest_fuzz)]
 pub fn fuzz_dmar(b: &[u8]) -> u32 {
-    let Some((haw, units, rmrrs)) = parse_dmar_bytes(b) else { return 0 };
+    let Some(Dmar { haw, units, rmrrs, .. }) = parse_dmar_bytes(b) else { return 0 };
     if haw == 0 {
         return 1;
     }
     for u in &units {
-        if u.base == 0 || u.base % PAGE != 0 || u.scopes.len() > b.len() / 8 {
+        if u.base == 0 || u.base % PAGE != 0 || u.scopes.len() + u.ioapics.len() > b.len() / 8 {
             return 2;
         }
     }
@@ -183,7 +289,7 @@ pub fn fuzz_dmar(b: &[u8]) -> u32 {
 
 /// The DMAR table's bytes (untrusted): host address width, remapping units, RMRRs (one range per
 /// device in scope).
-fn parse_dmar_bytes(b: &[u8]) -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
+fn parse_dmar_bytes(b: &[u8]) -> Option<Dmar> {
     if b.len() < 48 {
         return None;
     }
@@ -203,6 +309,7 @@ fn parse_dmar_bytes(b: &[u8]) -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
                 let seg = u16::from_le_bytes([s[6], s[7]]);
                 let base = u64::from_le_bytes(s[8..16].try_into().ok()?);
                 let mut scopes = Vec::new();
+                let mut ioapics = Vec::new();
                 let mut p = 16;
                 while p + 6 <= l {
                     let (sty, sl) = (s[p], usize::from(s[p + 1]));
@@ -213,10 +320,14 @@ fn parse_dmar_bytes(b: &[u8]) -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
                     if (sty == 1 || sty == 2) && sl == 8 && scopes.try_reserve(1).is_ok() {
                         scopes.push(Bdf::new(s[p + 5], s[p + 6], s[p + 7]));
                     }
+                    // I/O APIC (3): enumeration id = its APIC id.
+                    if sty == 3 && sl == 8 && ioapics.len() < 8 && ioapics.try_reserve(1).is_ok() {
+                        ioapics.push((s[p + 4], Bdf::new(s[p + 5], s[p + 6], s[p + 7])));
+                    }
                     p += sl;
                 }
                 if seg == 0 && base != 0 && base % PAGE == 0 && units.try_reserve(1).is_ok() {
-                    units.push(Drhd { base, include_all: s[4] & 1 != 0, scopes });
+                    units.push(Drhd { base, include_all: s[4] & 1 != 0, scopes, ioapics });
                 }
             }
             1 if l >= 24 => {
@@ -245,7 +356,7 @@ fn parse_dmar_bytes(b: &[u8]) -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
         }
         off += l;
     }
-    Some((haw, units, rmrrs))
+    Some(Dmar { haw, intr_remap: b[37] & 1 != 0, units, rmrrs })
 }
 
 fn bring_up(d: &Drhd) -> Result<Unit, &'static str> {
@@ -254,7 +365,21 @@ fn bring_up(d: &Drhd) -> Result<Unit, &'static str> {
     }
     // SAFETY: maps the unit's register page (device memory) uncached into the direct map.
     let regs = unsafe { ffi::vmm_map_phys(d.base, PAGE, ffi::VMM_W | ffi::VMM_UC) } as u64;
-    let mut u = Unit { regs, cap: 0, ecap: 0, levels: 0, root: 0, include_all: d.include_all, scopes: Vec::new(), fault_regs: 0, nfr: 0 };
+    let mut u = Unit {
+        regs,
+        cap: 0,
+        ecap: 0,
+        levels: 0,
+        root: 0,
+        include_all: d.include_all,
+        scopes: Vec::new(),
+        fault_regs: 0,
+        nfr: 0,
+        qi: 0,
+        qwait: 0,
+        qtail: AtomicU32::new(0),
+        qseq: AtomicU32::new(0),
+    };
     if u.r32(VER) == 0xFFFF_FFFF {
         return Err("no unit at the register base");
     }
@@ -273,8 +398,16 @@ fn bring_up(d: &Drhd) -> Result<Unit, &'static str> {
     if u.fault_regs == 0 || u.fault_regs + u64::from(u.nfr) * 16 > PAGE || u.iotlb_reg() + 8 > PAGE {
         return Err("register layout outside the register page");
     }
+    // Whatever the firmware left on goes first: translation, interrupt remapping, the queue
+    // (register-based invalidation is not allowed while it is on).
     if u.r32(GSTS) & GSTS_TES != 0 {
-        u.command(GCMD_TE, GSTS_TES, false); // firmware left it on: start from a clean state
+        u.command(GCMD_TE, GSTS_TES, false);
+    }
+    if u.r32(GSTS) & GSTS_IRES != 0 {
+        u.command(GCMD_IRE, GSTS_IRES, false);
+    }
+    if u.r32(GSTS) & GSTS_QIES != 0 {
+        u.command(GCMD_QIE, GSTS_QIES, false);
     }
     u.root = alloc_table().map_err(|_| "out of memory")?;
     u.scopes = d.scopes.to_vec();
@@ -298,7 +431,7 @@ fn setup_faults(u: &Unit, vector: u32) {
 /// Find and enable every DMA remapping unit. None without a DMAR table, else a status line, the
 /// RMRRs and the highest domain id every unit supports.
 pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
-    let (haw, drhds, rmrrs) = parse_dmar()?;
+    let Dmar { haw, intr_remap, units: drhds, rmrrs } = parse_dmar()?;
     let none = |s| Some((s, Vec::new(), 0));
     let mut units = Vec::new();
     for d in &drhds {
@@ -328,7 +461,9 @@ pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
     }
     let n = units.len();
     let levels = units[0].levels;
-    *STATE.lock() = Some(State { units });
+    let mut st = State { units, irt: 0, dest: 0, ioapics: [(0, 0); 8], nioapic: 0 };
+    let ir = ir_enable(&mut st, &drhds, intr_remap);
+    *STATE.lock() = Some(st);
     set_backend(Backend::Vtd);
     crate::kprintln!(
         "IOMMU: Intel VT-d, {} unit(s), host address width {}, {}-level tables ({}-bit device addresses), {} RMRR device range(s)",
@@ -338,7 +473,148 @@ pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
         if levels == 4 { 48 } else { 39 },
         rmrrs.len()
     );
+    super::ir_result(Backend::Vtd, ir);
     Some(("DMA remapping on for every device (default deny, faults reported)", rmrrs, max_did))
+}
+
+// ---- interrupt remapping ------------------------------------------------------------------------
+
+/// Switch interrupt remapping on for every unit (all or none): the queue, the table, then IRE with
+/// compatibility-format interrupts blocked. Ok: a description; Err: why it stays off.
+fn ir_enable(st: &mut State, drhds: &[Drhd], intr_remap: bool) -> Result<&'static str, &'static str> {
+    if !intr_remap {
+        return Err("the DMAR does not offer it");
+    }
+    if st.units.iter().any(|u| u.ecap & (ECAP_IR | ECAP_QI) != ECAP_IR | ECAP_QI) {
+        return Err("a unit has no interrupt remapping or invalidation queue");
+    }
+    // Every I/O APIC in use needs its source id, else its interrupts could not be verified.
+    let mut ids = [0u8; 8];
+    // SAFETY: writes at most 8 ids into `ids`.
+    let nids = unsafe { ffi::ioapic_ids(ids.as_mut_ptr(), 8) } as usize;
+    for &id in &ids[..nids.min(8)] {
+        let Some(sid) = drhds.iter().flat_map(|d| d.ioapics.iter()).find(|(i, _)| *i == id).map(|(_, b)| b.0) else {
+            return Err("an I/O APIC in use is missing from the DMAR");
+        };
+        st.ioapics[st.nioapic] = (id, sid);
+        st.nioapic += 1;
+    }
+    // SAFETY: plain reads.
+    let (x2apic, apic) = unsafe { (ffi::lapic_x2apic(), ffi::irq_target_apic()) };
+    let eime = x2apic && st.units.iter().all(|u| u.ecap & ECAP_EIM != 0);
+    if !eime && apic > 0xFF {
+        return Err("the boot CPU's APIC id needs the extended (x2APIC) format");
+    }
+    st.dest = if eime { u64::from(apic) << 32 } else { u64::from(apic & 0xFF) << 40 };
+    // Every page first, so a shortage leaves every unit as it was (register-based, IR off).
+    let mut pages = [0u64; 1 + 2 * 16];
+    let need = 1 + 2 * st.units.len();
+    if need > pages.len() {
+        return Err("too many units");
+    }
+    for i in 0..need {
+        match alloc_table() {
+            Ok(pa) => pages[i] = pa,
+            Err(_) => {
+                for &pa in &pages[..i] {
+                    // SAFETY: pages allocated just above and referenced nowhere.
+                    unsafe { ffi::pmm_free(pa) };
+                }
+                return Err("out of memory");
+            }
+        }
+    }
+    st.irt = pages[0];
+    for (i, u) in st.units.iter_mut().enumerate() {
+        u.qi = pages[1 + 2 * i];
+        u.qwait = pages[2 + 2 * i];
+    }
+    // The pins routed so far (the serial port's) get their entries before IRE: only the moment
+    // between IRE and `ioapic_reroute` rewriting them in remappable format is left uncovered.
+    for &(id, sid) in &st.ioapics[..st.nioapic] {
+        let mut routed = [0u16; 256];
+        // SAFETY: writes at most 256 entries into `routed`.
+        let n = unsafe { ffi::ioapic_routed(id, routed.as_mut_ptr(), 256) } as usize;
+        for &r in &routed[..n.min(256)] {
+            irte_fill(st, r as u8, sid, r & 0x100 != 0);
+        }
+    }
+    for u in &mut st.units {
+        u.w64(IQT, 0);
+        u.w64(IQA, u.qi); // one page (QS 0), 128-bit descriptors
+        u.command(GCMD_QIE, GSTS_QIES, true);
+        u.w64(IRTA, st.irt | u64::from(eime) << 11 | 7); // 2^(7+1) = 256 entries
+        u.command(GCMD_SIRTP, GSTS_IRTPS, true);
+        u.invalidate_iec(None);
+        if u.r32(GSTS) & GSTS_CFIS != 0 {
+            u.command(GCMD_CFI, GSTS_CFIS, false);
+        }
+        u.command(GCMD_IRE, GSTS_IRES, true);
+    }
+    Ok(if eime { "x2APIC destinations" } else { "xAPIC destinations" })
+}
+
+/// Point entry `vector` at the boot CPU for requester `sid` only (`level`: level-triggered).
+fn irte_write(st: &State, vector: u8, sid: u16, level: bool) {
+    let e = irte_fill(st, vector, sid, level);
+    irte_done(st, e, vector);
+}
+
+/// Write entry `vector` without invalidating (the caller does, or remapping is not on yet).
+fn irte_fill(st: &State, vector: u8, sid: u16, level: bool) -> *mut u64 {
+    let e = table(st.irt).wrapping_add(usize::from(vector) * 2);
+    // SAFETY: entry `vector` (16 bytes) of the shared table. Not present while it changes; the
+    // low quad (with P) goes last.
+    unsafe {
+        core::ptr::write_volatile(e, 0);
+        core::ptr::write_volatile(e.wrapping_add(1), u64::from(sid) | 1 << 18); // SVT 01: all 16 bits of the SID
+        core::ptr::write_volatile(e, 1 | u64::from(level) << 4 | u64::from(vector) << 16 | st.dest);
+    }
+    for u in &st.units {
+        u.flush(e as u64);
+    }
+    e
+}
+
+fn irte_done(st: &State, e: *mut u64, vector: u8) {
+    for u in &st.units {
+        u.flush(e as u64);
+        u.invalidate_iec(Some(u16::from(vector)));
+    }
+}
+
+/// Install the entry for a device's MSI on `vector`; returns its MSI address and data
+/// (remappable format, handle = vector).
+pub fn ir_msi(sid: u16, vector: u32) -> KResult<(u64, u32)> {
+    let g = STATE.lock();
+    let st = g.as_ref().ok_or(Status::NotSupported)?;
+    if st.irt == 0 || vector as usize >= IRTE_COUNT {
+        return Err(Status::NotSupported);
+    }
+    irte_write(st, vector as u8, sid, false);
+    Ok((0xFEE0_0000 | u64::from(vector) << 5 | 1 << 4, 0))
+}
+
+/// Install the entry for an I/O APIC pin; returns the pin's high dword (remappable format).
+pub fn ir_ioapic(id: u8, vector: u8, level: bool) -> Option<u32> {
+    let g = STATE.lock();
+    let st = g.as_ref()?;
+    let sid = st.ioapics[..st.nioapic].iter().find(|(i, _)| *i == id)?.1;
+    irte_write(st, vector, sid, level);
+    Some(1 << 16 | u32::from(vector) << 17) // format 1, handle[14:0] = vector
+}
+
+/// Remove the entry of `vector`.
+pub fn ir_clear(vector: u32) {
+    let g = STATE.lock();
+    let Some(st) = g.as_ref() else { return };
+    if st.irt == 0 || vector as usize >= IRTE_COUNT {
+        return;
+    }
+    let e = table(st.irt).wrapping_add(vector as usize * 2);
+    // SAFETY: entry `vector` of the shared table: not present.
+    unsafe { core::ptr::write_volatile(e, 0) };
+    irte_done(st, e, vector as u8);
 }
 
 /// Create the domain of a device (its context entry, an empty page table). `did` must be unique.
@@ -511,6 +787,12 @@ pub fn fault_irq(vector: u32) -> bool {
                 let lo = u.r64(off);
                 let sid = hi as u16;
                 let reason = (hi >> 32) & 0xFF;
+                if (0x20..0x30).contains(&reason) {
+                    // Interrupt remapping fault: the handle is in bits 63:48 of the low quad.
+                    report_irq(sid, (lo >> 48) as u32, reason as u32);
+                    u.w64(off + 8, 1 << 63);
+                    continue;
+                }
                 let read = hi & (1 << 62) != 0;
                 let mut why = crate::fmtbuf::FmtBuf::<48>::new();
                 let _ = core::fmt::Write::write_fmt(

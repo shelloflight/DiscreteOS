@@ -33,6 +33,9 @@ void     ioapic_init(void);
 bool     ioapic_route_isa_irq(uint8_t irq, uint8_t vector);
 bool     ioapic_route_sci(uint8_t irq, uint8_t vector);   /* level/low unless the MADT overrides */
 void     ioapic_mask_isa_irq(uint8_t irq);
+void     ioapic_reroute(void);                            /* interrupt remapping just turned on */
+uint32_t ioapic_ids(uint8_t *out, uint32_t max);         /* ids of the I/O APICs in use */
+uint32_t ioapic_routed(uint8_t id, uint16_t *out, uint32_t max); /* routed pins: vector | level << 8 */
 /* APIC id device interrupts (MSI, I/O APIC) are sent to: the boot CPU. */
 uint32_t irq_target_apic(void);
 

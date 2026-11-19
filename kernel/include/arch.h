@@ -60,6 +60,8 @@ void idt_load(void);                                         /* APs: load the sh
 void backtrace_print(uint64_t rip, uint64_t rbp);             /* frame-pointer backtrace (exceptions.c) */
 void interrupt_register(uint8_t vector, irq_handler_t h);
 /* A free device vector (its handler calls the Rust device layer), or -1; and back. */
+extern uint64_t irq_unexpected;    /* interrupts on a vector with no handler */
+extern uint64_t irq_unexpected_last;
 int  irq_vector_alloc(void);
 void irq_vector_free(int vector);
 

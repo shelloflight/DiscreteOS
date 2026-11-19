@@ -68,6 +68,9 @@ pub const TEST_CRASH: u32 = 20;
 /// Manager -> block driver (tests): point a request at memory the device was not given (the
 /// kernel image's physical address); reply `status` = what the device reported.
 pub const TEST_DMA_ESCAPE: u32 = 21;
+/// Manager -> block driver (tests): make the device write MSI data into the MSI window (a forged
+/// interrupt the IOMMU must block); reply `status` = what the device reported.
+pub const TEST_MSI_FORGE: u32 = 22;
 
 pub const HEADER: usize = 32;
 pub const SECTOR: usize = 512;

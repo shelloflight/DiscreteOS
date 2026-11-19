@@ -72,16 +72,21 @@ fn synthetic() -> Vec<(&'static [u8; 4], Vec<u8>)> {
     c[44..52].copy_from_slice(&0xB000_0000u64.to_le_bytes());
     c[55] = 255;
     v.push((b"MCFG", c));
-    // DMAR: one DRHD with an endpoint and a bridge scope, an RMRR.
+    // DMAR (interrupt remapping flag set): one DRHD with an endpoint, a bridge and an I/O APIC
+    // scope; an RMRR with an endpoint scope.
     let mut d = header(b"DMAR", 48);
     d[36] = 38;
-    let mut drhd = alloc::vec![0u8, 0, 32, 0, 1, 0, 0, 0];
+    d[37] = 1;
+    let mut drhd = alloc::vec![0u8, 0, 40, 0, 1, 0, 0, 0];
     drhd.extend_from_slice(&0xFED9_0000u64.to_le_bytes());
     drhd.extend_from_slice(&[1, 8, 0, 0, 0, 0, 2, 0]);
     drhd.extend_from_slice(&[2, 8, 0, 0, 0, 0, 3, 1]);
-    d.extend_from_slice(&drhd[..32]);
-    d.extend_from_slice(&[1, 0, 24, 0, 0, 0, 0, 0]);
-    d.extend_from_slice(&[0; 16]);
+    drhd.extend_from_slice(&[3, 8, 0, 0, 2, 0xF0, 0x1F, 0]);
+    d.extend_from_slice(&drhd);
+    d.extend_from_slice(&[1, 0, 32, 0, 0, 0, 0, 0]);
+    d.extend_from_slice(&0xA000_0000u64.to_le_bytes());
+    d.extend_from_slice(&0xA00F_FFFFu64.to_le_bytes());
+    d.extend_from_slice(&[1, 8, 0, 0, 0, 0, 0x14, 0]);
     let n = d.len() as u32;
     d[4..8].copy_from_slice(&n.to_le_bytes());
     v.push((b"DMAR", d));

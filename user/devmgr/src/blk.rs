@@ -18,6 +18,10 @@ const DATA_PAGES: usize = (MAX_SECTORS as usize * SECTOR).div_ceil(4096);
 /// Physical address of the kernel image (the bootloader loads it at 1 MiB): the target of the
 /// DMA test, which the IOMMU must block.
 const KERNEL_PHYS: u64 = 0x10_0000;
+/// The MSI window: a device write here is an interrupt request (the forged-interrupt test).
+const MSI_WINDOW: u64 = 0xFEE0_0000;
+/// The sector the forged-interrupt test reads into the MSI window (filled with a vector first).
+const FORGE_LBA: u64 = 300;
 
 struct Blk {
     v: Virtio,
@@ -32,8 +36,8 @@ struct Blk {
 
 impl Blk {
     /// One request: `sectors` at `lba`; data moves through `self.data`. With `escape`, the data
-    /// descriptor points at kernel memory instead (test only). Returns the device status byte.
-    fn io(&mut self, ty: u32, lba: u64, sectors: u64, escape: bool, timeout: u64) -> Result<u8, &'static str> {
+    /// descriptor points at that device address instead (tests only). Returns the device status.
+    fn io(&mut self, ty: u32, lba: u64, sectors: u64, escape: Option<u64>, timeout: u64) -> Result<u8, &'static str> {
         let r = &self.req.map;
         r.w32(0, ty);
         r.w32(4, 0);
@@ -47,7 +51,10 @@ impl Blk {
         let mut done = 0usize;
         while done < bytes {
             let n = (bytes - done).min(4096 - done % 4096);
-            let addr = if escape { KERNEL_PHYS + done as u64 } else { self.data.dev_addr(done as u64) };
+            let addr = match escape {
+                Some(a) => a + done as u64,
+                None => self.data.dev_addr(done as u64),
+            };
             q.desc(d, addr, n as u32, write_flag | DESC_NEXT, d + 1);
             d += 1;
             done += n;
@@ -88,21 +95,21 @@ impl Disk for Blk {
         b"virtio-blk"
     }
     fn read(&mut self, _unit: usize, lba: u64, count: u64, out: &mut [u8]) -> Result<(), i32> {
-        let r = self.io(T_IN, lba, count, false, 2_000_000_000);
+        let r = self.io(T_IN, lba, count, None, 2_000_000_000);
         Self::status(r, "read")?;
         out.copy_from_slice(&self.data.map.bytes()[..out.len()]);
         Ok(())
     }
     fn write(&mut self, _unit: usize, lba: u64, count: u64, data: &[u8]) -> Result<(), i32> {
         self.data.map.bytes_mut()[..data.len()].copy_from_slice(data);
-        let r = self.io(T_OUT, lba, count, false, 2_000_000_000);
+        let r = self.io(T_OUT, lba, count, None, 2_000_000_000);
         Self::status(r, "write")
     }
     fn flush(&mut self, _unit: usize) -> Result<(), i32> {
         if !self.flush {
             return Ok(()); // no write cache: every completed write is durable
         }
-        let r = self.io(T_FLUSH, 0, 0, false, 5_000_000_000);
+        let r = self.io(T_FLUSH, 0, 0, None, 5_000_000_000);
         Self::status(r, "flush")
     }
     fn stats(&self) -> (u64, u64) {
@@ -122,7 +129,7 @@ impl Disk for Blk {
                     return None; // without an IOMMU the device really would overwrite the kernel
                 }
                 println!("virtio-blk: DMA test: asking the device to write sector 0 to {:#x} (kernel memory)", KERNEL_PHYS);
-                let st = self.io(T_IN, 0, 1, true, 300_000_000);
+                let st = self.io(T_IN, 0, 1, Some(KERNEL_PHYS), 300_000_000);
                 let status = self.v.status();
                 let code = match st {
                     Ok(0) => 0,
@@ -131,6 +138,32 @@ impl Disk for Blk {
                 };
                 reply(ch, h, code, u64::from(status), u64::from(status & STATUS_NEEDS_RESET != 0), &[]);
                 Some(3) // the device needs a reset: the device manager restarts this driver
+            }
+            proto::TEST_MSI_FORGE => {
+                if !self.iommu {
+                    reply(ch, h, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]);
+                    return None;
+                }
+                // A sector of compatibility-format MSI data (vector 0xDF, which nothing handles:
+                // the kernel test counts any that arrive), then the device is told
+                // to read it into the MSI window: every dword it writes there is an interrupt.
+                for c in self.data.map.bytes_mut()[..SECTOR].as_chunks_mut::<4>().0 {
+                    *c = 0xDFu32.to_le_bytes();
+                }
+                if self.io(T_OUT, FORGE_LBA, 1, None, 2_000_000_000) != Ok(0) {
+                    reply(ch, h, proto::ERR_IO, 0, 0, &[]);
+                    return None;
+                }
+                println!("virtio-blk: interrupt test: asking the device to write sector {} to {:#x} (the MSI window)", FORGE_LBA, MSI_WINDOW);
+                let st = self.io(T_IN, FORGE_LBA, 1, Some(MSI_WINDOW), 300_000_000);
+                let status = self.v.status();
+                let code = match st {
+                    Ok(0) => 0,
+                    Ok(_) => -1,
+                    Err(_) => sys::ERR_TIMED_OUT as i32,
+                };
+                reply(ch, h, code, u64::from(status), 0, &[]);
+                Some(3) // restart: a fresh instance and device state, as after the DMA test
             }
             _ => {
                 reply(ch, h, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);

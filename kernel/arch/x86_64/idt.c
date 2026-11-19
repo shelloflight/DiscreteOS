@@ -93,6 +93,11 @@ static uint64_t   vec_used[(VEC_DEV_END - VEC_DEV_BASE + 63) / 64];
 
 static void dev_irq(struct interrupt_frame *f) { dkrnl_dev_irq((uint32_t)f->vector); }
 
+/* Interrupts on a vector nothing was ever set up for (with interrupt remapping, none can come
+ * from a device: the drivers test checks this stays 0 after a forged interrupt). */
+uint64_t irq_unexpected;
+uint64_t irq_unexpected_last;    /* the last such vector (diagnostics) */
+
 int irq_vector_alloc(void)
 {
     int v = -1;
@@ -156,6 +161,8 @@ void isr_dispatch(struct interrupt_frame *f)
     uint64_t t0 = __atomic_load_n(&profile_active, __ATOMIC_RELAXED) ? time_ns() : 0;
     if (handlers[v])
         handlers[v](f);
+    else
+        __atomic_fetch_add(&irq_unexpected, 1, __ATOMIC_RELAXED), irq_unexpected_last = v;
     if (t0)
         lat_record(&lat_irq, time_ns() - t0);
     lapic_eoi();

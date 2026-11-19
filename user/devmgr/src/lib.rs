@@ -774,6 +774,29 @@ fn tests(m: &mut Mgr) -> bool {
     }
     println!("devmgr: test: virtio-blk recovered after the DMA test (device reset by the new instance)");
 
+    // A forged interrupt: the device writes MSI data into the MSI window. With interrupt
+    // remapping the IOMMU blocks every one of those writes: the kernel test checks that none
+    // arrived (under QEMU's VT-d the faults carry no requester id, so they may not be charged to
+    // the device).
+    let before = sys::device_info(dev).map_or(0, |i| i.dma_faults);
+    let before_start = m.starts(b);
+    let r = m.call(b, proto::TEST_MSI_FORGE, 0, 0, &[], &mut out);
+    check!(r.is_ok(), "no answer to the interrupt test");
+    let after = sys::device_info(dev).map_or(0, |i| i.dma_faults);
+    println!("devmgr: test: forged interrupt sent ({} fault(s) charged to the device)", after - before);
+    check!(m.wait_ready_after(b, before_start, 10 * SEC), "virtio-blk.ddrv was not restarted after the interrupt test");
+    // The test sector held the MSI data: the known pattern goes back (the disk is shared with
+    // the read-only boot tests, which check it is unchanged).
+    let mut sector = [0u8; SECTOR];
+    for (j, x) in sector.iter_mut().enumerate() {
+        *x = pattern(300, j);
+    }
+    let r = m.call(b, proto::BLK_WRITE, 300, 1, &sector, &mut out);
+    check!(r.is_ok_and(|(h, _)| h.status == 0), "restoring the interrupt test's sector failed");
+    if !blk_read_check(m, b, 300, 1) {
+        return false;
+    }
+
     // Keyboard: the harness types a line once this appears.
     println!("devmgr: test: waiting for keys");
     let deadline = sys::clock_ns() + 30 * SEC;

@@ -19,8 +19,12 @@
 //! refused (logged) if it overlaps usable RAM or the first MiB, lies above 512 GiB or is larger
 //! than 1 GiB.
 //!
-//! Not done yet: interrupt remapping (an MSI is still a plain memory write a device
-//! could forge), queued invalidation on VT-d.
+//! Interrupt remapping: an MSI is a memory write, so without it any device that can DMA could raise
+//! any vector. With it, every interrupt a device sends goes through an entry the kernel made for
+//! that device and vector (entry index = vector: every device interrupt goes to the boot CPU and
+//! each vector has one owner); anything else is blocked and reported. I/O APIC pins go through it
+//! too (the C side asks `dkrnl_ir_ioapic` for each pin). It is all or nothing: if the firmware
+//! does not name every I/O APIC in use, it stays off and the boot log says so.
 
 pub mod amdvi;
 pub mod vtd;
@@ -125,6 +129,79 @@ pub(super) fn count_fault(sid: u16) -> u64 {
         }
     }
     n
+}
+
+// ---- interrupt remapping ------------------------------------------------------------------------
+
+/// The backend remapping interrupts (`Backend` value), 0 = off.
+static IR: AtomicU8 = AtomicU8::new(0);
+
+/// Interrupts are remapped.
+pub fn ir_enabled() -> bool {
+    IR.load(Ordering::Acquire) != 0
+}
+
+/// A backend's bring-up finished (its state is published): log the outcome and, if on, move the
+/// I/O APIC pins routed so far to the new format.
+pub(super) fn ir_result(b: Backend, r: Result<&'static str, &'static str>) {
+    match r {
+        Ok(how) => {
+            IR.store(b as u8, Ordering::Release);
+            // SAFETY: plain call; re-routes every routed pin through `dkrnl_ir_ioapic`.
+            unsafe { ffi::ioapic_reroute() };
+            crate::kprintln!("IOMMU: interrupt remapping on ({}): a device can raise only its own interrupts", how);
+        }
+        Err(why) => crate::kprintln!("IOMMU: interrupt remapping off ({}): a device could forge interrupts", why),
+    }
+}
+
+/// The MSI address and data for `bdf`'s interrupt on `vector`, after installing its remapping
+/// entry (if remapping is on).
+pub fn msi_message(bdf: Bdf, vector: u32) -> KResult<(u64, u32)> {
+    match IR.load(Ordering::Acquire) {
+        1 => vtd::ir_msi(bdf.0, vector),
+        2 => amdvi::ir_msi(bdf.0, vector).map(|()| super::irq::msi_message(vector)),
+        _ => Ok(super::irq::msi_message(vector)),
+    }
+}
+
+/// The interrupt on `vector` (a PCI device's, or an I/O APIC pin's if `bdf` is None) is gone:
+/// remove its remapping entry.
+pub fn ir_release(bdf: Option<Bdf>, vector: u32) {
+    match IR.load(Ordering::Acquire) {
+        1 => vtd::ir_clear(vector),
+        2 => amdvi::ir_clear(bdf.map(|b| b.0), vector),
+        _ => {}
+    }
+}
+
+/// Called by apic.c for every I/O APIC pin it unmasks: installs the pin's remapping entry and
+/// returns the pin's high dword; -1 when remapping is off, -2 to refuse the route.
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_ir_ioapic(id: u8, vector: u8, level: bool) -> i64 {
+    match IR.load(Ordering::Acquire) {
+        1 => vtd::ir_ioapic(id, vector, level).map_or(-2, i64::from),
+        2 => amdvi::ir_ioapic(id, vector).map_or(-2, i64::from),
+        _ => -1,
+    }
+}
+
+/// Test images (ktest.c): which backend remaps interrupts (1 VT-d, 2 AMD-Vi, 0 none).
+#[cfg(ktest_drivers)]
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_ir_backend() -> u32 {
+    u32::from(IR.load(Ordering::Acquire))
+}
+
+/// A blocked interrupt request (interrupt context). `reason`: the VT-d fault reason, 0 on AMD-Vi.
+pub(super) fn report_irq(sid: u16, index: u32, reason: u32) {
+    if count_fault(sid) <= 32 {
+        if reason != 0 {
+            crate::kprintln!("IOMMU: blocked interrupt from {} (entry {}, fault reason {:#x})", Bdf(sid), index, reason);
+        } else {
+            crate::kprintln!("IOMMU: blocked interrupt from {} (no remapping entry for it)", Bdf(sid));
+        }
+    }
 }
 
 pub(super) fn report(sid: u16, addr: u64, write: Option<bool>, why: &str) {

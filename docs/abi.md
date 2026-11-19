@@ -269,7 +269,9 @@ manager, which grants each to its driver.
   the kernel programs interrupts). BARs overlapping RAM or another device are refused.
 - **I/O ports**: only inside the device's own I/O BARs or platform windows.
 - **Interrupts**: one Interrupt object per MSI-X/MSI entry or ISA line. Wait, `interrupt_ack`, then
-  service the device; nothing is lost. Legacy INTx is not offered.
+  service the device; nothing is lost. Legacy INTx is not offered. With interrupt remapping (boot
+  log `IOMMU: interrupt remapping on`), a device can only raise the interrupts bound to it: an MSI
+  it forges by DMA is blocked and counted like a blocked DMA.
 - **DMA**: `device_dma_map` pins VMO pages and returns device addresses. With an IOMMU, everything
   else the device tries to reach is blocked and counted; without one, the boot log says DMA is not
   confined. Sealed (code) VMOs can never be DMA targets.

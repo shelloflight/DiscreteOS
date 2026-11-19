@@ -17,13 +17,19 @@
 //! goes to the IOMMU that names "all", else the first one. The IOMMU's own PCI function is
 //! kernel-owned (never handed to a driver). IVMD blocks (all devices, one, a range) with the unity
 //! or exclusion flag become firmware-reserved ranges (an exclusion range is identity mapped too,
-//! as Linux does; never through the exclusion registers). Interrupt remapping is off (`IV` 0):
-//! MSIs pass as on VT-d.
+//! as Linux does; never through the exclusion registers).
+//!
+//! Interrupt remapping (when every I/O APIC in use is named by an IVHD special entry): every device
+//! table entry has `IV` set and `IntCtl` 00, so an interrupt from a device without a table is
+//! aborted. A device that binds an interrupt gets its own table (256 32-bit entries, indexed by
+//! the MSI data = vector), so it can only raise its own vectors; each I/O APIC has one too (the
+//! pin's vector field is the index, so the pins need no change). The IOMMU's own function forwards
+//! its interrupts unmapped (they are the IOMMU's, not a driver's).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Backend, Domain, PAGE, Reserved, alloc_table, report, set_backend, table};
+use super::{Backend, Domain, PAGE, Reserved, alloc_table, report, report_irq, set_backend, table};
 use crate::dev::pci::{self, Bdf};
 use crate::ffi::{self, rank};
 use crate::object::{KResult, Status};
@@ -63,6 +69,13 @@ const DTE_TV: u64 = 1 << 1;
 const DTE_MODE_SHIFT: u32 = 9;
 const DTE_IR: u64 = 1 << 61;
 const DTE_IW: u64 = 1 << 62;
+// Device table entry, quad 2 (interrupts)
+const DTE_IV: u64 = 1 << 0;
+const DTE_INT_LEN_256: u64 = 8 << 1; // 2^8 entries
+const DTE_INT_ADDR: u64 = 0x000F_FFFF_FFFF_FFC0;
+const DTE_INTCTL_PASS: u64 = 1 << 60;
+const DTE_INTCTL_REMAP: u64 = 2 << 60;
+const DTE_INTCTL_MASK: u64 = 3 << 60;
 /// Every device ID (bus 0-255): 65 536 entries of 32 bytes = 2 MiB, 512 pages.
 const DEVTAB_PAGES: u64 = 512;
 const DEVTAB_ENTRIES: usize = 65_536;
@@ -80,6 +93,7 @@ const LEVELS: u32 = 4;
 const CMD_COMPLETION_WAIT: u64 = 0x1 << 60;
 const CMD_INVAL_DEVTAB: u64 = 0x2 << 60;
 const CMD_INVAL_PAGES: u64 = 0x3 << 60;
+const CMD_INVAL_INTTAB: u64 = 0x5 << 60;
 const CMD_INVAL_ALL: u64 = 0x8 << 60;
 
 struct Unit {
@@ -153,6 +167,10 @@ impl Unit {
         self.push(CMD_INVAL_DEVTAB | u64::from(id), 0);
     }
 
+    fn inval_inttab(&mut self, id: u16) {
+        self.push(CMD_INVAL_INTTAB | u64::from(id), 0);
+    }
+
     /// Every cached translation of domain `did` (S = 1 and the all-ones address: the whole space;
     /// PDE = 1: directory entries too).
     fn inval_domain(&mut self, did: u16) {
@@ -163,6 +181,11 @@ impl Unit {
 struct State {
     units: Vec<Unit>,
     devtab: u64, // physical address of the shared device table
+    /// Interrupt remapping: on, the boot CPU's APIC id, the I/O APICs (id, device id).
+    ir: bool,
+    dest: u8,
+    ioapics: [(u8, u16); 8],
+    nioapic: usize,
 }
 
 static STATE: SpinLock<Option<State>> = SpinLock::new(c"iommu.amdvi", rank::IOMMU, None);
@@ -179,6 +202,7 @@ struct Ivhd {
     all: bool,
     no_translation: bool,
     ranges: Vec<(u16, u16)>,
+    ioapics: Vec<(u8, u16)>, // special entries: (I/O APIC id, its device id)
 }
 
 fn parse_ivrs() -> Option<(Vec<Ivhd>, Vec<Reserved>)> {
@@ -203,7 +227,7 @@ pub fn fuzz_ivrs(b: &[u8]) -> u32 {
         if u.base == 0 || u.base % MMIO_SIZE != 0 || u.base >= 1 << 46 {
             return 1;
         }
-        if u.ranges.len() > b.len() / 4 || u.ranges.iter().any(|&(s, e)| s > e) {
+        if u.ranges.len() + u.ioapics.len() > b.len() / 4 || u.ranges.iter().any(|&(s, e)| s > e) {
             return 2;
         }
         if units[..i].iter().any(|o| o.base == u.base) {
@@ -214,7 +238,7 @@ pub fn fuzz_ivrs(b: &[u8]) -> u32 {
 }
 
 /// Device entries of one IVHD block (`e`: the bytes after its header). Ranges are inclusive.
-fn parse_entries(e: &[u8], all: &mut bool, ranges: &mut Vec<(u16, u16)>) {
+fn parse_entries(e: &[u8], all: &mut bool, ranges: &mut Vec<(u16, u16)>, ioapics: &mut Vec<(u8, u16)>) {
     let mut p = 0usize;
     let mut start: Option<u16> = None;
     while p + 4 <= e.len() {
@@ -243,6 +267,10 @@ fn parse_entries(e: &[u8], all: &mut bool, ranges: &mut Vec<(u16, u16)>) {
                 if let Some(s) = start.take() {
                     add((s, id));
                 }
+            }
+            // Special device: handle (byte 4), device id (5-6), variety (7; 1 = I/O APIC).
+            0x48 if e[p + 7] == 1 && ioapics.len() < 8 && ioapics.try_reserve(1).is_ok() => {
+                ioapics.push((e[p + 4], u16::from_le_bytes([e[p + 5], e[p + 6]])));
             }
             _ => {} // padding, special devices (IOAPIC/HPET), ACPI devices: no PCI requester id
         }
@@ -284,8 +312,9 @@ fn parse_ivrs_bytes(b: &[u8]) -> Option<(Vec<Ivhd>, Vec<Reserved>)> {
                             all: false,
                             no_translation: ty != 0x10 && attrs & 1 != 0, // HATDis
                             ranges: Vec::new(),
+                            ioapics: Vec::new(),
                         };
-                        parse_entries(&s[hdr..], &mut u.all, &mut u.ranges);
+                        parse_entries(&s[hdr..], &mut u.all, &mut u.ranges, &mut u.ioapics);
                         if units.try_reserve(1).is_ok() {
                             units.push(u);
                         }
@@ -416,15 +445,50 @@ pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
     if devtab == 0 {
         return none("no memory for the AMD-Vi device table: device DMA is NOT confined, drivers are trusted with all memory");
     }
-    // Default deny: valid, translated through an empty table, no permission (quad 0 only).
+    // Default deny: valid, translated through an empty table, no permission (quad 0); with
+    // interrupt remapping, interrupts aborted (quad 2: IV, IntCtl 00).
     let Ok(empty) = alloc_table() else {
         return none("no memory for the AMD-Vi tables: device DMA is NOT confined, drivers are trusted with all memory");
     };
+    let mut ir = ir_plan(&ivhds);
     let deny = empty | u64::from(LEVELS) << DTE_MODE_SHIFT | DTE_TV | DTE_V;
+    let deny_int = if ir.is_ok() { DTE_IV } else { 0 };
     let dt = table(devtab);
     for i in 0..DEVTAB_ENTRIES {
         // SAFETY: entry i (4 quads) of the device table just allocated (direct map).
-        unsafe { core::ptr::write_volatile(dt.wrapping_add(i * 4), deny) };
+        unsafe {
+            core::ptr::write_volatile(dt.wrapping_add(i * 4), deny);
+            core::ptr::write_volatile(dt.wrapping_add(i * 4 + 2), deny_int);
+        }
+    }
+    if let Ok(plan) = &ir {
+        for d in &ivhds {
+            // SAFETY: quad 2 of the IOMMU function's own entry.
+            unsafe { core::ptr::write_volatile(dt.wrapping_add(usize::from(d.func) * 4 + 2), DTE_IV | DTE_INTCTL_PASS) };
+        }
+        for &(id, dev) in &plan.ioapics[..plan.n] {
+            let Ok(t) = alloc_table() else {
+                ir = Err("out of memory");
+                break;
+            };
+            // The pins routed so far (the serial port's) get their entries now, before the IOMMU
+            // is enabled: their interrupts are never refused in between (the pins stay as they are).
+            let mut routed = [0u16; 256];
+            // SAFETY: writes at most 256 entries into `routed`.
+            let n = unsafe { ffi::ioapic_routed(id, routed.as_mut_ptr(), 256) } as usize;
+            for &r in &routed[..n.min(256)] {
+                // SAFETY: entry `vector` of the new table (direct map, not in use yet).
+                unsafe { core::ptr::write_volatile((table(t) as *mut u32).wrapping_add(usize::from(r & 0xFF)), irte(plan.dest, r as u8)) };
+            }
+            // SAFETY: quad 2 of the I/O APIC's entry: its interrupt table.
+            unsafe { core::ptr::write_volatile(dt.wrapping_add(usize::from(dev) * 4 + 2), int_entry(t)) };
+        }
+        if ir.is_err() {
+            for i in 0..DEVTAB_ENTRIES {
+                // SAFETY: as above: interrupts back to unmapped (remapping stays off).
+                unsafe { core::ptr::write_volatile(dt.wrapping_add(i * 4 + 2), 0) };
+            }
+        }
     }
     let mut units = Vec::new();
     for d in &ivhds {
@@ -463,7 +527,10 @@ pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
         // Whatever the firmware left in the caches goes: every device table entry, then all.
         for id in 0..=u16::MAX {
             u.inval_devtab(id);
-            if id % 128 == 127 {
+            if ir.is_ok() {
+                u.inval_inttab(id);
+            }
+            if id % 64 == 63 {
                 u.sync();
             }
         }
@@ -473,7 +540,11 @@ pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
         u.sync();
     }
     let n = units.len();
-    *STATE.lock() = Some(State { units, devtab });
+    let (ioapics, nioapic, dest) = match &ir {
+        Ok(p) => (p.ioapics, p.n, p.dest),
+        Err(_) => ([(0, 0); 8], 0, 0),
+    };
+    *STATE.lock() = Some(State { units, devtab, ir: ir.is_ok(), dest, ioapics, nioapic });
     set_backend(Backend::AmdVi);
     crate::kprintln!(
         "IOMMU: AMD-Vi, {} unit(s), {}-level tables (48-bit device addresses), event log{}, {} IVMD range(s)",
@@ -482,7 +553,127 @@ pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
         if msi > 0 { " with interrupt" } else { " (no interrupt: faults not reported)" },
         ivmds.len()
     );
+    super::ir_result(Backend::AmdVi, ir.map(|_| "32-bit entries, xAPIC destinations"));
     Some(("DMA remapping on for every device (default deny, faults reported)", ivmds, u16::MAX))
+}
+
+// ---- interrupt remapping ------------------------------------------------------------------------
+
+struct IrPlan {
+    ioapics: [(u8, u16); 8],
+    n: usize,
+    dest: u8,
+}
+
+/// Can interrupts be remapped? Every I/O APIC in use must have its device id in the IVRS, and the
+/// boot CPU's APIC id must fit the 32-bit entry's 8-bit destination.
+fn ir_plan(ivhds: &[Ivhd]) -> Result<IrPlan, &'static str> {
+    // SAFETY: plain read.
+    let apic = unsafe { ffi::irq_target_apic() };
+    if apic > 0xFF {
+        return Err("the boot CPU's APIC id needs the 128-bit entry format");
+    }
+    let mut ids = [0u8; 8];
+    // SAFETY: writes at most 8 ids into `ids`.
+    let nids = unsafe { ffi::ioapic_ids(ids.as_mut_ptr(), 8) } as usize;
+    let mut plan = IrPlan { ioapics: [(0, 0); 8], n: 0, dest: apic as u8 };
+    for &id in &ids[..nids.min(8)] {
+        let Some(dev) = ivhds.iter().flat_map(|d| d.ioapics.iter()).find(|(i, _)| *i == id).map(|(_, d)| *d) else {
+            return Err("an I/O APIC in use is missing from the IVRS");
+        };
+        plan.ioapics[plan.n] = (id, dev);
+        plan.n += 1;
+    }
+    Ok(plan)
+}
+
+/// Quad 2 of a device table entry that remaps through table `t` (256 entries).
+fn int_entry(t: u64) -> u64 {
+    DTE_IV | DTE_INT_LEN_256 | (t & DTE_INT_ADDR) | DTE_INTCTL_REMAP
+}
+
+/// A 32-bit interrupt table entry: RemapEn, fixed delivery, physical destination `dest`.
+fn irte(dest: u8, vector: u8) -> u32 {
+    1 | u32::from(dest) << 8 | u32::from(vector) << 16
+}
+
+/// Point entry `vector` of device `dev`'s table at the boot CPU (creating the table).
+fn ir_set_locked(st: &mut State, dev: u16, vector: u8) -> KResult<()> {
+    let e = dte(st, Bdf(dev)).wrapping_add(2);
+    // SAFETY: quad 2 of entry `dev` of the device table.
+    let q2 = unsafe { core::ptr::read_volatile(e) };
+    let t = if q2 & DTE_INTCTL_MASK == DTE_INTCTL_REMAP {
+        q2 & DTE_INT_ADDR
+    } else {
+        let t = alloc_table()?;
+        // SAFETY: as above; one 64-bit store switches the entry from abort to the new table.
+        unsafe { core::ptr::write_volatile(e, int_entry(t)) };
+        t
+    };
+    let slot = (table(t) as *mut u32).wrapping_add(usize::from(vector));
+    // SAFETY: entry `vector` of the device's interrupt table (direct map).
+    unsafe { core::ptr::write_volatile(slot, irte(st.dest, vector)) };
+    ir_flush(st, dev);
+    Ok(())
+}
+
+fn ir_flush(st: &mut State, dev: u16) {
+    for u in &mut st.units {
+        u.inval_devtab(dev);
+        u.inval_inttab(dev);
+        u.sync();
+    }
+}
+
+/// Install the entry for a device's MSI on `vector` (the MSI data is the index: the message is
+/// the usual one).
+pub fn ir_msi(dev: u16, vector: u32) -> KResult<()> {
+    let mut g = STATE.lock();
+    let st = g.as_mut().ok_or(Status::NotSupported)?;
+    if !st.ir || vector > 0xFF {
+        return Err(Status::NotSupported);
+    }
+    ir_set_locked(st, dev, vector as u8)
+}
+
+/// Install the entry for an I/O APIC pin; returns the pin's high dword (unchanged format).
+pub fn ir_ioapic(id: u8, vector: u8) -> Option<u32> {
+    let mut g = STATE.lock();
+    let st = g.as_mut()?;
+    let dev = st.ioapics[..st.nioapic].iter().find(|(i, _)| *i == id)?.1;
+    ir_set_locked(st, dev, vector).ok()?;
+    Some(u32::from(st.dest) << 24)
+}
+
+/// Remove entry `vector` of device `dev` (None: of every I/O APIC).
+pub fn ir_clear(dev: Option<u16>, vector: u32) {
+    let mut g = STATE.lock();
+    let Some(st) = g.as_mut() else { return };
+    if !st.ir || vector > 0xFF {
+        return;
+    }
+    let mut devs = [0u16; 8];
+    let n = match dev {
+        Some(d) => {
+            devs[0] = d;
+            1
+        }
+        None => {
+            for (i, &(_, d)) in st.ioapics[..st.nioapic].iter().enumerate() {
+                devs[i] = d;
+            }
+            st.nioapic
+        }
+    };
+    for &d in &devs[..n] {
+        // SAFETY: quad 2 of entry `d`.
+        let q2 = unsafe { core::ptr::read_volatile(dte(st, Bdf(d)).wrapping_add(2)) };
+        if q2 & DTE_INTCTL_MASK == DTE_INTCTL_REMAP {
+            // SAFETY: entry `vector` of that device's interrupt table: not remapped any more.
+            unsafe { core::ptr::write_volatile((table(q2 & DTE_INT_ADDR) as *mut u32).wrapping_add(vector as usize), 0) };
+            ir_flush(st, d);
+        }
+    }
 }
 
 /// Is `bdf` an IOMMU's own PCI function (kept by the kernel, never given to a driver)?
@@ -644,6 +835,13 @@ pub fn fault_irq(vector: u32) -> bool {
             let id = q0 as u16;
             match q0 >> 60 {
                 2 => {
+                    // IO_PAGE_FAULT for an interrupt request (I, bit 51, at an MSI address): a
+                    // blocked interrupt. (QEMU sets I on every page fault and drops the address.)
+                    if q0 & (1 << 51) != 0 && q1 >> 20 == 0xFEE {
+                        report_irq(id, q1 as u32, 0);
+                        head = (head + 16) % RING_BYTES;
+                        continue;
+                    }
                     // IO_PAGE_FAULT. RW (bit 53) is meaningful for a present page (PR, bit 52).
                     let write = if q0 & (1 << 52) != 0 { Some(q0 & (1 << 53) != 0) } else { None };
                     report(id, q1, write, "IO page fault: not mapped for this device");

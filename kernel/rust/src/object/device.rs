@@ -395,9 +395,10 @@ impl DeviceObj {
     }
 
     fn enable_source(&self, src: Src, vector: u32) -> KResult<()> {
-        let (addr, data) = irq::msi_message(vector);
         match (src, &self.kind) {
             (Src::Msix(i), Kind::Pci(f)) => {
+                // Remapping entry first (IOMMU lock), then the device's table (device lock).
+                let (addr, data) = iommu::msi_message(f.bdf, vector)?;
                 let mut st = self.st.lock();
                 let t = self.msix_table(&mut st, f)? + u64::from(i) * 16;
                 // SAFETY: entry `i` (< count, checked by `interrupt`) of the mapped table.
@@ -409,6 +410,7 @@ impl DeviceObj {
                 }
             }
             (Src::Msi, Kind::Pci(f)) => {
+                let (addr, data) = iommu::msi_message(f.bdf, vector)?;
                 let _g = self.st.lock();
                 let m = f.msi.ok_or(Status::NotSupported)?;
                 let c = u16::from(m.cap);
@@ -606,6 +608,7 @@ impl Drop for InterruptObj {
     fn drop(&mut self) {
         if self.enabled.load(Ordering::Acquire) {
             self.dev.disable_source(self.src);
+            iommu::ir_release(self.dev.pci().map(|f| f.bdf), self.vector);
             irq::unbind(self.vector);
         }
         // SAFETY: the vector was allocated for this object and nothing delivers to it any more.

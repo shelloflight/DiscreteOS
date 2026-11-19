@@ -2287,6 +2287,7 @@ void ktest_run(void)
 
 #elif defined(KTEST_DRIVERS)
 
+#include "arch.h"
 #include "mm.h"
 
 /* devmgr test makes virtio-blk DMA a sector to physical 0x100000 (the kernel image), which the
@@ -2305,12 +2306,24 @@ static uint64_t hash_target(void)
 
 void ktest_run(void) { dma_target_hash = hash_target(); }
 
+extern uint32_t dkrnl_ir_backend(void);   /* dev/iommu: 1 VT-d, 2 AMD-Vi, 0 no interrupt remapping */
+
 void ktest_after_init(int code)
 {
     bool same = hash_target() == dma_target_hash;
     kprintf("KTEST drivers: kernel memory at %#llx %s after the DMA test\n", DMA_TARGET,
             same ? "unchanged" : "OVERWRITTEN");
-    kprintf("KTEST drivers: %s\n", same && code == 0 ? "PASSED" : "FAILED");
+    /* The forged-interrupt test sent vector 0xDF, which nothing handles: none may have arrived.
+     * Enforced on AMD-Vi. QEMU's VT-d forwards compatibility-format interrupts even with
+     * interrupt remapping on (real VT-d blocks them: CFI clear, and always in x2APIC mode), so
+     * there the test checks the remappable-format forgeries are blocked (serial log) instead. */
+    uint64_t unexpected = __atomic_load_n(&irq_unexpected, __ATOMIC_RELAXED);
+    uint32_t ir = dkrnl_ir_backend();
+    bool forged_ok = ir == 2 ? unexpected == 0 : ir == 1;
+    kprintf("KTEST drivers: %llu interrupt(s) on unhandled vectors after the forged-interrupt test (last %#llx)%s\n",
+            (unsigned long long)unexpected, (unsigned long long)irq_unexpected_last,
+            ir == 1 ? " (VT-d under QEMU: not enforced)" : "");
+    kprintf("KTEST drivers: %s\n", same && forged_ok && code == 0 ? "PASSED" : "FAILED");
 }
 
 #elif defined(KTEST_CPUPM)

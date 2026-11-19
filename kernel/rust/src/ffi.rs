@@ -258,6 +258,10 @@ unsafe extern "C" {
     pub fn ioapic_route_isa_irq(irq: u8, vector: u8) -> bool;
     pub fn ioapic_mask_isa_irq(irq: u8);
     pub fn irq_target_apic() -> u32;
+    pub fn ioapic_reroute();
+    pub fn ioapic_ids(out: *mut u8, max: u32) -> u32;
+    pub fn ioapic_routed(id: u8, out: *mut u16, max: u32) -> u32;
+    pub fn lapic_x2apic() -> bool;
 
     // console / kernel image (programs embedded by build.ps1, programs.asm)
     pub static user_program_table: [RawProgram; 0];
