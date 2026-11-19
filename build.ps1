@@ -66,9 +66,13 @@
       stackprot    stack buffer overflow is caught by the stack protector
       pagefault    unmapped access gives a decoded #PF report with backtrace
       doublefault  kernel stack overflow is reported via the #DF IST stack
+      cpupm        CPU power management: an I/O C-state entered on every CPU while they sleep and
+                   wake, CPPC configured; cpupm-bochs (Bochs, which faults on unknown MSRs like a
+                   CPU): MWAIT idle, missing MSRs refused without a panic, CPPC refused cleanly
       cet          CET shadow stacks in Bochs (QEMU has no CET): the release image boots to the shell
-                   with them on; cet-cp: an overwritten return address ends in #CP (skipped
-                   when Bochs is not installed)
+                   with them on; cet-cp: an overwritten return address ends in #CP; cet-user:
+                   user shadow stacks (utest cet: per thread, handler resume, attacks stopped)
+                   (skipped when Bochs is not installed)
       nx           executing kernel data faults (NX)
       wx           writing kernel code faults (W^X)
       nullderef    NULL is unmapped
@@ -323,6 +327,11 @@ $TestCases = [ordered]@{
                      Forbid = @('KERNEL PANIC', 'user fault', 'exited with code', 'FAIL') }
     'cet-cp'    = @{ Define = 'CET';         Bochs = 'tigerlake'; Timeout = 240
                      Expect = @('KTEST cet: shadow stacks on', 'Control protection (#CP)', $Halted); Forbid = @('FAILED') }
+    # User shadow stacks (ring 3, user/utest/cet.c): utest's threads run with them; an overwritten
+    # return address and a store to the shadow stack each kill a child process.
+    'cet-user'  = @{ Define = 'CETUSER';     Bochs = 'tigerlake'; Timeout = 400
+                     Expect = @('utest: shadow stacks: on in every thread', 'Control protection (#CP)', 'return address does not match the shadow stack', 'utest: PASSED', 'init: utest cet exited with code 0')
+                     Forbid = @('KERNEL PANIC', 'FAIL', 'shadow stacks: off') }
     nx          = @{ Define = 'NX';          Expect = @('Page fault (#PF)', 'instruction fetch', 'execute from non-executable memory', $Halted); Forbid = @('FAILED', 'SKIPPED') }
     wx          = @{ Define = 'WX';          Expect = @('Page fault (#PF)', 'protection violation (present), write, kernel', 'write to read-only kernel memory', $Halted); Forbid = @('FAILED') }
     nullderef   = @{ Define = 'NULLDEREF';   Expect = @('Page fault (#PF)', 'CR2=0000000000000000', 'NULL pointer dereference', $Halted); Forbid = @('FAILED') }
@@ -333,6 +342,12 @@ $TestCases = [ordered]@{
     rustpanic   = @{ Define = 'RUSTPANIC';   Expect = @('KERNEL PANIC', 'Rust panic: KASSERT failed: one == 2', 'kernel/rust/src/ktest.rs:', $Halted); Forbid = @('FAILED') }
     deadlock    = @{ Define = 'DEADLOCK';    Expect = @('KERNEL PANIC', "spinlock self-deadlock: 'ktest.a' is already held", 'Held locks', $Halted); Forbid = @('FAILED') }
     lockorder   = @{ Define = 'LOCKORDER';   Expect = @('KERNEL PANIC', "lock order violation: acquiring 'ktest.low' (rank 5) while holding 'ktest.high'", $Halted); Forbid = @('FAILED') }
+    # CPU power management (cpupm.c): a firmware description with an I/O-port C2 and CPPC; the C2 is
+    # entered on every CPU while threads sleep and wake. QEMU ignores unknown MSRs; Bochs
+    # faults like a CPU: there CPPC with missing MSRs must be refused, and the boot idle is MWAIT.
+    cpupm       = @{ Define = 'CPUPM';       Expect = @('Idle: HLT (under a hypervisor', 'KTEST cpupm: MSR read ok', 'Idle: C1 HLT (1 us), C2 I/O 0x80 (2 us) from _CST', 'Performance: ACPI CPPC (_CPC)', 'KTEST cpupm: 4 CPUs slept', ' in C2 (I/O): PASSED'); Forbid = @('KERNEL PANIC', 'FAILED') }
+    'cpupm-bochs' = @{ Define = 'CPUPM';     Bochs = 'tigerlake'; BochsStrictMsr = $true; Timeout = 240
+                     Expect = @('Idle: MWAIT C1', 'KTEST cpupm: MSR read ok, missing MSR read refused, missing MSR write refused', 'C2 I/O 0x80 (2 us) from _CST', 'refused on 1 CPU(s) (left as the firmware set them)', ' in C2 (I/O): PASSED'); Forbid = @('KERNEL PANIC', 'FAILED') }
     sched       = @{ Define = 'SCHED';       Expect = @('KTEST sched: PASSED');                                       Forbid = @('KERNEL PANIC', 'FAIL') }
     threadguard = @{ Define = 'THREADGUARD'; Expect = @('Double fault (#DF)', "hit guard page: kernel stack of thread 'ktest.recurse'", "in thread 'ktest.recurse'", $Halted); Forbid = @('FAILED') }
     mutexdeadlock = @{ Define = 'MUTEXDEADLOCK'; Expect = @('KERNEL PANIC', "mutex 'ktest.m' deadlock: already held by thread 'kmain'", $Halted); Forbid = @('FAILED') }
@@ -925,7 +940,7 @@ function Invoke-UserBuild([string]$OutDir, [string]$Clang, [string]$Lld, [script
         & $Log "  LD    user\$($p.Name).dx"
         Invoke-Native $Lld (@('-pie', '--no-dynamic-linker', '-nostdlib', '-e', '_start', '--build-id=none', '-s',
             '-z', 'noexecstack', '-z', 'relro', '-z', 'now', '-z', 'separate-loadable-segments',
-            '-z', 'max-page-size=4096', '-o', $dx) + $objs + $(if ($libs.Count) { @('--gc-sections') + $libs } else { @() }))
+            '-z', 'max-page-size=4096', '-z', 'shstk', '-o', $dx) + $objs + $(if ($libs.Count) { @('--gc-sections') + $libs } else { @() }))
         $out += [pscustomobject]@{ Name = "$($p.Name).dx"; Path = $dx }
     }
     return @($out) + @(Invoke-CompatBuild -OutDir $OutDir -Clang $Clang -Lld $Lld -Log $Log)
@@ -973,6 +988,10 @@ function Invoke-RustUserBuild($Crate, [string]$OutDir, [string]$Lld, [scriptbloc
     $ldflags = @('-pie', '--no-dynamic-linker', '-nostdlib', '--build-id=none', '-s', '--gc-sections',
         '-z', 'noexecstack', '-z', 'relro', '-z', 'now', '-z', 'separate-loadable-segments', '-z', 'max-page-size=4096')
     $toml = Get-Content (Join-Path $Crate.FullName 'Cargo.toml') -Raw
+    # CET shadow stacks (the ELF property the kernel reads): every program asks for them unless its
+    # crate says `shstk = false` under [package.metadata.dos] (D-CMPL: foreign code moves between
+    # frames by rewriting return addresses).
+    if ($toml -notmatch '(?m)^shstk\s*=\s*false') { $ldflags += @('-z', 'shstk') }
     $out = @()
     if ($toml -match '(?m)^dx\s*=\s*\[([^\]]*)\]') {
         # Several programs in one crate ([package.metadata.dos] dx = ["list", "show"]): the library
@@ -1854,7 +1873,7 @@ function Find-Bochs {
     return $null
 }
 
-function Invoke-BochsCapture([string]$image, [string]$log, [string[]]$Expect, [string[]]$Forbid, [int]$Timeout, [string]$CpuModel) {
+function Invoke-BochsCapture([string]$image, [string]$log, [string[]]$Expect, [string[]]$Forbid, [int]$Timeout, [string]$CpuModel, [switch]$StrictMsr) {
     $bochs = Find-Bochs
     if (-not $bochs) { return $null }
     $dir = Split-Path $log -Parent
@@ -1866,7 +1885,7 @@ function Invoke-BochsCapture([string]$image, [string]$log, [string[]]$Expect, [s
     $rc = Join-Path $dir 'bochsrc.txt'
     @(
         'megs: 512',
-        "cpu: model=$CpuModel, count=1, ips=200000000",
+        "cpu: model=$CpuModel, count=1, ips=200000000, ignore_bad_msrs=$(if ($StrictMsr) { 0 } else { 1 })",
         "romimage: file=`"$(Join-Path $home_ 'BIOS-bochs-latest')`"",
         "vgaromimage: file=`"$(Join-Path $home_ 'VGABIOS-lgpl-latest.bin')`"",
         "ata0-master: type=disk, path=`"$disk`", mode=flat",
@@ -2023,7 +2042,7 @@ function Invoke-Test {
         if ($tc.Contains('Bochs')) {
             $bdir = Join-Path $Build "bochs\$n"
             New-Item -ItemType Directory -Force $bdir | Out-Null
-            $r = Invoke-BochsCapture $image (Join-Path $bdir "serial-$n.log") $tc.Expect $tc.Forbid $limit $tc.Bochs
+            $r = Invoke-BochsCapture $image (Join-Path $bdir "serial-$n.log") $tc.Expect $tc.Forbid $limit $tc.Bochs -StrictMsr:($tc.Contains('BochsStrictMsr') -and $tc.BochsStrictMsr)
             if (-not $r) {
                 Write-Host "--- [$n] skipped: Bochs is not installed (winget install Bochs.Bochs) ---" -ForegroundColor Yellow
                 $results += [pscustomobject]@{ Case = $n; Result = 'SKIP'; Seconds = 0 }

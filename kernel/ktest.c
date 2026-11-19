@@ -7,6 +7,9 @@
  *   KTEST_DOUBLEFAULT - a kernel stack overflow must be reported via the #DF IST stack
  *   KTEST_CET       - with CET shadow stacks on (Bochs), an overwritten return address must end
  *                     in #CP, not at the planted address
+ *   KTEST_CETUSER   - user shadow stacks (Bochs): init runs "utest cet"
+ *   KTEST_CPUPM     - idle states and performance control: safe MSR access, an I/O C-state on
+ *                     every CPU, CPPC refused cleanly (cpupm.c)
  *   KTEST_NX        - executing kernel data must fault (NX)
  *   KTEST_WX        - writing kernel code must fault (W^X)
  *   KTEST_KASLR     - the image runs relocated at its random base; the region bases are in their
@@ -126,6 +129,8 @@ const char *ktest_init_args(void)
     return "run utest smap";
 #elif defined(KTEST_SMEP)
     return "run utest smep";
+#elif defined(KTEST_CETUSER)
+    return "run utest cet";
 #else
     return "";
 #endif
@@ -2308,8 +2313,74 @@ void ktest_after_init(int code)
     kprintf("KTEST drivers: %s\n", same && code == 0 ? "PASSED" : "FAILED");
 }
 
+#elif defined(KTEST_CPUPM)
+
+#include "cpu.h"
+#include "cpupm.h"
+#include "percpu.h"
+#include "smp.h"
+
+/* CPU power management in QEMU (no real C-states or CPPC there):
+ *  - MSR access that survives missing MSRs (a #GP becomes false, not a panic);
+ *  - a firmware description with an I/O-port C2 (port 0x80: harmless) used under the hypervisor
+ *    (test override), while every CPU sleeps and wakes many times (IPIs, timers);
+ *  - CPPC whose MSRs this CPU does not have: refused on every CPU, the kernel goes on.
+ * QEMU's TCG reads unknown MSRs as 0 and ignores writes to them (no #GP), so the missing-MSR
+ * checks are strict only without a hypervisor (the Bochs variant, which faults as CPUs do). */
+static int cpupm_sleeper(void *arg)
+{
+    (void)arg;
+    for (int i = 0; i < 200; i++)
+        thread_sleep_ns(300 * NS_PER_US);
+    return 0;
+}
+
+void ktest_run(void)
+{
+    uint64_t v = 0;
+    bool tsc = msr_read_safe(0x10, &v);                  /* IA32_TIME_STAMP_COUNTER: always there */
+    bool missing = msr_read_safe(0xC00102B0, &v);        /* AMD CPPC_CAP1: not in QEMU's model */
+    bool wr = msr_write_safe(0xC00102B1, 1);
+    bool strict = !cpu.hypervisor;
+    bool msr_ok = tsc && (!strict || (!missing && !wr));
+    kprintf("KTEST cpupm: MSR read %s, missing MSR read %s, missing MSR write %s%s\n", tsc ? "ok" : "FAILED",
+            missing ? "accepted" : "refused", wr ? "accepted" : "refused",
+            !msr_ok ? ": FAILED" : strict ? "" : " (this emulator ignores unknown MSRs)");
+
+    struct cpupm_desc d = { 0 };
+    d.ncstates = 2;
+    d.cst[0] = (struct cpupm_cstate){ CPUPM_HLT, 1, 0, 1 };
+    d.cst[1] = (struct cpupm_cstate){ CPUPM_IO, 2, 0x80, 2 };
+    d.cpc = 1;
+    d.highest = (struct cpupm_reg){ .kind = CPUPM_REG_INT, .value = 200 };
+    d.lowest = (struct cpupm_reg){ .kind = CPUPM_REG_INT, .value = 20 };
+    d.min = (struct cpupm_reg){ .kind = CPUPM_REG_MSR, .bit_offset = 8, .bit_width = 8, .value = 0xC00102B3 };
+    d.max = (struct cpupm_reg){ .kind = CPUPM_REG_MSR, .bit_offset = 0, .bit_width = 8, .value = 0xC00102B3 };
+    d.enable = (struct cpupm_reg){ .kind = CPUPM_REG_MSR, .bit_offset = 0, .bit_width = 1, .value = 0xC00102B1 };
+    cpupm_test_force_deep = true;
+    cpupm_configure(&d);
+
+    uint32_t n = smp_cpus();
+    struct thread *t[MAX_CPUS];
+    for (uint32_t c = 0; c < n; c++)
+        t[c] = thread_create_on("cpupm.sleep", cpupm_sleeper, NULL, THREAD_PRIO_HIGH, THREAD_CPU(c));
+    for (uint32_t c = 0; c < n; c++)
+        if (t[c])
+            thread_join(t[c]);
+    uint64_t c1 = 0, c2 = 0;
+    for (uint32_t c = 0; c < cpu_slots; c++)
+        if (cpus[c]) {
+            c1 += cpus[c]->idle_count[0];
+            c2 += cpus[c]->idle_count[1];
+        }
+    cpupm_print();
+    bool ok = msr_ok && c2 > 0;
+    kprintf("KTEST cpupm: %u CPUs slept %llu times in C1 and %llu in C2 (I/O): %s\n", n,
+            (unsigned long long)c1, (unsigned long long)c2, ok ? "PASSED" : "FAILED");
+}
+
 #elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_ATTESTTPM) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES) || \
-    defined(KTEST_TIME) || defined(KTEST_SHELL)
+    defined(KTEST_TIME) || defined(KTEST_SHELL) || defined(KTEST_CETUSER)
 
 /* Ring-3 tests: init runs utest (ktest_init_args); nothing to do in the kernel first. */
 void ktest_run(void) {}

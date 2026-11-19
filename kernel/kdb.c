@@ -10,9 +10,11 @@
  *   prof [ms] sample every CPU at 1 kHz for ms (default 1000), then print the profile and the
  *             latency histograms (syscalls, wake-ups, interrupts)
  *   lat       the latency histograms of the last profiling session
+ *   power     idle states (entries and time per CPU) and CPU performance control
  */
 
 #include <stdbool.h>
+#include "cpupm.h"
 #include "kdb.h"
 #include "mm.h"
 #include "printf.h"
@@ -25,7 +27,7 @@
 bool kdb_command(const char *line)
 {
     if (strcmp(line, "help") == 0) {
-        kprintf("kdb: commands: help, threads, cpus, objects, measure, mem, prof [ms], lat, poweroff, reboot\n");
+        kprintf("kdb: commands: help, threads, cpus, objects, measure, mem, prof [ms], lat, power, poweroff, reboot\n");
     } else if (memcmp(line, "prof", 4) == 0 && (line[4] == '\0' || line[4] == ' ')) {
         uint64_t ms = 0;
         for (const char *p = line + 4; *p == ' ' || (*p >= '0' && *p <= '9'); p++)
@@ -43,6 +45,8 @@ bool kdb_command(const char *line)
         power_off();
     } else if (strcmp(line, "reboot") == 0) {
         power_reboot();
+    } else if (strcmp(line, "power") == 0) {
+        cpupm_print();
     } else if (strcmp(line, "lat") == 0) {
         lat_print_all();
     } else if (strcmp(line, "threads") == 0) {

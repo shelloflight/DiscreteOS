@@ -14,13 +14,18 @@
 struct percpu;
 struct thread;
 
+#define MSR_U_CET          0x6A0
 #define MSR_S_CET          0x6A2
 #define MSR_PL0_SSP        0x6A4
+#define MSR_PL3_SSP        0x6A7
 #define MSR_ISST           0x6A8        /* IA32_INTERRUPT_SSP_TABLE_ADDR */
 #define S_CET_SH_STK_EN    1ull
+#define U_CET_SH_STK_EN    1ull
 #define CR4_CET            (1ull << 23)
 
-extern bool cet_ss;                     /* shadow stacks in use: decided once, before any thread */
+/* Shadow stacks in use: decided once, before any thread. User shadow stacks (ring 3, per
+ * process: user/thread.rs) are available exactly when this is set. */
+extern bool cet_ss;
 
 /* Boot CPU, after spec_detect, the VMM and the heap, before sched_init: decide, and give the boot
  * CPU its IST shadow stacks. */

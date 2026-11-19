@@ -120,6 +120,9 @@ model. See [abi.md](abi.md#exceptions).
 - A program read from a file is unsigned code: D-CMPL makes it executable with VMEX (Windows) or
   allows it with `vmo_allow_unsigned` (Linux); both decisions are measured into PCR 10.
 - The Linux server runs per program, never as one system-wide server.
+- No CET shadow stacks yet: `dcmpl` is built without them (Windows exception handling resumes a
+  context by rewriting a return address), and FORWARD processes never get one. CET-aware unwinding
+  (Windows `CETCOMPAT` images, glibc's `arch_prctl` shadow-stack calls) would lift this.
 
 ## Roadmap
 

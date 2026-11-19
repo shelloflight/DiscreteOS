@@ -89,6 +89,8 @@ static const char *const vec_names[32] = {
 
 static const char *pf_hint(uint64_t addr, uint64_t err)
 {
+    if (err & (1u << 6))
+        return "shadow-stack access outside the thread's shadow stack (overflow, or a bad SSP)";
     if (addr >= USER_TOP)
         return "access to kernel memory (supervisor pages)";
     if (addr < USER_BASE)
@@ -124,6 +126,10 @@ void user_fault(struct interrupt_frame *f)
         hint = "privileged instruction, I/O port or non-canonical address";
     else if (f->vector == 6)
         hint = "invalid instruction";
+    else if (f->vector == 21)
+        hint = (f->error & 0x7FFF) == 1 ? "return address does not match the shadow stack (CET): "
+                                          "a stack overwrite, stopped"
+                                        : "control-flow protection (CET) violation";
 
     /* A program that faults in a loop (spawning crashing children) must not be able to flood
      * the console: full reports for the first USER_FAULT_REPORTS faults, then silence. */

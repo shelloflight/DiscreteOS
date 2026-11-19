@@ -67,8 +67,8 @@ Main groups:
 | Group | Cases |
 |---|---|
 | Boot | `boot`, `boot-amd`, `uefi`, `uefi-uniproc`, `uniproc`, `bios-badsig`, `uefi-badsig`, `manydevices` |
-| Protections fire | `stackprot`, `cet`, `cet-cp`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `kaslr`, ... |
-| Kernel | `selftest`, `sched`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench` |
+| Protections fire | `stackprot`, `cet`, `cet-cp`, `cet-user`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `kaslr`, ... |
+| Kernel | `selftest`, `sched`, `cpupm`, `cpupm-bochs`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
 | User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `services`, `shell`, `time`, `time-uefi`, `attest`, `attest-tpm`, `poweroff`, `reboot` |
 | Host | `storage-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |

@@ -56,7 +56,33 @@ normal stack raises #CP, a kernel panic. A stack buffer overflow can no longer r
   release image boots to the shell with shadow stacks on, and an overwritten return address ends in
   #CP. Skipped when Bochs is not installed.
 
-Not yet: user-mode shadow stacks (ring 3) and kernel IBT (needs Rust's `-Zcf-protection`, unstable).
+**User shadow stacks** (ring 3) are on with them, for every program whose image asks: the ELF
+property `GNU_PROPERTY_X86_FEATURE_1_AND` with SHSTK (`kernel/rust/src/user/elf.rs`). The build
+links every D-OS program with `-z shstk`; a crate opts out with `shstk = false` under
+`[package.metadata.dos]` (only `dcmpl`, whose Windows exception handling resumes a context by
+rewriting a return address).
+
+- The kernel makes each thread's shadow stack (`kernel/rust/src/user/thread.rs`): a region of its
+  own at a random address between unmapped guard pages, half the size of the mapping the thread's
+  stack pointer starts in plus a page (16 KiB to 32 MiB), read-only + dirty pages. The program has
+  no handle to it, and `process_write_memory` needs a writable mapping, so only CALL and RET change
+  it. It is freed when the thread ends.
+- IA32_U_CET and the user SSP (IA32_PL3_SSP) are switched with the thread (`sched.c`).
+- An in-process exception handler starts with the SSP the thread faulted with, and
+  `exception_return` restores it: the handler may return from inside a call. A supervisor's resume
+  keeps the SSP.
+- Never for a process with a foreign personality (FORWARD, or a START exception that sets its first
+  registers): those programs switch frames in ways a shadow stack refuses.
+- A RET to an overwritten return address raises #CP: the process is killed and the report says
+  "return address does not match the shadow stack"; a store to the shadow stack is a page fault.
+- Test: `cet-user` (Bochs) runs `utest cet`: a shadow stack per thread (65 made and freed), a
+  2000-deep call chain, a handler returning from inside a call, and two attacks (an overwritten
+  return address, a store to the shadow stack) that each kill a child. Without CET (`user`), utest
+  says so.
+
+**Kernel IBT** stays off: every indirect-branch target must start with ENDBR64, and the pinned Rust
+(1.100) can only mark them with the unstable `-Zcf-protection` (and its prebuilt `core` has no
+marks at all). AMD CPUs, up to Zen 5, have no IBT.
 
 ## Speculative-execution mitigations
 

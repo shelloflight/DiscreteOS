@@ -33,8 +33,23 @@ void cpu_init(void)
         cpu.rdrand       = bit(r[2], 30);
         cpu.hypervisor   = bit(r[2], 31);
         cpu.pat          = bit(r[3], 16);
+        cpu.monitor      = bit(r[2], 3);
+        cpu.family       = (r[0] >> 8) & 0xF;
+        if (cpu.family == 0xF)
+            cpu.family += (r[0] >> 20) & 0xFF;
         if (cpu.rdrand)
             rdrand_check();
+    }
+    if (cpu.max_leaf >= 5 && cpu.monitor) {
+        cpuid(5, 0, r);
+        cpu.mwait_irq = bit(r[2], 0) && bit(r[2], 1);
+        cpu.mwait_substates = r[3];
+    }
+    if (cpu.max_leaf >= 6) {
+        cpuid(6, 0, r);
+        cpu.arat = bit(r[0], 2);
+        cpu.hwp = bit(r[0], 7);
+        cpu.hwp_epp = cpu.hwp && bit(r[0], 10);
     }
     if (cpu.max_leaf >= 7) {
         cpuid(7, 0, r);
@@ -51,6 +66,10 @@ void cpu_init(void)
     if (cpu.max_ext_leaf >= 0x80000007u) {
         cpuid(0x80000007u, 0, r);
         cpu.invariant_tsc = bit(r[3], 8);
+    }
+    if (cpu.max_ext_leaf >= 0x80000008u && strcmp(cpu.vendor, "AuthenticAMD") == 0) {
+        cpuid(0x80000008u, 0, r);
+        cpu.amd_cppc = bit(r[1], 27);
     }
     if (cpu.max_ext_leaf >= 0x80000004u) {
         for (uint32_t i = 0; i < 3; i++) {
@@ -201,4 +220,30 @@ void cpu_print_info(void)
                 (cpu.xcr0 & 4) ? " AVX" : "", (cpu.xcr0 & 0xE0) ? " AVX-512" : "");
     else
         kprintf("FPU: FXSAVE for user threads (x87 SSE; no XSAVE)\n");
+}
+
+/* #GP on the RDMSR/WRMSR of msr_read_safe / msr_write_safe (msr.asm): tell the function (R8 = 1)
+ * and run the same instruction again on an MSR that cannot fault: RDMSR of the TSC, WRMSR of
+ * IA32_FMASK with the value it holds. RIP stays (CET: a kernel IRETQ must return where the shadow
+ * stack says). Kernel mode only; anything else is a real fault. */
+#define MSR_TSC   0x10
+#define MSR_FMASK 0xC0000084
+extern const char msr_insn_read[], msr_insn_write[];
+
+bool msr_fixup_try(struct interrupt_frame *f)
+{
+    if (f->vector != 13 || (f->cs & 3))
+        return false;
+    if (f->rip != (uint64_t)(uintptr_t)msr_insn_read && f->rip != (uint64_t)(uintptr_t)msr_insn_write)
+        return false;
+    if (f->rip == (uint64_t)(uintptr_t)msr_insn_read) {
+        f->rcx = MSR_TSC;
+    } else {
+        uint64_t v = rdmsr(MSR_FMASK);    /* the same on every CPU (user_cpu_init) */
+        f->rcx = MSR_FMASK;
+        f->rax = (uint32_t)v;
+        f->rdx = v >> 32;
+    }
+    f->r8 = 1;
+    return true;
 }

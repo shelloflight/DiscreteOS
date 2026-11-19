@@ -211,6 +211,7 @@ unsafe extern "C" {
         arg: *mut c_void,
         a: *mut RawUspace,
         user: *mut c_void,
+        ussp: u64,
     ) -> *mut RawThread;
     pub fn user_enter(rip: u64, rsp: u64, arg0: u64, arg1: u64) -> !;
     pub fn user_enter_frame(f: *const crate::user::syscall::Frame) -> !;
@@ -224,6 +225,10 @@ unsafe extern "C" {
     pub fn thread_kill_pending() -> bool;
     pub fn uthread_get_base(which: u32) -> u64;
     pub fn uthread_set_base(which: u32, value: u64);
+    pub fn uthread_get_ssp() -> u64;
+    pub fn uthread_set_ssp(ssp: u64);
+    /// CET shadow stacks in use (cet.h); user shadow stacks are available exactly then.
+    pub static cet_ss: bool;
 
     // user.h
     pub fn user_copy(dst: *mut u8, src: *const u8, n: u64) -> u64;
@@ -244,6 +249,8 @@ unsafe extern "C" {
     pub fn acpi_mmio_map(pa: u64, len: u32) -> *mut u8;
     pub fn ioapic_route_sci(irq: u8, vector: u8) -> bool;
     pub fn power_set_s5(typ_a: u8, typ_b: u8);
+    /// `struct cpupm_desc` (dev/cpupm.rs) or NULL; copied before it returns (cpupm.h).
+    pub fn cpupm_configure(d: *const c_void);
     pub fn vmm_map_phys(pa: u64, size: u64, flags: u32) -> *mut u8;
     pub fn pmm_range_is_ram(pa: u64, len: u64) -> bool;
     pub fn irq_vector_alloc() -> c_int;
@@ -313,6 +320,7 @@ pub const VMM_W: u32 = 1 << 0;
 pub const VMM_X: u32 = 1 << 1;
 pub const VMM_UC: u32 = 1 << 2;
 pub const VMM_WC: u32 = 1 << 3;
+pub const VMM_SHSTK: u32 = 1 << 4;
 /// `WAIT_INTERRUPTED` (thread.h).
 pub const WAIT_INTERRUPTED: c_int = 2;
 /// `UTHREAD_EXIT_KILLED`, `DOS_EXIT_*` (user.h).

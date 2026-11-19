@@ -168,6 +168,7 @@ Executables (`.dx`, ELF64):
 | Segments | at most 16 PT_LOAD, in order, inside the file, never sharing a page, never W+X |
 | Refused | PT_INTERP, PT_TLS, executable stack, DT_NEEDED, other relocation types, entry outside code, over 64 MiB |
 | Stack | 256 KiB, guard pages on both sides, random address |
+| Shadow stack | with CET, when the ELF property SHSTK is set (`-z shstk`): one per thread, made by the kernel, not for FORWARD or START-exception processes ([hardening.md](hardening.md)) |
 
 At the entry point, RDI points at `struct dos_startup`: magic `DOSS`, ABI version, the handle list
 (`{handle, tag}` pairs, up to 256 passed by the spawner plus the process's own three), the argument
@@ -235,6 +236,11 @@ Spawn flags:
   runs Linux programs).
 
 Register sets from user space are validated (user addresses only, user-settable flags only).
+
+With a shadow stack, the handler runs on the shadow-stack pointer the thread faulted with, and
+`exception_return` restores it (whatever the handler called); a supervisor's resume leaves it as it
+was. Resuming in an outer frame (unwinding past the fault) needs the SSP moved too, which no call
+allows yet.
 
 ## Code signing, attestation, power
 

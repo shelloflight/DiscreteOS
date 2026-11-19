@@ -12,6 +12,10 @@
 //!    a message with an `Exception` handle, reads and edits the registers and resolves it.
 //! 3. Otherwise the fault kills the process (with the crash report).
 //!
+//! Shadow stacks (CET): a handler starts with the shadow-stack pointer the thread faulted with,
+//! and `exception_return` puts that one back, so the resumed code finds its own return addresses
+//! whatever the handler called. A supervisor's resume keeps the thread's SSP as it was.
+//!
 //! Everything a handler or supervisor hands back is validated (`Regs::validate`): RIP and the
 //! FS/GS bases must be user addresses, RFLAGS keeps only user bits. The return to user mode after
 //! a change goes through IRETQ (all registers exact), never SYSRET (which clobbers RCX and R11).
@@ -130,6 +134,11 @@ fn to_handler(u: &UserThread, f: &mut Frame, info: &Info) -> bool {
         return false;
     }
     u.in_handler.store(true, Ordering::Relaxed);
+    // Shadow stack: the handler runs on it from here; the return restores this SSP with the
+    // registers, so a handler may return from inside a call (or resume elsewhere in the frame
+    // that faulted) without leaving its own return addresses on it.
+    // SAFETY: plain read of the current thread's SSP (0 without a shadow stack).
+    u.handler_ssp.store(unsafe { ffi::uthread_get_ssp() }, Ordering::Relaxed);
     f.rip = entry;
     f.rsp = at - 8; // as after a call: RSP + 8 is 16-byte aligned at the entry point
     f.rdi = at;
@@ -285,5 +294,11 @@ pub fn handler_return(u: &UserThread, f: &mut Frame, rec_ptr: u64) -> crate::obj
     regs.validate()?;
     u.in_handler.store(false, Ordering::Relaxed);
     apply(f, &regs);
+    let ssp = u.handler_ssp.load(Ordering::Relaxed);
+    if ssp != 0 {
+        // SAFETY: the SSP this thread had when the kernel entered the handler (never a value
+        // from user space), on the thread's own shadow stack.
+        unsafe { ffi::uthread_set_ssp(ssp) };
+    }
     Ok(())
 }

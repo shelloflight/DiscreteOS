@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "arch.h"
+#include "cpupm.h"
 #include "ktime.h"
 #include "thread.h"
 
@@ -50,6 +51,7 @@ struct percpu {
     uint64_t        entry_cr3;       /* 104: KPTI: CR3 found on the last interrupt from ring 3 (tests) */
     uint64_t        ss_token;        /* 112: shadow stacks: the running user thread's supervisor
                                       * shadow-stack token (IA32_PL0_SSP), cleared on exit to ring 3 */
+    uint64_t        u_cet;           /* IA32_U_CET as last written here (shadow stacks) */
     uint64_t        last_uid;        /* id of the user address space that ran last here (IBPB) */
     struct uspace  *uspace;          /* user address space loaded (NULL: the kernel's) */
     struct runqueue rq;
@@ -78,6 +80,10 @@ struct percpu {
     /* lock-order checking, test builds (spinlock.c) */
     const struct spinlock *held[LOCKDEP_DEPTH];
     uint32_t        held_n;
+
+    /* idle states (cpupm.c) */
+    uint64_t        idle_avg_ns;     /* recent idle periods (moving average): what the next may be */
+    uint64_t        idle_count[CPUPM_MAX_CSTATES], idle_ns[CPUPM_MAX_CSTATES];
 
     /* stats */
     uint64_t        switches, preemptions, irqs, timer_irqs, ipis, steals, tlb_flushes;

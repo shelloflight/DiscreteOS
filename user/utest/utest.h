@@ -67,4 +67,8 @@ int  ipc_fuzz_child(uint64_t seed, uint64_t n);
 /* compat.c */
 void test_compat(void);
 
+/* cet.c */
+void test_shstk(void);
+int  cet_child(const char *a);   /* child modes "cet ..." */
+
 #endif

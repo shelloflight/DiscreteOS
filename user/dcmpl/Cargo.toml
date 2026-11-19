@@ -17,6 +17,11 @@ path = "src/lib.rs"
 test = false
 bench = false
 
+[package.metadata.dos]
+# No CET shadow stack: Windows exception handling resumes a CONTEXT by rewriting a return address
+# (win/seh.rs), which a shadow stack refuses. Revisit with CET-aware unwinding (CETCOMPAT images).
+shstk = false
+
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
 

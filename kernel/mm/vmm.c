@@ -581,6 +581,8 @@ bool uspace_map(struct uspace *as, uint64_t va, const uint64_t *frames, uint64_t
         leaf |= nx_bit;
     if (flags & VMM_UC)
         leaf |= PTE_PCD | PTE_PWT;           /* device memory (MMIO BARs of user-space drivers) */
+    if (flags & VMM_SHSTK)
+        leaf |= PTE_D;                       /* read-only + dirty: a user shadow stack (CET) */
     uint64_t f = spin_lock_irqsave(&as->lock);
     uint64_t before = as->tables;
     for (uint64_t i = 0; i < pages; i++) {

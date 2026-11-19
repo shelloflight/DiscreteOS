@@ -15,6 +15,11 @@
  *     marks it busy first, SETSSBSY); SYSRET does not, so that return clears it (CLRSSBSY);
  *   - NMI, #DF, #MC: the CPU takes the IST stack's shadow stack from the table.
  *
+ * User shadow stacks (ring 3) come with them: a process whose image asks for them (ELF property
+ * SHSTK, user/elf.rs) gets one per thread, made by the kernel (user/thread.rs). IA32_U_CET and
+ * IA32_PL3_SSP (the user SSP while the thread is in the kernel) are switched with the thread
+ * (sched.c: switch_user_state).
+ *
  * Off (reported at boot) when the CPU has none, when KPTI runs entries on per-CPU stacks, and when
  * Spectre v2 needs retpolines (their thunk rewrites its own return address).
  */
@@ -69,6 +74,9 @@ uint64_t *cet_cpu_prepare(struct percpu *pc, struct thread *t, uint64_t *restore
     wrmsr(MSR_ISST, (uint64_t)(uintptr_t)pc->ssp_table);
     wrmsr(MSR_PL0_SSP, 0);                 /* no user thread yet; set when one is switched in */
     pc->ss_token = 0;
+    wrmsr(MSR_U_CET, 0);                   /* ring 3: per thread (sched.c: switch_user_state) */
+    wrmsr(MSR_PL3_SSP, 0);
+    pc->u_cet = 0;
     *restore = t->ssp;
     uint64_t va = t->ssp + 8;              /* the first return address, above the restore token */
     uint64_t pa = vmm_translate(va & ~(uint64_t)(PAGE_SIZE - 1));
@@ -86,6 +94,7 @@ void cet_print(void)
 {
     if (cet_ss)
         kprintf("CET: supervisor shadow stacks on (every kernel thread and IST stack, %u KiB each); "
+                "user shadow stacks for programs that ask for them; "
                 "IBT not enabled (the Rust compiler cannot mark branch targets yet)\n", SHSTK_SIZE / 1024);
     else
         kprintf("CET: supervisor shadow stacks %s; IBT %s\n", cet_off,

@@ -60,7 +60,9 @@ has:
 2. loaded the DSDT (FADT `X_DSDT`/`DSDT`) and every SSDT;
 3. run `\_PIC(1)` (APIC mode) and `initialize`;
 4. evaluated `\_S5` and handed it to the power code (`power_set_s5`; a method works too);
-5. set up the SCI (below).
+5. read the first present processor's `_CST`, `_CPC` and `_PSS`/`_PCT` (`aml::processor`) and
+   configured idle states and performance control on every CPU ([power.md](power.md));
+6. set up the SCI (below).
 
 ```
 ACPI: AML: DSDT + 0 SSDT(s), 8 KiB, 280 objects in 4 ms; 0 definition(s) skipped
@@ -119,8 +121,9 @@ the volumes durable, then `system_power`.
   and, on Windows, the build machine's own DSDT and SSDTs (dumped from `HKLM\HARDWARE\ACPI` into
   `build\host\acpi`, never committed): loaded with no error, initialised, `\_S5`, the power button
   and TPM devices found, the TPM start `_DSM` listing and running function 1, every method run
-  against simulated hardware (each one returns or fails cleanly), and its SSDTs mutated on top of
-  its DSDT.
+  against simulated hardware (each one returns or fails cleanly), its processors' `_CST`, `_CPC`
+  and `_PSS` read, and its SSDTs mutated on top of its DSDT. Processor objects are also read from
+  built byte code shaped like a desktop's, and malformed ones read as absent.
 - `boot`, `uefi`: QEMU's tables (SeaBIOS and OVMF) load with nothing skipped, initialisation has no
   failure, the SCI is set up.
 - `powerbutton`: QEMU's `system_powerdown` reaches init through the SCI; clean shutdown and
@@ -133,5 +136,7 @@ the volumes durable, then `system_power`.
 - No EmbeddedControl handler yet (laptops: battery, lid, many thermal zones), no SMBus, GPIO or
   GenericSerialBus regions, no dynamic table loading.
 - S3 sleep, wake events and device power states (`_PSx`, power resources) are not used yet.
+- `_OSC`/`_PDC` are not run: firmware that loads processor tables only after them (some Intel
+  machines) shows no `_CST`.
 - `_PRT` interrupt routing is not used: devices use MSI/MSI-X.
 - The AML thread serialises all evaluation; a method that sleeps delays the next event.

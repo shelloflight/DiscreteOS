@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include "apic.h"
 #include "cet.h"
+#include "cpupm.h"
 #include "cpu.h"
 #include "mm.h"
 #include "panic.h"
@@ -473,11 +474,22 @@ static void switch_user_state(struct percpu *pc, struct thread *prev, struct thr
         fpu_save(prev->fpu);
         prev->fs_base = rdmsr(MSR_FS_BASE);
         prev->gs_base = rdmsr(MSR_KERNEL_GS_BASE);
+        if (prev->ushstk)
+            prev->ussp = rdmsr(MSR_PL3_SSP);     /* CALL/RET in ring 3 moved it */
     }
     if (next->fpu) {
         fpu_restore(next->fpu);
         wrmsr(MSR_FS_BASE, next->fs_base);
         wrmsr(MSR_KERNEL_GS_BASE, next->gs_base);
+        /* User shadow stacks: on for this thread or off (U_CET written only when it changes);
+         * the next return to ring 3 loads SSP from PL3_SSP. */
+        uint64_t u_cet = next->ushstk ? U_CET_SH_STK_EN : 0;
+        if (pc->u_cet != u_cet) {
+            wrmsr(MSR_U_CET, u_cet);
+            pc->u_cet = u_cet;
+        }
+        if (next->ushstk)
+            wrmsr(MSR_PL3_SSP, next->ussp);
     }
     load_uspace(pc, next->uspace);
     /* IBPB: a thread of another process: branch predictions trained by the previous one must
@@ -804,8 +816,10 @@ struct thread *thread_create_on(const char *name, thread_fn fn, void *arg, unsig
 /* Initial FPU state of a user thread: what FNINIT + LDMXCSR(0x1F80) give (all exceptions masked,
  * round to nearest, empty x87 stack, AVX state zero). With XSAVE the header (XSTATE_BV = 0) makes
  * XRSTOR load the init state of every component; MXCSR still comes from the legacy area. */
-struct thread *thread_create_user(const char *name, thread_fn fn, void *arg, struct uspace *as, void *user)
+struct thread *thread_create_user(const char *name, thread_fn fn, void *arg, struct uspace *as, void *user,
+                                  uint64_t ussp)
 {
+    KASSERT(!ussp || cet_ss);
     void *raw = kmalloc(cpu.fpu_size + 64);          /* zeroed */
     if (!raw)
         return NULL;
@@ -823,6 +837,8 @@ struct thread *thread_create_user(const char *name, thread_fn fn, void *arg, str
     t->fpu_alloc = raw;
     t->fs_base = 0;
     t->gs_base = 0;
+    t->ussp = ussp;
+    t->ushstk = ussp != 0;
     t->affinity = THREAD_AFFINITY_ALL;
     wake_thread(t, WAIT_OK);
     return t;
@@ -854,6 +870,25 @@ void uthread_set_base(uint32_t which, uint64_t value)
     irq_restore(f);
 }
 
+uint64_t uthread_get_ssp(void)
+{
+    struct thread *t = current_thread();
+    uint64_t f = irq_save();                       /* no switch between the check and the MSR */
+    uint64_t v = t->ushstk ? rdmsr(MSR_PL3_SSP) : 0;
+    irq_restore(f);
+    return v;
+}
+
+void uthread_set_ssp(uint64_t ssp)
+{
+    struct thread *t = current_thread();
+    KASSERT(t->ushstk && ssp && ssp < USER_TOP && !(ssp & 7));
+    uint64_t f = irq_save();
+    t->ussp = ssp;
+    wrmsr(MSR_PL3_SSP, ssp);
+    irq_restore(f);
+}
+
 void uthread_exit(int code)
 {
     struct thread *t = current_thread();
@@ -866,6 +901,7 @@ void uthread_exit(int code)
     void *fpu = t->fpu_alloc;
     t->fpu = NULL;                                 /* no more saves into it */
     t->fpu_alloc = NULL;
+    t->ushstk = false;                             /* never in ring 3 again; its shadow stack goes below */
     irq_restore(f);
     kfree(fpu);
     void *user = t->user;
@@ -1006,7 +1042,8 @@ uint32_t thread_count(void)
 /* Under a hypervisor, waking a halted virtual CPU with an IPI costs tens of microseconds (exits on
  * both sides, host thread wake-up). An idle CPU therefore polls need_resched for a short while
  * before halting, and wakers skip the IPI while it polls. On bare metal the IPI is cheap and
- * polling would only burn power, so the CPU halts at once. */
+ * polling would only burn power, so the CPU goes straight to an idle state (cpupm.c: MWAIT or
+ * an ACPI C-state, where a store to need_resched or an interrupt wakes it). */
 #define IDLE_POLL_US 30
 
 static NORETURN void idle_loop(void)
@@ -1031,8 +1068,7 @@ static NORETURN void idle_loop(void)
             if (__atomic_load_n(&pc->need_resched, __ATOMIC_RELAXED))
                 continue;
         }
-        tlb_lazy_enter();               /* shootdowns stop interrupting this CPU (flushed on wake-up) */
-        cpu_idle();                     /* sti; hlt: atomic, no wake-up is missed */
+        cpupm_idle(pc);                 /* the deepest idle state worth it; returns with IF=1 */
     }
 }
 

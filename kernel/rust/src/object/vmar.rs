@@ -221,6 +221,26 @@ impl Vmar {
         len: u64,
         perms: Rights,
     ) -> KResult<u64> {
+        self.map_with(offset, vmo, vmo_off, len, perms, 0)
+    }
+
+    /// Map all of `vmo` as a CET shadow stack (read-only + dirty pages: only CALL, RET and the
+    /// CPU's shadow-stack instructions write it). Kernel use only (user/thread.rs): the VMO is
+    /// never handed out, and its READ-only permission keeps `process_write_memory` off it.
+    pub fn map_shadow_stack(&self, offset: u64, vmo: KRef<Vmo>) -> KResult<u64> {
+        let len = vmo.size();
+        self.map_with(Some(offset), vmo, 0, len, Rights::READ, ffi::VMM_SHSTK)
+    }
+
+    fn map_with(
+        &self,
+        offset: Option<u64>,
+        vmo: KRef<Vmo>,
+        vmo_off: u64,
+        len: u64,
+        perms: Rights,
+        extra: u32,
+    ) -> KResult<u64> {
         if perms == Rights::NONE || !PERM_MASK.contains(perms) {
             return Err(Status::InvalidArgs);
         }
@@ -252,7 +272,7 @@ impl Vmar {
             (true, false) => ffi::VMM_UC,
             _ => 0,
         };
-        self.aspace.map(start, frames, vmm_flags(perms) | uc)?;
+        self.aspace.map(start, frames, vmm_flags(perms) | uc | extra)?;
         g.entries.insert(
             pos,
             Entry {
@@ -410,6 +430,19 @@ impl Vmar {
             }
         };
         child.lookup(addr) // outside the lock (never nested)
+    }
+
+    /// Length of the mapping containing `addr` (searching child regions too).
+    pub fn mapping_len(&self, addr: u64) -> Option<u64> {
+        let child = {
+            let g = self.inner.lock();
+            let e = g.entries.iter().find(|e| addr >= e.start && addr < e.start + e.len)?;
+            match &e.kind {
+                Kind::Mapping { .. } => return Some(e.len),
+                Kind::Child(c) => c.clone(),
+            }
+        };
+        child.mapping_len(addr) // outside the lock (never nested)
     }
 
     /// Permissions of the mapping containing `addr`, if any (inspection, tests).

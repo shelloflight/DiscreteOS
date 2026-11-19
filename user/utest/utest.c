@@ -6,8 +6,9 @@
  *   smap / smep      ask a test kernel to touch / execute user memory without permission (must panic)
  *   bench            only the benchmarks (the profile test runs them with histograms on)
  *   compat           the D-CMPL proofs (compat.c: W1, L1, start exception, PE fuzzing)
+ *   cet              only the CET shadow-stack checks (cet.c; the Bochs test, which is slow)
  * Child modes (spawned by the modes above): crash <kind>, exit <code>, spin, block, threads,
- * fpu <seed>, quota, fuzzchild <seed> <n>, and the IPC ones ("p10 ...", ipc.c).
+ * fpu <seed>, quota, fuzzchild <seed> <n>, the IPC ones ("p10 ...", ipc.c) and "cet ..." (cet.c).
  *
  * Output lines start with "utest:"; failures print "FAIL" (the test harness looks for it).
  */
@@ -674,6 +675,8 @@ static int child(const char *a)
         return ipc_fuzz_child(parse_u(word(a, 1)), parse_u(word(a, 2)));
     if (!strncmp(a, "p10 ", 4))
         return ipc_child(a + 4);
+    if (!strncmp(a, "cet ", 4))
+        return cet_child(a + 4);
     return 99;
 }
 
@@ -715,6 +718,11 @@ int main(void)
         test_compat();
         return failures ? 1 : 0;
     }
+    if (!strcmp(a, "cet")) {
+        test_shstk();
+        dos_printf("utest: %s (%u failures)\n", failures ? "FAILED" : "PASSED", failures);
+        return failures ? 1 : 0;
+    }
     if (strcmp(a, "all"))
         return child(a);
 
@@ -735,6 +743,7 @@ int main(void)
     test_bases();
     test_sealing();
     test_avx();
+    test_shstk();
     test_attest();
     bench();
     bench_ipc();

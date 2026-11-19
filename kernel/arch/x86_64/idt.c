@@ -4,6 +4,7 @@
 #include "apic.h"
 #include "arch.h"
 #include "compiler.h"
+#include "cpu.h"
 #include "panic.h"
 #include "ktime.h"
 #include "percpu.h"
@@ -137,6 +138,8 @@ void isr_dispatch(struct interrupt_frame *f)
         user_bad_iret_check(f);                   /* IRETQ to a bad user frame: the process dies */
         if (user_copy_fixup_try(f))
             return;                               /* bad user pointer: user_copy returns an error */
+        if (msr_fixup_try(f))
+            return;                               /* missing MSR: msr_read_safe / msr_write_safe fail */
         exception_handler(f);
     }
 

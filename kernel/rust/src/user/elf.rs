@@ -10,6 +10,9 @@
 //! - ET_DYN relocations: only R_X86_64_RELATIVE (and NONE), each target 8 bytes inside a segment;
 //!   no DT_NEEDED, no PLT/REL/RELR relocations, no text relocations.
 //!
+//! PT_GNU_PROPERTY is read for its x86 feature bits (SHSTK: the program runs with a shadow
+//! stack); a malformed note only means no features.
+//!
 //! The parser only reads through `Source`, so it can be fuzzed on plain byte buffers.
 
 const PAGE: u64 = 4096;
@@ -31,6 +34,15 @@ const PT_SHLIB: u32 = 5;
 const PT_TLS: u32 = 7;
 const PT_GNU_STACK: u32 = 0x6474_E551;
 const PT_GNU_RELRO: u32 = 0x6474_E552;
+const PT_GNU_PROPERTY: u32 = 0x6474_E553;
+
+/// x86 feature bits of the GNU property note (GNU_PROPERTY_X86_FEATURE_1_AND): what every object
+/// linked into the image supports (or what the linker was told to force, `-z shstk`).
+const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
+const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xC000_0002;
+pub const FEATURE_1_IBT: u32 = 1;
+pub const FEATURE_1_SHSTK: u32 = 2;
+const MAX_PROPERTY: u64 = 4096;
 
 const DT_NULL: i64 = 0;
 const DT_NEEDED: i64 = 1;
@@ -116,6 +128,8 @@ pub struct Image {
     pub lo: u64, // page-aligned span of all segments
     pub hi: u64,
     pub relro: Option<(u64, u64)>, // page-aligned range made read-only after relocation
+    /// GNU_PROPERTY_X86_FEATURE_1_AND (FEATURE_1_*; 0 without the note or with a bad one).
+    pub x86_features: u32,
     rela: Option<(u64, u64)>,      // (file offset, count)
 }
 
@@ -176,6 +190,7 @@ pub fn parse<S: Source + ?Sized>(src: &S, user_lo: u64, user_hi: u64) -> R<Image
         lo: 0,
         hi: 0,
         relro: None,
+        x86_features: 0,
         rela: None,
     };
     let mut dyn_seg: Option<(u64, u64)> = None;
@@ -241,7 +256,8 @@ pub fn parse<S: Source + ?Sized>(src: &S, user_lo: u64, user_hi: u64) -> R<Image
                 let end = vaddr.checked_add(memsz).ok_or(ElfError::Malformed("PT_GNU_RELRO overflow"))?;
                 img.relro = Some((vaddr, end));
             }
-            _ => {} // PT_NULL, PT_NOTE, PT_PHDR, PT_GNU_EH_FRAME, PT_GNU_PROPERTY, ...
+            PT_GNU_PROPERTY => img.x86_features = x86_features(src, offset, filesz),
+            _ => {} // PT_NULL, PT_NOTE, PT_PHDR, PT_GNU_EH_FRAME, ...
         }
     }
     if img.nseg == 0 {
@@ -272,6 +288,43 @@ pub fn parse<S: Source + ?Sized>(src: &S, user_lo: u64, user_hi: u64) -> R<Image
         img.rela = parse_dynamic(src, &img, off, len)?;
     }
     Ok(img)
+}
+
+/// The x86 feature bits of a PT_GNU_PROPERTY segment (`.note.gnu.property`): notes of type
+/// NT_GNU_PROPERTY_TYPE_0 named "GNU", each a list of (type, size, data) properties padded to
+/// 8 bytes. Anything malformed counts as no features (shadow stacks stay off: fail closed).
+fn x86_features<S: Source + ?Sized>(src: &S, off: u64, len: u64) -> u32 {
+    if len > MAX_PROPERTY || off.checked_add(len).is_none_or(|e| e > src.size()) {
+        return 0;
+    }
+    let mut b = [0u8; MAX_PROPERTY as usize];
+    let b = &mut b[..len as usize];
+    if !src.read(off, b) {
+        return 0;
+    }
+    let mut at = 0usize;
+    while at + 12 <= b.len() {
+        let (namesz, descsz, ty) = (u32_at(b, at) as usize, u32_at(b, at + 4) as usize, u32_at(b, at + 8));
+        let name = at + 12;
+        let desc = name + namesz.next_multiple_of(4); // u32 sizes: no overflow in a usize
+        let Some(end) = desc.checked_add(descsz).filter(|&e| e <= b.len()) else { return 0 };
+        if ty == NT_GNU_PROPERTY_TYPE_0 && namesz == 4 && b.get(name..name + 4) == Some(b"GNU\0") {
+            let mut p = desc;
+            while p + 8 <= end {
+                let (pt, sz) = (u32_at(b, p), u32_at(b, p + 4) as usize);
+                let data = p + 8;
+                if data + sz > end {
+                    return 0;
+                }
+                if pt == GNU_PROPERTY_X86_FEATURE_1_AND {
+                    return if sz == 4 { u32_at(b, data) } else { 0 };
+                }
+                p = data + sz.next_multiple_of(8);
+            }
+        }
+        at = end.next_multiple_of(8);
+    }
+    0
 }
 
 /// File offset of [vaddr, vaddr+len) if it lies in the file part of one segment.

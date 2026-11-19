@@ -733,6 +733,7 @@ fn load(fadt: &[u8]) -> Interpreter<Kernel> {
 extern "C" fn worker() {
     let Some(fadt) = table(b"FACP", 0) else {
         kprintln!("ACPI: no FADT; AML not loaded");
+        super::cpupm::configure_without_acpi();
         READY.signal();
         idle();
     };
@@ -764,6 +765,7 @@ extern "C" fn worker() {
         Some((a, b)) => unsafe { ffi::power_set_s5(a, b) },
         None => kprintln!("ACPI: no \\_S5 in the namespace"),
     }
+    super::cpupm::configure(&mut aml); // idle states and performance control (every CPU)
 
     let flags = rd::<4>(fadt, F_FLAGS) as u32;
     let buttons: Vec<String> = aml.find_devices(&["PNP0C0C"]).into_iter().map(|n| aml.path(n)).collect();

@@ -42,6 +42,8 @@ pub struct Process {
     /// Syscall personality `FORWARD` (fixed before the first thread starts): every syscall of the
     /// process goes to its supervisor as an exception instead of being run by the kernel.
     forward: AtomicBool,
+    /// Every thread gets a CET shadow stack (fixed before the first thread starts; user/thread.rs).
+    shstk: AtomicBool,
     /// The kernel's end of the exception channel (the supervisor holds the other end).
     exc: SpinLock<Option<KRef<ChannelObj>>>,
 }
@@ -138,6 +140,7 @@ impl Process {
             exit_code: AtomicI32::new(0),
             term_pending: AtomicU32::new(0),
             forward: AtomicBool::new(false),
+            shstk: AtomicBool::new(false),
             exc: SpinLock::new(c"process.exc", rank::OBJECT, None),
         })
         .map_err(|_| Status::NoMemory)
@@ -150,6 +153,15 @@ impl Process {
 
     pub fn forwards_syscalls(&self) -> bool {
         self.forward.load(Ordering::Acquire)
+    }
+
+    /// Shadow stacks for every thread: set by the loader before the first thread runs, never cleared.
+    pub(crate) fn set_shadow_stacks(&self) {
+        self.shstk.store(true, Ordering::Release);
+    }
+
+    pub fn shadow_stacks(&self) -> bool {
+        self.shstk.load(Ordering::Acquire)
     }
 
     /// Create the exception channel; returns the supervisor's end. `BadState` if the process

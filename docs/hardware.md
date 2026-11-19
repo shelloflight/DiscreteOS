@@ -46,6 +46,7 @@ Management and create a new one.
 | `Speculation: ...` | mitigations chosen for this CPU ([hardening.md](hardening.md)) |
 | `CET: supervisor shadow stacks on ...` | CET shadow stacks in use; `off: ...` says why not ([hardening.md](hardening.md#cet)) |
 | `SMP: N CPUs online` | every hardware thread started |
+| `Idle: C1 MWAIT ...` (then the `_CST` states), `Performance: ...` | idle states and CPU speed control in use; kdb's `power` shows each CPU's idle-state counts ([power.md](power.md)) |
 | `IOMMU: ...` | Intel VT-d or AMD-Vi driven: `DMA remapping on for every device`; the AMD-Vi unit's own PCI function is listed as kept by the kernel |
 | `TPM: ...` | whether the firmware TPM was found and answered |
 | `devmgr: disks are read-only`, `storaged: volume '...': ... read-only` | safety mode active |

@@ -96,6 +96,8 @@ struct thread {
     uint8_t           *fpu;            /* FPU state (XSAVE or FXSAVE area, 64-aligned), saved/restored on switches */
     void              *fpu_alloc;      /* the allocation behind `fpu` */
     uint64_t           fs_base, gs_base;   /* user segment bases, saved/restored on switches */
+    uint64_t           ussp;           /* user shadow stack: its SSP while switched out (IA32_PL3_SSP) */
+    bool               ushstk;         /* runs ring 3 with a shadow stack (IA32_U_CET.SH_STK_EN) */
     uint32_t           kill;           /* exit at the next return to user mode (atomic) */
     spinlock_t         intr_lock;      /* protects intr_wq (thread_interrupt) */
     struct waitq      *intr_wq;        /* wait queue of an interruptible wait in progress */
@@ -172,8 +174,10 @@ void           kstack_test_near_end(void);           /* see vm_test_near_end (mm
 
 struct uspace;
 struct waitq;
-/* Like thread_create, with the address space and the Rust state set before it first runs. */
-struct thread *thread_create_user(const char *name, thread_fn fn, void *arg, struct uspace *as, void *user);
+/* Like thread_create, with the address space and the Rust state set before it first runs. ussp:
+ * the top of its user shadow stack (0: none; only when cet_ss). */
+struct thread *thread_create_user(const char *name, thread_fn fn, void *arg, struct uspace *as, void *user,
+                                  uint64_t ussp);
 NORETURN void  user_enter(uint64_t rip, uint64_t rsp, uint64_t arg0, uint64_t arg1);   /* syscall.asm */
 struct interrupt_frame;
 NORETURN void  user_enter_frame(const struct interrupt_frame *f);   /* syscall.asm: every register from f */
@@ -190,6 +194,10 @@ bool           thread_kill_pending(void);    /* current thread was killed (user 
 /* The current user thread's FS (which = 0) or GS (1) base; set takes a canonical user address. */
 uint64_t       uthread_get_base(uint32_t which);
 void           uthread_set_base(uint32_t which, uint64_t value);
+/* The current user thread's shadow-stack pointer in ring 3 (0: it has none). set takes an SSP the
+ * kernel saved itself (when it delivered an exception), never one from user space. */
+uint64_t       uthread_get_ssp(void);
+void           uthread_set_ssp(uint64_t ssp);
 
 /* Name of the thread whose stack guard page contains `va`, or NULL (fault reports). */
 const char *thread_guard_name(uint64_t va);

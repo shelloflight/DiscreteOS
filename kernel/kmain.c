@@ -13,6 +13,7 @@
 #include "cet.h"
 #include "console.h"
 #include "cpu.h"
+#include "cpupm.h"
 #include "fbcon.h"
 #include "kasan.h"
 #include "kdb.h"
@@ -302,6 +303,7 @@ void kmain(BootInfo *bi_phys)
     pic_disable();
     tsc_init();
     time_init();
+    cpupm_init();                       /* idle method: MWAIT C1 on bare metal, else HLT */
     acpi_init();
     power_init();
     lapic_init();

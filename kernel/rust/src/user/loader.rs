@@ -7,6 +7,8 @@
 //!   base with their RELATIVE relocations applied before anything is mapped; code mapped R-X
 //!   (its VMO is the only kind marked executable), data RW-, the RELRO part read-only;
 //! - a stack (`STACK_SIZE`, RW, never executable) with an unmapped guard page on each side;
+//! - with CET, for an image that asks for it (ELF property SHSTK): a shadow stack per thread
+//!   (user/thread.rs);
 //! - the startup block at the top of the stack (`Startup`, docs/abi.md): ABI version, the
 //!   arguments and the startup handles (own process, own thread, root VMAR, then the ones the
 //!   spawner passed, each with its tag). RDI points at it.
@@ -138,6 +140,15 @@ pub fn spawn(req: Spawn<'_>) -> Result<(KRef<Process>, Option<KRef<ChannelObj>>)
     };
     if req.forward {
         child.set_forward();
+    }
+    // Shadow stacks when the image asks for them (`-z shstk`) and the CPU has them. Not for a
+    // process whose supervisor runs a foreign personality (FORWARD, or a START stop that sets
+    // the first registers): those programs move between frames in ways the kernel cannot
+    // follow on a shadow stack.
+    // SAFETY: plain read of a flag set once at boot.
+    let cet = unsafe { crate::ffi::cet_ss };
+    if cet && img.x86_features & elf::FEATURE_1_SHSTK != 0 && !req.forward && !req.start_exception {
+        child.set_shadow_stacks();
     }
     match load(&child, &img, &src, req.args, req.handles, req.start_exception) {
         Ok(()) => Ok((child, exc)),

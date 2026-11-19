@@ -15,6 +15,7 @@
 pub mod acpi;
 #[cfg(ktest_fuzz)]
 pub mod acpi_fuzz;
+pub mod cpupm;
 pub mod iommu;
 pub mod irq;
 pub mod pci;

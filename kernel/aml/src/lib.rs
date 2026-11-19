@@ -28,6 +28,7 @@ mod field;
 mod interp;
 pub mod namespace;
 pub mod object;
+pub mod processor;
 
 pub use interp::{Interpreter, Stats};
 pub use namespace::{NodeId, ROOT};

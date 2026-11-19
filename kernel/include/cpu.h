@@ -44,6 +44,13 @@ static inline void wrmsr(uint32_t msr, uint64_t v)
     __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)) : "memory");
 }
 
+/* RDMSR/WRMSR that return false instead of faulting when the CPU has no such MSR or refuses the
+ * value (msr.asm): for MSRs named by firmware tables. */
+bool msr_read_safe(uint32_t msr, uint64_t *value);
+bool msr_write_safe(uint32_t msr, uint64_t value);
+struct interrupt_frame;
+bool msr_fixup_try(struct interrupt_frame *f);   /* #GP on one of them: resume with the error */
+
 #define MSR_APIC_BASE 0x1B
 #define MSR_EFER      0xC0000080
 #define MSR_PAT       0x277
@@ -99,6 +106,14 @@ struct cpu_info {
     bool     nx, smep, smap, umip;
     bool     cet_ss, cet_ibt;     /* CET shadow stacks / indirect branch tracking supported (use: cet.c) */
     bool     pat;                    /* PAT: entry 1 is write-combining (cpu_init_pat), VMM_WC */
+    /* power management (cpupm.c) */
+    bool     monitor;                /* MONITOR/MWAIT */
+    bool     mwait_irq;              /* MWAIT ends on an interrupt even with IF=0 (CPUID 5, ECX[1]) */
+    uint32_t mwait_substates;        /* CPUID 5 EDX: sub-states per MWAIT C-state, 4 bits each */
+    bool     arat;                   /* the APIC timer runs in every C-state (CPUID 6, EAX[2]) */
+    bool     hwp, hwp_epp;           /* Intel HWP (hardware P-states), with energy-performance preference */
+    bool     amd_cppc;               /* AMD CPPC through MSRs (CPUID 0x80000008, EBX[27]) */
+    uint32_t family;                 /* display family (base + extended) */
     bool     xsave;                  /* XSAVE enabled (CR4.OSXSAVE, XCR0 = xcr0) */
     uint64_t xcr0;                   /* state components saved for user threads */
     uint32_t fpu_size;               /* bytes of FPU state per user thread (XSAVE or FXSAVE area) */
