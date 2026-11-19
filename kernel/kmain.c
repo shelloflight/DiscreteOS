@@ -10,6 +10,7 @@
 #include "apic.h"
 #include "arch.h"
 #include "bootinfo.h"
+#include "cet.h"
 #include "console.h"
 #include "cpu.h"
 #include "fbcon.h"
@@ -22,6 +23,7 @@
 #include "thread.h"
 #include "ktest.h"
 #include "panic.h"
+#include "percpu.h"
 #include "printf.h"
 #include "rust.h"
 #include "smp.h"
@@ -198,9 +200,9 @@ static void boot_summary(void)
     const struct kernel_layout *l = &kernel_layout;
     kprintf("Summary: %s, %u CPU%s online, %llu MiB RAM\n", cpu.brand[0] ? cpu.brand : cpu.vendor, smp_cpus(),
             smp_cpus() == 1 ? "" : "s", (unsigned long long)(pmm_total_frames() * PAGE_SIZE >> 20));
-    kprintf("Summary: NX %s, SMEP %s, SMAP %s, UMIP %s; CET shadow stacks %s, IBT %s (not enabled yet)\n",
+    kprintf("Summary: NX %s, SMEP %s, SMAP %s, UMIP %s; CET shadow stacks %s, IBT %s\n",
             cpu.nx ? "on" : "off", cpu.smep ? "on" : "off", cpu.smap ? "on" : "off", cpu.umip ? "on" : "off",
-            cpu.cet_ss ? "supported" : "absent", cpu.cet_ibt ? "supported" : "absent");
+            cet_ss ? "on" : cpu.cet_ss ? "off" : "absent", cpu.cet_ibt ? "off" : "absent");
     kprintf("Summary: KASLR image %llu bits, direct map %llu, heap %llu, stacks %llu (sources %s%s%s%s)\n",
             (unsigned long long)l->image_bits, (unsigned long long)l->physmap_bits, (unsigned long long)l->heap_bits,
             (unsigned long long)l->kstack_bits, (l->sources & KASLR_SRC_RDSEED) ? "RDSEED " : "",
@@ -311,8 +313,16 @@ void kmain(BootInfo *bi_phys)
     kprintf("Interrupts enabled, timer OK (tickless, %s)\n", timer_mode());
     kprintf("Time: monotonic clock (TSC, ns since kernel entry), timer callbacks at their exact deadline\n");
 
-    /* Threads: from here on kmain is a thread like any other */
+    /* Threads: from here on kmain is a thread like any other. With CET shadow stacks, every thread
+     * is made with one and this CPU switches them on before the first switch (interrupts off until
+     * then); kmain never returns, so the frames made before need none. */
+    cet_init();
+    cpu_cli();
     sched_init();
+    if (cet_ss)
+        cet_cpu_enable(&bsp_percpu, current_thread());
+    cpu_sti();
+    cet_print();
     sched_print();
 
     /* Every other CPU core: started now, scheduled from here on */

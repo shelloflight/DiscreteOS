@@ -5,6 +5,8 @@
  *   KTEST_STACKPROT - a stack buffer overflow must be caught by the stack protector
  *   KTEST_PAGEFAULT - an unmapped access must give a decoded #PF report
  *   KTEST_DOUBLEFAULT - a kernel stack overflow must be reported via the #DF IST stack
+ *   KTEST_CET       - with CET shadow stacks on (Bochs), an overwritten return address must end
+ *                     in #CP, not at the planted address
  *   KTEST_NX        - executing kernel data must fault (NX)
  *   KTEST_WX        - writing kernel code must fault (W^X)
  *   KTEST_KASLR     - the image runs relocated at its random base; the region bases are in their
@@ -707,6 +709,36 @@ void ktest_run(void)
     kprintf("KTEST doublefault: switching to an unmapped stack\n");
     __asm__ volatile("movq %0, %%rsp\n\tpushq %%rax" : : "r"(0x6000000000ull) : "memory");
     kprintf("KTEST doublefault: FAILED (no fault)\n");
+}
+
+#elif defined(KTEST_CET)
+
+#include "cet.h"
+
+static void cet_landing(void)
+{
+    kprintf("KTEST cet: FAILED (the overwritten return address was used)\n");
+    for (;;)
+        __asm__ volatile("cli; hlt");
+}
+
+/* The CALL puts the return address on both stacks; the stub overwrites the normal stack's copy,
+ * as a stack buffer overflow would, and returns: the shadow stack disagrees, so #CP. */
+void ktest_run(void)
+{
+    if (!cet_ss) {
+        kprintf("KTEST cet: FAILED (shadow stacks are off on this CPU)\n");
+        return;
+    }
+    kprintf("KTEST cet: shadow stacks on; overwriting a return address\n");
+    __asm__ volatile("call 1f\n\t"
+                     "jmp 2f\n"
+                     "1:\n\t"
+                     "movq %0, (%%rsp)\n\t"
+                     "ret\n"
+                     "2:\n"
+                     : : "r"(cet_landing) : "memory");
+    kprintf("KTEST cet: FAILED (no fault)\n");
 }
 
 #elif defined(KTEST_NX)

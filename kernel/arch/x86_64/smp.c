@@ -12,6 +12,7 @@
 #include "acpi.h"
 #include "apic.h"
 #include "arch.h"
+#include "cet.h"
 #include "cpu.h"
 #include "mm.h"
 #include "panic.h"
@@ -334,6 +335,8 @@ void ap_main(struct percpu *pc)
         ist[i] = pc->tss.ist[i];
     gdt_init_cpu(pc, ist);
     idt_load();
+    if (cet_ss)
+        cet_cpu_enable(pc, pc->idle);                      /* ap_main never returns (cet.h) */
     lapic_init_ap();
     timer_init_ap();
     bool tsc_behind = rdtsc() < start_tsc;
@@ -369,6 +372,8 @@ static struct percpu *ap_alloc(uint32_t apic_id)
             return NULL;
     }
     kpti_map_cpu(pc, pc->tss.ist, KSTACK_SIZE);   /* KPTI: what this CPU's entries need */
+    if (cet_ss && !cet_cpu_alloc(pc))
+        return NULL;
     pc->idle = sched_alloc_idle(pc->cpu_id);
     return pc->idle ? pc : NULL;
 }

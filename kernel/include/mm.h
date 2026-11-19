@@ -98,6 +98,8 @@ bool     pmm_range_is_ram(uint64_t pa, uint64_t len);
 #define VMM_X   (1u << 1)   /* executable (never together with VMM_W: W^X) */
 #define VMM_UC  (1u << 2)   /* uncached (MMIO) */
 #define VMM_WC  (1u << 3)   /* write-combining (framebuffers); uncached without PAT */
+#define VMM_SHSTK (1u << 4) /* CET shadow stack: read-only + dirty (only CALL, RET and the CPU's
+                             * shadow-stack instructions write it); never with VMM_W or VMM_X */
 
 #define VMM_NOT_MAPPED (~0ull)
 

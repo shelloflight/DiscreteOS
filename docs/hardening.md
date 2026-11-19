@@ -37,9 +37,26 @@ Static PIE with a packed RELR table; `-z text` (no relocation in code); `.rela.d
 
 ## CET
 
-Detected and reported, not enabled yet. IBT needs Rust built with `-Zcf-protection`; supervisor
-shadow stacks need testing on a CET-capable CPU (QEMU TCG does not implement CET). Untested CET code
-would only break boot on the machines that have it.
+**Supervisor shadow stacks** (`kernel/arch/x86_64/cet.c`) are on when the CPU has them: every kernel
+thread has an 8 KiB shadow stack beside its kernel stack (a guard page between), every CPU one per
+IST stack. CALL stores each return address there as well; a RET that finds a different one on the
+normal stack raises #CP, a kernel panic. A stack buffer overflow can no longer redirect a return.
+
+- Switched with the thread (`context_switch`: RSTORSSP / SAVEPREVSSP). An entry from ring 3 lands on
+  the user thread's shadow stack (IA32_PL0_SSP, written when a user thread is switched in) and marks
+  its token busy; SYSCALL does not switch, so its entry does (SETSSBSY). IRETQ back to ring 3 clears
+  the token; SYSRET does not, so that path clears it (CLRSSBSY).
+- Kernel code never rewrites a return address: the user-copy fault fixup resumes the copy with
+  nothing left to copy instead of jumping elsewhere, so the kernel never needs to write its own
+  shadow stacks (WRSS stays off).
+- Off, and said so at boot, when KPTI is on (entries run on per-CPU stacks) or when Spectre v2 needs
+  retpolines (their thunk rewrites its return address). CPUs with CET have eIBRS or AutoIBRS and
+  need neither.
+- Tests: QEMU's TCG has no CET, so `cet` and `cet-cp` run in Bochs (Tiger Lake model, one CPU): the
+  release image boots to the shell with shadow stacks on, and an overwritten return address ends in
+  #CP. Skipped when Bochs is not installed.
+
+Not yet: user-mode shadow stacks (ring 3) and kernel IBT (needs Rust's `-Zcf-protection`, unstable).
 
 ## Speculative-execution mitigations
 

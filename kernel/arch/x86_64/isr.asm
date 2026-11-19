@@ -16,6 +16,9 @@
 ; (percpu.cr3), and moves the CPU's frame to the thread's kernel stack. The exit copies the IRETQ
 ; frame back to the entry stack before switching to the user tables (percpu.user_cr3).
 ; MDS/TAA (MIT_VERW): VERW clears CPU buffers right before every return to ring 3.
+; CET shadow stacks (MIT_SHSTK, cet.c): an entry from ring 3 makes the CPU switch to the thread's
+; shadow stack and mark its supervisor token busy; the IRETQ back to ring 3 clears it, since SSP
+; points at that token again by then (user_enter sets it busy first, with SETSSBSY).
 ; =============================================================================
 
 [bits 64]

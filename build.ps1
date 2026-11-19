@@ -66,6 +66,9 @@
       stackprot    stack buffer overflow is caught by the stack protector
       pagefault    unmapped access gives a decoded #PF report with backtrace
       doublefault  kernel stack overflow is reported via the #DF IST stack
+      cet          CET shadow stacks in Bochs (QEMU has no CET): the release image boots to the shell
+                   with them on; cet-cp: an overwritten return address ends in #CP (skipped
+                   when Bochs is not installed)
       nx           executing kernel data faults (NX)
       wx           writing kernel code faults (W^X)
       nullderef    NULL is unmapped
@@ -312,6 +315,14 @@ $TestCases = [ordered]@{
     stackprot   = @{ Define = 'STACKPROT';   Expect = @('KERNEL PANIC', 'stack smashing detected', $Halted);              Forbid = @('FAILED') }
     pagefault   = @{ Define = 'PAGEFAULT';   Expect = @('Page fault (#PF)', 'CR2=0000006000000000', 'not-present page, read, kernel', 'Backtrace', $Halted); Forbid = @('FAILED') }
     doublefault = @{ Define = 'DOUBLEFAULT'; Expect = @('Double fault (#DF)', $Halted);                                    Forbid = @('FAILED') }
+    # CET shadow stacks (kernel/arch/x86_64/cet.c) run only in Bochs (Tiger Lake model): the release
+    # image boots to the shell with them on (thread switches, syscalls, interrupts from ring 3);
+    # KTEST_CET overwrites a return address and must die of #CP.
+    cet         = @{ Define = $null;         Bochs = 'tigerlake'; Timeout = 300
+                     Expect = @('CET: supervisor shadow stacks on', 'CET shadow stacks on, IBT', 'shell: ready')
+                     Forbid = @('KERNEL PANIC', 'user fault', 'exited with code', 'FAIL') }
+    'cet-cp'    = @{ Define = 'CET';         Bochs = 'tigerlake'; Timeout = 240
+                     Expect = @('KTEST cet: shadow stacks on', 'Control protection (#CP)', $Halted); Forbid = @('FAILED') }
     nx          = @{ Define = 'NX';          Expect = @('Page fault (#PF)', 'instruction fetch', 'execute from non-executable memory', $Halted); Forbid = @('FAILED', 'SKIPPED') }
     wx          = @{ Define = 'WX';          Expect = @('Page fault (#PF)', 'protection violation (present), write, kernel', 'write to read-only kernel memory', $Halted); Forbid = @('FAILED') }
     nullderef   = @{ Define = 'NULLDEREF';   Expect = @('Page fault (#PF)', 'CR2=0000000000000000', 'NULL pointer dereference', $Halted); Forbid = @('FAILED') }
@@ -1832,6 +1843,59 @@ function Invoke-QemuCapture([string]$image, [string]$log, [string[]]$Expect, [st
     return [pscustomobject]@{ Log = (Read-Shared $log); Seconds = $sw.Elapsed.TotalSeconds; Exited = $exited }
 }
 
+# Bochs: the only emulator here with CET (QEMU's TCG has none). One CPU (the Windows build has no
+# SMP), BIOS boot, serial to a file; same Expect/Forbid polling as QEMU. Returns $null when Bochs
+# is not installed (winget install Bochs.Bochs): such cases are skipped, not failed.
+function Find-Bochs {
+    $cmd = Get-Command 'bochs' -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $dirs = @(Get-ChildItem "$env:ProgramFiles\Bochs-*" -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    foreach ($d in $dirs) { $p = Join-Path $d.FullName 'bochs.exe'; if (Test-Path $p) { return $p } }
+    return $null
+}
+
+function Invoke-BochsCapture([string]$image, [string]$log, [string[]]$Expect, [string[]]$Forbid, [int]$Timeout, [string]$CpuModel) {
+    $bochs = Find-Bochs
+    if (-not $bochs) { return $null }
+    $dir = Split-Path $log -Parent
+    $disk = Join-Path $dir 'bochs-disk.img'
+    Copy-Item $image $disk -Force                      # Bochs locks its disk; never the shared image
+    Remove-Item "$disk.lock" -ErrorAction SilentlyContinue
+    if (Test-Path $log) { Remove-Item $log }
+    $home_ = Split-Path $bochs -Parent
+    $rc = Join-Path $dir 'bochsrc.txt'
+    @(
+        'megs: 512',
+        "cpu: model=$CpuModel, count=1, ips=200000000",
+        "romimage: file=`"$(Join-Path $home_ 'BIOS-bochs-latest')`"",
+        "vgaromimage: file=`"$(Join-Path $home_ 'VGABIOS-lgpl-latest.bin')`"",
+        "ata0-master: type=disk, path=`"$disk`", mode=flat",
+        'boot: disk',
+        "com1: enabled=1, mode=file, dev=`"$log`"",
+        'display_library: nogui',
+        "log: `"$(Join-Path $dir 'bochs.log')`"",
+        'panic: action=fatal', 'error: action=report', 'info: action=ignore',
+        'clock: sync=none, time0=local'
+    ) | Set-Content -Encoding ascii $rc
+    $proc = Start-Process -FilePath $bochs -ArgumentList @('-q', '-f', "`"$rc`"") -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput (Join-Path $dir 'bochs-out.txt') -RedirectStandardError (Join-Path $dir 'bochs-err.txt')
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while (-not $proc.HasExited -and $sw.Elapsed.TotalSeconds -lt $Timeout) {
+            Start-Sleep -Milliseconds 500
+            $out = Read-Shared $log
+            $done = @($Expect | Where-Object { -not $out.Contains($_) }).Count -eq 0
+            $bad  = @($Forbid | Where-Object { $out.Contains($_) }).Count -gt 0
+            if ($done -or $bad) { Start-Sleep -Milliseconds 500; break }
+        }
+    } finally {
+        if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+        $proc.WaitForExit()
+        Remove-Item "$disk.lock" -ErrorAction SilentlyContinue
+    }
+    return [pscustomobject]@{ Log = (Read-Shared $log); Seconds = $sw.Elapsed.TotalSeconds; Exited = $true }
+}
+
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
@@ -1956,8 +2020,19 @@ function Invoke-Test {
             Copy-Item $usb (Join-Path $diskDir 'usb.pristine')
             $extra += @('-drive', "if=none,id=usb1,format=raw,file=$usb", '-device', "usb-storage,bus=xhci.0,drive=usb1$($tc.UsbDisk)")
         }
-        $r = Invoke-QemuCapture $image (Join-Path $outDir "serial-$n.log") $tc.Expect $tc.Forbid $limit $keys $after $cpus $model `
-            -Devices:$devs -Serial $ser -SerialAfter $serAfter -DiskDir $diskDir -Uefi:$uefi -Extra $extra -MustExit:$mustExit -IommuKind $iommuKind
+        if ($tc.Contains('Bochs')) {
+            $bdir = Join-Path $Build "bochs\$n"
+            New-Item -ItemType Directory -Force $bdir | Out-Null
+            $r = Invoke-BochsCapture $image (Join-Path $bdir "serial-$n.log") $tc.Expect $tc.Forbid $limit $tc.Bochs
+            if (-not $r) {
+                Write-Host "--- [$n] skipped: Bochs is not installed (winget install Bochs.Bochs) ---" -ForegroundColor Yellow
+                $results += [pscustomobject]@{ Case = $n; Result = 'SKIP'; Seconds = 0 }
+                continue
+            }
+        } else {
+            $r = Invoke-QemuCapture $image (Join-Path $outDir "serial-$n.log") $tc.Expect $tc.Forbid $limit $keys $after $cpus $model `
+                -Devices:$devs -Serial $ser -SerialAfter $serAfter -DiskDir $diskDir -Uefi:$uefi -Extra $extra -MustExit:$mustExit -IommuKind $iommuKind
+        }
         $missing = @($tc.Expect | Where-Object { -not $r.Log.Contains($_) })
         $found   = @($tc.Forbid | Where-Object { $r.Log.Contains($_) })
         $ok = ($missing.Count -eq 0) -and ($found.Count -eq 0)
@@ -1979,10 +2054,12 @@ function Invoke-Test {
 
     Write-Host ''
     foreach ($r in $results) {
-        Write-Host ("  {0,-13} {1}  ({2}s)" -f $r.Case, $r.Result, $r.Seconds) -ForegroundColor $(if ($r.Result -eq 'PASS') { 'Green' } else { 'Red' })
+        Write-Host ("  {0,-13} {1}  ({2}s)" -f $r.Case, $r.Result, $r.Seconds) -ForegroundColor $(switch ($r.Result) { 'PASS' { 'Green' } 'SKIP' { 'Yellow' } default { 'Red' } })
     }
     $failed = @($results | Where-Object Result -eq 'FAIL')
-    $verdict = if ($failed.Count) { "TEST FAILED ($($failed.Count) of $($results.Count))" } else { "TEST PASSED ($($results.Count) cases)" }
+    $skipped = @($results | Where-Object Result -eq 'SKIP').Count
+    $skipNote = if ($skipped) { ", $skipped skipped" } else { '' }
+    $verdict = if ($failed.Count) { "TEST FAILED ($($failed.Count) of $($results.Count))" } else { "TEST PASSED ($($results.Count) cases$skipNote)" }
     Write-TestReport $results $verdict -Partial:([bool]$Case)
     if ($failed.Count) {
         Write-Host $verdict -ForegroundColor Red

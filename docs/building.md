@@ -15,9 +15,10 @@ Everything goes through one script, `build.ps1`, on Windows x64.
 | Windows 10/11 SDK | W2, the static C runtime test program (headers, the static UCRT, `kernel32.lib`) | `Windows Kits\10` under Program Files (x86); `DOS_WINSDK` overrides |
 | MinGW gcc (optional) | host check of the loaders' C crypto | skipped with a note if missing |
 | 7-Zip (optional) | host check that a FAT32 volume written by D-OS reads correctly | skipped if missing |
+| Bochs (optional) | the CET test cases (QEMU's TCG has no CET) | `C:\Program Files\Bochs-*` or `PATH`; skipped if missing |
 
 Most of these install with `winget`: `LLVM.LLVM`, `NASM.NASM`, `SoftwareFreedomConservancy.QEMU`,
-`Rustlang.Rustup`, `7zip.7zip`.
+`Rustlang.Rustup`, `7zip.7zip`, `Bochs.Bochs`.
 
 The first build creates a development signing key in `build\keys\` (never committed). Every
 checkout trusts only its own key; `DOS_SIGNING_KEY` points at another key file.
@@ -66,7 +67,7 @@ Main groups:
 | Group | Cases |
 |---|---|
 | Boot | `boot`, `boot-amd`, `uefi`, `uefi-uniproc`, `uniproc`, `bios-badsig`, `uefi-badsig`, `manydevices` |
-| Protections fire | `stackprot`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `kaslr`, ... |
+| Protections fire | `stackprot`, `cet`, `cet-cp`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `kaslr`, ... |
 | Kernel | `selftest`, `sched`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
 | User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `services`, `shell`, `time`, `time-uefi`, `attest`, `attest-tpm`, `poweroff`, `reboot` |

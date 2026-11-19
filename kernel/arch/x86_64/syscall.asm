@@ -13,8 +13,8 @@
 ;   user_enter_frame first entry with every register from a frame (after a START exception).
 ;   user_copy       copy_from_user / copy_to_user: the only code that touches user memory, with
 ;                   SMAP opened (STAC) just for the copy. A page fault inside it is fixed up by the
-;                   exception handler (user_copy_fault -> user_copy_fixup), so a bad user pointer
-;                   is an error code, never a kernel crash.
+;                   exception handler (user_copy_fixup_try), so a bad user pointer is an error
+;                   code, never a kernel crash.
 ;
 ; GS: in the kernel GS_BASE is the per-CPU block; in user mode it is 0 and KERNEL_GS_BASE holds
 ; the per-CPU block. SWAPGS on every entry from and exit to ring 3.
@@ -23,6 +23,11 @@
 ; before touching the kernel stack; SYSRET switches back to the user's last (after the final
 ; kernel memory access) and clears CPU buffers. The entry and exit code is in .entry.text, the
 ; only kernel code mapped in the user page tables.
+;
+; CET shadow stacks (MIT_SHSTK, cet.c): SYSCALL does not switch shadow stacks; the entry does
+; (SETSSBSY: the thread's token from IA32_PL0_SSP, marked busy), before anything is called. SYSRET
+; leaves the token busy, so the return clears it (CLRSSBSY); the IRETQ returns clear it
+; themselves. user_enter marks it busy too, so every IRETQ to ring 3 finds SSP on a busy token.
 ; =============================================================================
 
 [bits 64]
@@ -32,8 +37,10 @@
 %define PC_MITIG     60          ; offsetof(struct percpu, mitig)
 %define PC_CR3       80          ; offsetof(struct percpu, cr3)
 %define PC_USER_CR3  96          ; offsetof(struct percpu, user_cr3)
+%define PC_SS_TOKEN  112         ; offsetof(struct percpu, ss_token)
 %define MIT_KPTI     1           ; spec.h
 %define MIT_VERW     2
+%define MIT_SHSTK    16
 %define UCODE        0x23        ; GDT_UCODE | 3
 %define UDATA        0x1B        ; GDT_UDATA | 3
 %define USER_TOP     0x00007FFFFFFF0000
@@ -57,6 +64,10 @@ global syscall_entry
 syscall_entry:
     swapgs
     mov [gs:PC_USER_RSP], rsp
+    test byte [gs:PC_MITIG], MIT_SHSTK  ; flags are free: SYSCALL saved them in R11
+    jz .shstk_done
+    setssbsy
+.shstk_done:
     test byte [gs:PC_MITIG], MIT_KPTI
     jz .kernel_tables
     mov rsp, [gs:PC_CR3]            ; RSP is free here: the kernel's page tables
@@ -118,6 +129,11 @@ syscall_return:
     mov rsi, [rsp + 80]
     mov rdx, [rsp + 88]
     mov rbx, [rsp + 104]
+    test byte [gs:PC_MITIG], MIT_SHSTK
+    jz .shstk_done
+    mov rax, [gs:PC_SS_TOKEN]
+    clrssbsy [rax]                  ; token free for the next entry; SSP = 0 until SYSRET
+.shstk_done:
     mov rax, [rsp + F_RSP]
     mov [gs:PC_USER_RSP], rax
     mov rax, [rsp + F_RAX]
@@ -166,6 +182,10 @@ syscall_restore:
 global user_enter
 user_enter:
     cli
+    test byte [gs:PC_MITIG], MIT_SHSTK
+    jz .shstk_done
+    setssbsy                        ; SSP -> this thread's token (busy), as after an entry
+.shstk_done:
     push qword UDATA                ; ss
     push rsi                        ; rsp
     push qword 0x202                ; rflags: IF
@@ -194,6 +214,10 @@ user_enter:
 global user_enter_frame
 user_enter_frame:
     cli
+    test byte [gs:PC_MITIG], MIT_SHSTK
+    jz .shstk_done
+    setssbsy
+.shstk_done:
     mov rsp, rdi
     jmp syscall_restore
 
@@ -202,17 +226,20 @@ section .text
 ; uint64_t user_copy(void *dst, const void *src, uint64_t n)
 ; Returns the number of bytes NOT copied (0 = success). The caller has checked that the user side
 ; of the range lies below USER_TOP. STAC/CLAC are NOPed at boot on CPUs without SMAP (user.c).
-global user_copy, user_copy_fault, user_copy_fixup
+; A fault in the copy moves the bytes left from RCX to R8 and resumes the same instruction with
+; RCX = 0, which then copies nothing. The return address stays the one the CPU saved, as CET
+; shadow stacks require (IRETQ compares it with the shadow stack's copy).
+global user_copy, user_copy_fault
 user_copy:
     mov rcx, rdx
+    xor r8d, r8d                    ; bytes left after a fault
 user_copy_stac:
     stac
 user_copy_fault:                    ; the only instruction that may fault on a user address
     rep movsb
-user_copy_fixup:                    ; a fault above resumes here with RCX = bytes left
 user_copy_clac:
     clac
-    mov rax, rcx
+    lea rax, [rcx + r8]
     ret
 
 ; Addresses of every STAC/CLAC (patched to NOPs when the CPU has no SMAP).

@@ -48,6 +48,8 @@ struct percpu {
     uint64_t        entry_top;       /* 88: top of this CPU's entry stack (KPTI: TSS.RSP0) */
     uint64_t        user_cr3;        /* 96: KPTI: the user page tables of `uspace` (exit to ring 3) */
     uint64_t        entry_cr3;       /* 104: KPTI: CR3 found on the last interrupt from ring 3 (tests) */
+    uint64_t        ss_token;        /* 112: shadow stacks: the running user thread's supervisor
+                                      * shadow-stack token (IA32_PL0_SSP), cleared on exit to ring 3 */
     uint64_t        last_uid;        /* id of the user address space that ran last here (IBPB) */
     struct uspace  *uspace;          /* user address space loaded (NULL: the kernel's) */
     struct runqueue rq;
@@ -70,6 +72,8 @@ struct percpu {
     uint64_t        gdt[GDT_ENTRIES] __attribute__((aligned(16)));
     struct tss      tss __attribute__((aligned(16)));
     uint64_t        ist_guard[IST_COUNT];   /* guard page below each IST stack (APs) */
+    uint64_t        ssp_table[8] __attribute__((aligned(8)));   /* shadow stacks: IA32_INTERRUPT_SSP_TABLE
+                                      * (entry n = the token of IST n's shadow stack; 0 unused) */
 
     /* lock-order checking, test builds (spinlock.c) */
     const struct spinlock *held[LOCKDEP_DEPTH];
@@ -94,6 +98,7 @@ _Static_assert(offsetof(struct percpu, entry_top) == 88, "PC_ENTRY_TOP in isr.as
 _Static_assert(offsetof(struct percpu, cr3) == 80, "PC_CR3 in isr.asm / syscall.asm");
 _Static_assert(offsetof(struct percpu, user_cr3) == 96, "PC_USER_CR3 in isr.asm / syscall.asm");
 _Static_assert(offsetof(struct percpu, entry_cr3) == 104, "PC_ENTRY_CR3 in isr.asm");
+_Static_assert(offsetof(struct percpu, ss_token) == 112, "PC_SS_TOKEN in isr.asm / syscall.asm");
 /* The rest of the page is this CPU's entry stack (KPTI: TSS.RSP0, mapped in the user page tables):
  * at least 1 KiB for an interrupt frame and the frame of a fault on the IRETQ back to ring 3. */
 #define PERCPU_ENTRY_STACK_MIN 1024

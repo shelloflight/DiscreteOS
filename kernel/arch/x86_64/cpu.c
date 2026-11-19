@@ -192,10 +192,9 @@ void cpu_print_info(void)
     kprintf("CPU: %s (%s)\n", cpu.brand[0] ? cpu.brand : "unknown model", cpu.vendor);
     kprintf("Protections: WP on, NX %s, SMEP %s, SMAP %s, UMIP %s\n",
             onoff(cpu.nx), onoff(cpu.smep), onoff(cpu.smap), onoff(cpu.umip));
-    /* CET is not switched on yet: kernel IBT needs every indirect-branch target marked, which the
-     * pinned stable Rust cannot do (-Zcf-protection), and supervisor shadow stacks need hardware
-     * to test on (QEMU's TCG has no CET). Plan: docs/hardening.md. */
-    kprintf("CET: shadow stacks %s, IBT %s by this CPU; kernel CET not enabled yet\n",
+    /* Whether the kernel uses them: cet.c (shadow stacks). Kernel IBT needs every indirect-branch
+     * target marked, which the pinned stable Rust cannot do (-Zcf-protection). */
+    kprintf("CET: shadow stacks %s, IBT %s by this CPU\n",
             cpu.cet_ss ? "supported" : "not supported", cpu.cet_ibt ? "supported" : "not supported");
     if (cpu.xsave)
         kprintf("FPU: XSAVE for user threads, %u bytes per thread (x87 SSE%s%s)\n", cpu.fpu_size,

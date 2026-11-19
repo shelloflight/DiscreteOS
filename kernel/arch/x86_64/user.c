@@ -26,7 +26,7 @@
 #define SYSCALL_FMASK 0x47700ull
 
 extern char syscall_entry[];
-extern const char user_copy_fault[], user_copy_fixup[];
+extern const char user_copy_fault[];
 extern const uint64_t smap_sites[], smap_sites_end[], isr_smap_site[];
 
 void user_cpu_init(void)
@@ -71,7 +71,8 @@ bool user_copy_fixup_try(struct interrupt_frame *f)
         return false;
     if (read_cr2() >= USER_TOP)
         return false;                 /* a kernel address: the caller's check failed; a real bug */
-    f->rip = (uint64_t)(uintptr_t)user_copy_fixup;
+    f->r8 = f->rcx;                   /* bytes left (syscall.asm: user_copy) */
+    f->rcx = 0;                       /* the REP MOVSB resumes and stops at once */
     return true;
 }
 

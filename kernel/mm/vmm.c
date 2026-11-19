@@ -31,6 +31,7 @@ extern char __ro_after_init_start[], __ro_after_init_end[];
 #define PTE_U    (1ull << 2)
 #define PTE_PWT  (1ull << 3)
 #define PTE_PCD  (1ull << 4)
+#define PTE_D    (1ull << 6)
 #define PTE_PS   (1ull << 7)
 #define PTE_G    (1ull << 8)
 #define PTE_NX   (1ull << 63)
@@ -70,6 +71,8 @@ static uint64_t leaf_bits(uint64_t va, uint32_t flags)
         e |= PTE_PCD | PTE_PWT;
     else if (flags & VMM_WC)
         e |= cpu.pat ? PTE_PWT : PTE_PCD | PTE_PWT;   /* PAT entry 1 = WC (cpu_init_pat) */
+    if (flags & VMM_SHSTK)
+        e |= PTE_D;                /* not writable + dirty = a shadow-stack page (CET) */
     if (va >= PHYSMAP_BASE)
         e |= PTE_G;                /* kernel half: survives address-space switches */
     return e;
@@ -111,6 +114,8 @@ static void check_wx(uint64_t va, uint32_t flags)
 {
     if ((flags & VMM_W) && (flags & VMM_X))
         panic("VMM: W^X violation: writable + executable mapping requested at %#llx", (unsigned long long)va);
+    if ((flags & VMM_SHSTK) && (flags & (VMM_W | VMM_X)))
+        panic("VMM: a shadow stack may be neither writable nor executable (%#llx)", (unsigned long long)va);
 }
 
 static uint64_t *walk(uint64_t va, int level, bool create)

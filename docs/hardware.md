@@ -44,6 +44,7 @@ Management and create a new one.
 | `D-OS: kernel signature valid`, `kernel relocated (KASLR, ...)` | verified boot and KASLR work on this firmware |
 | `CPU: ...`, `Protections: WP on, NX on, SMEP on, SMAP on, UMIP on` | CPU and protections detected |
 | `Speculation: ...` | mitigations chosen for this CPU ([hardening.md](hardening.md)) |
+| `CET: supervisor shadow stacks on ...` | CET shadow stacks in use; `off: ...` says why not ([hardening.md](hardening.md#cet)) |
 | `SMP: N CPUs online` | every hardware thread started |
 | `IOMMU: ...` | Intel VT-d or AMD-Vi driven: `DMA remapping on for every device`; the AMD-Vi unit's own PCI function is listed as kept by the kernel |
 | `TPM: ...` | whether the firmware TPM was found and answered |

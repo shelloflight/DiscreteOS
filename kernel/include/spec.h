@@ -14,6 +14,8 @@
 #define MIT_VERW  2u     /* clear CPU buffers (VERW) before returning to user mode */
 #define MIT_IBPB  4u     /* flush branch predictions when another process's thread runs */
 #define MIT_RSB   8u     /* refill the return stack buffer on context switch */
+#define MIT_SHSTK 16u    /* CET supervisor shadow stacks are on (cet.c): switch them with threads,
+                          * mark/clear the busy token on ring-3 entry/exit */
 
 enum spec_v2 { V2_RETPOLINE, V2_EIBRS, V2_AUTOIBRS };
 

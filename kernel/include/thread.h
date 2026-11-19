@@ -38,6 +38,7 @@
 
 #define THREAD_NAME_MAX     24
 #define KSTACK_SIZE         (16 * 1024)
+#define SHSTK_SIZE          (8 * 1024)      /* CET supervisor shadow stack per thread (cet.c) */
 
 #define SCHED_SLICE_NS      (5 * NS_PER_MS)
 
@@ -73,6 +74,10 @@ struct thread {
     int                exit_code;
     uint64_t           kstack_guard;   /* guard page below the stack (0 for static stacks) */
     uint64_t           kstack_top;
+    /* CET supervisor shadow stack (0 when shadow stacks are off; cet.c): */
+    uint64_t           ssp;            /* while switched out: its restore token (context_switch) */
+    uint64_t           ss_token;       /* supervisor token at the top (IA32_PL0_SSP for ring-3 entries) */
+    uint64_t           ss_slot;        /* stack-region slot holding it */
 
     struct thread     *rq_next;        /* run queue link */
     struct waitq      *wq;             /* wait queue it is blocked on, if any */

@@ -22,6 +22,7 @@
 
 #include <stdint.h>
 #include "apic.h"
+#include "cet.h"
 #include "cpu.h"
 #include "mm.h"
 #include "panic.h"
@@ -38,7 +39,8 @@
 #define THREAD_MAGIC      0x54485244u   /* "THRD" */
 #define THREAD_DEAD_MAGIC 0x44454144u   /* "DEAD": freed, catches use-after-free of a handle */
 
-extern void context_switch(uint64_t *save_rsp, uint64_t new_rsp);   /* switch.asm */
+extern void context_switch(uint64_t *save_rsp, uint64_t new_rsp,
+                           uint64_t *save_ssp, uint64_t new_ssp);   /* switch.asm */
 extern char boot_stack_guard[];                                      /* entry.asm */
 
 static spinlock_t      kstack_lk = SPINLOCK_INIT("kstack", LOCK_RANK_KSTACK);
@@ -118,10 +120,66 @@ uint64_t kstack_new(uint64_t *guard)
     return base + KSTACK_SIZE;
 }
 
+/* A slot's last SHSTK_SIZE bytes: [guard page][stack][unmapped page][shadow stack]. A shadow stack
+ * that overflows runs into the unmapped page. */
+_Static_assert(PAGE_SIZE + KSTACK_SIZE + PAGE_SIZE + SHSTK_SIZE <= KSTACK_SLOT, "stack slot layout");
+
 static bool kstack_alloc(struct thread *t)
 {
     t->kstack_top = kstack_new(&t->kstack_guard);
-    return t->kstack_top != 0;
+    if (!t->kstack_top)
+        return false;
+    if (cet_ss && !shstk_new(t, t->kstack_guard, (uint64_t)(uintptr_t)thread_start)) {
+        vmm_unmap_free(t->kstack_guard + PAGE_SIZE, KSTACK_SIZE / PAGE_SIZE);
+        return false;
+    }
+    return true;
+}
+
+/* Shadow stack in `slot` for thread t, or a lone one (t NULL: IST stacks). Layout from the top:
+ * the supervisor token (busy while the thread is in the kernel after an entry from ring 3), the
+ * first return address of context_switch (`ret`, thread_start) and a restore token for it.
+ * Written through the direct map before the page is mapped read-only + dirty. Returns the token,
+ * or 0 when out of memory. */
+uint64_t shstk_new(struct thread *t, uint64_t slot, uint64_t first_ret)
+{
+    if (!slot)
+        slot = kstack_slot();
+    uint64_t base = slot + KSTACK_SLOT - SHSTK_SIZE;
+    uint64_t top = base + SHSTK_SIZE;
+    uint64_t pas[SHSTK_SIZE / PAGE_SIZE];
+    for (unsigned i = 0; i < SHSTK_SIZE / PAGE_SIZE; i++) {
+        pas[i] = pmm_alloc_zeroed();
+        if (!pas[i]) {
+            while (i--)
+                pmm_free(pas[i]);
+            return 0;
+        }
+    }
+    uint64_t *last = (uint64_t *)((uint8_t *)phys_to_virt(pas[SHSTK_SIZE / PAGE_SIZE - 1]) + PAGE_SIZE);
+    last[-1] = top - 8;                           /* supervisor token: its own address, not busy */
+    last[-2] = first_ret;                         /* popped by context_switch's `ret` */
+    last[-3] = (top - 16) | 1;                    /* restore token (64-bit): SSP = top - 16 */
+    for (unsigned i = 0; i < SHSTK_SIZE / PAGE_SIZE; i++) {
+        if (!vmm_try_map_page(base + i * PAGE_SIZE, pas[i], VMM_SHSTK)) {
+            vmm_unmap_free(base, i);
+            for (unsigned j = i; j < SHSTK_SIZE / PAGE_SIZE; j++)
+                pmm_free(pas[j]);
+            return 0;
+        }
+    }
+    if (t) {
+        t->ssp = top - 24;
+        t->ss_token = top - 8;
+        t->ss_slot = slot;
+    }
+    return top - 8;
+}
+
+static void shstk_free(struct thread *t)
+{
+    if (t->ss_slot)
+        vmm_unmap_free(t->ss_slot + KSTACK_SLOT - SHSTK_SIZE, SHSTK_SIZE / PAGE_SIZE);
 }
 
 /* ---- run queue -------------------------------------------------------------------------- */
@@ -429,6 +487,12 @@ static void switch_user_state(struct percpu *pc, struct thread *prev, struct thr
             spec_ibpb();
         pc->last_uid = next->uspace->id;
     }
+    /* Shadow stacks: an entry from ring 3 switches to the user thread's own shadow stack (its
+     * token); kernel threads never run ring 3, so the last user thread's stays loaded. */
+    if ((pc->mitig & MIT_SHSTK) && next->user && pc->ss_token != next->ss_token) {
+        wrmsr(MSR_PL0_SSP, next->ss_token);
+        pc->ss_token = next->ss_token;
+    }
     pc->kstack_top = next->kstack_top;
     if (!(pc->mitig & MIT_KPTI))
         pc->tss.rsp[0] = next->kstack_top;   /* KPTI: entries land on the entry stack instead */
@@ -479,7 +543,7 @@ static void switch_locked(struct percpu *pc)
     update_slice(pc, now);
     switch_user_state(pc, prev, next);
 
-    context_switch(&prev->rsp, next->rsp);
+    context_switch(&prev->rsp, next->rsp, &prev->ssp, next->ssp);
 
     finish_switch(percpu());
 }
@@ -713,6 +777,7 @@ static void thread_free(struct thread *t)
     KASSERT(t->exited && !t->on_cpu && !t->static_stack);
     list_remove(t);
     vmm_unmap_free(t->kstack_guard + PAGE_SIZE, KSTACK_SIZE / PAGE_SIZE);
+    shstk_free(t);
     t->magic = THREAD_DEAD_MAGIC;
     kfree(t);
 }
@@ -1014,6 +1079,8 @@ void sched_init(void)
     b->kstack_guard = (uint64_t)(uintptr_t)boot_stack_guard;
     b->kstack_top = b->kstack_guard + PAGE_SIZE + KSTACK_SIZE;
     set_name(b, "kmain");
+    if (cet_ss && !shstk_new(b, 0, 0))            /* its first return address: cet_ss_enter's */
+        panic("cannot allocate the boot thread's shadow stack");
     b->intr_lock = (spinlock_t)SPINLOCK_INIT("thread.intr", LOCK_RANK_INTR);
     list_add(b);
     b->switched_in_ns = time_ns();

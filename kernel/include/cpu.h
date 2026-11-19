@@ -97,7 +97,7 @@ struct cpu_info {
     bool     apic, x2apic, tsc_deadline, invariant_tsc, rdrand, hypervisor;
     bool     rdrand_broken;          /* CPUID says RDRAND, but it failed the boot self-check */
     bool     nx, smep, smap, umip;
-    bool     cet_ss, cet_ibt;     /* CET shadow stacks / indirect branch tracking (detected, not enabled yet) */
+    bool     cet_ss, cet_ibt;     /* CET shadow stacks / indirect branch tracking supported (use: cet.c) */
     bool     pat;                    /* PAT: entry 1 is write-combining (cpu_init_pat), VMM_WC */
     bool     xsave;                  /* XSAVE enabled (CR4.OSXSAVE, XCR0 = xcr0) */
     uint64_t xcr0;                   /* state components saved for user threads */
