@@ -24,6 +24,7 @@ extern crate alloc;
 
 #[cfg(feature = "capi")]
 pub mod capi;
+pub mod audio;
 pub mod chan;
 pub mod fs;
 pub mod handle;

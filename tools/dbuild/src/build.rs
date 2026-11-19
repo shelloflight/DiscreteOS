@@ -40,6 +40,9 @@ const BOOTSTRAP_PROGS: &[&str] = &[
     "xhci.ddrv",
     "ps2.ddrv",
     "virtio-input.ddrv",
+    "hda.ddrv",
+    "virtio-snd.ddrv",
+    "usbaudio.ddrv",
 ];
 
 /// Service manifests that stay embedded in `kernel.bin` to mount `sys:`.
@@ -47,6 +50,7 @@ const BOOTSTRAP_MANIFESTS: &[&str] = &["clock.dman", "storaged.dman", "devmgr.dm
 
 /// Non-bootstrap programs placed (with `.dsig` signatures) on the immutable `sys` DFS volume.
 const SYS_BIN_PROGS: &[&str] = &[
+    "audio.dsvc",
     "log.dx",
     "terminal.dx",
     "shell.dx",
@@ -70,7 +74,7 @@ fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
             "utest.dx" | "dcmpl.dx" | "w1.exe" | "w1_32.exe" | "w1fault.exe" | "w1bad.exe" | "l1" | "w2.exe" | "l2"
         ),
         Some("LIBD") => matches!(name, "ltest.dx" | "ctest.dx"),
-        Some("SERVICES" | "TIME") => name == "ltest.dx",
+        Some("SERVICES" | "TIME" | "AUDIO") => name == "ltest.dx",
         Some("STORAGE" | "READONLY") => name == "fstest.dx",
         Some("HWBENCH") => matches!(name, "utest.dx" | "fstest.dx"),
         _ => false,
@@ -445,6 +449,7 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
     if let Some(sub) = match opts.kernel_test.as_deref() {
         Some("SERVICES") => Some("test"),
         Some("TIME") => Some("time"),
+        Some("AUDIO") => Some("audio"),
         _ => None,
     } {
         manifests.extend(collect_files(&man_dir.join(sub), "dman", false));
@@ -1337,6 +1342,15 @@ fn link_rust_user_crate(
         for d in dx_list {
             let sym = format!("dx_{}", d.replace('-', "_"));
             res.push(link_one(&format!("{d}.dx"), &sym)?);
+        }
+        return Ok(res);
+    }
+
+    if let Some(dsvc_list) = parse_toml_string_list(&toml, "dsvc") {
+        let mut res = Vec::new();
+        for d in dsvc_list {
+            let sym = format!("dsvc_{}", d.replace('-', "_"));
+            res.push(link_one(&format!("{d}.dsvc"), &sym)?);
         }
         return Ok(res);
     }

@@ -15,6 +15,7 @@ that cover it.
 | [services.md](services.md) | init, the service manager: manifests, exact grants, supervision, shutdown |
 | [shell.md](shell.md) | The terminal, the shell (typed records, places, jobs) and the tools with declared rights |
 | [storage.md](storage.md) | Block drivers, `storaged`, files as handles, DFS and FAT32 |
+| [audio.md](audio.md) | Audio service (`audio.dsvc`), HDA/USB/VirtIO drivers, mixing, routing, microphone indicator |
 | [compat.md](compat.md) | D-CMPL: running Windows and Linux programs unchanged |
 | [signing.md](signing.md) | Verified boot, measured boot, code signing, `.dsig` format |
 | [attestation.md](attestation.md) | Remote attestation reports |

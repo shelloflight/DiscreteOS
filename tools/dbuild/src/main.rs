@@ -40,6 +40,7 @@ fn print_help() {
            --uefi                  Boot with UEFI firmware (OVMF) (run, debug)\n\
            --smp <N>               Number of vCPUs, default 4 (run, debug, soak)\n\
            --iommu <intel|amd>     Emulated IOMMU, default intel (run, debug)\n\
+           --audio <hda|virtio|usb|none>  Emulated audio device, default hda for run (run, debug)\n\
            --case <a,b,...>        Run only selected test cases (test)\n\
            --timeout <secs>        Min timeout per case, default 15 (test)\n\
            --no-repro              Skip the reproducible-build check (test)\n\
@@ -132,6 +133,7 @@ fn run() -> Result<(), String> {
             let mut smp = 4u32;
             let mut uefi = false;
             let mut iommu = "intel".to_string();
+            let mut audio = if cmd == "debug" { "none".to_string() } else { "hda".to_string() };
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -151,6 +153,16 @@ fn run() -> Result<(), String> {
                             return Err("--iommu must be 'intel' or 'amd'".into());
                         }
                     }
+                    "--audio" | "-Audio" => {
+                        i += 1;
+                        audio = rest
+                            .get(i)
+                            .ok_or("--audio needs hda, virtio, usb, or none")?
+                            .clone();
+                        if !matches!(audio.as_str(), "hda" | "virtio" | "usb" | "none") {
+                            return Err("--audio must be 'hda', 'virtio', 'usb', or 'none'".into());
+                        }
+                    }
                     other => return Err(format!("unknown {cmd} option '{other}'")),
                 }
                 i += 1;
@@ -167,7 +179,7 @@ fn run() -> Result<(), String> {
                     jobs: cpus,
                 },
             )?;
-            run_interactive(&env, &res.image, smp, uefi, &iommu, cmd == "debug")
+            run_interactive(&env, &res.image, smp, uefi, &iommu, &audio, cmd == "debug")
         }
         "test" => {
             let mut cases: Vec<String> = Vec::new();

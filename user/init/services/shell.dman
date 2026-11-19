@@ -12,6 +12,7 @@ description = "the command shell"
 [grants]
 log = true
 connect = ["terminal.session", "log.read", "clock.time"]
+audio = ["playback", "control"]
 namespace = ["*"]
 manager = ["services", "power"]
 tools = true

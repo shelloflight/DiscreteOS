@@ -30,14 +30,18 @@
 mod ahci;
 mod blk;
 mod blkserve;
+mod hda;
 mod input;
 mod keymap;
 mod nvme;
 mod ps2;
 mod trust;
+mod usbaudio;
 mod virtio;
+mod virtio_snd;
 mod xhci;
 
+use libd::audio;
 use libd::fs;
 use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
 use libd::svc;
@@ -51,9 +55,13 @@ libd::entry!(ddrv_virtio_input, input::main);
 libd::entry!(ddrv_ahci, ahci::main);
 libd::entry!(ddrv_nvme, nvme::main);
 libd::entry!(ddrv_xhci, xhci::main);
+libd::entry!(ddrv_hda, hda::main);
+libd::entry!(ddrv_virtio_snd, virtio_snd::main);
+libd::entry!(ddrv_usbaudio, usbaudio::main);
 
-const MAX_DRIVERS: usize = 8;
+const MAX_DRIVERS: usize = 24;
 const MAX_DISKS: usize = 16;
+const MAX_AUDIO: usize = 32;
 const MAX_INPUT_CLIENTS: usize = 8;
 /// Port key of the control channel from the service manager.
 const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
@@ -66,6 +74,20 @@ struct Disk {
     sectors: u64,
     model: [u8; 40],
     model_len: usize,
+}
+
+/// An audio endpoint a driver announced (kept to hand over again when `audio.dsvc` connects/restarts).
+#[derive(Clone, Copy)]
+struct AudioDev {
+    drv: usize,
+    unit: u16,
+    kind: u8,
+    flags: u32,
+    rate: u32,
+    channels: u8,
+    format: u8,
+    name: [u8; 40],
+    name_len: usize,
 }
 
 /// Formats into a byte buffer (no allocator).
@@ -98,6 +120,8 @@ struct Driver {
     capacity: u64,
     /// DISK messages announced by READY that have not arrived yet.
     disks_due: u64,
+    /// Dynamic child driver (e.g. `usbaudio.ddrv` spawned on USB attach, no PCI handle).
+    dynamic: bool,
 }
 
 struct Mgr {
@@ -114,6 +138,9 @@ struct Mgr {
     storage: Handle,
     disks: u32,
     known: [Option<Disk>; MAX_DISKS],
+    /// Channel to the audio service (`devmgr.audio` endpoint; 0 until connected).
+    audio_svc: Handle,
+    known_audio: [Option<AudioDev>; MAX_AUDIO],
     /// Control channel from the service manager (0: started without one).
     mgr: Handle,
     /// SHUTDOWN received.
@@ -135,10 +162,11 @@ fn driver_for(i: &DeviceInfo) -> Option<&'static str> {
     match (i.kind, i.vendor, i.device) {
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1042) => Some("virtio-blk"),
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1052) => Some("virtio-input"),
-        // By class: AHCI (01.06.01) and NVMe (01.08.02) are standard interfaces.
+        (sys::DEV_KIND_PCI, 0x1AF4, 0x1059) => Some("virtio-snd"),
+        // By class: AHCI (01.06.01), NVMe (01.08.02), Intel HD Audio (04.03.*), xHCI (0C.03.30).
         _ if i.kind == sys::DEV_KIND_PCI && (i.class, i.subclass, i.progif) == (1, 6, 1) => Some("ahci"),
         _ if i.kind == sys::DEV_KIND_PCI && (i.class, i.subclass, i.progif) == (1, 8, 2) => Some("nvme"),
-        // xHCI USB host controllers (0C.03.30): USB keyboards.
+        _ if i.kind == sys::DEV_KIND_PCI && (i.class, i.subclass) == (0x04, 0x03) => Some("hda"),
         _ if i.kind == sys::DEV_KIND_PCI && (i.class, i.subclass, i.progif) == (0x0C, 3, 0x30) => Some("xhci"),
         (sys::DEV_KIND_PLATFORM, _, _) if i.name() == "ps2" => Some("ps2"),
         _ => None,
@@ -227,18 +255,31 @@ impl Mgr {
             if d.ch == 0 {
                 return;
             }
-            match sys::channel_read(d.ch, &mut buf, 0) {
-                Ok(n) => {
-                    let Some(h) = Header::get(&buf[..n as usize]) else { continue };
+            let ch = d.ch;
+            let mut hs = [0 as Handle; 1];
+            match sys::channel_read_h(ch, &mut buf, &mut hs, 0) {
+                Ok((n, nh)) => {
+                    let hnd = if nh > 0 { hs[0] } else { 0 };
+                    let Some(h) = Header::get(&buf[..n]) else {
+                        if hnd != 0 {
+                            sys::handle_close(hnd);
+                        }
+                        continue;
+                    };
+                    if h.op != proto::USB_AUDIO_ATTACH && hnd != 0 {
+                        sys::handle_close(hnd);
+                    }
                     match h.op {
                         proto::READY => {
-                            d.ready = true;
-                            d.capacity = h.a;
-                            d.disks_due = h.b.min(64);
-                            println!("devmgr: {}.ddrv ready on {} (start {})", d.prog, d.info.name(), d.starts);
+                            if let Some(d) = self.drv[i].as_mut() {
+                                d.ready = true;
+                                d.capacity = h.a;
+                                d.disks_due = h.b.min(64);
+                                println!("devmgr: {}.ddrv ready on {} (start {})", d.prog, d.info.name(), d.starts);
+                            }
                         }
                         proto::KEY => {
-                            let from = d.prog;
+                            let from = self.drv[i].as_ref().map_or("?", |d| d.prog);
                             let k = h.a as u32;
                             match self.trust.key((i, h.b as u32), k) {
                                 trust::Verdict::Pass => self.key(k, from, i),
@@ -256,19 +297,34 @@ impl Mgr {
                         }
                         proto::KEYBOARD_GONE => self.trust.gone((i, h.a as u32)),
                         proto::POINTER => {
-                            let from = d.prog;
+                            let from = self.drv[i].as_ref().map_or("?", |d| d.prog);
                             self.pointer(h.a, h.b, from, i);
                         }
                         proto::DISK => {
-                            d.disks_due = d.disks_due.saturating_sub(1);
-                            let payload = &buf[HEADER..n as usize];
+                            if let Some(d) = self.drv[i].as_mut() {
+                                d.disks_due = d.disks_due.saturating_sub(1);
+                            }
+                            let payload = &buf[HEADER..n];
                             self.disk(i, h.a, h.b, payload);
+                        }
+                        proto::AUDIO_DEV => {
+                            let payload = &buf[HEADER..n];
+                            self.audio_dev(i, h.a, h.b, payload);
+                        }
+                        proto::AUDIO_JACK => {
+                            let payload = &buf[HEADER..n];
+                            self.audio_jack(i, h.a as u16, h.b as u32, payload);
+                        }
+                        proto::AUDIO_GONE => {
+                            self.audio_gone(i, h.a as u16);
+                        }
+                        proto::USB_AUDIO_ATTACH if hnd != 0 => {
+                            self.spawn_usb_audio(h.a, h.b, hnd);
                         }
                         _ => {}
                     }
                 }
                 Err(sys::ERR_SHOULD_WAIT) => {
-                    let ch = d.ch;
                     self.port.arm(ch, sys::READABLE | sys::PEER_CLOSED, key_chan(i));
                     return;
                 }
@@ -319,6 +375,21 @@ impl Mgr {
                                 }
                             }
                         }
+                        Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"audio" && handle != 0 => {
+                            if self.audio_svc != 0 {
+                                sys::handle_close(self.audio_svc);
+                            }
+                            self.audio_svc = handle;
+                            let known = self.known_audio;
+                            let mut attached = 0u32;
+                            for a in known.iter().flatten() {
+                                if self.drv[a.drv].as_ref().is_some_and(|d| d.proc != 0 && d.ch != 0) {
+                                    self.attach_audio_to_svc(*a);
+                                    attached += 1;
+                                }
+                            }
+                            println!("devmgr: audio service connected: {} endpoint(s) attached", attached);
+                        }
                         Some(h) if h.op == svc::SUSPEND => {
                             if handle != 0 {
                                 sys::handle_close(handle);
@@ -357,6 +428,154 @@ impl Mgr {
                 }
                 Err(_) => return, // the manager is gone: keep serving
             }
+        }
+    }
+
+    /// Spawn an isolated `usbaudio.ddrv` process for a USB Audio Class device discovered by `xhci.ddrv`.
+    fn spawn_usb_audio(&mut self, _ident: u64, _port: u64, bus_ch: Handle) {
+        let Some(image) = libd::find_program(b"usbaudio.ddrv") else {
+            println!("devmgr: no driver program usbaudio.ddrv");
+            sys::handle_close(bus_ch);
+            return;
+        };
+        let Some(slot) = (0..MAX_DRIVERS).find(|&idx| self.drv[idx].is_none()) else {
+            println!("devmgr: no free driver slot for usbaudio.ddrv");
+            sys::handle_close(bus_ch);
+            return;
+        };
+        let (Ok(log), Ok((mine, theirs))) = (
+            sys::handle_duplicate(libd::startup_handle(sys::TAG_LOG), sys::RIGHTS_SAME),
+            sys::channel_pair(),
+        ) else {
+            println!("devmgr: out of handles starting usbaudio.ddrv");
+            sys::handle_close(bus_ch);
+            return;
+        };
+        let hs = [
+            sys::SpawnHandle { handle: log, rights: sys::RIGHTS_SAME, tag: sys::TAG_LOG, reserved: 0 },
+            sys::SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: proto::TAG_CONTROL, reserved: 0 },
+            sys::SpawnHandle { handle: bus_ch, rights: sys::RIGHTS_SAME, tag: proto::TAG_USB_BUS, reserved: 0 },
+        ];
+        let limits = sys::Limits { memory: 8 << 20, handles: 256, threads: 4 };
+        match sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), image, b"usbaudio.ddrv", b"", &hs, &limits) {
+            Ok(p) => {
+                let mut info = DeviceInfo::default();
+                let tag = b"usb-audio";
+                info.name[..tag.len()].copy_from_slice(tag);
+                self.drv[slot] = Some(Driver {
+                    prog: "usbaudio",
+                    image,
+                    dev: 0,
+                    info,
+                    proc: p,
+                    ch: mine,
+                    ready: false,
+                    starts: 1,
+                    gave_up: false,
+                    capacity: 0,
+                    disks_due: 0,
+                    dynamic: true,
+                });
+                self.port.arm(p, sys::TERMINATED, key_proc(slot));
+                self.port.arm(mine, sys::READABLE | sys::PEER_CLOSED, key_chan(slot));
+            }
+            Err(e) => {
+                println!("devmgr: cannot start usbaudio.ddrv: {}", sys::status(e));
+                sys::handle_close(mine);
+            }
+        }
+    }
+
+    fn audio_dev(&mut self, i: usize, a: u64, b: u64, name: &[u8]) {
+        let unit = (a & 0xFFFF) as u16;
+        let kind = ((a >> 16) & 0xFF) as u8;
+        let flags = (a >> 32) as u32;
+        let rate = (b as u32).max(8_000);
+        let channels = (((b >> 32) & 0xFF) as u8).max(1);
+        let format = (((b >> 40) & 0xFF) as u8).max(audio::FMT_S16_LE);
+        let mut rec = AudioDev {
+            drv: i,
+            unit,
+            kind,
+            flags,
+            rate,
+            channels,
+            format,
+            name: [0; 40],
+            name_len: name.len().min(40),
+        };
+        rec.name[..rec.name_len].copy_from_slice(&name[..rec.name_len]);
+        let slot = self.known_audio.iter().position(|x| x.is_some_and(|x| x.drv == i && x.unit == unit));
+        if let Some(s) = slot.or_else(|| self.known_audio.iter().position(|x| x.is_none())) {
+            self.known_audio[s] = Some(rec);
+        }
+        if self.audio_svc != 0 {
+            self.attach_audio_to_svc(rec);
+        }
+    }
+
+    fn attach_audio_to_svc(&self, rec: AudioDev) {
+        let Some(d) = self.drv[rec.drv].as_ref() else { return };
+        if d.ch == 0 || self.audio_svc == 0 {
+            return;
+        }
+        let Ok((mine, theirs)) = sys::channel_pair() else {
+            println!("devmgr: out of handles attaching audio endpoint");
+            return;
+        };
+        let mut m = [0u8; HEADER];
+        Header { txid: 0, op: proto::AUDIO_ATTACH, status: 0, a: u64::from(rec.unit), b: 0 }.put(&mut m);
+        if sys::channel_write_h(d.ch, &m, &[sys::MsgHandle { handle: theirs, rights: sys::RIGHTS_SAME }]) < 0 {
+            sys::handle_close(mine);
+            return;
+        }
+        // Use stable dev_key: for dynamic USB drivers use 0x4000 | unit so restarts map to same key!
+        let dev_key: u16 = if d.dynamic {
+            0x4000 | rec.unit
+        } else {
+            ((rec.drv as u16) << 6) | (rec.unit & 0x3F)
+        };
+        let a = u64::from(dev_key) | (u64::from(rec.kind) << 16) | (u64::from(rec.flags) << 32);
+        let b = u64::from(rec.rate) | (u64::from(rec.channels) << 32) | (u64::from(rec.format) << 40);
+        let mut msg = [0u8; HEADER + 40];
+        Header { txid: 0, op: audio::BACKEND_ADD, status: 0, a, b }.put(&mut msg);
+        msg[HEADER..HEADER + rec.name_len].copy_from_slice(&rec.name[..rec.name_len]);
+        let _ = sys::channel_write_h(
+            self.audio_svc,
+            &msg[..HEADER + rec.name_len],
+            &[sys::MsgHandle { handle: mine, rights: sys::RIGHTS_SAME }],
+        );
+    }
+
+    fn audio_jack(&mut self, i: usize, unit: u16, flags: u32, name: &[u8]) {
+        let is_dyn = self.drv[i].as_ref().is_some_and(|d| d.dynamic);
+        let dev_key: u16 = if is_dyn { 0x4000 | unit } else { ((i as u16) << 6) | (unit & 0x3F) };
+        if let Some(rec) = self.known_audio.iter_mut().flatten().find(|x| x.drv == i && x.unit == unit) {
+            rec.flags = flags;
+            if !name.is_empty() {
+                rec.name_len = name.len().min(40);
+                rec.name[..rec.name_len].copy_from_slice(&name[..rec.name_len]);
+            }
+        }
+        if self.audio_svc != 0 {
+            let n = name.len().min(40);
+            let mut msg = [0u8; HEADER + 40];
+            Header { txid: 0, op: audio::BACKEND_JACK, status: 0, a: u64::from(dev_key), b: u64::from(flags) }.put(&mut msg);
+            msg[HEADER..HEADER + n].copy_from_slice(&name[..n]);
+            let _ = sys::channel_write(self.audio_svc, &msg[..HEADER + n]);
+        }
+    }
+
+    fn audio_gone(&mut self, i: usize, unit: u16) {
+        let is_dyn = self.drv[i].as_ref().is_some_and(|d| d.dynamic);
+        let dev_key: u16 = if is_dyn { 0x4000 | unit } else { ((i as u16) << 6) | (unit & 0x3F) };
+        for slot in &mut self.known_audio {
+            if slot.is_some_and(|x| x.drv == i && x.unit == unit) {
+                *slot = None;
+            }
+        }
+        if self.audio_svc != 0 {
+            proto::send(self.audio_svc, audio::BACKEND_GONE, u64::from(dev_key), 0);
         }
     }
 
@@ -462,7 +681,7 @@ impl Mgr {
         for i in 0..MAX_DRIVERS {
             let Some(d) = self.drv[i].as_mut() else { continue };
             // Quiesce PCI bus mastering before killing the driver so no DMA races with unpinning.
-            if d.info.kind == sys::DEV_KIND_PCI {
+            if d.dev != 0 && d.info.kind == sys::DEV_KIND_PCI {
                 let _ = sys::config_write(d.dev, 0x04, 2, 0);
             }
             if d.proc != 0 {
@@ -473,6 +692,10 @@ impl Mgr {
                 d.proc = 0;
                 d.ch = 0;
                 n += 1;
+            }
+            if d.dynamic {
+                self.drv[i] = None;
+                continue;
             }
             d.ready = false;
             d.disks_due = 0;
@@ -520,11 +743,26 @@ impl Mgr {
         d.ready = false;
         d.disks_due = 0;
         println!("devmgr: {}.ddrv exited with code {}{}", d.prog, code, exit_text(code));
+        let is_dynamic = d.dynamic;
         self.trust.driver_gone(i);
         self.pointer_seen &= !(1u64 << i);
+        if is_dynamic {
+            // Dynamic USB class driver: free slot cleanly (unplug exited 0; crash is re-attached by xhci).
+            if code == 0 {
+                for slot in &mut self.known_audio {
+                    if let Some(a) = slot.take_if(|a| a.drv == i)
+                        && self.audio_svc != 0
+                    {
+                        proto::send(self.audio_svc, audio::BACKEND_GONE, u64::from(0x4000 | a.unit), 0);
+                    }
+                }
+            }
+            self.drv[i] = None;
+            return;
+        }
         let Some(d) = self.drv[i].as_mut() else { return };
         // Quiesce: no decode, no bus mastering, until the next instance has reset the device.
-        if d.info.kind == sys::DEV_KIND_PCI {
+        if d.dev != 0 && d.info.kind == sys::DEV_KIND_PCI {
             let _ = sys::config_write(d.dev, 0x04, 2, 0);
         }
         if d.starts > MAX_RESTARTS {
@@ -607,6 +845,8 @@ fn devmgr_main(s: *const Startup) -> i32 {
         },
         disks: 0,
         known: [None; MAX_DISKS],
+        audio_svc: 0,
+        known_audio: [None; MAX_AUDIO],
         mgr: libd::startup_handle(proto::TAG_CONTROL),
         stop: false,
         suspended: false,
@@ -639,7 +879,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
             continue;
         };
         if n < MAX_DRIVERS {
-            m.drv[n] = Some(Driver { prog, image, dev: h, info, proc: 0, ch: 0, ready: false, starts: 0, gave_up: false, capacity: 0, disks_due: 0 });
+            m.drv[n] = Some(Driver { prog, image, dev: h, info, proc: 0, ch: 0, ready: false, starts: 0, gave_up: false, capacity: 0, disks_due: 0, dynamic: false });
             n += 1;
         }
     }
@@ -676,7 +916,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
     }
     let mut n = 0;
     for d in m.drv.iter_mut().flatten() {
-        if d.info.kind == sys::DEV_KIND_PCI {
+        if d.dev != 0 && d.info.kind == sys::DEV_KIND_PCI {
             let _ = sys::config_write(d.dev, 0x04, 2, 0);
         }
         if d.proc != 0 {

@@ -270,6 +270,7 @@ fn main(s: *const Startup) -> i32 {
             }
         }
         "time test" => return time_test(),
+        "audio test" => return audio_test(),
         _ => {}
     }
 
@@ -418,6 +419,28 @@ fn services_test() -> i32 {
     m.shutdown();
     check!(m.svcs.iter().all(|s| !matches!(s.state, State::Running)), "a service is still running");
     println!("init: test: PASSED");
+    let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
+    println!("init: power: system_power returned {}", r);
+    1
+}
+
+/// Audio security, capability, microphone indicator, hot-plug switching, and driver crash recovery test.
+fn audio_test() -> i32 {
+    let Some(mut m) = start_system(&[("audio", "test"), ("terminal", "mirror")], &[Group::System, Group::Test], true) else {
+        return 1;
+    };
+    let state = |m: &Mgr, name: &str| m.find(name).map(|i| m.svcs[i].state);
+    let ok = m.run_until(45 * SEC, |m| {
+        matches!(state(m, "svc-audio-ungranted"), Some(State::Done(_)))
+            && matches!(state(m, "svc-audio-playonly"), Some(State::Done(_)))
+            && matches!(state(m, "svc-audio-full"), Some(State::Done(_)))
+    });
+    check!(ok, "audio test services did not finish in time");
+    for s in ["svc-audio-ungranted", "svc-audio-playonly", "svc-audio-full"] {
+        check!(state(&m, s) == Some(State::Done(0)), "{} ended with {:?}", s, state(&m, s));
+    }
+    m.shutdown();
+    println!("init: audio test: PASSED");
     let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
     println!("init: power: system_power returned {}", r);
     1

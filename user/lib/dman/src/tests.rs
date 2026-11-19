@@ -10,6 +10,7 @@ const DEVMGR: &[u8] = include_bytes!("../../../init/services/devmgr.dman");
 const SEEDS: &[&[u8]] = &[
     STORAGED,
     DEVMGR,
+    include_bytes!("../../../init/services/audio.dman"),
     include_bytes!("../../../init/services/log.dman"),
     include_bytes!("../../../init/services/clock.dman"),
     include_bytes!("../../../init/services/terminal.dman"),
@@ -42,10 +43,15 @@ fn the_system_manifests_parse() {
     assert_eq!(d.after, vec!["storaged".to_string()]);
     assert_eq!(d.devices, vec![DeviceSel::AllPci, DeviceSel::Platform("ps2".into())]);
     assert!(d.devices[0].matches(true, 1, 6, 1, "") && !d.devices[0].matches(false, 0, 0, 0, "rtc") && !d.devices[1].matches(false, 0, 0, 0, "rtc"));
-    assert_eq!(d.endpoints, vec!["input".to_string()]);
+    assert_eq!(d.endpoints, vec!["input".to_string(), "audio".to_string()]);
     assert_eq!(d.programs, vec!["*.ddrv".to_string()]);
     assert_eq!(d.connect, vec![Connect { service: "storaged".into(), endpoint: "disks".into() }]);
     assert_eq!(summary(&d), "log, 2 device selector(s), programs *.ddrv, storaged.disks");
+    let au = parse(include_bytes!("../../../init/services/audio.dman")).unwrap();
+    assert_eq!((au.name.as_str(), au.image.as_str()), ("audio", "audio.dsvc"));
+    assert_eq!(au.endpoints, vec!["playback".to_string(), "capture".to_string(), "control".to_string()]);
+    let sh = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
+    assert!(sh.audio_playback && sh.audio_control && !sh.audio_capture);
     let l = parse(include_bytes!("../../../init/services/log.dman")).unwrap();
     assert!(l.kernel_log && !l.boot_time && l.endpoints == vec!["read".to_string()]);
     assert_eq!(summary(&l), "log, kernel log");
@@ -281,7 +287,8 @@ fn the_shell_manifest_grants_its_session() {
     let s = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
     assert!(s.tools && s.manage_services && s.manage_power && s.log && s.vmex);
     assert_eq!(s.namespace, vec![NsGrant { path: "*".into(), volume: "*".into(), rights: NS_READ | NS_WRITE }]);
-    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, every volume, VMEX, manager (services, power), tools");
+    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, audio.playback, audio.control, every volume, VMEX, manager (services, power), tools, audio (playback, control)");
+    assert!(refused("name = \"x\"\nimage = \"x.dx\"\ngroup = \"test\"\n[grants]\naudio = [\"root\"]\n").contains("unknown audio right"));
     let t = parse(include_bytes!("../../../init/services/terminal.dman")).unwrap();
     assert_eq!(t.devices, vec![DeviceSel::Platform("display".into())]);
     assert!(!t.tools && !t.manage_services && t.namespace.is_empty());

@@ -539,6 +539,12 @@ fn main(s: *const Startup) -> i32 {
         return svc::log_read();
     } else if a.starts_with(b"svc-time") {
         return svc::time();
+    } else if a.starts_with(b"svc-audio-ungranted") {
+        return svc::audio_ungranted();
+    } else if a.starts_with(b"svc-audio-playonly") {
+        return svc::audio_playonly();
+    } else if a.starts_with(b"svc-audio-full") {
+        return svc::audio_full();
     }
     let ok = test_abi()
         && test_handles()

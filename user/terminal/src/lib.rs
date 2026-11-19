@@ -36,6 +36,7 @@ libd::entry!(_start, main);
 const KEY_CTL: u64 = 1;
 const KEY_INPUT: u64 = 2;
 const KEY_SESSION: u64 = 3;
+const KEY_INDICATOR: u64 = 4;
 
 /// Lines kept for scrolling back.
 const MAX_LINES: usize = 2000;
@@ -100,6 +101,8 @@ struct Term {
     saved: String,
     waiting_completion: bool,
     session: Handle,
+    indicator: Handle,
+    mic_active: bool,
     mirror: bool,
     /// Which keyboard the last key came from (for the log line).
     from: [u8; 24],
@@ -211,6 +214,15 @@ impl Term {
             for x in 0..self.scr.cols {
                 let c = line.get(x).copied().unwrap_or(blank);
                 self.scr.put(x, y, c);
+            }
+        }
+        // Visible active microphone indicator (top-right badge on row 0, unforgeable: only audio.dsvc holds `terminal.indicator`).
+        if self.mic_active && self.scr.rows > 0 && self.scr.cols >= 12 {
+            let badge = b" [MIC LIVE] ";
+            let attr = term::WHITE | (term::RED << 4);
+            let start = self.scr.cols - badge.len();
+            for (i, &ch) in badge.iter().enumerate() {
+                self.scr.put(start + i, 0, cell(ch, attr));
             }
         }
     }
@@ -461,6 +473,8 @@ fn main(s: *const Startup) -> i32 {
         saved: String::new(),
         waiting_completion: false,
         session: 0,
+        indicator: 0,
+        mic_active: false,
         mirror,
         from: [0; 24],
         from_len: 0,
@@ -512,6 +526,40 @@ fn main(s: *const Startup) -> i32 {
                     }
                 }
             },
+            KEY_INDICATOR => loop {
+                match sys::channel_read(t.indicator, &mut buf, 0) {
+                    Ok(n) => {
+                        let n = n as usize;
+                        if let Some(h) = Header::get(&buf[..n])
+                            && h.op == term::INDICATOR
+                        {
+                            let active = (h.a & term::IND_MIC_ACTIVE) != 0;
+                            if active != t.mic_active {
+                                t.mic_active = active;
+                                let label = core::str::from_utf8(&buf[HEADER..n]).unwrap_or("");
+                                if active {
+                                    println!("terminal: indicator: MIC LIVE{}", if label.is_empty() { "" } else { " (active)" });
+                                } else {
+                                    println!("terminal: indicator: MIC OFF");
+                                }
+                            }
+                        }
+                    }
+                    Err(sys::ERR_SHOULD_WAIT) => {
+                        port.arm(t.indicator, sys::READABLE | sys::PEER_CLOSED, KEY_INDICATOR);
+                        break;
+                    }
+                    Err(_) => {
+                        sys::handle_close(t.indicator);
+                        t.indicator = 0;
+                        if t.mic_active {
+                            t.mic_active = false;
+                            println!("terminal: indicator: MIC OFF (peer closed)");
+                        }
+                        break;
+                    }
+                }
+            },
             _ => loop {
                 // The service manager: a session (the shell), a new input channel, or stop.
                 let mut hs = [0 as Handle; 1];
@@ -529,6 +577,13 @@ fn main(s: *const Startup) -> i32 {
                             Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"session" && handle != 0 => {
                                 t.connect(handle);
                                 port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_SESSION);
+                            }
+                            Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"indicator" && handle != 0 => {
+                                if t.indicator != 0 {
+                                    sys::handle_close(t.indicator);
+                                }
+                                t.indicator = handle;
+                                port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_INDICATOR);
                             }
                             Some(h) if h.op == svc::SHUTDOWN => return 0,
                             _ => {

@@ -31,6 +31,7 @@ enum PostCheck {
     TimeRebootUefi,
     ServicesOrder,
     KaslrReboots,
+    AudioWav(u32),
 }
 
 #[derive(Clone, Copy)]
@@ -38,6 +39,7 @@ enum HostTest {
     Dosfs,
     Crypto,
     Manifest,
+    Audio,
     Aml,
     Kaslr,
     Static,
@@ -63,6 +65,7 @@ struct TestCase {
     must_exit: bool,
     tamper: bool,
     usb_disk: Option<&'static str>,
+    audio_wav: bool,
     bochs: Option<&'static str>,
     bochs_strict_msr: bool,
     qemu_extra: Vec<String>,
@@ -92,6 +95,7 @@ impl TestCase {
             must_exit: false,
             tamper: false,
             usb_disk: None,
+            audio_wav: false,
             bochs: None,
             bochs_strict_msr: false,
             qemu_extra: Vec::new(),
@@ -141,6 +145,7 @@ impl TestCase {
     fn must_exit(mut self) -> Self { self.must_exit = true; self }
     fn tamper(mut self) -> Self { self.tamper = true; self }
     fn usb_disk(mut self, s: &'static str) -> Self { self.usb_disk = Some(s); self }
+    fn audio_wav(mut self) -> Self { self.audio_wav = true; self }
     fn bochs(mut self, model: &'static str) -> Self { self.bochs = Some(model); self }
     fn bochs_strict_msr(mut self) -> Self { self.bochs_strict_msr = true; self }
     fn qemu(mut self, items: &[&str]) -> Self {
@@ -1354,7 +1359,109 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::host_case("storage-host", HostTest::Dosfs),
         TestCase::host_case("crypto-host", HostTest::Crypto),
         TestCase::host_case("manifest-host", HostTest::Manifest),
+        TestCase::host_case("audio-host", HostTest::Audio),
         TestCase::host_case("aml-host", HostTest::Aml),
+
+        TestCase::boot("audio-hda")
+            .def("SHELL")
+            .audio_wav()
+            .qemu(&["-device", "ich9-intel-hda", "-device", "hda-duplex,audiodev=snd0"])
+            .timeout(60)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(&["audio", "audio tone 440 800", "@~400", "power off"], 400),
+                "shell: ready",
+            )
+            .expect(&[
+                "hda: controller ready on pci-",
+                "devmgr: hda.ddrv ready",
+                "audio: backend 'HDA",
+                "terminal| v played 440 Hz tone for 800 ms",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "exited with code", "user fault"])
+            .post(PostCheck::AudioWav(440)),
+
+        TestCase::boot("audio-virtio")
+            .def("SHELL")
+            .audio_wav()
+            .qemu(&["-device", "virtio-sound-pci,audiodev=snd0,iommu_platform=on"])
+            .timeout(60)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(&["audio", "audio tone 440 800", "@~400", "power off"], 400),
+                "shell: ready",
+            )
+            .expect(&[
+                "virtio-snd: ready on pci-",
+                "devmgr: virtio-snd.ddrv ready",
+                "audio: backend 'VirtIO Sound Out'",
+                "terminal| v played 440 Hz tone for 800 ms",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "exited with code", "user fault"])
+            .post(PostCheck::AudioWav(440)),
+
+        TestCase::boot("audio-usb")
+            .def("SHELL")
+            .audio_wav()
+            .qemu(&["-device", "qemu-xhci,id=xhci", "-device", "usb-audio,bus=xhci.0,audiodev=snd0"])
+            .timeout(60)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(&["audio", "audio tone 440 800", "@~400", "power off"], 400),
+                "shell: ready",
+            )
+            .expect(&[
+                "xhci: controller ready on pci-",
+                "audio device ready on port",
+                "usbaudio:",
+                "audio: backend 'USB Audio Output'",
+                "terminal| v played 440 Hz tone for 800 ms",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "exited with code", "user fault"])
+            .post(PostCheck::AudioWav(440)),
+
+        TestCase::boot("audio-sec")
+            .def("AUDIO")
+            .audio_wav()
+            .qemu(&[
+                "-audiodev", "none,id=mic0",
+                "-device", "ich9-intel-hda",
+                "-device", "hda-duplex,audiodev=snd0",
+                "-device", "hda-micro,audiodev=mic0",
+                "-device", "qemu-xhci,id=xhci",
+            ])
+            .timeout(90)
+            .must_exit()
+            .keys(
+                &[
+                    "!device_add usb-audio,bus=xhci.0,id=ua1,audiodev=snd0",
+                    "~2000",
+                    "!device_del ua1",
+                ],
+                "svc-audio-full: ready for usb hotplug",
+            )
+            .expect(&[
+                "svc-audio-ungranted: PASSED (ungranted app refused)",
+                "audio: refused capture on non-capture endpoint",
+                "svc-audio-playonly: PASSED",
+                "terminal: indicator: MIC LIVE",
+                "terminal: indicator: MIC OFF",
+                "audio: refused capture (microphone policy revoked)",
+                "audio: output switched to 'USB Audio Output'",
+                "svc-audio-full: usb hotplug active",
+                "svc-audio-full: switched back to HDA",
+                "hda: intentional crash requested",
+                "devmgr: restarting hda.ddrv",
+                "audio: backend 'HDA Line Out' (id 1) reconnected",
+                "svc-audio-full: PASSED",
+                "init: audio test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "audio test services did not finish"])
+            .post(PostCheck::AudioWav(660)),
 
         TestCase::boot("uefi-badsig")
             .uefi()
@@ -1654,6 +1761,19 @@ pub fn run_test_suite(
             ]);
         }
 
+        if tc.audio_wav {
+            fs::create_dir_all(&disk_dir).map_err(|e| e.to_string())?;
+            let wav = disk_dir.join("out.wav");
+            let _ = fs::remove_file(&wav);
+            extra.extend([
+                "-audiodev".into(),
+                format!(
+                    "wav,id=snd0,out.frequency=48000,out.channels=2,out.format=s16,path={}",
+                    wav.display()
+                ),
+            ]);
+        }
+
         let limit = tc.timeout.max(default_timeout);
         let cap = if let Some(bochs_model) = tc.bochs {
             let bdir = env.build.join("bochs").join(tc.name);
@@ -1806,7 +1926,123 @@ fn run_post_check(
         PostCheck::TimeRebootUefi => post_time_reboot(env, disk_dir, image, log, true),
         PostCheck::ServicesOrder => Ok(post_services_order(log)),
         PostCheck::KaslrReboots => post_kaslr_reboots(env, image, log),
+        PostCheck::AudioWav(hz) => post_audio_wav(disk_dir, hz),
     }
+}
+
+/// Verify a QEMU `-audiodev wav` capture file: valid RIFF/WAVE PCM header, audible RMS & peak
+/// level, and dominant Goertzel frequency matching `expected_hz` (±25 Hz).
+fn post_audio_wav(disk_dir: &Path, expected_hz: u32) -> Result<bool, String> {
+    let path = disk_dir.join("out.wav");
+    let raw = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if raw.len() < 44 || &raw[0..4] != b"RIFF" || &raw[8..12] != b"WAVE" {
+        println!("  wav: invalid RIFF/WAVE header ({} bytes)", raw.len());
+        return Ok(false);
+    }
+    let mut off = 12usize;
+    let mut channels = 0u16;
+    let mut rate = 0u32;
+    let mut bits = 0u16;
+    let mut pcm: &[u8] = &[];
+    while off + 8 <= raw.len() {
+        let id = &raw[off..off + 4];
+        let sz = u32::from_le_bytes([raw[off + 4], raw[off + 5], raw[off + 6], raw[off + 7]]) as usize;
+        let body_start = off + 8;
+        let body_end = body_start.saturating_add(sz).min(raw.len());
+        if id == b"fmt " && body_end - body_start >= 16 {
+            channels = u16::from_le_bytes([raw[body_start + 2], raw[body_start + 3]]);
+            rate = u32::from_le_bytes([
+                raw[body_start + 4],
+                raw[body_start + 5],
+                raw[body_start + 6],
+                raw[body_start + 7],
+            ]);
+            bits = u16::from_le_bytes([raw[body_start + 14], raw[body_start + 15]]);
+        } else if id == b"data" {
+            // Streaming WAV writers (including QEMU `-audiodev wav`) leave `sz == 0` when closed
+            // without rewriting the header, meaning PCM continues to EOF.
+            let data_end = if sz == 0 { raw.len() } else { body_end };
+            pcm = &raw[body_start..data_end];
+            break;
+        }
+        off = body_start.saturating_add(sz + (sz & 1));
+    }
+    if channels == 0 || rate == 0 || bits != 16 || pcm.is_empty() {
+        println!("  wav: unsupported format (ch={channels}, rate={rate}, bits={bits}, data={})", pcm.len());
+        return Ok(false);
+    }
+    let frame_bytes = usize::from(channels) * 2;
+    let total_frames = pcm.len() / frame_bytes;
+    let mut mono = Vec::with_capacity(total_frames);
+    for i in 0..total_frames {
+        let mut sum = 0i32;
+        for c in 0..usize::from(channels) {
+            let p = i * frame_bytes + c * 2;
+            sum += i32::from(i16::from_le_bytes([pcm[p], pcm[p + 1]]));
+        }
+        mono.push((sum / i32::from(channels)) as f64);
+    }
+    // Locate the active non-silent window (samples above threshold 400).
+    let first = mono.iter().position(|&s| s.abs() > 400.0);
+    let last = mono.iter().rposition(|&s| s.abs() > 400.0);
+    let (Some(start), Some(end)) = (first, last) else {
+        println!("  wav: {total_frames} frames @ {rate} Hz, but completely silent (peak < 400)");
+        return Ok(false);
+    };
+    let active = &mono[start..=end];
+    let n = active.len().min((rate as usize) * 3 / 4); // analyze up to the final 750 ms of active tone
+    if n < 480 {
+        println!("  wav: active tone too short ({n} frames)");
+        return Ok(false);
+    }
+    let seg = &active[active.len() - n..];
+    let mut peak = 0.0f64;
+    let mut sum_sq = 0.0f64;
+    for &s in seg {
+        peak = peak.max(s.abs());
+        sum_sq += s * s;
+    }
+    let rms = (sum_sq / n as f64).sqrt();
+
+    // Goertzel magnitude sweep across 100..=1600 Hz in 5 Hz steps.
+    let goertzel = |freq_hz: f64| -> f64 {
+        let omega = 2.0 * std::f64::consts::PI * freq_hz / (rate as f64);
+        let coeff = 2.0 * omega.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in seg {
+            let s0 = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0).sqrt() / (n as f64)
+    };
+
+    let mut best_hz = 0u32;
+    let mut best_mag = 0.0f64;
+    let mut bg_sum = 0.0f64;
+    let mut bg_cnt = 0usize;
+    let mut f = 100u32;
+    while f <= 1600 {
+        let m = goertzel(f64::from(f));
+        if m > best_mag {
+            best_mag = m;
+            best_hz = f;
+        }
+        if f.abs_diff(expected_hz) > 60 {
+            bg_sum += m;
+            bg_cnt += 1;
+        }
+        f += 5;
+    }
+    let bg_avg = if bg_cnt > 0 { bg_sum / bg_cnt as f64 } else { 1.0 };
+    let snr = best_mag / bg_avg.max(1.0);
+    let freq_ok = best_hz.abs_diff(expected_hz) <= 25;
+    let level_ok = peak >= 2500.0 && rms >= 1200.0 && snr >= 5.0;
+    println!(
+        "  wav: {rate} Hz {channels}ch 16-bit, active {n} frames ({:.0} ms), peak={peak:.0}, rms={rms:.0}, dominant={best_hz} Hz (expected {expected_hz} Hz, SNR={snr:.1}x)",
+        (n as f64 * 1000.0) / (rate as f64)
+    );
+    Ok(freq_ok && level_ok)
 }
 
 fn post_disks_unchanged(env: &Env, disk_dir: &Path, image: &Path) -> Result<bool, String> {
@@ -2258,6 +2494,7 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
     match test {
         HostTest::Dosfs => host_cargo_test(env, "user/lib/fs", &[], &[]),
         HostTest::Manifest => host_cargo_test(env, "user/lib/dman", &["--", "--nocapture"], &["test result", "FAILED", "panicked", "dman fuzz"]),
+        HostTest::Audio => host_cargo_test(env, "user/lib/audio", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Aml => host_aml_test(env),
         HostTest::Crypto => host_crypto_test(env),
         HostTest::Kaslr => host_kaslr_test(env),
@@ -2763,9 +3000,10 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     let cargo = env.cargo()?;
     let clippy_dir = env.build.join("clippy");
     let cargo_env = env.cargo_env_pairs();
-    let standalone: [(&str, &[&str]); 6] = [
+    let standalone: [(&str, &[&str]); 7] = [
         ("kernel/rust", &[]),
         ("kernel/aml", &["--all-targets"]),
+        ("user/lib/audio", &["--all-targets"]),
         ("user/lib/crypto", &["--all-targets"]),
         ("user/lib/fs", &["--all-targets"]),
         ("user/lib/dman", &["--all-targets"]),
@@ -2803,6 +3041,7 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     // User workspace crates (shared target-dir, ring-3 target):
     let user_pkgs = [
         ("libd", &["--features", "capi"][..]),
+        ("audio", &[]),
         ("init", &[]),
         ("log", &[]),
         ("clock", &[]),

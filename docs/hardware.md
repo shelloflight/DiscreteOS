@@ -59,17 +59,22 @@ Large screens get doubled glyphs. If the log scrolls too fast, film it.
 - **USB** (xHCI, any port, behind USB 2 and USB 3 hubs): keyboards (boot protocol, US layout, key
   repeat, Caps Lock LED; up to four at once, as receivers and lighting controllers often offer a
   keyboard interface too), mice (up to two; their input reaches the device manager's input
-  endpoint, nothing uses it yet), and USB sticks and disks (bulk-only mass storage, 512-byte
-  sectors, read-only like every disk). The driver prints one line per device it finds
+  endpoint, nothing uses it yet), USB sticks and disks (bulk-only mass storage, 512-byte
+  sectors, read-only like every disk), and USB Audio Class 1.0/2.0 devices via xHCI isochronous
+  transfers (`usbaudio.ddrv`). The driver prints one line per device it finds
   (xhci 10:00.0: port 8.2: mouse ready on port 8.2 ...), with the controller's PCI address and the
   port path through any hubs. A device that keeps disconnecting and reconnecting on its own is
   left alone after three tries, until it is unplugged. Not supported: tablets and other absolute
-  pointers, audio and video (isochronous), UAS-only disks, 4K-sector disks.
+  pointers, USB video, UAS-only disks, 4K-sector disks.
+- **Audio** ([audio.md](audio.md)): Intel HD Audio (`hda.ddrv`, dynamic codec/widget/pin graph
+  discovery, jack sense, HDMI/DP ELD), USB Audio (`usbaudio.ddrv`), and VirtIO Sound
+  (`virtio-snd.ddrv`), routed through `audio.dsvc` with automatic output switching and the shell's
+  `audio` command.
 - **Several keyboards**: the first keyboard that types is in use. A keyboard plugged in while
   another is in use is held: nothing it types arrives until it is accepted with
   **Ctrl+Alt+Insert** on a keyboard already in use (so a USB device posing as a keyboard cannot
   type commands on its own).
-- **Network, sound, GPU acceleration.**
+- **Network, GPU acceleration.**
 - The kernel debugger needs a serial port.
 
 Switch off with the power button; nothing needs saving.

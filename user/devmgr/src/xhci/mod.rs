@@ -48,10 +48,12 @@ macro_rules! say {
 
 mod hid;
 mod hub;
+mod isoc;
 mod msc;
 
 use hid::{Kbd, Mouse};
 use hub::Hub;
+use isoc::{KEY_AUDIO, MAX_AUDIO_DEVS, UsbAudioDev};
 use msc::{UsbDisk, serve_disk};
 
 use libd::handle::sleep;
@@ -347,6 +349,7 @@ enum Found {
     /// A keyboard, a mouse, or both on one device (a receiver).
     Input(Option<Kbd>, Option<Mouse>),
     Disk(UsbDisk),
+    Audio(UsbAudioDev),
     /// A hub: ports, identity, USB 3.
     Hub(u32, Ident, bool),
     Other(Ident),
@@ -368,6 +371,7 @@ struct Iface {
 }
 
 struct Xhci {
+    dev: Handle,
     bar: Mapping,
     op: u64,
     rt: u64,
@@ -396,6 +400,8 @@ struct Xhci {
     kbds: [Option<Kbd>; MAX_KBDS],
     mice: [Option<Mouse>; MAX_MICE],
     disks: [Option<UsbDisk>; MAX_DISKS],
+    audios: [Option<UsbAudioDev>; MAX_AUDIO_DEVS],
+    audio_armed: [Handle; MAX_AUDIO_DEVS],
     /// The control channel to the device manager (KEY, POINTER, DISK messages).
     ctl: Handle,
     /// Disks may be written (started with `rw`).
@@ -514,12 +520,15 @@ impl Xhci {
     /// and mouse reports kept for the main loop, the rest dropped.
     fn wait_event(&mut self, ms: u64, mut want: impl FnMut(&Trb) -> bool) -> Option<Trb> {
         let deadline = sys::clock_ns() + ms * MS;
-        let mut eps = [(0u32, 0u32); MAX_KBDS + MAX_MICE];
+        let mut eps = [(0u32, 0u32); MAX_KBDS + MAX_MICE + MAX_AUDIO_DEVS];
         for (i, k) in self.kbds.iter().enumerate() {
             eps[i] = k.as_ref().map_or((0, 0), |k| (k.slot, k.dci));
         }
         for (i, m) in self.mice.iter().enumerate() {
             eps[MAX_KBDS + i] = m.as_ref().map_or((0, 0), |m| (m.slot, m.dci));
+        }
+        for (i, a) in self.audios.iter().enumerate() {
+            eps[MAX_KBDS + MAX_MICE + i] = a.as_ref().and_then(|a| a.active_dci().map(|d| (a.slot, d))).unwrap_or((0, 0));
         }
         loop {
             while let Some(e) = self.poll_event() {
@@ -764,6 +773,15 @@ impl Xhci {
                     }
                 }
             }
+            for (ai, a) in self.audios.iter_mut().enumerate() {
+                if let Some(a) = a.take_if(|a| a.slot == s) {
+                    println!("xhci: audio {:04x}:{:04x} on port {} unplugged", a.id.vid, a.id.pid, a.loc);
+                    if a.ch != 0 {
+                        sys::handle_close(a.ch); // usbaudio.ddrv sees PEER_CLOSED and exits cleanly
+                    }
+                    self.audio_armed[ai] = 0;
+                }
+            }
             self.disable_slot(s);
         }
     }
@@ -806,7 +824,7 @@ impl Xhci {
         if self.get_descriptor(slot, 2, 9).map_err(|_| "configuration unreadable")? < 9 {
             return Err("configuration descriptor too short");
         }
-        let total = u16::from_le_bytes([self.desc(2), self.desc(3)]).min(1024);
+        let total = u16::from_le_bytes([self.desc(2), self.desc(3)]).min(2048);
         let got = u64::from(self.get_descriptor(slot, 2, total).map_err(|_| "configuration unreadable")?);
         let cfg_value = self.desc(5);
         // The interfaces (alternate setting 0) and their endpoints.
@@ -894,6 +912,10 @@ impl Xhci {
         if let Some(d) = disk {
             return self.setup_storage(slot, loc, cfg_value, id, d);
         }
+        let has_audio = ifs.iter().any(|f| f.class == 1 && f.sub == 1);
+        if has_audio {
+            return self.setup_audio(slot, loc, cfg_value, id, got as usize);
+        }
         Ok(Found::Other(id))
     }
 
@@ -928,10 +950,11 @@ impl Xhci {
             Ok(Found::Input(Some(k), _)) => k.loc,
             Ok(Found::Input(None, Some(m))) => m.loc,
             Ok(Found::Disk(d)) => d.loc,
+            Ok(Found::Audio(a)) => a.loc,
             _ => self.loc_of(parent, port),
         };
         let key = match &r {
-            Ok(Found::Input(..)) | Ok(Found::Disk(_)) => 0,
+            Ok(Found::Input(..)) | Ok(Found::Disk(_)) | Ok(Found::Audio(_)) => 0,
             Ok(Found::Hub(_, id, _)) | Ok(Found::Other(id)) => id.key(),
             Err(_) => u32::MAX,
         };
@@ -976,6 +999,11 @@ impl Xhci {
                 sys::channel_write(self.ctl, &m[..HEADER + d.model_len]);
                 let i = d.idx;
                 self.disks[i] = Some(d);
+            }
+            Ok(Found::Audio(a)) => {
+                say!(self, "audio device ready on port {} (USB Audio Class, slot {}): {:04x}:{:04x}", at, a.slot, a.id.vid, a.id.pid);
+                let i = a.idx;
+                self.audios[i] = Some(a);
             }
             Ok(Found::Hub(n, id, ss)) if !repeat => say!(self, "port {}: hub {:04x}:{:04x}, {} ports{}", at, id.vid, id.pid, n, if ss { " (USB 3)" } else { "" }),
             Ok(Found::Other(id)) if !repeat => say!(self, "port {}: {} {:04x}:{:04x} (left unused)", at, id.kind(), id.vid, id.pid),
@@ -1105,6 +1133,8 @@ impl Xhci {
                             self.drop_slot(m.slot);
                         }
                     }
+                } else {
+                    let _ = self.on_isoc_event(&e);
                 }
             }
             E_PORT => {
@@ -1245,7 +1275,8 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
     let mut tag = [0u8; 16];
     let tag_len = name.len().min(16);
     tag[..tag_len].copy_from_slice(&name[..tag_len]);
-    let mut x = Xhci {
+        let mut x = Xhci {
+        dev,
         bar,
         op: caplen,
         rt,
@@ -1271,6 +1302,8 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         kbds: [const { None }; MAX_KBDS],
         mice: [const { None }; MAX_MICE],
         disks: [const { None }; MAX_DISKS],
+        audios: [const { None }; MAX_AUDIO_DEVS],
+        audio_armed: [0; MAX_AUDIO_DEVS],
         ctl: ch,
         writable: libd::args() == b"rw",
         requests: 0,
@@ -1333,7 +1366,7 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         }
     }
     sleep(DEBOUNCE);
-    let port = Port::new(16).map_err(|_| "no port")?;
+    let port = Port::new(32).map_err(|_| "no port")?;
     port.arm(x.irq, sys::SIGNALED, KEY_IRQ);
     port.arm(ch, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
     // What is connected now is probed right away (the wait above was its debounce); devices
@@ -1347,6 +1380,15 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         }
     }
     x.service(sys::clock_ns());
+    for i in 0..MAX_AUDIO_DEVS {
+        if let Some(a) = x.audios[i].as_ref()
+            && a.ch != 0
+            && x.audio_armed[i] != a.ch
+        {
+            port.arm(a.ch, sys::READABLE | sys::PEER_CLOSED, KEY_AUDIO + i as u64);
+            x.audio_armed[i] = a.ch;
+        }
+    }
     println!(
         "xhci: controller ready on {}: {} ports ({} USB 3), {} slots, {}-byte contexts, {} scratchpad page(s), DMA {}",
         info.name(),
@@ -1410,6 +1452,9 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
             } else if (KEY_DISK..KEY_DISK + MAX_DISKS as u64).contains(&key) {
                 let u = (key - KEY_DISK) as usize;
                 serve_disk(&mut x, u, &port, key, &mut msg, &mut data);
+            } else if (KEY_AUDIO..KEY_AUDIO + MAX_AUDIO_DEVS as u64).contains(&key) {
+                let u = (key - KEY_AUDIO) as usize;
+                x.serve_audio(u, &port);
             } else {
                 let _ = sys::interrupt_ack(x.irq);
                 x.bar.w32(x.rt + IMAN, IMAN_IE | IMAN_IP);
@@ -1420,6 +1465,15 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         let now = sys::clock_ns();
         x.root_changes(now);
         x.service(now);
+        for i in 0..MAX_AUDIO_DEVS {
+            if let Some(a) = x.audios[i].as_ref()
+                && a.ch != 0
+                && x.audio_armed[i] != a.ch
+            {
+                port.arm(a.ch, sys::READABLE | sys::PEER_CLOSED, KEY_AUDIO + i as u64);
+                x.audio_armed[i] = a.ch;
+            }
+        }
         x.drain(ch); // keyboard and mouse reports that arrived during hub requests
         x.repeat_keys(ch, sys::clock_ns());
     }

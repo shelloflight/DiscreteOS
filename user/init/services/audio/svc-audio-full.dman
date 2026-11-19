@@ -1,0 +1,19 @@
+# Audio test service with playback, capture, and control grants: tests mic indicator, mic revoke,
+# per-device volume, automatic output switching on USB hot-plug, and HDA driver crash/restart recovery.
+name = "svc-audio-full"
+image = "ltest.dx"
+args = "svc-audio-full"
+group = "test"
+after = ["audio", "svc-audio-ungranted", "svc-audio-playonly"]
+
+[grants]
+log = true
+audio = ["playback", "capture", "control"]
+
+[quota]
+memory = "16M"
+handles = 128
+threads = 4
+
+[restart]
+policy = "never"

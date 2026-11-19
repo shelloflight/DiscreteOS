@@ -4,6 +4,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "audio",
     "clock",
     "dcmpl",
     "devmgr",
@@ -18,6 +19,7 @@ members = [
     "tools",
 ]
 exclude = [
+    "lib/audio",
     "lib/crypto",
     "lib/dman",
     "lib/fs",

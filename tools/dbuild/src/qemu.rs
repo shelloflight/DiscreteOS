@@ -439,15 +439,61 @@ pub fn bochs_capture(
     }))
 }
 
+fn detect_host_audiodev(qemu: &Path) -> &'static str {
+    let preferred: &[&str] = if cfg!(windows) {
+        &["sdl", "dsound", "none"]
+    } else if cfg!(target_os = "macos") {
+        &["coreaudio", "sdl", "none"]
+    } else {
+        &["pipewire", "pa", "alsa", "sdl", "none"]
+    };
+    let out = match Command::new(qemu).args(["-audiodev", "help"]).output() {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => return "none",
+    };
+    let avail: Vec<&str> = out.lines().map(str::trim).collect();
+    for &drv in preferred {
+        if avail.contains(&drv) {
+            return drv;
+        }
+    }
+    "none"
+}
+
 pub fn run_interactive(
     env: &Env,
     image: &Path,
     smp: u32,
     uefi: bool,
     iommu: &str,
+    audio: &str,
     debug: bool,
 ) -> Result<(), String> {
     let qemu = env.qemu()?;
+    let mut extra: Vec<String> = Vec::new();
+    if audio != "none" {
+        let host_drv = detect_host_audiodev(qemu);
+        extra.extend(["-audiodev".into(), format!("{host_drv},id=snd0")]);
+        match audio {
+            "hda" => extra.extend([
+                "-device".into(),
+                "ich9-intel-hda".into(),
+                "-device".into(),
+                "hda-duplex,audiodev=snd0".into(),
+            ]),
+            "virtio" => extra.extend([
+                "-device".into(),
+                "virtio-sound-pci,audiodev=snd0,iommu_platform=on".into(),
+            ]),
+            "usb" => extra.extend([
+                "-device".into(),
+                "qemu-xhci,id=xhci".into(),
+                "-device".into(),
+                "usb-audio,bus=xhci.0,audiodev=snd0".into(),
+            ]),
+            _ => {}
+        }
+    }
     let opts = QemuOpts {
         image,
         cpus: smp,
@@ -456,7 +502,7 @@ pub fn run_interactive(
         disk_dir: &env.build,
         uefi,
         iommu,
-        extra: &[],
+        extra: &extra,
         must_exit: false,
     };
     let mut qargs = build_qemu_args(env, &opts)?;

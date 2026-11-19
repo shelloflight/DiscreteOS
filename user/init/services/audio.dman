@@ -1,0 +1,24 @@
+# Audio service: shared-memory PCM mixer, format/rate/channel conversion, automatic output
+# switching, per-device volume, capability-gated playback & microphone capture.
+name = "audio"
+image = "audio.dsvc"
+group = "system"
+after = ["devmgr", "terminal"]
+description = "audio mixer, routing, and microphone policy"
+
+[provides]
+endpoints = ["playback", "capture", "control"]
+
+[grants]
+log = true
+connect = ["devmgr.audio", "terminal.indicator"]
+
+[quota]
+memory = "32M"
+handles = 256
+threads = 4
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

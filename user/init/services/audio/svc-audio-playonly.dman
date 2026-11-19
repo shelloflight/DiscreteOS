@@ -1,0 +1,18 @@
+# Audio test service with playback grant ONLY: may play (24 kHz mono resampled) but must be refused capture.
+name = "svc-audio-playonly"
+image = "ltest.dx"
+args = "svc-audio-playonly"
+group = "test"
+after = ["audio"]
+
+[grants]
+log = true
+audio = ["playback"]
+
+[quota]
+memory = "16M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"

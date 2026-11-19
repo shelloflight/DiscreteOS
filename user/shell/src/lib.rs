@@ -94,6 +94,8 @@ pub struct Shell {
     pub mgr: Handle,
     pub log: Handle,
     pub clock: Handle,
+    pub audio_play: Handle,
+    pub audio_ctl: Handle,
     pub jobs: Vec<Job>,
     next_job: u32,
     /// The job whose output the terminal is waiting for.
@@ -868,6 +870,8 @@ fn main(s: *const Startup) -> i32 {
         mgr: libd::startup_handle(tool::TAG_MANAGER),
         log: svc::endpoint(b"log.read"),
         clock: svc::endpoint(b"clock.time"),
+        audio_play: svc::endpoint(b"audio.playback"),
+        audio_ctl: svc::endpoint(b"audio.control"),
         jobs: Vec::new(),
         next_job: 1,
         fg: None,
@@ -929,6 +933,8 @@ fn main(s: *const Startup) -> i32 {
                                     b"terminal.session" => &mut sh.term,
                                     b"log.read" => &mut sh.log,
                                     b"clock.time" => &mut sh.clock,
+                                    b"audio.playback" => &mut sh.audio_play,
+                                    b"audio.control" => &mut sh.audio_ctl,
                                     _ => {
                                         sys::handle_close(handle);
                                         continue;

@@ -10,6 +10,8 @@
 //! channel name no unit (the channel is the disk); on the control channel they address unit 0.
 
 pub const TAG_CONTROL: u32 = crate::sys::TAG_USER;
+/// Channel handed to a USB class driver (`usbaudio.ddrv`) to talk to its `xhci.ddrv` host.
+pub const TAG_USB_BUS: u32 = crate::sys::TAG_USER + 1;
 
 /// Driver -> manager: initialised; `a` = capacity in sectors (block) or 0.
 pub const READY: u32 = 1;
@@ -22,6 +24,18 @@ pub const KEY: u32 = 2;
 pub const POINTER: u32 = 4;
 /// Driver -> manager: keyboard `a` (the `KEY` id) is gone (unplugged or failed).
 pub const KEYBOARD_GONE: u32 = 5;
+/// Audio driver -> manager: audio endpoint announced.
+/// `a` = unit (0..15) | kind (16..23) | flags (32..63);
+/// `b` = default_rate (0..31) | channels (32..39) | format (40..47);
+/// payload = UTF-8 device name.
+pub const AUDIO_DEV: u32 = 6;
+/// Audio driver -> manager: jack or ELD state update for unit `a`; `b` = new flags; optional payload = name.
+pub const AUDIO_JACK: u32 = 7;
+/// Audio driver -> manager: audio endpoint unit `a` removed (hot-unplugged).
+pub const AUDIO_GONE: u32 = 8;
+/// xHCI driver -> manager (carries 1 USB bus channel): spawn `usbaudio.ddrv` for a USB Audio device.
+/// `a` = vid (0..15) | pid (16..31) | speed (32..39) | slot (40..47); `b` = port.
+pub const USB_AUDIO_ATTACH: u32 = 9;
 /// Device manager -> each client of its `input` endpoint: a key typed. `a` = the key value
 /// (`key`: a character, US layout, or a named key with modifiers), `b` = which input device (an
 /// index); payload: the driver's name (`ps2`, `xhci`, `virtio-input`).
@@ -69,6 +83,8 @@ pub const BLK_RING_SETUP: u32 = 15;
 /// Client -> block driver (attached channel): drain pending SQEs in the attached ring, post CQEs,
 /// and reply with `a` = completions posted.
 pub const BLK_RING_DOORBELL: u32 = 16;
+/// Manager -> audio driver: serve audio unit `a` on the channel this message carries (no reply).
+pub const AUDIO_ATTACH: u32 = 17;
 /// Manager -> driver (tests): fault on purpose (restart test).
 pub const TEST_CRASH: u32 = 20;
 /// Manager -> block driver (tests): point a request at memory the device was not given (the

@@ -7,7 +7,7 @@ after = ["storaged"]
 description = "devices and their drivers"
 
 [provides]
-endpoints = ["input"]   # every key typed, to each client (the console)
+endpoints = ["input", "audio"]   # keyboard/pointer input and audio driver backend endpoints
 
 [grants]
 log = true

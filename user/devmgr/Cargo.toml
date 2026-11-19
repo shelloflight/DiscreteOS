@@ -18,7 +18,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [package.metadata.dos]
-ddrv = ["ps2", "virtio-blk", "virtio-input", "ahci", "nvme", "xhci"]
+ddrv = ["ps2", "virtio-blk", "virtio-input", "ahci", "nvme", "xhci", "hda", "virtio-snd", "usbaudio"]
 
 [lib]
 crate-type = ["staticlib"]
@@ -28,6 +28,7 @@ bench = false
 
 [dependencies]
 libd = { path = "../lib/libd" }
+dosaudio = { path = "../lib/audio" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

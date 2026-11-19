@@ -32,7 +32,8 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "wait", aliases: &[], usage: "wait <job>", description: "wait for a job and show its output" },
     Builtin { name: "log", aliases: &[], usage: "log [source]", description: "the system log (every record, or one source's)" },
     Builtin { name: "time", aliases: &["date"], usage: "time", description: "the date and time (UTC) and the time since boot" },
-    Builtin { name: "power", aliases: &[], usage: "power off | restart", description: "switch off or restart, after every service stopped cleanly" },
+    Builtin { name: "audio", aliases: &["sound"], usage: "audio [vol <0-100%> | mute [on|off] | out <id|auto> | tone [hz] [ms] | mic <on|off>]", description: "audio devices, volume, output switching and test tone" },
+    Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
 ];
 
@@ -52,6 +53,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let max_args = match b.name {
         "help" | "go" | "objects" | "log" => 1,
         "end" | "restart" | "wait" | "power" => 1,
+        "audio" => 3,
         _ => 0,
     };
     if args.len() > max_args {
@@ -70,6 +72,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "wait" => wait(sh, arg),
         "log" => log(sh, arg),
         "time" => clock(sh),
+        "audio" => audio_cmd(sh, args),
         "power" => power(sh, arg),
         _ => {
             sh.clear();
@@ -369,4 +372,206 @@ fn power(sh: &Shell, what: Option<&str>) -> Res {
     };
     sh.write(&show::ok_line(msg));
     Ok(Vec::new())
+}
+
+/// Parse a non-negative integer or single-decimal number scaled by `scale` (e.g. `"1.5"` * 1000 = 1500).
+fn parse_scaled_u32(num: &str, scale: u64) -> Option<u32> {
+    if num.is_empty() {
+        return None;
+    }
+    let (whole_s, frac_s) = match num.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (num, ""),
+    };
+    if whole_s.is_empty() && frac_s.is_empty() {
+        return None;
+    }
+    let whole: u64 = if whole_s.is_empty() { 0 } else { whole_s.parse().ok()? };
+    let mut frac_val = 0u64;
+    let mut frac_div = 1u64;
+    for b in frac_s.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        if frac_div < 10_000 {
+            frac_val = frac_val * 10 + u64::from(b - b'0');
+            frac_div *= 10;
+        }
+    }
+    let total = whole.checked_mul(scale)?.checked_add((frac_val * scale) / frac_div)?;
+    u32::try_from(total).ok()
+}
+
+/// Parse a frequency like `"440"`, `"500Hz"`, `"1.5kHz"` -> Hz (clamped to `80..=8000`).
+fn parse_hz(raw: &str) -> Result<u32, String> {
+    let lower = raw.to_ascii_lowercase();
+    let (num, scale) = if let Some(n) = lower.strip_suffix("khz") {
+        (n, 1000u64)
+    } else if let Some(n) = lower.strip_suffix("hz") {
+        (n, 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let hz = parse_scaled_u32(num, scale)
+        .filter(|&v| v > 0)
+        .ok_or_else(|| format!("audio: invalid frequency '{}' (e.g. 440, 500Hz, 1.5kHz)", raw))?;
+    Ok(hz.clamp(80, 8000))
+}
+
+/// Parse a duration like `"500"`, `"1000ms"`, `"1.5s"` -> ms (clamped to `50..=5000`).
+fn parse_ms(raw: &str) -> Result<u32, String> {
+    let lower = raw.to_ascii_lowercase();
+    let (num, scale) = if let Some(n) = lower.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = lower.strip_suffix('s') {
+        (n, 1000u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let ms = parse_scaled_u32(num, scale)
+        .filter(|&v| v > 0)
+        .ok_or_else(|| format!("audio: invalid duration '{}' (e.g. 500, 1000ms, 1.5s)", raw))?;
+    Ok(ms.clamp(50, 5000))
+}
+
+fn audio_cmd(sh: &Shell, args: &[String]) -> Res {
+    use dosaudio::pcm::{SampleFormat, StreamParams, ToneGen};
+    use dosaudio::route::DeviceKind;
+    use libd::audio::{self, DeviceEntry, FMT_S16_LE, PlaybackStream};
+
+    let sub = args.first().map(String::as_str);
+    match sub {
+        None | Some("list") => {
+            let ch = if sh.audio_ctl != 0 { sh.audio_ctl } else { sh.audio_play };
+            if ch == 0 {
+                return Err(String::from("audio: no audio capability granted to this session"));
+            }
+            let mut devs = [DeviceEntry::empty(); 16];
+            let n = audio::list_devices(ch, &mut devs).map_err(|e| format!("audio: {}", sys::status(e)))?;
+            let mut rs = Vec::new();
+            for d in &devs[..n] {
+                let state = if d.active_out {
+                    "active out"
+                } else if d.active_in {
+                    "active in"
+                } else if !d.online {
+                    "offline"
+                } else if (d.flags & audio::FLAG_PLUGGED) != 0 {
+                    "plugged"
+                } else {
+                    "unplugged"
+                };
+                let vol = if d.muted {
+                    format!("{}% (muted)", d.volume)
+                } else {
+                    format!("{}%", d.volume)
+                };
+                rs.push(
+                    Record::new()
+                        .with("id", Value::Int(i64::from(d.id)))
+                        .with("name", Value::Text(String::from(d.name_str())))
+                        .with("kind", text(DeviceKind::from_u8(d.kind).label()))
+                        .with("state", text(state))
+                        .with("volume", Value::Text(vol)),
+                );
+            }
+            Ok(rs)
+        }
+        Some("vol") => {
+            let Some(vs) = args.get(1) else {
+                return Err(String::from("audio: usage: audio vol <0-100%> [device-id]"));
+            };
+            let vs = vs.strip_suffix('%').unwrap_or(vs.as_str());
+            let vol: u8 = vs.parse().map_err(|_| String::from("audio: volume must be 0..=100"))?;
+            if vol > 100 {
+                return Err(String::from("audio: volume must be 0..=100"));
+            }
+            let dev_id: u64 = match args.get(2) {
+                Some(s) => s.parse().map_err(|_| format!("audio: invalid device id '{}'", s))?,
+                None => 0,
+            };
+            audio::control_call(sh.audio_ctl, audio::OP_SET_VOL, dev_id, u64::from(vol))
+                .map_err(|e| format!("audio: {}", sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("volume set to {}%", vol)));
+            Ok(Vec::new())
+        }
+        Some("mute") => {
+            let mut devs = [DeviceEntry::empty(); 16];
+            let n = audio::list_devices(sh.audio_ctl, &mut devs).unwrap_or(0);
+            let active = devs[..n].iter().find(|d| d.active_out);
+            let cur_vol = active.map_or(100, |d| d.volume);
+            let cur_muted = active.is_some_and(|d| d.muted);
+            let muted = match args.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                None => !cur_muted,
+                Some("on" | "1" | "true") => true,
+                Some("off" | "0" | "false") => false,
+                Some(_) => return Err(String::from("audio: usage: audio mute [on|off]")),
+            };
+            let b = u64::from(cur_vol) | (u64::from(muted) << 8);
+            audio::control_call(sh.audio_ctl, audio::OP_SET_VOL, 0, b)
+                .map_err(|e| format!("audio: {}", sys::status(e)))?;
+            sh.write(&show::ok_line(if muted { "output muted" } else { "output unmuted" }));
+            Ok(Vec::new())
+        }
+        Some("out") => {
+            let Some(sel) = args.get(1).map(String::as_str) else {
+                return Err(String::from("audio: usage: audio out <id|auto>"));
+            };
+            let id: u64 = if sel == "auto" {
+                0
+            } else {
+                sel.parse().map_err(|_| String::from("audio: device id must be a number or 'auto'"))?
+            };
+            audio::control_call(sh.audio_ctl, audio::OP_SET_DEFAULT, id, 0)
+                .map_err(|e| format!("audio: {}", sys::status(e)))?;
+            sh.write(&show::ok_line(if id == 0 { "automatic output switching enabled" } else { "output switched" }));
+            Ok(Vec::new())
+        }
+        Some("mic") => {
+            let allow = match args.get(1).map(String::as_str) {
+                Some("on" | "allow" | "1") => true,
+                Some("off" | "revoke" | "0") => false,
+                _ => return Err(String::from("audio: usage: audio mic <on|off>")),
+            };
+            audio::control_call(sh.audio_ctl, audio::OP_SET_MIC_GRANT, u64::from(allow), 0)
+                .map_err(|e| format!("audio: {}", sys::status(e)))?;
+            sh.write(&show::ok_line(if allow { "microphone capture allowed" } else { "microphone capture revoked" }));
+            Ok(Vec::new())
+        }
+        Some("tone") => {
+            let hz: u32 = match args.get(1) {
+                Some(s) => parse_hz(s)?,
+                None => 440,
+            };
+            let ms: u32 = match args.get(2) {
+                Some(s) => parse_ms(s)?,
+                None => 500,
+            };
+            let mut stream = PlaybackStream::open(sh.audio_play, 48_000, 2, FMT_S16_LE, 0)
+                .map_err(|e| format!("audio: cannot open playback: {}", sys::status(e)))?;
+            let params = StreamParams { rate: 48_000, channels: 2, format: SampleFormat::S16Le };
+            let mut tone = ToneGen::new(hz, 48_000, 16_000);
+            let total_frames = (48_000u64 * u64::from(ms) / 1000) as usize;
+            let mut buf = alloc::vec![0u8; 480 * 4]; // 10 ms chunks
+            let mut sent = 0usize;
+            while sent < total_frames {
+                let chunk_frames = (total_frames - sent).min(480);
+                let bytes = chunk_frames * 4;
+                tone.fill(params, &mut buf[..bytes]);
+                stream.write(&buf[..bytes]).map_err(|e| format!("audio: write failed: {}", sys::status(e)))?;
+                sent += chunk_frames;
+            }
+            // Flush 120 ms of trailing silence so hardware DMA and host audio buffers finish
+            // playing the tone cleanly and retain no stale PCM after stream close.
+            buf.fill(0);
+            for _ in 0..12 {
+                let _ = stream.write(&buf);
+            }
+            stream.drain(2_000_000_000);
+            stream.close();
+            sh.write(&show::ok_line(&format!("played {} Hz tone for {} ms", hz, ms)));
+            Ok(Vec::new())
+        }
+        _ => Err(String::from("audio: usage: audio [vol <0-100%> | mute [on|off] | out <id|auto> | tone [hz] [ms] | mic <on|off>]")),
+    }
 }

@@ -1,0 +1,27 @@
+# D-OS audio service (`audio.dsvc`): mixer, resampler/converter, automatic output switching,
+# per-device volume, capability-gated playback & capture, and visible microphone indicator.
+[package]
+name = "audio"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata.dos]
+dsvc = ["audio"]
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+dosaudio = { path = "../lib/audio" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

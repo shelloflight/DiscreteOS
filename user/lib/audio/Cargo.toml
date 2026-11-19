@@ -1,0 +1,22 @@
+# `dosaudio`: pure no_std, zero-alloc, zero-unsafe audio core for D-OS.
+# Shared between user-space audio drivers (`hda.ddrv`, `usbaudio.ddrv`, `virtio-snd.ddrv`),
+# the audio service (`audio.dsvc`), and host unit/fuzz tests (`audio-host`).
+[package]
+name = "dosaudio"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"

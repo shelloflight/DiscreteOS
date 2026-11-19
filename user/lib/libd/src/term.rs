@@ -24,6 +24,12 @@ pub const COMPLETE: u32 = 504;
 pub const COMPLETIONS: u32 = 505;
 pub const SIZE: u32 = 506;
 pub const CLEAR: u32 = 507;
+/// Audio service -> terminal (`terminal.indicator`): update live indicator state.
+/// `a` = flags (`IND_MIC_ACTIVE`), payload = optional short source label.
+pub const INDICATOR: u32 = 508;
+
+/// Indicator flag bits for `INDICATOR`.
+pub const IND_MIC_ACTIVE: u64 = 1 << 0;
 
 /// Style control bytes in text.
 pub const STYLE: u8 = 0x01;

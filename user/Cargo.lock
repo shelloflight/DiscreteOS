@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "audio"
+version = "0.1.0"
+dependencies = [
+ "dosaudio",
+ "libd",
+]
+
+[[package]]
 name = "clock"
 version = "0.1.0"
 dependencies = [
@@ -20,11 +28,16 @@ dependencies = [
 name = "devmgr"
 version = "0.1.0"
 dependencies = [
+ "dosaudio",
  "libd",
 ]
 
 [[package]]
 name = "dman"
+version = "0.1.0"
+
+[[package]]
+name = "dosaudio"
 version = "0.1.0"
 
 [[package]]
@@ -66,6 +79,7 @@ dependencies = [
 name = "ltest"
 version = "0.1.0"
 dependencies = [
+ "dosaudio",
  "libd",
 ]
 
@@ -74,6 +88,7 @@ name = "shell"
 version = "0.1.0"
 dependencies = [
  "dman",
+ "dosaudio",
  "libd",
 ]
 

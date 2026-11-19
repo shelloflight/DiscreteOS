@@ -23,8 +23,8 @@ data ▸ copy report.txt /backup
 
 | Process | Holds | Does not hold |
 |---|---|---|
-| `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session |
-| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, a manager channel (`services`, `power`), the tools | the screen, the keyboard |
+| `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge) |
+| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone |
 | a tool | an output channel, one node per path argument with the rights its manifest declares, the log | the namespace, endpoints, anything else of the shell |
 
 The terminal and the shell are separate so that neither gets the other's authority: a bug in the
@@ -75,7 +75,8 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   `end <n>`. Ctrl+C ends the command in front.
 - **Built-ins** (they use the session's own grants): `go`, `places`, `tasks` (services through the
   manager, and jobs), `objects [job | service]` (handles held, through `process_handles`),
-  `end`/`restart` (services through the manager), `log [source]`, `time`, `power off | restart`
+  `end`/`restart` (services through the manager), `log [source]`, `time`, `audio` (devices,
+  volume, routing, test tone, mic policy; [audio.md](audio.md)), `power off | restart | sleep`
   (the manager stops every service cleanly first), `clear`, `run <tool> [arguments]`.
 - **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
   (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place

@@ -174,6 +174,10 @@ pub struct Manifest {
     pub manage_power: bool,
     /// The tool manifests and the tools' program images (the shell).
     pub tools: bool,
+    /// Audio capabilities (`grants.audio`: `playback`, `capture`, `control`).
+    pub audio_playback: bool,
+    pub audio_capture: bool,
+    pub audio_control: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
@@ -193,10 +197,10 @@ pub fn valid_name(s: &str) -> bool {
     !b.is_empty() && b.len() <= MAX_NAME && b[0].is_ascii_lowercase() && b.iter().all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
-/// A program file name: a valid name, then `.dx` or `.ddrv`.
+/// A program file name: a valid name, then `.dx`, `.dsvc`, or `.ddrv`.
 pub fn valid_program(s: &str) -> bool {
     match s.rsplit_once('.') {
-        Some((n, "dx" | "ddrv")) => valid_name(n),
+        Some((n, "dx" | "dsvc" | "ddrv")) => valid_name(n),
         _ => false,
     }
 }
@@ -300,6 +304,7 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "boot-time", Want::Bool),
     ("grants", "manager", Want::Strings),
     ("grants", "tools", Want::Bool),
+    ("grants", "audio", Want::Strings),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -351,6 +356,9 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         manage_services: false,
         manage_power: false,
         tools: false,
+        audio_playback: false,
+        audio_capture: false,
+        audio_control: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -368,7 +376,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
             (Want::Str, Value::Str(s)) => match e.key.as_str() {
                 "name" if !valid_name(s) => return Err(invalid("not a valid name (a-z 0-9 -, at most 24)", s)),
                 "name" => m.name = s.clone(),
-                "image" if !valid_program(s) => return Err(invalid("not a program name (<name>.dx or <name>.ddrv)", s)),
+                "image" if !valid_program(s) => return Err(invalid("not a program name (<name>.dx, <name>.dsvc or <name>.ddrv)", s)),
                 "image" => m.image = s.clone(),
                 "args" => m.args = s.clone(),
                 "description" => m.description = s.clone(),
@@ -467,18 +475,21 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                     "grants.programs" => {
                         for s in &list {
                             let ok = match s.strip_prefix("*.") {
-                                Some(ext) => matches!(ext, "dx" | "ddrv"),
+                                Some(ext) => matches!(ext, "dx" | "dsvc" | "ddrv"),
                                 None => valid_program(s),
                             };
                             if !ok {
-                                return Err(invalid("not a program name or pattern (<name>.dx, *.ddrv)", s));
+                                return Err(invalid("not a program name or pattern (<name>.dx, <name>.dsvc, *.ddrv)", s));
                             }
                         }
                         m.programs = list;
                     }
                     "grants.connect" => {
                         for s in &list {
-                            m.connect.push(parse_connect(s).ok_or_else(|| invalid("not an endpoint (<service>.<endpoint>)", s))?);
+                            let c = parse_connect(s).ok_or_else(|| invalid("not an endpoint (<service>.<endpoint>)", s))?;
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
+                            }
                         }
                     }
                     "grants.namespace" => {
@@ -499,6 +510,29 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                                 "services" => m.manage_services = true,
                                 "power" => m.manage_power = true,
                                 _ => return Err(invalid("unknown manager right (services, power)", s)),
+                            }
+                        }
+                    }
+                    "grants.audio" => {
+                        for s in &list {
+                            let ep = match s.as_str() {
+                                "playback" => {
+                                    m.audio_playback = true;
+                                    "playback"
+                                }
+                                "capture" => {
+                                    m.audio_capture = true;
+                                    "capture"
+                                }
+                                "control" => {
+                                    m.audio_control = true;
+                                    "control"
+                                }
+                                _ => return Err(invalid("unknown audio right (playback, capture, control)", s)),
+                            };
+                            let c = Connect { service: "audio".to_string(), endpoint: ep.to_string() };
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
                             }
                         }
                     }
@@ -570,6 +604,19 @@ pub fn summary(m: &Manifest) -> String {
     }
     if m.tools {
         add("tools");
+    }
+    if m.audio_playback || m.audio_capture || m.audio_control {
+        let mut parts: Vec<&str> = Vec::new();
+        if m.audio_playback {
+            parts.push("playback");
+        }
+        if m.audio_capture {
+            parts.push("capture");
+        }
+        if m.audio_control {
+            parts.push("control");
+        }
+        add(&format!("audio ({})", parts.join(", ")));
     }
     if s.is_empty() {
         s.push_str("nothing");

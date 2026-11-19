@@ -28,7 +28,7 @@ Use `.\dbuild.ps1` on Windows or `./dbuild.sh` on Linux:
 
 ```sh
 ./dbuild.sh                           # build build/discrete.img (BIOS + UEFI, 64 MiB GPT image)
-./dbuild.sh run                       # build and boot in QEMU, serial on this console (--uefi, --smp N, --iommu amd)
+./dbuild.sh run                       # build and boot in QEMU, serial on this console (--uefi, --smp N, --iommu amd, --audio hda|virtio|usb|none)
 ./dbuild.sh debug                     # boot paused with a GDB stub on localhost:1234
 ./dbuild.sh test                      # run the full test suite (repro + QEMU/Bochs + host + static)
 ./dbuild.sh test --case boot,uefi     # selected cases only
@@ -93,9 +93,9 @@ reached from `kernel/rust/src/ktest.rs`) that prints the expected line.
 (Rust) and run inside an existing case (`user`, `libd`, `storage`, `compat`). Add a function there,
 print a clear `FAIL: ...` line on failure, and it is covered.
 
-**A host test.** Libraries that do not need the kernel (`user/lib/fs`, `user/lib/crypto`,
-`user/lib/dman`, `kernel/aml`) use ordinary `cargo test`. Parsers of untrusted data also get a
-fuzzer.
+**A host test.** Libraries that do not need the kernel (`user/lib/audio`, `user/lib/fs`,
+`user/lib/crypto`, `user/lib/dman`, `kernel/aml`) use ordinary `cargo test`. Parsers of untrusted
+data also get a fuzzer.
 
 A good test fails without your change and passes with it. A protection test must prove the
 protection *fires* (the fault, refusal or panic happens), not only that nothing breaks.

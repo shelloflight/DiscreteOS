@@ -184,6 +184,12 @@ impl Virtio {
 
     /// Set up queue `index` (MSI-X entry `index`) with its ring in pinned memory.
     pub fn queue(&self, index: u16) -> Result<Queue, &'static str> {
+        self.queue_with_vector(index, index, true)
+    }
+
+    /// Set up queue `index` routed to MSI-X entry `vector`; if `bind_irq` is false, reuses an
+    /// already-bound vector (for devices offering fewer MSI-X vectors than virtqueues).
+    pub fn queue_with_vector(&self, index: u16, vector: u16, bind_irq: bool) -> Result<Queue, &'static str> {
         let c = self.common;
         self.w16(c, 0x16, index);
         let max = self.r16(c, 0x18);
@@ -194,11 +200,15 @@ impl Virtio {
         if !size.is_power_of_two() {
             return err("odd queue size");
         }
-        let irq = sys::device_interrupt(self.dev, u64::from(index)).map_err(|_| "no interrupt for the queue")?;
+        let irq = if bind_irq {
+            sys::device_interrupt(self.dev, u64::from(vector)).map_err(|_| "no interrupt for the queue")?
+        } else {
+            0
+        };
         let ring = Dma::new(self.dev, 4096, sys::DMA_DEVICE_READ | sys::DMA_DEVICE_WRITE).map_err(|_| "cannot pin the ring")?;
         self.w16(c, 0x18, size);
-        self.w16(c, 0x1A, index);
-        if self.r16(c, 0x1A) != index {
+        self.w16(c, 0x1A, vector);
+        if self.r16(c, 0x1A) != vector {
             return err("device refused the MSI-X vector");
         }
         let base = ring.dev_addr(0);

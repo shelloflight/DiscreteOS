@@ -1,0 +1,17 @@
+# Audio test service with NO audio grant: must receive no audio endpoints and be refused playback.
+name = "svc-audio-ungranted"
+image = "ltest.dx"
+args = "svc-audio-ungranted"
+group = "test"
+after = ["audio"]
+
+[grants]
+log = true
+
+[quota]
+memory = "8M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"
