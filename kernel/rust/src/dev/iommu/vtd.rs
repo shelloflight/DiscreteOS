@@ -4,12 +4,13 @@
 //! IOTLB, globally or per domain, waited for synchronously.
 //!
 //! The DMAR table is firmware data: every structure is bounds-checked. Units are matched to
-//! devices by their device scopes (single-level paths) or INCLUDE_PCI_ALL.
+//! devices by their device scopes (single-level paths) or INCLUDE_PCI_ALL. RMRRs (endpoint scopes
+//! with single-level paths) become firmware-reserved ranges, read/write.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Backend, Domain, PAGE, alloc_table, report, set_backend, table};
+use super::{Backend, Domain, PAGE, Reserved, alloc_table, report, set_backend, table};
 use crate::dev::pci::Bdf;
 use crate::ffi::{self, rank};
 use crate::object::{KResult, Status};
@@ -151,7 +152,7 @@ struct Drhd {
     scopes: Vec<Bdf>,
 }
 
-fn parse_dmar() -> Option<(u8, Vec<Drhd>, u32)> {
+fn parse_dmar() -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
     let mut len = 0u32;
     // SAFETY: the C side returns a validated, mapped table of `len` bytes or NULL.
     let t = unsafe { ffi::acpi_find_table(b"DMAR".as_ptr(), &mut len) };
@@ -165,7 +166,7 @@ fn parse_dmar() -> Option<(u8, Vec<Drhd>, u32)> {
 /// Fuzzing (ktest fuzz): parse `b` as a DMAR table and check what bring-up relies on. 0 = fine.
 #[cfg(ktest_fuzz)]
 pub fn fuzz_dmar(b: &[u8]) -> u32 {
-    let Some((haw, units, _)) = parse_dmar_bytes(b) else { return 0 };
+    let Some((haw, units, rmrrs)) = parse_dmar_bytes(b) else { return 0 };
     if haw == 0 {
         return 1;
     }
@@ -174,17 +175,21 @@ pub fn fuzz_dmar(b: &[u8]) -> u32 {
             return 2;
         }
     }
+    if rmrrs.len() > b.len() / 8 || rmrrs.iter().any(|r| r.first != r.last || r.start >= r.end || (r.start | r.end) % PAGE != 0) {
+        return 3;
+    }
     0
 }
 
-/// The DMAR table's bytes (untrusted): host address width, remapping units, RMRR count.
-fn parse_dmar_bytes(b: &[u8]) -> Option<(u8, Vec<Drhd>, u32)> {
+/// The DMAR table's bytes (untrusted): host address width, remapping units, RMRRs (one range per
+/// device in scope).
+fn parse_dmar_bytes(b: &[u8]) -> Option<(u8, Vec<Drhd>, Vec<Reserved>)> {
     if b.len() < 48 {
         return None;
     }
     let haw = b[36].saturating_add(1);
     let mut units = Vec::new();
-    let mut rmrr = 0u32;
+    let mut rmrrs: Vec<Reserved> = Vec::new();
     let mut off = 48usize;
     while off + 4 <= b.len() {
         let ty = u16::from_le_bytes([b[off], b[off + 1]]);
@@ -214,12 +219,33 @@ fn parse_dmar_bytes(b: &[u8]) -> Option<(u8, Vec<Drhd>, u32)> {
                     units.push(Drhd { base, include_all: s[4] & 1 != 0, scopes });
                 }
             }
-            1 => rmrr += 1,
+            1 if l >= 24 => {
+                let seg = u16::from_le_bytes([s[6], s[7]]);
+                let base = u64::from_le_bytes(s[8..16].try_into().ok()?);
+                let limit = u64::from_le_bytes(s[16..24].try_into().ok()?);
+                let mut p = 24;
+                while seg == 0 && p + 6 <= l {
+                    let (sty, sl) = (s[p], usize::from(s[p + 1]));
+                    if sl < 6 || p + sl > l {
+                        break;
+                    }
+                    if sty == 1
+                        && sl == 8
+                        && rmrrs.len() < 256
+                        && let Some(r) = Reserved::new(0, 0, base, limit, true, "RMRR")
+                        && rmrrs.try_reserve(1).is_ok()
+                    {
+                        let id = Bdf::new(s[p + 5], s[p + 6], s[p + 7]).0;
+                        rmrrs.push(Reserved { first: id, last: id, ..r });
+                    }
+                    p += sl;
+                }
+            }
             _ => {}
         }
         off += l;
     }
-    Some((haw, units, rmrr))
+    Some((haw, units, rmrrs))
 }
 
 fn bring_up(d: &Drhd) -> Result<Unit, &'static str> {
@@ -269,9 +295,11 @@ fn setup_faults(u: &Unit, vector: u32) {
     u.w32(FECTL, 0); // unmask
 }
 
-/// Find and enable every DMA remapping unit. None without a DMAR table, else a status line.
-pub fn init() -> Option<&'static str> {
-    let (haw, drhds, rmrr) = parse_dmar()?;
+/// Find and enable every DMA remapping unit. None without a DMAR table, else a status line, the
+/// RMRRs and the highest domain id every unit supports.
+pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
+    let (haw, drhds, rmrrs) = parse_dmar()?;
+    let none = |s| Some((s, Vec::new(), 0));
     let mut units = Vec::new();
     for d in &drhds {
         match bring_up(d) {
@@ -284,8 +312,9 @@ pub fn init() -> Option<&'static str> {
         }
     }
     if units.is_empty() {
-        return Some("no usable VT-d unit: device DMA is NOT confined, drivers are trusted with all memory");
+        return none("no usable VT-d unit: device DMA is NOT confined, drivers are trusted with all memory");
     }
+    let max_did = units.iter().map(|u| (1u32 << (4 + 2 * (u.cap & 7).min(6))) - 1).min().unwrap_or(0).min(0xFFFF) as u16;
     // SAFETY: plain call; -1 when no vector is free.
     let v = unsafe { ffi::irq_vector_alloc() };
     if v >= 0 {
@@ -302,14 +331,14 @@ pub fn init() -> Option<&'static str> {
     *STATE.lock() = Some(State { units });
     set_backend(Backend::Vtd);
     crate::kprintln!(
-        "IOMMU: Intel VT-d, {} unit(s), host address width {}, {}-level tables ({}-bit device addresses), {} RMRR(s) ignored",
+        "IOMMU: Intel VT-d, {} unit(s), host address width {}, {}-level tables ({}-bit device addresses), {} RMRR device range(s)",
         n,
         haw,
         levels,
         if levels == 4 { 48 } else { 39 },
-        rmrr
+        rmrrs.len()
     );
-    Some("DMA remapping on for every device (default deny, faults reported)")
+    Some(("DMA remapping on for every device (default deny, faults reported)", rmrrs, max_did))
 }
 
 /// Create the domain of a device (its context entry, an empty page table). `did` must be unique.
@@ -392,6 +421,25 @@ fn walk(d: &mut Domain, u: &Unit, iova: u64) -> KResult<*mut u64> {
         };
     }
     Ok(table(t).wrapping_add(((iova >> 12) & 511) as usize))
+}
+
+/// Test images: what `iova` translates to in `d` (frame, writable), without allocating.
+#[cfg(ktest_drivers)]
+pub fn lookup(d: &Domain, iova: u64) -> Option<(u64, bool)> {
+    let _g = STATE.lock();
+    let mut t = d.root;
+    for level in (1..=d.levels).rev() {
+        // SAFETY: an entry of a page table this domain owns (direct map), read under the lock.
+        let v = unsafe { core::ptr::read_volatile(table(t).wrapping_add(((iova >> (12 + 9 * (level - 1))) & 511) as usize)) };
+        if v & (PTE_R | PTE_W) == 0 {
+            return None;
+        }
+        if level == 1 {
+            return Some((v & PTE_ADDR, v & PTE_W != 0));
+        }
+        t = v & PTE_ADDR;
+    }
+    None
 }
 
 /// Map `frames` at `iova` (device may read; may write if `write`). On error nothing stays mapped.

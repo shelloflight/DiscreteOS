@@ -15,13 +15,15 @@
 //! The IVRS table is firmware data: every structure is bounds-checked. IOMMUs are matched to
 //! devices by their IVHD device entries (select, range, alias, extended); a device no IVHD names
 //! goes to the IOMMU that names "all", else the first one. The IOMMU's own PCI function is
-//! kernel-owned (never handed to a driver). Interrupt remapping is off (`IV` 0): MSIs pass as on
-//! VT-d.
+//! kernel-owned (never handed to a driver). IVMD blocks (all devices, one, a range) with the unity
+//! or exclusion flag become firmware-reserved ranges (an exclusion range is identity mapped too,
+//! as Linux does; never through the exclusion registers). Interrupt remapping is off (`IV` 0):
+//! MSIs pass as on VT-d.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Backend, Domain, PAGE, alloc_table, report, set_backend, table};
+use super::{Backend, Domain, PAGE, Reserved, alloc_table, report, set_backend, table};
 use crate::dev::pci::{self, Bdf};
 use crate::ffi::{self, rank};
 use crate::object::{KResult, Status};
@@ -179,7 +181,7 @@ struct Ivhd {
     ranges: Vec<(u16, u16)>,
 }
 
-fn parse_ivrs() -> Option<(Vec<Ivhd>, u32)> {
+fn parse_ivrs() -> Option<(Vec<Ivhd>, Vec<Reserved>)> {
     let mut len = 0u32;
     // SAFETY: the C side returns a validated, mapped table of `len` bytes or NULL.
     let t = unsafe { ffi::acpi_find_table(b"IVRS".as_ptr(), &mut len) };
@@ -193,7 +195,10 @@ fn parse_ivrs() -> Option<(Vec<Ivhd>, u32)> {
 /// Fuzzing (ktest fuzz): parse `b` as an IVRS table and check what bring-up relies on. 0 = fine.
 #[cfg(ktest_fuzz)]
 pub fn fuzz_ivrs(b: &[u8]) -> u32 {
-    let Some((units, _)) = parse_ivrs_bytes(b) else { return 0 };
+    let Some((units, ivmds)) = parse_ivrs_bytes(b) else { return 0 };
+    if ivmds.len() > b.len() / 32 || ivmds.iter().any(|r| r.first > r.last || r.start >= r.end || (r.start | r.end) % PAGE != 0) {
+        return 4;
+    }
     for (i, u) in units.iter().enumerate() {
         if u.base == 0 || u.base % MMIO_SIZE != 0 || u.base >= 1 << 46 {
             return 1;
@@ -245,13 +250,13 @@ fn parse_entries(e: &[u8], all: &mut bool, ranges: &mut Vec<(u16, u16)>) {
     }
 }
 
-/// The IVRS table's bytes (untrusted): the IOMMUs (one per register base), IVMD count.
-fn parse_ivrs_bytes(b: &[u8]) -> Option<(Vec<Ivhd>, u32)> {
+/// The IVRS table's bytes (untrusted): the IOMMUs (one per register base), the IVMD ranges.
+fn parse_ivrs_bytes(b: &[u8]) -> Option<(Vec<Ivhd>, Vec<Reserved>)> {
     if b.len() < 48 {
         return None;
     }
     let mut units: Vec<Ivhd> = Vec::new();
-    let mut ivmd = 0u32;
+    let mut ivmds: Vec<Reserved> = Vec::new();
     let mut off = 48usize;
     while off + 4 <= b.len() {
         let ty = b[off];
@@ -287,12 +292,34 @@ fn parse_ivrs_bytes(b: &[u8]) -> Option<(Vec<Ivhd>, u32)> {
                     }
                 }
             }
-            0x20..=0x22 => ivmd += 1,
+            0x20..=0x22 if l >= 32 => {
+                // Flags: unity (0), read (1), write (2), exclusion range (3).
+                let flags = s[1];
+                let id = u16::from_le_bytes([s[4], s[5]]);
+                let (first, last) = match ty {
+                    0x20 => (0, u16::MAX),
+                    0x21 => (id, id),
+                    _ => (id, u16::from_le_bytes([s[6], s[7]])),
+                };
+                let start = u64::from_le_bytes(s[16..24].try_into().ok()?);
+                let len = u64::from_le_bytes(s[24..32].try_into().ok()?);
+                let excl = flags & 8 != 0;
+                let usable = excl || (flags & 1 != 0 && flags & 6 != 0);
+                if usable
+                    && len != 0
+                    && ivmds.len() < 256
+                    && let Some(last_byte) = start.checked_add(len - 1)
+                    && let Some(r) = Reserved::new(first, last, start, last_byte, excl || flags & 4 != 0, "IVMD")
+                    && ivmds.try_reserve(1).is_ok()
+                {
+                    ivmds.push(r);
+                }
+            }
             _ => {}
         }
         off += l;
     }
-    Some((units, ivmd))
+    Some((units, ivmds))
 }
 
 // ---- bring-up -----------------------------------------------------------------------------------
@@ -376,20 +403,22 @@ fn bring_up(d: &Ivhd, devtab: u64) -> Result<Unit, &'static str> {
     Ok(u)
 }
 
-/// Find and enable every AMD-Vi IOMMU. None without an IVRS table, else a status line.
-pub fn init() -> Option<&'static str> {
-    let (ivhds, ivmd) = parse_ivrs()?;
+/// Find and enable every AMD-Vi IOMMU. None without an IVRS table, else a status line, the IVMD
+/// ranges and the highest domain id.
+pub fn init() -> Option<(&'static str, Vec<Reserved>, u16)> {
+    let (ivhds, ivmds) = parse_ivrs()?;
+    let none = |s| Some((s, Vec::new(), 0));
     if ivhds.is_empty() {
-        return Some("IVRS lists no usable AMD-Vi unit: device DMA is NOT confined, drivers are trusted with all memory");
+        return none("IVRS lists no usable AMD-Vi unit: device DMA is NOT confined, drivers are trusted with all memory");
     }
     // SAFETY: plain PMM call; 0 when no 2 MiB run is free.
     let devtab = unsafe { ffi::pmm_alloc_contig_zeroed(DEVTAB_PAGES) };
     if devtab == 0 {
-        return Some("no memory for the AMD-Vi device table: device DMA is NOT confined, drivers are trusted with all memory");
+        return none("no memory for the AMD-Vi device table: device DMA is NOT confined, drivers are trusted with all memory");
     }
     // Default deny: valid, translated through an empty table, no permission (quad 0 only).
     let Ok(empty) = alloc_table() else {
-        return Some("no memory for the AMD-Vi tables: device DMA is NOT confined, drivers are trusted with all memory");
+        return none("no memory for the AMD-Vi tables: device DMA is NOT confined, drivers are trusted with all memory");
     };
     let deny = empty | u64::from(LEVELS) << DTE_MODE_SHIFT | DTE_TV | DTE_V;
     let dt = table(devtab);
@@ -414,7 +443,7 @@ pub fn init() -> Option<&'static str> {
             // SAFETY: frames of the device table allocated above, referenced by no unit.
             unsafe { ffi::pmm_free(devtab + i * PAGE) };
         }
-        return Some("no usable AMD-Vi unit: device DMA is NOT confined, drivers are trusted with all memory");
+        return none("no usable AMD-Vi unit: device DMA is NOT confined, drivers are trusted with all memory");
     }
     // SAFETY: plain call; -1 when no vector is free.
     let v = unsafe { ffi::irq_vector_alloc() };
@@ -447,13 +476,13 @@ pub fn init() -> Option<&'static str> {
     *STATE.lock() = Some(State { units, devtab });
     set_backend(Backend::AmdVi);
     crate::kprintln!(
-        "IOMMU: AMD-Vi, {} unit(s), {}-level tables (48-bit device addresses), event log{}, {} IVMD(s) ignored",
+        "IOMMU: AMD-Vi, {} unit(s), {}-level tables (48-bit device addresses), event log{}, {} IVMD range(s)",
         n,
         LEVELS,
         if msi > 0 { " with interrupt" } else { " (no interrupt: faults not reported)" },
-        ivmd
+        ivmds.len()
     );
-    Some("DMA remapping on for every device (default deny, faults reported)")
+    Some(("DMA remapping on for every device (default deny, faults reported)", ivmds, u16::MAX))
 }
 
 /// Is `bdf` an IOMMU's own PCI function (kept by the kernel, never given to a driver)?
@@ -498,6 +527,25 @@ pub fn domain_create(bdf: Bdf, did: u16) -> KResult<Domain> {
     u.inval_domain(did);
     u.sync();
     Ok(Domain { backend: Backend::AmdVi, unit: ui, did, root, levels: LEVELS, limit: 1 << 48, tables: 1 })
+}
+
+/// Test images: what `iova` translates to in `d` (frame, writable), without allocating.
+#[cfg(ktest_drivers)]
+pub fn lookup(d: &Domain, iova: u64) -> Option<(u64, bool)> {
+    let _g = STATE.lock();
+    let mut t = d.root;
+    for level in (1..=d.levels).rev() {
+        // SAFETY: an entry of a page table this domain owns (direct map), read under the lock.
+        let v = unsafe { core::ptr::read_volatile(table(t).wrapping_add(((iova >> (12 + 9 * (level - 1))) & 511) as usize)) };
+        if v & PTE_PR == 0 {
+            return None;
+        }
+        if level == 1 {
+            return Some((v & PTE_ADDR, v & PTE_IW != 0));
+        }
+        t = v & PTE_ADDR;
+    }
+    None
 }
 
 /// Leaf entry for `iova`, creating page tables on the way.

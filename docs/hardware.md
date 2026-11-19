@@ -47,7 +47,7 @@ Management and create a new one.
 | `CET: supervisor shadow stacks on ...` | CET shadow stacks in use; `off: ...` says why not ([hardening.md](hardening.md#cet)) |
 | `SMP: N CPUs online` | every hardware thread started |
 | `Idle: C1 MWAIT ...` (then the `_CST` states), `Performance: ...` | idle states and CPU speed control in use; kdb's `power` shows each CPU's idle-state counts ([power.md](power.md)) |
-| `IOMMU: ...` | Intel VT-d or AMD-Vi driven: `DMA remapping on for every device`; the AMD-Vi unit's own PCI function is listed as kept by the kernel |
+| `IOMMU: ...` | Intel VT-d or AMD-Vi driven: `DMA remapping on for every device`; the AMD-Vi unit's own PCI function is listed as kept by the kernel; firmware-reserved ranges (RMRR, IVMD) show as `... identity mapped for <device>` or `... refused: <why>` |
 | `TPM: ...` | whether the firmware TPM was found and answered |
 | `devmgr: disks are read-only`, `storaged: volume '...': ... read-only` | safety mode active |
 | `Summary: ...` (just before `User: init started`) | the key early lines repeated, since they scroll off screen |

@@ -405,7 +405,7 @@ $TestCases = [ordered]@{
                      Expect = @('IOMMU: DMA remapping on', 'devmgr: test: device ABI: config writes filtered, MSI-X table hidden', 'virtio-blk: 2048 sectors', 'DMA confined by the IOMMU',
                                 'devmgr: test: virtio-blk: 2048 sectors', 'write + read back OK', 'devmgr: test: interrupt delivery: virtio-blk', "user fault: process 'virtio-blk.ddrv'", 'devmgr: restarting virtio-blk.ddrv',
                                 'devmgr: test: virtio-blk.ddrv crashed and was restarted; I/O works again', 'IOMMU: blocked DMA write by 00:02.0 at 0x100000',
-                                'devmgr: test: DMA outside the driver''s pins blocked by the IOMMU', 'devmgr: test: virtio-blk recovered after the DMA test',
+                                'devmgr: test: DMA outside the driver''s pins blocked by the IOMMU', 'IOMMU: test range 0xc0000000-0xc000ffff identity mapped for', 'IOMMU: test: firmware range 0xc0000000-0xc000ffff kept in', 'devmgr: test: virtio-blk recovered after the DMA test',
                                 "devmgr: test: keyboard: 'virtio' typed on virtio-input", 'devmgr: test: interrupt delivery: virtio-input', 'devmgr: test PASSED', 'init: devmgr exited with code 0', 'KTEST drivers: kernel memory at 0x100000 unchanged', 'KTEST drivers: PASSED')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC'); Timeout = 90
                      Keys = @('v', 'i', 'r', 't', 'i', 'o', 'ret'); KeysAfter = 'devmgr: test: waiting for keys' }
@@ -416,7 +416,7 @@ $TestCases = [ordered]@{
                      Expect = @('IOMMU: AMD-Vi, 1 unit(s)', 'IOMMU: DMA remapping on', 'devmgr: test: device ABI: config writes filtered, MSI-X table hidden', 'DMA confined by the IOMMU',
                                 'devmgr: test: virtio-blk: 2048 sectors', 'write + read back OK', 'devmgr: test: interrupt delivery: virtio-blk',
                                 'devmgr: test: virtio-blk.ddrv crashed and was restarted; I/O works again', 'IOMMU: blocked DMA access by 00:03.0 at ',
-                                'devmgr: test: DMA outside the driver''s pins blocked by the IOMMU', 'devmgr: test: virtio-blk recovered after the DMA test',
+                                'devmgr: test: DMA outside the driver''s pins blocked by the IOMMU', 'IOMMU: test range 0xc0000000-0xc000ffff identity mapped for', 'IOMMU: test: firmware range 0xc0000000-0xc000ffff kept in', 'devmgr: test: virtio-blk recovered after the DMA test',
                                 "devmgr: test: keyboard: 'virtio' typed on virtio-input", 'devmgr: test PASSED', 'init: devmgr exited with code 0', 'KTEST drivers: kernel memory at 0x100000 unchanged', 'KTEST drivers: PASSED')
                      Forbid = @('KERNEL PANIC', 'FAIL', 'PANIC', 'unusable'); Timeout = 90
                      Keys = @('v', 'i', 'r', 't', 'i', 'o', 'ret'); KeysAfter = 'devmgr: test: waiting for keys' }

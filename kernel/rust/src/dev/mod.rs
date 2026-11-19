@@ -74,7 +74,7 @@ pub fn init() {
         crate::kprintln!("PCI: {} (no MCFG), {} functions", method, funcs.len());
     }
     // The IOMMU first: an AMD-Vi unit is itself a PCI function, which the kernel keeps.
-    let status = iommu::init();
+    let status = iommu::init(&funcs);
     crate::kprintln!("IOMMU: {}", status);
     let mut devs: Vec<KRef<DeviceObj>> = Vec::new();
     for f in funcs {

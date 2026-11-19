@@ -477,7 +477,7 @@ impl DeviceObj {
                 pos = i;
                 break;
             }
-            at = s + n * PAGE + PAGE; // one unmapped guard page between pins
+            at = at.max(s + n * PAGE + PAGE); // one unmapped guard page between pins
         }
         if at.checked_add(pages * PAGE).is_none_or(|e| e > limit) {
             return Err(Status::NoSpace);
@@ -518,7 +518,11 @@ impl DeviceObj {
         let iova = if iommu::enabled() {
             let mut st = this.st.lock();
             if st.domain.is_none() {
+                // Firmware-reserved ranges stay identity mapped: never handed out (no pins yet).
+                let reserved = iommu::reserved_of(f.bdf)?;
+                st.iova.try_reserve(reserved.len()).map_err(|_| Status::NoMemory)?;
                 st.domain = Some(iommu::domain_create(f.bdf, this.index + 1)?);
+                st.iova.extend_from_slice(&reserved);
             }
             let limit = st.domain.as_ref().map_or(0, |d| d.limit);
             let at = Self::iova_alloc(&mut st, pages, limit)?;

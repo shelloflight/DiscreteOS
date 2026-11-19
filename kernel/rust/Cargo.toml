@@ -35,7 +35,7 @@ incremental = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ktest, ktest_selftest, ktest_rustpanic, ktest_bench, ktest_hwbench, ktest_poweroff, ktest_reboot, ktest_panic, ktest_stackprot, ktest_pagefault, ktest_doublefault, ktest_nx, ktest_wx, ktest_nullderef, ktest_stackguard, ktest_doublefree, ktest_uaf, ktest_heapguard, ktest_deadlock, ktest_lockorder, ktest_sched, ktest_threadguard, ktest_mutexdeadlock, ktest_atomicsleep, ktest_smp, ktest_lockup, ktest_softlockup, ktest_soak, ktest_objects, ktest_ubsan, ktest_ubsantrap, ktest_faultinject, ktest_user, ktest_fuzz, ktest_smap, ktest_smep, ktest_compat, ktest_attesttpm)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ktest, ktest_selftest, ktest_rustpanic, ktest_bench, ktest_hwbench, ktest_poweroff, ktest_reboot, ktest_panic, ktest_stackprot, ktest_pagefault, ktest_doublefault, ktest_nx, ktest_wx, ktest_nullderef, ktest_stackguard, ktest_doublefree, ktest_uaf, ktest_heapguard, ktest_deadlock, ktest_lockorder, ktest_sched, ktest_threadguard, ktest_mutexdeadlock, ktest_atomicsleep, ktest_smp, ktest_lockup, ktest_softlockup, ktest_soak, ktest_objects, ktest_ubsan, ktest_ubsantrap, ktest_faultinject, ktest_user, ktest_fuzz, ktest_smap, ktest_smep, ktest_compat, ktest_attesttpm, ktest_drivers)'] }
 
 [lints.clippy]
 undocumented_unsafe_blocks = "warn"
