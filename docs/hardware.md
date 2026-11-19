@@ -87,4 +87,4 @@ Open an issue with photos of the boot log, the board model and firmware version,
 
 | Machine | Result |
 |---|---|
-| Gigabyte B650 AORUS ELITE AX, Ryzen 9 9900X, RX 9070, 32 GiB, NVMe; UEFI | boots to user space; verified + measured boot (firmware TPM via TCG2); NVMe read; EFI partition mounted read-only. The kernel drives the firmware TPM through CRB with the ACPI start method (`_DSM`); the first run read a stale response (the start register was not set), fixed, rerun pending. USB: keyboards, a mouse, the boot stick as a disk at SuperSpeed (port 5), USB 2 and USB 3 hubs (0bda:5411, 0bda:0411) |
+| Gigabyte B650 AORUS ELITE AX, Ryzen 9 9900X, RX 9070, 32 GiB, NVMe; UEFI | boots to user space; verified + measured boot (firmware TPM via TCG2); NVMe read; EFI partition mounted read-only. The kernel drives the firmware TPM through CRB with the ACPI start method (`_DSM`): `TPM 2.0 (CRB, ACPI start, manufacturer 'AMD')`, the loader's measurement replayed. USB: keyboards, a mouse, the boot stick as a disk at SuperSpeed (port 5), USB 2 and USB 3 hubs (0bda:5411, 0bda:0411) |
