@@ -1,7 +1,7 @@
-# `dosimg`: host tool that makes and inspects D-OS disk images with the OS's own storage code
-# (user/lib/fs). Built by build.ps1 for the host (std).
+# `dbuild`: cross-platform (Windows & Linux) host build, test, image, and contributor CLI for D-OS.
+# Zero external crates: uses only std and the in-tree `dosfs` and `doscrypt` libraries.
 [package]
-name = "dosimg"
+name = "dbuild"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
@@ -15,3 +15,6 @@ doscrypt = { path = "../../user/lib/crypto" }
 opt-level = 2
 debug = false
 overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"

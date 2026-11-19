@@ -77,7 +77,7 @@ int main(void)
 }
 ```
 
-`build.ps1` builds libd as a static library with feature `capi` and links it into every C program
+`dbuild` builds libd as a static library with feature `capi` and links it into every C program
 that includes `libd.h`. C allocations carry a 16-byte size header (C's `free` has no size).
 
 ## Measured

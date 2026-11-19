@@ -3,7 +3,7 @@
 # Reads the manifests (embedded in the verified kernel, or signed on the boot volume), starts the
 # services in dependency order with exactly the capabilities each manifest grants, supervises and
 # restarts them, connects them through named endpoints, and shuts them down in reverse order.
-# Also the test runner of the ring-3 test images (see src/lib.rs). Linked by build.ps1 like the
+# Also the test runner of the ring-3 test images (see src/lib.rs). Linked by dbuild like the
 # other ring-3 programs (static PIE).
 [package]
 name = "init"
@@ -22,19 +22,6 @@ bench = false
 libd = { path = "../lib/libd", features = ["alloc"] }
 dman = { path = "../lib/dman" }
 doscrypt = { path = "../lib/crypto" }
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-debug = false
-overflow-checks = true  # Secure: manifests and service messages are untrusted input
-debug-assertions = false
-incremental = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

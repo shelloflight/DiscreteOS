@@ -3,17 +3,17 @@
 version = 4
 
 [[package]]
+name = "dbuild"
+version = "0.1.0"
+dependencies = [
+ "doscrypt",
+ "dosfs",
+]
+
+[[package]]
 name = "doscrypt"
 version = "0.1.0"
 
 [[package]]
 name = "dosfs"
 version = "0.1.0"
-
-[[package]]
-name = "dosimg"
-version = "0.1.0"
-dependencies = [
- "doscrypt",
- "dosfs",
-]

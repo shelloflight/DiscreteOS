@@ -17,19 +17,6 @@ bench = false
 libd = { path = "../lib/libd", features = ["alloc"] }
 dman = { path = "../lib/dman" }
 
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-debug = false
-overflow-checks = true
-debug-assertions = false
-incremental = false
-
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 

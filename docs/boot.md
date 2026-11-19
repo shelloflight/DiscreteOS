@@ -7,7 +7,7 @@ the kernel has a single entry contract.
 **Code:** `boot/stage1.asm`, `boot/stage2.asm`, `boot/stage3/` (BIOS); `boot/uefi/` (UEFI);
 `boot/common/` (signature verifier and KASLR, shared by both); `kernel/include/bootinfo.h` (the
 contract); `kernel/bootinfo.c` (validation); `kernel/mm/kaslr.c`; `kernel/drivers/fbcon.c`;
-`tools/dosimg` (`dosimg boot` builds the image).
+`tools/dbuild` (`dbuild img boot` builds the image).
 
 ## Disk image (64 MiB, GPT)
 
@@ -19,7 +19,7 @@ contract); `kernel/bootinfo.c` (validation); `kernel/mm/kaslr.c`; `kernel/driver
 | Partition 2 `esp` | FAT32 EFI System Partition: `\EFI\BOOT\BOOTX64.EFI`, `\DOS\KERNEL.BIN` |
 
 The image is deterministic (fixed GUIDs and timestamps), so the reproducible-build check covers it.
-The LBA constants are shared between `build.ps1` and `tools/dosimg` and must stay in sync.
+The LBA constants live in `tools/dbuild/src/img.rs` and are passed to stage 1 and stage 2 as NASM defines.
 
 ## Kernel image header
 

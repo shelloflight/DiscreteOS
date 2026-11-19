@@ -1,6 +1,6 @@
 # Storage tests: run by init ("storage test") with every volume in its namespace;
 # spawns a copy of itself (`child`) to check namespace isolation. See src/lib.rs.
-# Linked by build.ps1 (ld.lld, static PIE) like the other ring-3 programs.
+# Linked by dbuild (ld.lld, static PIE) like the other ring-3 programs.
 [package]
 name = "fstest"
 version = "0.1.0"
@@ -16,19 +16,6 @@ bench = false
 
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-debug = false
-overflow-checks = true
-debug-assertions = false
-incremental = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

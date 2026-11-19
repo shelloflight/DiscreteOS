@@ -4,7 +4,7 @@ Storage is entirely in user space: disk drivers, a storage service and filesyste
 
 **Code:** `user/devmgr/src/{blkserve,blk,ahci,nvme,virtio}.rs` (block drivers);
 `user/storaged/` (the service); `user/lib/fs/` (`dosfs`: GPT, FAT32, DFS, BLAKE3);
-`user/lib/libd/src/fs.rs` (file protocol, client, namespaces); `tools/dosimg` (host image tool, fsck).
+`user/lib/libd/src/fs.rs` (file protocol, client, namespaces); `tools/dbuild` (`dbuild img`: host image tool, fsck).
 
 ## Processes
 
@@ -83,7 +83,7 @@ ring of 4 superblocks, and snapshots as saved read-only roots.
   flush, write the next superblock, flush. Nothing reachable from the previous commit is
   overwritten.
 - **Mount** picks the newest superblock whose roots verify and falls back to older ones.
-- **fsck** (`Dfs::fsck`, `dosimg fsck`) checks every hash, key order, entry/inode consistency and
+- **fsck** (`Dfs::fsck`, `dbuild img fsck`) checks every hash, key order, entry/inode consistency and
   that the bitmap equals the reachable set.
 
 ## Block cache
@@ -105,7 +105,7 @@ are refused. FAT has no crash consistency; use DFS for data that must survive a 
   fuzzers, the cache, calendar and FAT time fields, and **power-cut sweeps** (a cut after every
   sector of a workload, and of a rename on DFS and on FAT32; the volume must mount, pass fsck and
   hold one committed state, the renamed file under exactly one name on DFS, at least one on FAT32).
-- `storage` (QEMU): SATA + NVMe disks built by `dosimg`; host-written files, FAT32 writes (then
+- `storage` (QEMU): SATA + NVMe disks built by `dbuild img`; host-written files, FAT32 writes (then
   read back by 7-Zip on the host), DFS operations, snapshots, namespace isolation, rename on both
   filesystems (and a rename cut by power failures), simulated power cuts, corruption detection.
 - `time`, `time-uefi`: file times on DFS and FAT32 kept across a reboot ([services.md](services.md)).

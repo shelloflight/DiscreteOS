@@ -6,7 +6,7 @@ answer.
 
 **Code:** `kernel/rust/src/security/attest.rs` (kernel side) and `tpm.rs` (TPM commands);
 `user/lib/crypto/src/attest.rs` (`doscrypt::attest`: report format, verifier, challenge);
-`doscrypt::{tpm, rsa, x509, sym}` (quotes, endorsement keys, certificates); `tools/dosimg`
+`doscrypt::{tpm, rsa, x509, sym}` (quotes, endorsement keys, certificates); `tools/dbuild` (`dbuild img`)
 (`attest-verify`, `attest-challenge`); `user/utest/attest.c`.
 
 ## Protocol
@@ -30,8 +30,8 @@ answer.
  credential equal: the attestation key that quoted is in the TPM the certificate names
 ```
 
-`dosimg attest-verify <report> <nonce hex> <KERNEL.DSIG> <public key hex> [allow-unsigned]
-[require-tpm] [ek-ca=<cert.der> ...]` is a complete verifier; `dosimg attest-challenge <report>
+`dbuild img attest-verify <report> <nonce hex> <KERNEL.DSIG> <public key hex> [allow-unsigned]
+[require-tpm] [ek-ca=<cert.der> ...]` is a complete verifier; `dbuild img attest-challenge <report>
 <out>` writes the challenge and prints the credential the machine must return.
 
 ## The keys

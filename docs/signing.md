@@ -2,7 +2,7 @@
 
 **Code:** `user/lib/crypto` (`doscrypt`: SHA-256, SHA-512, Ed25519, `.dsig`);
 `boot/common/dcrypto.c` (the loaders' C verifier); `boot/stage3`, `boot/uefi/loader.c`;
-`kernel/rust/src/security/` (verification, measurement log, TPM 2.0 driver); `tools/dosimg`
+`kernel/rust/src/security/` (verification, measurement log, TPM 2.0 driver); `tools/dbuild` (`dbuild img`)
 (`pubkey`, `sign`, `verify`).
 
 ## Chain of trust
@@ -51,7 +51,7 @@ signed service manifests (kind 5): the manifest is known genuine, but never beco
 | 104 | 88 | name (UTF-8, NUL-padded) |
 | 192 | 64 | Ed25519 signature of bytes 0-191 |
 
-`dosimg sign <seed> <kind> <name> <file> <out.dsig>` makes one; `dosimg verify` checks one.
+`dbuild img sign <seed> <kind> <name> <file> <out.dsig>` makes one; `dbuild img verify` checks one.
 
 ## Measured boot
 

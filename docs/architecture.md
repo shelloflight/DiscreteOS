@@ -69,8 +69,8 @@ installer yet); `init` gets a read-only VMO for each one ([services.md](services
 | `user/terminal/`, `user/shell/`, `user/tools/` | Rust | the terminal (screen, keyboard, line editing), the shell, the core tools ([shell.md](shell.md)) |
 | `user/dcmpl/`, `compat/` | Rust, C, C++ | D-CMPL on libd and its Windows/Linux test programs ([compat.md](compat.md)) |
 | `user/utest/`, `user/fstest/`, `user/ltest/`, `user/ctest/`, `user/hello/` | C, Rust | ring-3 test programs |
-| `tools/dosimg/` | Rust | host tool: disk images, signing, fsck, attestation verifier |
-| `build.ps1` | PowerShell | build, run, debug, test ([building.md](building.md)) |
+| `tools/dbuild/` | Rust | cross-platform host tool: build, run, debug, test, disk images, signing, attestation, commit ([building.md](building.md)) |
+| `dbuild.ps1`, `dbuild.sh` | PowerShell / sh | thin bootstrappers for `tools/dbuild` on Windows and Linux |
 
 ## Languages
 
@@ -94,7 +94,7 @@ with a `// SAFETY:` comment (clippy enforces it in the kernel).
 - **W^X**: no page is ever writable and executable, through any mapping or alias.
 - **Rights never grow.** A handle can be narrowed, never widened.
 - **Hot paths stay short**: no allocation in interrupt handlers, the scheduler, or the syscall and
-  IPC fast paths. Measure before and after a performance change (`.\build.ps1 test -Case bench`).
+  IPC fast paths. Measure before and after a performance change (`dbuild test --case bench`).
 - **Reproducible builds**: no timestamps, absolute paths or build-time randomness in outputs. The
   full test run rebuilds the image elsewhere and requires identical bytes.
 - **Clear errors**: every failure says what happened and, where possible, what to do.
@@ -108,7 +108,7 @@ with a `// SAFETY:` comment (clippy enforces it in the kernel).
 | A device driver | a module in `user/devmgr/src/` implementing the driver protocol (`user/lib/libd/src/proto.rs`); block drivers implement `Disk` for `blkserve.rs` | a test in `devmgr test` or `storage` |
 | A filesystem or on-disk parser | `user/lib/fs/` (host-testable, `no_std + alloc`) | unit tests and a fuzzer in `fuzz.rs` |
 | A kernel object or syscall | `kernel/rust/src/object/` and `user/syscall.rs`; C binding in `dos.h` | bump the ABI version, update [abi.md](abi.md), add `utest` cases |
-| A user program | `user/<name>/`: a Rust crate on libd with its own `_start` (see `user/ltest`), or `.c` files (include `libd.h` for the heap, threads and locks); `build.ps1` embeds it as `<name>.dx` | run it from `init` (`init run <name>`) in a test case |
+| A user program | `user/<name>/`: a Rust crate on libd with its own `_start` (see `user/ltest`), or `.c` files (include `libd.h` for the heap, threads and locks); `dbuild` embeds it as `<name>.dx` | run it from `init` (`init run <name>`) in a test case |
 | A service | a program as above, plus a manifest in `user/init/services/` naming exactly what it gets ([services.md](services.md)) | the `services` case; a test manifest in `user/init/services/test/` |
 | Low-level arch code | `kernel/arch/x86_64/` | a KTEST variant if it can fail in an interesting way |
 

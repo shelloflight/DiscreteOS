@@ -28,7 +28,7 @@ describe the plan. It saves you from building something that cannot be merged.
 
 1. Read [docs/architecture.md](docs/architecture.md), then the doc page for the area you are
    changing.
-2. Set up the toolchain and run `.\build.ps1 test` once on a clean checkout, so you know your
+2. Set up the toolchain and run `.\dbuild.ps1 test` (Windows) or `./dbuild.sh test` (Linux) once on a clean checkout, so you know your
    environment passes before you change anything ([docs/building.md](docs/building.md)).
 
 ## Requirements for every pull request
@@ -37,11 +37,12 @@ describe the plan. It saves you from building something that cannot be merged.
 2. **Tested.** New behaviour has a test that fails without your change and passes with it. A
    protection test proves the protection *fires*. Parsers of untrusted input get a fuzzer.
 3. **Proof of passing.** Run the **full** suite on your final commit:
-   ```powershell
-   .\build.ps1 test
+   ```sh
+   ./dbuild.sh test      # Linux
+   .\dbuild.ps1 test     # Windows
    ```
-   Paste `build\test-report.md` into the pull request. It must say `TEST PASSED`, `full suite`,
-   and a tree of `<commit> (clean)` matching the head of your branch. A partial run (`-Case`) is
+   Paste `build/test-report.md` into the pull request. It must say `TEST PASSED`, `full suite`,
+   and a tree of `<commit> (clean)` matching the head of your branch. A partial run (`--case`) is
    fine while working but not as proof.
 4. **Clean.** No new compiler warnings; the `static` case (clang analyzer, clippy) passes; the
    build stays reproducible.
@@ -49,7 +50,7 @@ describe the plan. It saves you from building something that cannot be merged.
    [docs/abi.md](docs/abi.md#versioning) (new numbers only, version bump).
 6. **Trade-offs stated.** D-OS weighs every change against being *Fast, Secure, Practical*. If
    your change costs one for another, say so in the pull request.
-7. **Signed off.** Commit with `git commit -s`, certifying the
+7. **Signed off.** Commit with `git commit -s` (or use `.\dbuild.ps1 commit` / `./dbuild.sh commit`, which prompts for DCO sign-off), certifying the
    [Developer Certificate of Origin](https://developercertificate.org/): you wrote the code or have
    the right to submit it under the project's license.
 

@@ -12,7 +12,7 @@
 
 ## Test report
 
-<!-- Paste build\test-report.md from a FULL `.\build.ps1 test` run on the final commit of this branch. -->
+<!-- Paste build/test-report.md from a FULL `.\dbuild.ps1 test` (Windows) or `./dbuild.sh test` (Linux) run on the final commit of this branch. -->
 
 ```
 (paste here)
@@ -22,7 +22,7 @@
 
 - [ ] One focused change
 - [ ] New or changed behaviour is covered by a test
-- [ ] Full `.\build.ps1 test` passes; the report shows `full suite` and `<commit> (clean)` matching this branch
+- [ ] Full `dbuild` test suite (`.\dbuild.ps1 test` / `./dbuild.sh test`) passes; the report shows `full suite` and `<commit> (clean)` matching this branch
 - [ ] Docs updated for the area touched (and `docs/abi.md` for any ABI change)
 - [ ] No new warnings; no new external dependencies
 - [ ] Commits are signed off (`git commit -s`)

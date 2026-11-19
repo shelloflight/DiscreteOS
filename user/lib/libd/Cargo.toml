@@ -4,7 +4,7 @@
 # and the device-manager protocol. A C binding of the same runtime is in user/include/libd.h.
 # no_std, no dependencies (CONTRIBUTING.md, "Dependencies").
 #
-# Linked into the program crates that use it (devmgr, storaged, fstest, ltest). build.ps1 also
+# Linked into the program crates that use it (devmgr, storaged, fstest, ltest). dbuild also
 # builds it on its own as a static library with feature `capi` for C programs that include libd.h.
 [package]
 name = "libd"
@@ -25,19 +25,6 @@ bench = false
 alloc = []
 # The C API (capi.rs, user/include/libd.h): exported `libd_*` functions for C programs.
 capi = ["alloc"]
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-debug = false
-overflow-checks = true
-debug-assertions = false
-incremental = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

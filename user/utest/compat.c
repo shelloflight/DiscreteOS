@@ -133,6 +133,20 @@ static int64_t run_dcmpl(const char *pname, const char *args)
 #define REFUSED 2                           /* dcmpl's exit code for a refused program */
 #define USAGE   3
 
+static int has_program(const char *name)
+{
+    char buf[32];
+    size_t n = strlen(name);
+    for (uint32_t i = 0; i < dos_start->nhandles; i++) {
+        if (dos_start->handles[i].tag != DOS_TAG_PROGRAM)
+            continue;
+        if (dos_object_name(dos_start->handles[i].handle, buf, sizeof(buf)) == (int64_t)n &&
+            strncmp(buf, name, n) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 void test_compat(void)
 {
     dos_printf("utest: compat: D-CMPL proofs\n");
@@ -152,9 +166,14 @@ void test_compat(void)
     EXPECT(run_dcmpl("l1", "linux w1.exe"), REFUSED);       /* a PE is not an ELF */
     EXPECT(run_dcmpl("l1", "linux l1 bench 5000"), 0);
 
-    /* W2 and L2: programs on their runtimes (files are tested from the shell, which has disks). */
-    EXPECT(run_dcmpl("w2.exe", "win w2.exe alpha beta"), 0);
-    EXPECT(run_dcmpl("w2.exe", "win w2.exe fault"), DOS_EXIT_FAULT);
+    /* W2 and L2: programs on their runtimes (files are tested from the shell, which has disks).
+     * W2 requires MSVC + the Windows SDK on the build host; skip only W2 when not embedded. */
+    if (has_program("w2.exe")) {
+        EXPECT(run_dcmpl("w2.exe", "win w2.exe alpha beta"), 0);
+        EXPECT(run_dcmpl("w2.exe", "win w2.exe fault"), DOS_EXIT_FAULT);
+    } else {
+        dos_printf("utest: compat: w2.exe not built (no Windows SDK)\n");
+    }
     EXPECT(run_dcmpl("l2", "linux l2"), 0);
 
     /* The PE parser against mutated images. */

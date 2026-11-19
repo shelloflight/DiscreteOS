@@ -58,7 +58,7 @@ backoff = 100               # ms before the first restart, doubled each time, at
 | `DOS/SERVICES/<NAME>.DMAN` on the boot volume (`esp`) | a `<NAME>.DSIG` next to it: a `.dsig` of kind manifest (5) for this name, by the D-OS key, checked by the kernel (`vmo_verify`) |
 
 Anything else is refused: no `.dsig`, a signature that does not match, a `.dsig` of another kind or
-for another name. `dosimg sign <seed> manifest <name>.dman <file> <out.dsig>` signs one.
+for another name. `dbuild img sign <seed> manifest <name>.dman <file> <out.dsig>` signs one.
 
 ### Checks across manifests
 

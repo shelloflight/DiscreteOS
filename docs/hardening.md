@@ -3,7 +3,7 @@
 Every protection below has a test that proves it **fires**. Keep it that way: a new protection
 comes with a test that triggers it.
 
-**Code:** `build.ps1` (`$cflags`, `$linkArgs`, `Test-StaticAnalysis`); `kernel/rust/.cargo/config.toml`;
+**Code:** `tools/dbuild` (`build.rs`, `test.rs`); `kernel/rust/.cargo/config.toml`;
 `kernel/linker.ld`; `kernel/arch/x86_64/spec.c` (speculation policy); `kernel/mm/kpti.c`;
 `isr.asm`, `syscall.asm`, `switch.asm`, `thunk.asm`; `kernel/rust/src/nospec.rs`, `spec.h`.
 KASLR is in [boot.md](boot.md#kaslr).

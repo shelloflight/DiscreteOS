@@ -48,12 +48,20 @@ is no GUI yet.
 
 ## Quick start
 
-Windows x64 with LLVM, NASM, Rust (rustup), QEMU, the Visual Studio C++ tools and the Windows SDK
-([full setup](docs/building.md)):
+Windows x64 or Linux x64 with LLVM (Clang + LLD), NASM, Rust (rustup), and QEMU (plus Visual
+Studio C++ tools and the Windows SDK on Windows for the W2 CRT compatibility test;
+[full setup](docs/building.md)):
 
 ```powershell
-.\build.ps1 run      # build and boot in QEMU
-.\build.ps1 test     # run the full test suite
+# Windows
+.\dbuild.ps1 run      # build and boot in QEMU
+.\dbuild.ps1 test     # run the full test suite
+```
+
+```sh
+# Linux
+./dbuild.sh run       # build and boot in QEMU
+./dbuild.sh test      # run the full test suite
 ```
 
 To try it on real hardware, see [docs/hardware.md](docs/hardware.md). D-OS never writes your
@@ -70,8 +78,8 @@ Contributions are welcome, and the bar is deliberate. A pull request must:
 
 - **make a real, positive difference**: a feature, a fix, a measurable speed-up, better hardware
   support, stronger security;
-- **prove it works**: the full `.\build.ps1 test` suite passing on your machine, with the generated
-  `build\test-report.md` attached, plus a test that covers the change.
+- **prove it works**: the full `dbuild` test suite (`.\dbuild.ps1 test` / `./dbuild.sh test`) passing on your machine, with the generated
+  `build/test-report.md` attached, plus a test that covers the change.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening one. Merged changes are announced in the
 `#changelog` channel of the [community Discord](https://discord.gg/discrete).

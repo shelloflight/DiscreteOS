@@ -19,7 +19,7 @@ boot. Nothing is saved anywhere, so reports are photos of the screen.
 ## 1. Make a USB stick
 
 ```powershell
-.\build.ps1          # build\discrete.img (BIOS + UEFI)
+.\dbuild.ps1          # build/discrete.img (BIOS + UEFI; ./dbuild.sh on Linux)
 ```
 
 > **Writing the image erases the whole USB stick.** Double-check you picked the stick, not an

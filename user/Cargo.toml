@@ -1,0 +1,37 @@
+# Ring-3 user-space Cargo workspace: libd and every Rust program/service/driver.
+# Host-testable shared libraries (lib/crypto, lib/dman, lib/fs) stay excluded so `cargo test`
+# inside them builds natively for the host without inheriting ring-3 workspace profiles.
+[workspace]
+resolver = "2"
+members = [
+    "clock",
+    "dcmpl",
+    "devmgr",
+    "fstest",
+    "init",
+    "lib/libd",
+    "log",
+    "ltest",
+    "shell",
+    "storaged",
+    "terminal",
+    "tools",
+]
+exclude = [
+    "lib/crypto",
+    "lib/dman",
+    "lib/fs",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+lto = true
+codegen-units = 1
+debug = false
+overflow-checks = true  # Secure: untrusted input panics instead of wrapping
+debug-assertions = false
+incremental = false

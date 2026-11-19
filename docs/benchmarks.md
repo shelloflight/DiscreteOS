@@ -2,9 +2,9 @@
 
 D-OS measures before it optimizes. There are two ways to get numbers:
 
-- `.\build.ps1 test -Case bench` runs the kernel benchmark harness in QEMU (use it to compare
+- `.\dbuild.ps1 test --case bench` (or `./dbuild.sh test --case bench`) runs the kernel benchmark harness in QEMU (use it to compare
   before/after a change on the same machine; QEMU's absolute numbers mean little);
-- `.\build.ps1 bench` builds **`build\discrete-bench.img`**, a hardware benchmark image that boots
+- `.\dbuild.ps1 bench` (or `./dbuild.sh bench`) builds **`build/discrete-bench.img`**, a hardware benchmark image that boots
   on a real PC, runs everything, and ends on one results page to photograph.
 
 **Code:** `kernel/lib/bench.c`, `kernel/include/bench.h` (kernel), `utest bench` and `fstest bench`

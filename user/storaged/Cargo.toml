@@ -1,7 +1,7 @@
 # The storage service: block layer over the user-space disk drivers, GPT, FAT32 and
 # DFS volumes, and the file service (every open file is a channel). Started by init; disks come
 # from devmgr. `test` turns on the test hooks (corruption, power cut, remount, fsck).
-# Linked by build.ps1 (ld.lld, static PIE) like the other ring-3 programs.
+# Linked by dbuild (ld.lld, static PIE) like the other ring-3 programs.
 [package]
 name = "storaged"
 version = "0.1.0"
@@ -18,19 +18,6 @@ bench = false
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
 dosfs = { path = "../lib/fs" }
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-debug = false
-overflow-checks = true  # Secure: disks are untrusted; a missed check ends a request's process, never wraps
-debug-assertions = false
-incremental = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

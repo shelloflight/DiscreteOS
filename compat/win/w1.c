@@ -1,6 +1,6 @@
 /*
- * W1 (docs/compat.md): a Windows console Hello World without a C runtime. Built by build.ps1
- * with MSVC (cl /GS- /Zl, link /NODEFAULTLIB /ENTRY:w1_main /Brepro) against import libraries
+ * W1 (docs/compat.md): a Windows console Hello World without a C runtime. Built by dbuild
+ * (MSVC when present, else Clang + lld-link + llvm-dlltool) against import libraries
  * made from kernel32.def, so the build needs no Windows SDK and is reproducible. Run on D-OS by
  * D-CMPL's PE loader (user/dcmpl, `dcmpl win w1.exe`).
  *
@@ -24,8 +24,17 @@ __declspec(dllimport) __declspec(noreturn) void __stdcall ExitProcess(unsigned c
 __declspec(dllimport) int __stdcall MessageBoxA(HANDLE wnd, const char *text, const char *caption, unsigned type);
 #endif
 
+#ifdef __clang__
+static inline unsigned long long __readgsqword(unsigned long offset)
+{
+    unsigned long long v;
+    __asm__ volatile("movq %%gs:(%1), %0" : "=r"(v) : "r"((unsigned long long)offset));
+    return v;
+}
+#else
 unsigned __int64 __readgsqword(unsigned long offset);
 #pragma intrinsic(__readgsqword)
+#endif
 
 extern char __ImageBase;                  /* the linker's symbol for this image's load address */
 

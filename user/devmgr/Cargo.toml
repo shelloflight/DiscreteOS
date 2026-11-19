@@ -7,7 +7,7 @@
 #   ahci.ddrv          AHCI (SATA) disks
 #   nvme.ddrv          NVMe namespace 1
 #   xhci.ddrv          xHCI USB host controller: USB keyboards (HID boot protocol)
-# One staticlib; build.ps1 links it once per program with that program's entry symbol (`_start`,
+# One staticlib; dbuild links it once per program with that program's entry symbol (`_start`,
 # `ddrv_<name>`), and --gc-sections keeps only what each one uses. Each driver runs as its own
 # isolated process. Linked like the other ring-3 programs (static PIE).
 [package]
@@ -28,19 +28,6 @@ bench = false
 
 [dependencies]
 libd = { path = "../lib/libd" }
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-debug = false
-overflow-checks = true  # Secure: device data is untrusted; a missed check ends the driver, never wraps
-debug-assertions = false
-incremental = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

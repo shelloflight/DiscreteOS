@@ -2,7 +2,7 @@
 #   win <exe> [args]   PE32+ loader + kernel32: runs a Windows program in this process
 #   linux <elf> [args] Linux server: supervises a FORWARD process and serves its syscalls
 #   pefuzz <rounds>    mutates every embedded .exe and runs it through the PE parser and binder
-# Linked by build.ps1 (ld.lld, static PIE) like the other Rust programs. Only libd (same policy as
+# Linked by dbuild (ld.lld, static PIE) like the other Rust programs. Only libd (same policy as
 # kernel/rust: CONTRIBUTING.md, "Dependencies").
 [package]
 name = "dcmpl"
@@ -24,19 +24,6 @@ shstk = false
 
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
-
-[profile.dev]
-panic = "abort"
-
-[profile.release]
-panic = "abort"
-opt-level = 2
-lto = true
-codegen-units = 1
-debug = false
-overflow-checks = true  # Secure: parsers of foreign data panic (the process exits) instead of wrapping
-debug-assertions = false
-incremental = false
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
