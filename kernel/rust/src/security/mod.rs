@@ -91,7 +91,12 @@ pub unsafe extern "C" fn dkrnl_security_init(firmware: u32, flags: u32, kernel_d
     }
     // Remote attestation: this boot's key, measured right after the kernel (attest.rs).
     let ak = attest::init(firmware, flags & BOOT_KERNEL_VERIFIED != 0);
-    match tpm::probe().map_err(tpm::Error::Protocol).and_then(tpm::Tpm::new) {
+    // The attest-tpm test: the simulated TPM (TEST keys) stands in for hardware.
+    #[cfg(ktest_attesttpm)]
+    let found = tpm::Tpm::new(alloc::boxed::Box::new(tpm::Sim::new()));
+    #[cfg(not(ktest_attesttpm))]
+    let found = tpm::probe().map_err(tpm::Error::Protocol).and_then(tpm::Tpm::new);
+    match found {
         Ok(t) => {
             let (m, i) = (t.manufacturer, t.interface());
             let n = measure::attach_tpm(t);

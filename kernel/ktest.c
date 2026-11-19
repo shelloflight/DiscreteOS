@@ -112,7 +112,7 @@ const char *ktest_init_args(void)
     return "shell test";
 #elif defined(KTEST_FUZZ)
     return "run utest fuzz 200000";
-#elif defined(KTEST_ATTEST)
+#elif defined(KTEST_ATTEST) || defined(KTEST_ATTESTTPM)
     return "run utest attest";
 #elif defined(KTEST_HWBENCH)
     return "bench";
@@ -2276,7 +2276,7 @@ void ktest_after_init(int code)
     kprintf("KTEST drivers: %s\n", same && code == 0 ? "PASSED" : "FAILED");
 }
 
-#elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES) || \
+#elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_ATTESTTPM) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES) || \
     defined(KTEST_TIME) || defined(KTEST_SHELL)
 
 /* Ring-3 tests: init runs utest (ktest_init_args); nothing to do in the kernel first. */

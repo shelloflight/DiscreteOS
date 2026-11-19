@@ -254,11 +254,36 @@ $TestCases = [ordered]@{
                      Keys = @('shift-u', 's', 'b', 'spc', 'shift-k', 'b', 'd', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready' }
     # USB without a keyboard: a tablet and a mouse are probed and reported once each, then left
     # alone (a probe's own port reset must not trigger another probe); typing still works on PS/2.
+    # The mouse is served (report protocol, from its HID report descriptor) and its movement reaches
+    # the device manager's input endpoint; the tablet (an absolute pointer) is left unused.
     usbnokbd    = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-tablet,bus=xhci.0', '-device', 'usb-mouse,bus=xhci.0')
-                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', ': mouse 0627:0001 (left unused)', 'devmgr: xhci.ddrv ready', 'terminal: line from ps2: Disc OS')
+                     Expect = @('xhci: controller ready on pci-', ': HID device 0627:0001 (left unused)', ': mouse ready on port ', '(USB HID report protocol, 5 buttons, wheel', 'devmgr: xhci.ddrv ready', 'terminal: line from ps2: Disc OS', 'devmgr: pointer input from xhci: moved (20, -10)')
                      Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'keyboard ready on port'); Timeout = 60
-                     Keys = @('shift-d', 'i', 's', 'c', 'spc', 'shift-o', 'shift-s', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready'
+                     Keys = @('shift-d', 'i', 's', 'c', 'spc', 'shift-o', 'shift-s', 'ret', '~300', '!mouse_move 20 -10', '~200', '!mouse_button 1', '~100', '!mouse_button 0'); KeysAfter = 'devmgr: xhci.ddrv ready'
                      Post = 'Test-UsbProbedOnce' }
+    # A held key repeats (QEMU holds 'a' for 900 ms: about 12 repeats after the 500 ms delay); Caps
+    # Lock turns the keyboard's LED on without the device refusing the report.
+    usbrepeat   = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-kbd,bus=xhci.0')
+                     Expect = @(': keyboard ready on port ', 'devmgr: xhci.ddrv ready', 'terminal: line from xhci: Raaaaaa', 'terminal: line from xhci: CAPS')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'LED report refused'); Timeout = 60
+                     Keys = @('shift-r', '!sendkey a 900', '~1100', 'ret', 'caps_lock', 'c', 'a', 'p', 's', 'caps_lock', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready' }
+    # A keyboard plugged in while another is in use is held: what it types never reaches the
+    # terminal; unplugged again, the keyboard in use types on.
+    usbhold     = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-kbd,bus=xhci.0,port=1')
+                     Expect = @(': keyboard ready on port ', 'devmgr: xhci.ddrv ready', 'terminal: line from xhci: One', 'devmgr: keyboard xhci ', ' in use', 'is typing: its input is held until it is accepted with Ctrl+Alt+Insert', 'keyboard 0627:0001 on port 6 unplugged', 'terminal: line from xhci: Two')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'line from xhci: Evil', 'not set up'); Timeout = 60
+                     Keys = @('shift-o', 'n', 'e', 'ret', '~300', '!device_add usb-kbd,bus=xhci.0,port=2,id=k2', '~2000', 'shift-e', 'v', 'i', 'l', 'ret', '~300', '!device_del k2', '~1500', 'shift-t', 'w', 'o', 'ret'); KeysAfter = 'devmgr: xhci.ddrv ready' }
+    # A USB stick (bulk-only mass storage, SCSI) with a DFS volume: found, sized, mounted by the
+    # storage service through the xHCI driver; the boot is read-only, so the stick is unchanged.
+    usbstorage  = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci'); UsbDisk = ''
+                     Expect = @('xhci: controller ready on pci-', ': disk ready on port ', '32 MiB, "QEMU QEMU HARDDISK" (USB mass storage, unit 0', 'devmgr: xhci.ddrv disk 0: 65536 sectors (32 MiB)', 'storaged: volume ''data'': DFS on xhci:')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'not set up', 'read at sector'); Timeout = 60
+                     Post = 'Test-UsbDiskUnchanged' }
+    # The same stick on a USB 2 port (high speed: 512-byte packets) behind a hub.
+    usbstorage2 = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-hub,bus=xhci.0,port=1'); UsbDisk = ',port=1.2'
+                     Expect = @(': hub 0409:55aa, 8 ports', ': disk ready on port ', '.2: 32 MiB', 'storaged: volume ''data'': DFS on xhci:')
+                     Forbid = @('KERNEL PANIC', 'exited with code', 'blocked DMA', 'FAIL', 'not set up', 'read at sector'); Timeout = 60
+                     Post = 'Test-UsbDiskUnchanged' }
     # USB hot-plug: a tablet unplugged and plugged back three times is reported once, then left
     # alone (third identical probe); a keyboard plugged into a hub later is found and types.
     usbplug     = @{ Define = $null;         Qemu = @('-device', 'qemu-xhci,id=xhci', '-device', 'usb-hub,bus=xhci.0,port=1', '-device', 'usb-tablet,bus=xhci.0,port=2,id=tab')
@@ -338,6 +363,9 @@ $TestCases = [ordered]@{
     # prints it; the host then plays the remote verifier (dosimg attest-verify) against this build's
     # kernel .dsig and key: the report must verify, and tampered, replayed or foreign ones must not.
     attest      = @{ Define = 'ATTEST';      Expect = @('Attestation: key ', 'utest: attest report: ', 'init: utest attest exited with code 0'); Forbid = @('KERNEL PANIC', 'FAIL'); Post = 'Test-AttestReport' }
+    # The same with the kernel's simulated TPM (TEST endorsement key and CA) in place of hardware: the
+    # report carries the TPM's quote and EK certificate; the host checks them (require-tpm, ek-ca).
+    'attest-tpm' = @{ Define = 'ATTESTTPM';  Expect = @('TPM: TPM 2.0 (simulator', 'Attestation: TPM attestation key ready', 'utest: attest report: ', 'init: utest attest exited with code 0'); Forbid = @('KERNEL PANIC', 'FAIL', 'no TPM evidence'); Post = 'Test-AttestReport' }
     smap        = @{ Define = 'SMAP';        Expect = @('KTEST smap: kernel reading user address', 'Page fault (#PF)', 'protection violation (present), read, kernel', 'kernel accessed user memory outside user_copy (SMAP)', $Halted); Forbid = @('KTEST smap: FAILED') }
     smep        = @{ Define = 'SMEP';        Expect = @('KTEST smep: kernel calling user code', 'Page fault (#PF)', 'instruction fetch', 'kernel tried to execute user memory (SMEP)', $Halted); Forbid = @('KTEST smep: FAILED') }
     kdb         = @{ Define = $null;         Expect = @('kdb: threads', 'TID  NAME', 'reaper', 'kdb: cpus', 'CPU  ONLINE', 'PCR  8', 'kdb: measure: '); Forbid = @('KERNEL PANIC')
@@ -1251,7 +1279,9 @@ function Get-StorageDisks([string]$Dir) {
 # NVMe disks (their pristine copies), the virtio-blk test disk (its generated pattern).
 # attest: the remote verifier's side. The report and nonce come from the guest's log; the reference
 # values (this build's kernel .dsig, the D-OS public key) from the build. Then the attacks: a replay
-# (another nonce), a changed byte, a report checked against another kernel.
+# (another nonce), a changed byte, a report checked against another kernel. With the simulated TPM
+# (attest-tpm) the TPM evidence is required and its EK certificate checked against the TEST CA, and
+# a CA that did not sign it is refused; without one, requiring a TPM is refused.
 function Test-AttestReport([string]$DiskDir, [string]$Image, [string]$Log) {
     $dir = Split-Path $Image -Parent
     $nonce = ''
@@ -1269,15 +1299,43 @@ function Test-AttestReport([string]$DiskDir, [string]$Image, [string]$Log) {
     $dsig = Join-Path $dir 'kernel.dsig'
     $key = (Get-SigningKey).Public
     $dosimg = Get-Dosimg
+    $withTpm = $Log -match 'TPM: TPM 2\.0 \(simulator'
+    $opts = @()
+    $ca = Join-Path $dir 'attest-test-ca.der'
+    if ($withTpm) {
+        & $dosimg attest-test-ca $ca | Out-Null
+        $opts = @('require-tpm', "ek-ca=$ca")
+    }
     $verify = {
-        param($r, $n, $d)
-        $out = & $dosimg attest-verify $r $n $d $key 2>&1 | Out-String
+        param($r, $n, $d, [string[]]$o = $opts)
+        $out = & $dosimg attest-verify $r $n $d $key @o 2>&1 | Out-String
         return @($LASTEXITCODE, $out.Trim())
     }
     $ok = $true
     $v = & $verify $report $nonce $dsig
     Write-Host "  host: $($v[1])"
     if ($v[0] -ne 0 -or $v[1] -notmatch 'attest: VALID') { $ok = $false }
+    if ($withTpm -and $v[1] -notmatch 'EK certified') { $ok = $false }
+    if ($withTpm) {
+        # The verifier's challenge for this report's TPM (answered by the kernel selftest's TPM; here
+        # only that one can be made from the report).
+        $ch = Join-Path $dir 'attest-challenge.bin'
+        $cred = (& $dosimg attest-challenge $report $ch 2>&1 | Out-String).Trim()
+        $made = $LASTEXITCODE -eq 0 -and $cred -match '^[0-9a-f]{64}$' -and (Get-Item $ch).Length -eq 328
+        Write-Host "  host: attest, credential challenge for the report's EK and AK: $(if ($made) { 'made (328 bytes)' } else { "NOT MADE: $cred" })"
+        if (-not $made) { $ok = $false }
+        $badCa = Join-Path $dir 'attest-other-ca.der'
+        $c = [IO.File]::ReadAllBytes($ca); $c[300] = $c[300] -bxor 0x10; [IO.File]::WriteAllBytes($badCa, $c)
+        $v = & $verify $report $nonce $dsig @('require-tpm', "ek-ca=$badCa")
+        $refused = $v[0] -ne 0 -and $v[1] -match 'REFUSED: EkUntrusted'
+        Write-Host "  host: attest, EK certificate checked against a CA that did not sign it: $(if ($refused) { 'refused (EkUntrusted)' } else { "NOT REFUSED: $($v[1])" })"
+        if (-not $refused) { $ok = $false }
+    } else {
+        $v = & $verify $report $nonce $dsig @('require-tpm')
+        $refused = $v[0] -ne 0 -and $v[1] -match 'REFUSED: TpmRequired'
+        Write-Host "  host: attest, a TPM required of a machine without one: $(if ($refused) { 'refused (TpmRequired)' } else { "NOT REFUSED: $($v[1])" })"
+        if (-not $refused) { $ok = $false }
+    }
     # Attacks, each must be refused for its own reason.
     $other = ($nonce.Substring(0, 63)) + $(if ($nonce[63] -eq '0') { '1' } else { '0' })
     $tampered = Join-Path $dir 'attest-tampered.bin'
@@ -1299,8 +1357,17 @@ function Test-AttestReport([string]$DiskDir, [string]$Image, [string]$Log) {
 # keys are typed elsewhere).
 function Test-UsbProbedOnce([string]$DiskDir, [string]$Image, [string]$Log) {
     $n = ([regex]::Matches($Log, 'left unused')).Count
-    Write-Host "  xhci: $n 'left unused' line(s) (expected 2: tablet, mouse)"
-    return $n -eq 2
+    $m = ([regex]::Matches($Log, 'mouse ready on port')).Count
+    Write-Host "  xhci: $n 'left unused' line(s) (expected 1: the tablet), $m mouse (expected 1)"
+    return $n -eq 1 -and $m -eq 1
+}
+
+# usbstorage: the boot was read-only, so the stick holds exactly what dosimg wrote.
+function Test-UsbDiskUnchanged([string]$DiskDir, [string]$Image, [string]$Log) {
+    $a = (Get-FileHash (Join-Path $DiskDir 'usb.img')).Hash
+    $b = (Get-FileHash (Join-Path $DiskDir 'usb.pristine')).Hash
+    Write-Host "  host: USB stick after a read-only boot: $(if ($a -eq $b) { 'unchanged' } else { 'CHANGED' })"
+    return $a -eq $b
 }
 
 # time: the second boot of the same disks must find the records and a later time; both boots'
@@ -1877,7 +1944,15 @@ function Invoke-Test {
         $mustExit = $tc.Contains('MustExit') -and $tc.MustExit
         $iommuKind = if ($tc.Contains('Iommu')) { $tc.Iommu } else { 'intel' }
         $diskDir = Join-Path $Build "disks\$n"
-        if ($devs -and (Test-Path $diskDir)) { Remove-Item -Recurse -Force $diskDir }   # fresh disks every run
+        if (($devs -or $tc.Contains('UsbDisk')) -and (Test-Path $diskDir)) { Remove-Item -Recurse -Force $diskDir }   # fresh disks every run
+        if ($tc.Contains('UsbDisk')) {
+            # A USB stick: a fresh dosimg "data" disk (GPT, DFS) on the case's xHCI controller.
+            New-Item -ItemType Directory -Force $diskDir | Out-Null
+            $usb = Join-Path $diskDir 'usb.img'
+            Invoke-Native (Get-Dosimg) @('nvme', $usb)
+            Copy-Item $usb (Join-Path $diskDir 'usb.pristine')
+            $extra += @('-drive', "if=none,id=usb1,format=raw,file=$usb", '-device', "usb-storage,bus=xhci.0,drive=usb1$($tc.UsbDisk)")
+        }
         $r = Invoke-QemuCapture $image (Join-Path $outDir "serial-$n.log") $tc.Expect $tc.Forbid $limit $keys $after $cpus $model `
             -Devices:$devs -Serial $ser -SerialAfter $serAfter -DiskDir $diskDir -Uefi:$uefi -Extra $extra -MustExit:$mustExit -IommuKind $iommuKind
         $missing = @($tc.Expect | Where-Object { -not $r.Log.Contains($_) })

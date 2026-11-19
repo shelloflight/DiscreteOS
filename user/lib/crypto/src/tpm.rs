@@ -12,8 +12,11 @@
 //!   to SHA-256 of the expected PCR values in index order.
 //!
 //! Every structure is untrusted input: sizes are bounds-checked and the whole blob must be consumed.
-//! Not here: proving that the attestation key belongs to a real TPM (certification through the
-//! endorsement key and the vendor's EK certificate chain, X.509), which the verifier must do too.
+//!
+//! Proving the attestation key lives in a genuine TPM: the vendor's certificate names the TPM's
+//! endorsement key (EK, `parse_rsa_ek`, `x509`); `make_credential` encrypts a fresh secret to that
+//! EK, bound to the AK's Name, and only that TPM, with that AK loaded, can return it
+//! (TPM2_ActivateCredential). `sim` is the TPM's side, for tests.
 
 use crate::p256::{self, PublicKey};
 use crate::sha2::{Sha256, sha256};
@@ -271,4 +274,220 @@ pub fn verify_quote<'a>(
         return Err(QuoteError::WrongPcrs);
     }
     Ok(q)
+}
+
+// ---- keys the kernel creates, and binding the attestation key to the endorsement key ---------
+
+pub const ALG_RSA: u16 = 0x0001;
+pub const ALG_AES: u16 = 0x0006;
+pub const ALG_CFB: u16 = 0x0043;
+pub const OBJ_USER_WITH_AUTH: u32 = 1 << 6;
+pub const OBJ_ADMIN_WITH_POLICY: u32 = 1 << 7;
+
+/// The TCG EK Credential Profile's RSA 2048 endorsement-key template ("L-1"): a restricted
+/// decryption key whose use needs PolicySecret(TPM_RH_ENDORSEMENT). Created from the TPM's
+/// endorsement seed, it is the key the manufacturer's EK certificate names.
+pub const EK_ATTRIBUTES: u32 =
+    OBJ_FIXED_TPM | OBJ_FIXED_PARENT | OBJ_SENSITIVE_DATA_ORIGIN | OBJ_ADMIN_WITH_POLICY | OBJ_RESTRICTED | OBJ_DECRYPT;
+pub const EK_POLICY: [u8; 32] = [
+    0x83, 0x71, 0x97, 0x67, 0x44, 0x84, 0xb3, 0xf8, 0x1a, 0x90, 0xcc, 0x8d, 0x46, 0xa5, 0xd7, 0x24, 0xfd, 0x52, 0xd7, 0x6e, 0x06, 0x52,
+    0x0b, 0x64, 0xf2, 0xa1, 0xda, 0x1b, 0x33, 0x14, 0x69, 0xaa,
+];
+/// The attestation key the kernel creates: ECC P-256, restricted signing (ECDSA-SHA256), usable
+/// with its (empty) password.
+pub const AK_CREATE_ATTRIBUTES: u32 = AK_ATTRIBUTES | OBJ_USER_WITH_AUTH;
+
+/// Fixed-capacity big-endian writer.
+struct Writer<const N: usize> {
+    b: [u8; N],
+    n: usize,
+}
+
+impl<const N: usize> Writer<N> {
+    fn new() -> Self {
+        Writer { b: [0; N], n: 0 }
+    }
+    fn put(&mut self, v: &[u8]) -> &mut Self {
+        self.b[self.n..self.n + v.len()].copy_from_slice(v);
+        self.n += v.len();
+        self
+    }
+    fn u16(&mut self, v: u16) -> &mut Self {
+        self.put(&v.to_be_bytes())
+    }
+    fn u32(&mut self, v: u32) -> &mut Self {
+        self.put(&v.to_be_bytes())
+    }
+    fn tpm2b(&mut self, v: &[u8]) -> &mut Self {
+        self.u16(v.len() as u16).put(v)
+    }
+}
+
+/// `TPMT_PUBLIC` of the RSA 2048 EK template (unique: 256 zero bytes, as the profile says).
+pub fn ek_template() -> ([u8; 320], usize) {
+    let mut w = Writer::<320>::new();
+    w.u16(ALG_RSA).u16(ALG_SHA256).u32(EK_ATTRIBUTES).tpm2b(&EK_POLICY);
+    w.u16(ALG_AES).u16(128).u16(ALG_CFB).u16(ALG_NULL).u16(2048).u32(0);
+    w.tpm2b(&[0u8; 256]);
+    (w.b, w.n)
+}
+
+/// `TPMT_PUBLIC` of the attestation-key template (empty unique: the TPM fills in the point).
+pub fn ak_template() -> ([u8; 64], usize) {
+    let mut w = Writer::<64>::new();
+    w.u16(ALG_ECC).u16(ALG_SHA256).u32(AK_CREATE_ATTRIBUTES).tpm2b(&[]);
+    w.u16(ALG_NULL).u16(ALG_ECDSA).u16(ALG_SHA256).u16(ECC_NIST_P256).u16(ALG_NULL);
+    w.tpm2b(&[]).tpm2b(&[]);
+    (w.b, w.n)
+}
+
+/// An RSA endorsement key's public area, parsed and checked against the EK template.
+pub struct RsaEk<'a> {
+    pub modulus: &'a [u8],
+    pub exponent: u32,
+    pub name: [u8; 34],
+}
+
+/// Parse an RSA EK `TPMT_PUBLIC`. Everything but the modulus must be the EK template's: a
+/// restricted decryption key with the endorsement policy, AES-128-CFB, 2048 bits.
+pub fn parse_rsa_ek(area: &[u8]) -> Option<RsaEk<'_>> {
+    let mut r = Reader::new(area);
+    if r.u16()? != ALG_RSA || r.u16()? != ALG_SHA256 || r.u32()? != EK_ATTRIBUTES || r.tpm2b()? != EK_POLICY {
+        return None;
+    }
+    if r.u16()? != ALG_AES || r.u16()? != 128 || r.u16()? != ALG_CFB || r.u16()? != ALG_NULL || r.u16()? != 2048 {
+        return None;
+    }
+    let exponent = match r.u32()? {
+        0 | 65537 => 65537,
+        _ => return None,
+    };
+    let modulus = r.tpm2b()?;
+    if modulus.len() != 256 || !r.done() {
+        return None;
+    }
+    let mut name = [0u8; 34];
+    name[..2].copy_from_slice(&ALG_SHA256.to_be_bytes());
+    name[2..].copy_from_slice(&sha256(area));
+    Some(RsaEk { modulus, exponent, name })
+}
+
+/// Size of the `TPM2B_ID_OBJECT` `make_credential` produces (wire form, with its size field).
+pub const ID_OBJECT: usize = 2 + 2 + 32 + 2 + 32;
+/// Size of the `TPM2B_ENCRYPTED_SECRET` for a 2048-bit EK.
+pub const SECRET: usize = 2 + 256;
+/// A credential challenge as the kernel's `attest_activate` takes it: blob, then secret.
+pub const CHALLENGE: usize = ID_OBJECT + SECRET;
+
+/// TPM2_MakeCredential done by the verifier (TPM 2.0 Library Part 1, 24): `credential` can only
+/// be recovered by the TPM that holds the EK's private key, and only for the object named
+/// `ak_name` loaded in it. `seed` and `oaep_seed` must be fresh random bytes. Returns the
+/// credential blob and the encrypted secret, as `TPM2_ActivateCredential` takes them.
+pub fn make_credential(
+    ek: &RsaEk<'_>,
+    ak_name: &[u8; 34],
+    credential: &[u8; 32],
+    seed: &[u8; 32],
+    oaep_seed: &[u8; 32],
+) -> Option<([u8; ID_OBJECT], [u8; SECRET])> {
+    use crate::sym::{Aes128, hmac_sha256, kdfa};
+    let key = crate::rsa::PublicKey::new(ek.modulus, ek.exponent)?;
+    if key.size() != 256 {
+        return None;
+    }
+    let mut secret = [0u8; SECRET];
+    secret[..2].copy_from_slice(&256u16.to_be_bytes());
+    crate::rsa::oaep_encrypt(&key, seed, b"IDENTITY\0", oaep_seed, &mut secret[2..])?;
+    let mut sym = [0u8; 16];
+    kdfa(seed, "STORAGE", ak_name, &[], &mut sym);
+    let mut enc = [0u8; 34];
+    enc[..2].copy_from_slice(&32u16.to_be_bytes());
+    enc[2..].copy_from_slice(credential);
+    Aes128::new(&sym).cfb_encrypt(&mut enc);
+    let mut hkey = [0u8; 32];
+    kdfa(seed, "INTEGRITY", &[], &[], &mut hkey);
+    let mac = hmac_sha256(&hkey, &[&enc, ak_name]);
+    let mut blob = [0u8; ID_OBJECT];
+    blob[..2].copy_from_slice(&((ID_OBJECT - 2) as u16).to_be_bytes());
+    blob[2..4].copy_from_slice(&32u16.to_be_bytes());
+    blob[4..36].copy_from_slice(&mac);
+    blob[36..].copy_from_slice(&enc);
+    sym.fill(0);
+    hkey.fill(0);
+    Some((blob, secret))
+}
+
+/// The TPM's side, for the test TPM simulator (the kernel's selftest and the host tests).
+pub mod sim {
+    use super::*;
+    use crate::sym::{Aes128, hmac_sha256, kdfa};
+
+    /// TPM2_ActivateCredential: recover the credential with the EK's private exponent `d`;
+    /// None if the blob was not made for this EK and `ak_name`.
+    pub fn open_credential(ek_n: &[u8], ek_d: &[u8], ak_name: &[u8; 34], blob: &[u8], secret: &[u8]) -> Option<[u8; 32]> {
+        let key = crate::rsa::PublicKey::new(ek_n, 65537)?;
+        let mut r = Reader::new(secret);
+        let ct = r.tpm2b()?;
+        let mut seed = [0u8; 64];
+        let n = crate::rsa::sim::oaep_decrypt(&key, ek_d, ct, b"IDENTITY\0", &mut seed)?;
+        let seed = &seed[..n];
+        let mut r = Reader::new(blob);
+        let inner = r.tpm2b()?;
+        let mut r = Reader::new(inner);
+        let mac = r.tpm2b()?;
+        let enc = r.bytes(inner.len().checked_sub(2 + mac.len())?)?;
+        let mut hkey = [0u8; 32];
+        kdfa(seed, "INTEGRITY", &[], &[], &mut hkey);
+        if hmac_sha256(&hkey, &[enc, ak_name]) != mac {
+            return None;
+        }
+        if enc.len() != 34 {
+            return None;
+        }
+        let mut sym = [0u8; 16];
+        kdfa(seed, "STORAGE", ak_name, &[], &mut sym);
+        let mut plain = [0u8; 34];
+        plain.copy_from_slice(enc);
+        Aes128::new(&sym).cfb_decrypt(&mut plain);
+        if plain[..2] != 32u16.to_be_bytes() {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&plain[2..]);
+        Some(out)
+    }
+
+    /// A `TPMS_ATTEST` quote of one SHA-256 PCR bank selection (`pcrs`: bit i = PCR i).
+    pub fn quote_info(signer: &[u8; 34], extra: &[u8], pcrs: u32, digest: &[u8; 32]) -> ([u8; 192], usize) {
+        let mut w = Writer::<192>::new();
+        w.u32(TPM_GENERATED).u16(ST_ATTEST_QUOTE).tpm2b(signer).tpm2b(extra);
+        w.put(&[0; 8]).u32(0).u32(0).put(&[1]); // clock, resets, restarts, safe
+        w.put(&0x0D05_0001u64.to_be_bytes()); // firmware version
+        w.u32(1).u16(ALG_SHA256).put(&[3, pcrs as u8, (pcrs >> 8) as u8, (pcrs >> 16) as u8]);
+        w.tpm2b(digest);
+        (w.b, w.n)
+    }
+
+    /// The `TPMT_PUBLIC` of an ECC P-256 attestation key with point (x, y).
+    pub fn ak_public(x: &[u8; 32], y: &[u8; 32]) -> ([u8; 128], usize) {
+        let mut w = Writer::<128>::new();
+        w.u16(ALG_ECC).u16(ALG_SHA256).u32(AK_CREATE_ATTRIBUTES).tpm2b(&[]);
+        w.u16(ALG_NULL).u16(ALG_ECDSA).u16(ALG_SHA256).u16(ECC_NIST_P256).u16(ALG_NULL);
+        w.tpm2b(x).tpm2b(y);
+        (w.b, w.n)
+    }
+
+    /// The `TPMT_PUBLIC` of the RSA EK with modulus `n` (the template, unique filled in).
+    pub fn ek_public(n: &[u8; 256]) -> ([u8; 320], usize) {
+        let (mut t, len) = ek_template();
+        t[len - 256..len].copy_from_slice(n);
+        (t, len)
+    }
+
+    /// A `TPMT_SIGNATURE` (ECDSA-SHA256).
+    pub fn ecdsa_signature(r: &[u8; 32], s: &[u8; 32]) -> ([u8; 72], usize) {
+        let mut w = Writer::<72>::new();
+        w.u16(ALG_ECDSA).u16(ALG_SHA256).tpm2b(r).tpm2b(s);
+        (w.b, w.n)
+    }
 }

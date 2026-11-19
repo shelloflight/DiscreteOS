@@ -99,6 +99,10 @@ bits) and wakes the thread, which:
 - `Notify(<PNP0C0C device>, 0x80)` (a control-method power button) signals the power-button event
   too; other notifications are logged.
 
+The thread also runs the **TPM start method** for the TPM driver: firmware TPMs whose ACPI `TPM2`
+table names start method 2 or 8 (AMD's) start each command through the TPM device's `_DSM`
+(MSFT0101, UUID 6BBF6CAB-5463-4714-B7CD-F0203C0368D4, function 1).
+
 GPEs listed in a `_PRW` (wake events) are not enabled at run time. Hardware-reduced ACPI (no SCI,
 GPIO events) is not supported yet.
 
@@ -112,8 +116,9 @@ the volumes durable, then `system_power`.
   ASL compiler needed); a mutation fuzzer (every truncation and 30 000 mutations of a built table);
   and, on Windows, the build machine's own DSDT and SSDTs (dumped from `HKLM\HARDWARE\ACPI` into
   `build\host\acpi`, never committed): loaded with no error, initialised, `\_S5`, the power button
-  and TPM devices found, every method run against simulated hardware (each one returns or fails
-  cleanly), and its SSDTs mutated on top of its DSDT.
+  and TPM devices found, the TPM start `_DSM` listing and running function 1, every method run
+  against simulated hardware (each one returns or fails cleanly), and its SSDTs mutated on top of
+  its DSDT.
 - `boot`, `uefi`: QEMU's tables (SeaBIOS and OVMF) load with nothing skipped, initialisation has no
   failure, the SCI is set up.
 - `powerbutton`: QEMU's `system_powerdown` reaches init through the SCI; clean shutdown and

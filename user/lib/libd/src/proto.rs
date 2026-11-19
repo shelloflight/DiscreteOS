@@ -13,12 +13,23 @@ pub const TAG_CONTROL: u32 = crate::sys::TAG_USER;
 
 /// Driver -> manager: initialised; `a` = capacity in sectors (block) or 0.
 pub const READY: u32 = 1;
-/// Driver -> manager: a key; `a` = the character.
+/// Driver -> manager: a key; `a` = the character, `b` = which keyboard of the driver (an id the
+/// driver chooses, e.g. its USB slot; 0 for drivers with one keyboard).
 pub const KEY: u32 = 2;
+/// Driver -> manager: a pointer moved or a button changed. `a` = dx (low 32 bits, signed) and dy
+/// (high 32 bits, signed, down positive); `b` = buttons (bit 0 left, 1 right, 2 middle) | wheel
+/// (signed byte, bits 8-15, up positive) | which pointer of the driver (bits 16-31).
+pub const POINTER: u32 = 4;
+/// Driver -> manager: keyboard `a` (the `KEY` id) is gone (unplugged or failed).
+pub const KEYBOARD_GONE: u32 = 5;
 /// Device manager -> each client of its `input` endpoint: a key typed. `a` = the key value
 /// (`key`: a character, US layout, or a named key with modifiers), `b` = which input device (an
 /// index); payload: the driver's name (`ps2`, `xhci`, `virtio-input`).
 pub const INPUT_KEY: u32 = 410;
+/// Device manager -> each client of its `input` endpoint: pointer input. `a` as in `POINTER`;
+/// `b` = buttons and wheel as in `POINTER` (bits 0-15) | which input device (bits 32-47);
+/// payload: the driver's name.
+pub const INPUT_POINTER: u32 = 411;
 
 /// Key values (`KEY`, `INPUT_KEY`): below 0x100 a character (`\n` Enter, 0x08 Backspace, 0x1B
 /// Escape, `\t` Tab, Ctrl+letter its control character); from 0x100 a named key, with the

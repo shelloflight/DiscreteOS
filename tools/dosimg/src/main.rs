@@ -8,6 +8,11 @@
 //!   dosimg sign <seed> <kind> <name> <file> <out.dsig>   sign (kind: kernel, program, driver, package)
 //!   dosimg verify <seed> <file> <dsig>       check a signature (exit 1 if invalid)
 //!   dosimg sha512 | sha256 <file>            print a digest (host cross-checks)
+//!   dosimg attest-verify <report> <nonce hex> <KERNEL.DSIG> <pubkey hex> [allow-unsigned] [require-tpm] [ek-ca=<cert.der> ...]
+//!                                            check an attestation report (docs/attestation.md)
+//!   dosimg attest-challenge <report> <out>   a TPM credential challenge for a checked report; prints
+//!                                            the credential the machine must send back
+//!   dosimg attest-test-ca <out.der>          the TEST EK CA certificate (the kernel's simulated TPM)
 //!   dosimg patch <img> <part> <path> <offset> <xor-hex>   flip bits of one byte of a file (tests)
 //!   dosimg sata <out.img>                    64 MiB: GPT, "boot" FAT32 (ESP), "system" DFS
 //!   dosimg nvme <out.img>                    32 MiB: GPT, "data" DFS
@@ -168,6 +173,19 @@ const STAGE3_SECTORS: u64 = 64;
 const KSIG_LBA: u64 = STAGE2_LBA + STAGE2_SECTORS + STAGE3_SECTORS;
 const KERNEL_LBA: u64 = KSIG_LBA + 8;
 
+/// 32 random bytes from the operating system (std's hasher keys come from its RNG), hashed.
+fn random32() -> [u8; 32] {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = doscrypt::sha2::Sha256::new();
+    for i in 0..8u64 {
+        let mut s = std::collections::hash_map::RandomState::new().build_hasher();
+        s.write_u64(i);
+        h.update(&s.finish().to_le_bytes());
+    }
+    h.update(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()).to_le_bytes());
+    h.finish()
+}
+
 fn read_file(path: &str) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("{}: {}", path, e))
 }
@@ -323,24 +341,37 @@ fn run(args: &[String]) -> Result<(), String> {
             })
         }
         "attest-verify" => {
-            // attest-verify <report.bin> <nonce hex> <KERNEL.DSIG> <pubkey hex> [allow-unsigned]
+            // attest-verify <report.bin> <nonce hex> <KERNEL.DSIG> <pubkey hex> [options]
             // The verifier side of remote attestation (docs/attestation.md): the nonce it sent,
-            // the reference kernel's .dsig and the D-OS public key are its reference values.
+            // the reference kernel's .dsig, the D-OS public key and the TPM vendors' CA
+            // certificates it trusts are its reference values.
             let r = read_file(a(2)?)?;
             let nonce: [u8; 32] = from_hex(a(3)?)?.try_into().map_err(|_| "nonce: 32 bytes".to_string())?;
             let kd = read_file(a(4)?)?;
             let key: [u8; 32] = from_hex(a(5)?)?.try_into().map_err(|_| "public key: 32 bytes".to_string())?;
-            let allow_unsigned = args.get(6).is_some_and(|x| x == "allow-unsigned");
-            let p = doscrypt::attest::Policy { kernel_dsig: &kd, key: &key, allow_unsigned };
+            let opts = &args[6.min(args.len())..];
+            let allow_unsigned = opts.iter().any(|x| x == "allow-unsigned");
+            let require_tpm = opts.iter().any(|x| x == "require-tpm");
+            let mut cas = Vec::new();
+            for o in opts {
+                if let Some(path) = o.strip_prefix("ek-ca=") {
+                    cas.push(read_file(path)?);
+                } else if o != "allow-unsigned" && o != "require-tpm" {
+                    return Err(format!("attest-verify: unknown option {}", o));
+                }
+            }
+            let issuers: Vec<&[u8]> = cas.iter().map(|c| c.as_slice()).collect();
+            let p = doscrypt::attest::Policy { kernel_dsig: &kd, key: &key, allow_unsigned, require_tpm, ek_issuers: &issuers };
             match doscrypt::attest::verify(&r, &nonce, &p) {
                 Ok(v) => {
                     let ver = String::from_utf8_lossy(&v.kernel_version).trim_end_matches(char::from(0)).to_string();
-                    let tpm = if v.flags & doscrypt::attest::F_TPM_MATCH != 0 {
-                        "TPM PCRs equal the log"
-                    } else if v.flags & doscrypt::attest::F_TPM != 0 {
-                        "TPM present, PCRs NOT equal to the log"
-                    } else {
-                        "no TPM (software evidence: rooted in the verified kernel)"
+                    let tpm = match v.tpm {
+                        doscrypt::attest::TpmStatus::Certified => "TPM quote verified, EK certified by a trusted TPM vendor CA",
+                        doscrypt::attest::TpmStatus::Quoted => "TPM quote verified (EK certificate not checked: no ek-ca given)",
+                        doscrypt::attest::TpmStatus::None if v.flags & doscrypt::attest::F_TPM != 0 => {
+                            "TPM present, PCRs NOT equal to the log: no TPM evidence"
+                        }
+                        doscrypt::attest::TpmStatus::None => "no TPM (software evidence: rooted in the verified kernel)",
                     };
                     println!(
                         "attest: VALID: D-KRNL {} ({}), the reference kernel, verified by its loader; {} events replayed to PCR 8 and 10; {} signed program(s), {} unsigned; {} service decision(s); attestation key {}; {}",
@@ -357,6 +388,25 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
                 Err(e) => Err(format!("attest: REFUSED: {:?}", e)),
             }
+        }
+        "attest-challenge" => {
+            // attest-challenge <report.bin> <out.bin>: after attest-verify accepted the report, a
+            // fresh credential encrypted to its TPM's EK for its attestation key. The machine
+            // answers with attest_activate; it must give back the printed credential.
+            let r = read_file(a(2)?)?;
+            let cred = random32();
+            let (blob, secret) = doscrypt::attest::challenge(&r, &cred, &random32(), &random32())
+                .ok_or("attest-challenge: the report has no TPM evidence")?;
+            let mut out = blob.to_vec();
+            out.extend_from_slice(&secret);
+            let path = a(3)?;
+            std::fs::write(path, &out).map_err(|e| format!("{}: {}", path, e))?;
+            println!("{}", to_hex(&cred));
+            Ok(())
+        }
+        "attest-test-ca" => {
+            let path = a(2)?;
+            std::fs::write(path, doscrypt::testkeys::CA_CERT).map_err(|e| format!("{}: {}", path, e))
         }
         "sha512" => {
             println!("{}", to_hex(&doscrypt::sha2::sha512(&read_file(a(2)?)?)));

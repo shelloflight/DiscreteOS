@@ -1,20 +1,26 @@
-//! TPM 2.0 driver: the commands measured boot needs, over the two memory-mapped interfaces PCs
-//! have, found through the ACPI `TPM2` table:
+//! TPM 2.0 driver: measured boot and hardware-rooted attestation, over the memory-mapped
+//! interfaces PCs have, found through the ACPI `TPM2` table:
 //!
 //! - TIS / FIFO (TCG PC Client Platform TPM Profile, start method 6), locality 0 at 0xFED40000
-//! - CRB (Command Response Buffer, start method 7), control area from the table
+//! - CRB (Command Response Buffer), control area from the table, started by writing its start
+//!   register (method 7), by the TPM device's ACPI `_DSM` (method 2: AMD firmware TPMs), or both
+//!   (method 8). The `_DSM` runs on the ACPI thread (`dev::acpi::tpm_start`).
 //!
-//! Commands (TPM 2.0 Library, Part 3): `TPM2_Startup(SU_CLEAR)` (the firmware normally did it:
-//! `TPM_RC_INITIALIZE` is fine), `TPM2_GetCapability` (manufacturer), `TPM2_PCR_Extend` and
-//! `TPM2_PCR_Read` on the SHA-256 bank. Every response is length- and tag-checked; a TPM that
-//! misbehaves or times out is dropped (measurements stay in the kernel's log).
+//! Commands (TPM 2.0 Library, Part 3): Startup, GetCapability (manufacturer), PCR_Extend and
+//! PCR_Read on the SHA-256 bank; for attestation CreatePrimary, ReadPublic, FlushContext, Quote,
+//! NV_ReadPublic / NV_Read (the EK certificate), and StartAuthSession + PolicySecret +
+//! ActivateCredential (proving the attestation key and the endorsement key share a TPM). Every
+//! response is length- and tag-checked; a TPM that misbehaves or times out is dropped
+//! (measurements stay in the kernel's log).
 //!
 //! The kernel drives the TPM itself (not a user-space driver): it is the root of the measurement
 //! chain, found through ACPI rather than PCI, and used only for a handful of short commands.
 //! Without a TPM in the test machine (QEMU on Windows has none), the command layer is tested
-//! against the simulator below (`Sim`, selftest); TIS and CRB are tested on real hardware.
+//! against the simulator below (`Sim`); TIS and CRB are tested on real hardware.
 
 use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 
 use crate::ffi;
 
@@ -25,10 +31,32 @@ const CC_STARTUP: u32 = 0x144;
 const CC_PCR_EXTEND: u32 = 0x182;
 const CC_PCR_READ: u32 = 0x17E;
 const CC_GET_CAPABILITY: u32 = 0x17A;
+const CC_CREATE_PRIMARY: u32 = 0x131;
+const CC_FLUSH_CONTEXT: u32 = 0x165;
+const CC_QUOTE: u32 = 0x158;
+const CC_READ_PUBLIC: u32 = 0x173;
+const CC_NV_READ_PUBLIC: u32 = 0x169;
+const CC_NV_READ: u32 = 0x14E;
+const CC_START_AUTH_SESSION: u32 = 0x176;
+const CC_POLICY_SECRET: u32 = 0x151;
+const CC_ACTIVATE_CREDENTIAL: u32 = 0x147;
 const RC_INITIALIZE: u32 = 0x100;
 const RS_PW: u32 = 0x4000_0009;
 const CAP_TPM_PROPERTIES: u32 = 6;
 const PT_MANUFACTURER: u32 = 0x105;
+pub const RH_OWNER: u32 = 0x4000_0001;
+pub const RH_NULL: u32 = 0x4000_0007;
+pub const RH_ENDORSEMENT: u32 = 0x4000_000B;
+/// Where Windows and Linux tools keep the RSA EK (TCG Provisioning Guidance).
+pub const EK_PERSISTENT: u32 = 0x8101_0001;
+/// The NV index of the RSA 2048 EK certificate (TCG EK Credential Profile).
+pub const EK_CERT_NV_RSA: u32 = 0x01C0_0002;
+/// Largest EK certificate read.
+pub const EK_CERT_MAX: usize = 2048;
+const SE_POLICY: u8 = 1;
+const ALG_NULL: u16 = 0x0010;
+/// Largest response accepted (and buffer allocated).
+const RSP_MAX: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -50,22 +78,26 @@ pub struct Tpm {
     pub manufacturer: [u8; 4],
 }
 
-/// Big-endian command builder.
-struct Cmd {
-    b: [u8; 128],
-    n: usize,
+/// A loaded key: its handle, `TPMT_PUBLIC` and Name (SHA-256 || digest of the public area).
+pub struct Key {
+    pub handle: u32,
+    pub public: Vec<u8>,
+    pub name: [u8; 34],
 }
+
+/// Big-endian command builder.
+struct Cmd(Vec<u8>);
 
 impl Cmd {
     fn new(tag: u16, cc: u32) -> Cmd {
-        let mut c = Cmd { b: [0; 128], n: 10 };
-        c.b[0..2].copy_from_slice(&tag.to_be_bytes());
-        c.b[6..10].copy_from_slice(&cc.to_be_bytes());
-        c
+        let mut v = Vec::with_capacity(96);
+        v.extend_from_slice(&tag.to_be_bytes());
+        v.extend_from_slice(&[0; 4]);
+        v.extend_from_slice(&cc.to_be_bytes());
+        Cmd(v)
     }
     fn u8(&mut self, v: u8) -> &mut Self {
-        self.b[self.n] = v;
-        self.n += 1;
+        self.0.push(v);
         self
     }
     fn u16(&mut self, v: u16) -> &mut Self {
@@ -75,14 +107,20 @@ impl Cmd {
         self.bytes(&v.to_be_bytes())
     }
     fn bytes(&mut self, v: &[u8]) -> &mut Self {
-        self.b[self.n..self.n + v.len()].copy_from_slice(v);
-        self.n += v.len();
+        self.0.extend_from_slice(v);
         self
     }
-    fn done(&mut self) -> &[u8] {
-        let n = self.n as u32;
-        self.b[2..6].copy_from_slice(&n.to_be_bytes());
-        &self.b[..self.n]
+    fn tpm2b(&mut self, v: &[u8]) -> &mut Self {
+        self.u16(v.len() as u16).bytes(v)
+    }
+    /// The authorization area: one password session with an empty password.
+    fn pw(&mut self) -> &mut Self {
+        self.u32(9).u32(RS_PW).u16(0).u8(0).u16(0)
+    }
+    fn done(mut self) -> Vec<u8> {
+        let n = self.0.len() as u32;
+        self.0[2..6].copy_from_slice(&n.to_be_bytes());
+        self.0
     }
 }
 
@@ -93,13 +131,47 @@ fn be32(b: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_be_bytes([*b.get(o)?, *b.get(o + 1)?, *b.get(o + 2)?, *b.get(o + 3)?]))
 }
 
-/// Builders, shared with the simulator's tests.
-pub fn cmd_pcr_extend(pcr: u32, digest: &[u8; 32]) -> ([u8; 128], usize) {
-    let mut c = Cmd::new(ST_SESSIONS, CC_PCR_EXTEND);
-    c.u32(pcr).u32(9).u32(RS_PW).u16(0).u8(0).u16(0); // password session, empty auth
-    c.u32(1).u16(SHA256_ALG).bytes(digest);
-    let n = c.done().len();
-    (c.b, n)
+/// Response parameter reader: every read is bounds-checked.
+struct Rsp<'a> {
+    b: &'a [u8],
+    o: usize,
+}
+
+const SHORT: Error = Error::Protocol("response too short");
+
+impl<'a> Rsp<'a> {
+    /// The parameters of a response with `handles` handles (and, with sessions, a parameter size).
+    fn params(r: &'a [u8], handles: usize) -> Result<Rsp<'a>, Error> {
+        let mut p = Rsp { b: r, o: 10 + 4 * handles };
+        if be16(r, 0) == Some(ST_SESSIONS) {
+            let size = p.u32()? as usize;
+            let end = p.o.checked_add(size).filter(|&e| e <= r.len()).ok_or(SHORT)?;
+            p.b = &r[..end];
+        }
+        Ok(p)
+    }
+    fn bytes(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        let v = self.b.get(self.o..self.o.checked_add(n).ok_or(SHORT)?).ok_or(SHORT)?;
+        self.o += n;
+        Ok(v)
+    }
+    fn u16(&mut self) -> Result<u16, Error> {
+        Ok(u16::from_be_bytes(self.bytes(2)?.try_into().map_err(|_| SHORT)?))
+    }
+    fn u32(&mut self) -> Result<u32, Error> {
+        Ok(u32::from_be_bytes(self.bytes(4)?.try_into().map_err(|_| SHORT)?))
+    }
+    fn tpm2b(&mut self) -> Result<&'a [u8], Error> {
+        let n = usize::from(self.u16()?);
+        self.bytes(n)
+    }
+}
+
+fn name_of(public: &[u8]) -> [u8; 34] {
+    let mut n = [0u8; 34];
+    n[..2].copy_from_slice(&SHA256_ALG.to_be_bytes());
+    n[2..].copy_from_slice(&doscrypt::sha2::sha256(public));
+    n
 }
 
 impl Tpm {
@@ -108,19 +180,18 @@ impl Tpm {
         let mut tpm = Tpm { t, manufacturer: [0; 4] };
         let mut c = Cmd::new(ST_NO_SESSIONS, CC_STARTUP);
         c.u16(0); // TPM_SU_CLEAR
-        match tpm.command(c.done().to_owned_array()) {
+        match tpm.command(c.done()) {
             Ok(_) | Err(Error::Tpm(RC_INITIALIZE)) => {}
             Err(e) => return Err(e),
         }
         let mut c = Cmd::new(ST_NO_SESSIONS, CC_GET_CAPABILITY);
         c.u32(CAP_TPM_PROPERTIES).u32(PT_MANUFACTURER).u32(1);
-        let (r, n) = tpm.command(c.done().to_owned_array())?;
+        let r = tpm.command(c.done())?;
         // moreData(1) capability(4) count(4) property(4) value(4)
-        let r = &r[..n];
-        if be32(r, 11) != Some(CAP_TPM_PROPERTIES) || be32(r, 15) != Some(1) || be32(r, 19) != Some(PT_MANUFACTURER) {
+        if be32(&r, 11) != Some(CAP_TPM_PROPERTIES) || be32(&r, 15) != Some(1) || be32(&r, 19) != Some(PT_MANUFACTURER) {
             return Err(Error::Protocol("unexpected GetCapability answer"));
         }
-        let v = be32(r, 23).ok_or(Error::Protocol("short GetCapability answer"))?;
+        let v = be32(&r, 23).ok_or(Error::Protocol("short GetCapability answer"))?;
         tpm.manufacturer = v.to_be_bytes();
         Ok(tpm)
     }
@@ -129,11 +200,11 @@ impl Tpm {
         self.t.name()
     }
 
-    /// One command; checks the response header. Returns the response buffer and its length.
-    fn command(&mut self, (cmd, n): ([u8; 128], usize)) -> Result<([u8; 512], usize), Error> {
-        let mut rsp = [0u8; 512];
-        let got = self.t.exchange(&cmd[..n], &mut rsp)?;
-        if got < 10 || got > rsp.len() {
+    /// One command; checks the response header. Returns the response.
+    fn command(&mut self, cmd: Vec<u8>) -> Result<Vec<u8>, Error> {
+        let mut rsp = vec![0u8; RSP_MAX];
+        let got = self.t.exchange(&cmd, &mut rsp)?;
+        if !(10..=rsp.len()).contains(&got) {
             return Err(Error::Protocol("short response"));
         }
         let tag = be16(&rsp, 0).unwrap_or(0);
@@ -145,11 +216,15 @@ impl Tpm {
         if rc != 0 {
             return Err(Error::Tpm(rc));
         }
-        Ok((rsp, got))
+        rsp.truncate(got);
+        Ok(rsp)
     }
 
     pub fn pcr_extend(&mut self, pcr: u32, digest: &[u8; 32]) -> Result<(), Error> {
-        self.command(cmd_pcr_extend(pcr, digest)).map(|_| ())
+        let mut c = Cmd::new(ST_SESSIONS, CC_PCR_EXTEND);
+        c.u32(pcr).pw();
+        c.u32(1).u16(SHA256_ALG).bytes(digest);
+        self.command(c.done()).map(|_| ())
     }
 
     pub fn pcr_read(&mut self, pcr: u32) -> Result<[u8; 32], Error> {
@@ -160,26 +235,150 @@ impl Tpm {
         sel[(pcr / 8) as usize] = 1 << (pcr % 8);
         let mut c = Cmd::new(ST_NO_SESSIONS, CC_PCR_READ);
         c.u32(1).u16(SHA256_ALG).u8(3).bytes(&sel);
-        let (r, n) = self.command(c.done().to_owned_array())?;
-        let r = &r[..n];
+        let r = self.command(c.done())?;
         // updateCounter(4) TPML_PCR_SELECTION(4 + 2 + 1 + 3) TPML_DIGEST count(4) TPM2B size(2) digest
-        if be32(r, 10 + 4) != Some(1) || be32(r, 24) != Some(1) || be16(r, 28) != Some(32) || r.len() < 62 {
+        if be32(&r, 10 + 4) != Some(1) || be32(&r, 24) != Some(1) || be16(&r, 28) != Some(32) || r.len() < 62 {
             return Err(Error::Protocol("unexpected PCR_Read answer"));
         }
         let mut d = [0u8; 32];
         d.copy_from_slice(&r[30..62]);
         Ok(d)
     }
-}
 
-trait ToOwnedArray {
-    fn to_owned_array(&self) -> ([u8; 128], usize);
-}
-impl ToOwnedArray for [u8] {
-    fn to_owned_array(&self) -> ([u8; 128], usize) {
-        let mut b = [0u8; 128];
-        b[..self.len()].copy_from_slice(self);
-        (b, self.len())
+    /// TPM2_CreatePrimary under `hierarchy` (empty authorization) from a `TPMT_PUBLIC` template.
+    pub fn create_primary(&mut self, hierarchy: u32, template: &[u8]) -> Result<Key, Error> {
+        let mut c = Cmd::new(ST_SESSIONS, CC_CREATE_PRIMARY);
+        c.u32(hierarchy).pw();
+        c.u16(4).u16(0).u16(0); // inSensitive: no auth, no data
+        c.tpm2b(template).u16(0).u32(0); // inPublic, outsideInfo, creationPCR
+        let r = self.command(c.done())?;
+        let handle = be32(&r, 10).ok_or(SHORT)?;
+        let mut p = Rsp::params(&r, 1)?;
+        let public = p.tpm2b()?.to_vec();
+        p.tpm2b()?; // creationData
+        p.tpm2b()?; // creationHash
+        p.u16()?; // creationTicket: tag
+        p.u32()?; // hierarchy
+        p.tpm2b()?; // digest
+        let n = p.tpm2b()?;
+        let name = name_of(&public);
+        if n != name {
+            self.flush(handle);
+            return Err(Error::Protocol("CreatePrimary: the name does not match the public area"));
+        }
+        Ok(Key { handle, public, name })
+    }
+
+    /// TPM2_ReadPublic of a loaded or persistent object.
+    pub fn read_public(&mut self, handle: u32) -> Result<Key, Error> {
+        let mut c = Cmd::new(ST_NO_SESSIONS, CC_READ_PUBLIC);
+        c.u32(handle);
+        let r = self.command(c.done())?;
+        let mut p = Rsp::params(&r, 0)?;
+        let public = p.tpm2b()?.to_vec();
+        let name = name_of(&public);
+        if p.tpm2b()? != name {
+            return Err(Error::Protocol("ReadPublic: the name does not match the public area"));
+        }
+        Ok(Key { handle, public, name })
+    }
+
+    /// TPM2_FlushContext (transient objects and sessions); errors are ignored.
+    pub fn flush(&mut self, handle: u32) {
+        let mut c = Cmd::new(ST_NO_SESSIONS, CC_FLUSH_CONTEXT);
+        c.u32(handle);
+        let _ = self.command(c.done());
+    }
+
+    /// TPM2_Quote: the SHA-256 PCRs in `pcrs` (bit i = PCR i, below 24) signed by the restricted
+    /// signing key `key` with `nonce` as qualifying data. Returns (`TPMS_ATTEST`, `TPMT_SIGNATURE`).
+    pub fn quote(&mut self, key: u32, nonce: &[u8], pcrs: u32) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        let mut c = Cmd::new(ST_SESSIONS, CC_QUOTE);
+        c.u32(key).pw();
+        c.tpm2b(nonce).u16(ALG_NULL); // the key's own scheme
+        c.u32(1).u16(SHA256_ALG).u8(3).bytes(&[pcrs as u8, (pcrs >> 8) as u8, (pcrs >> 16) as u8]);
+        let r = self.command(c.done())?;
+        let mut p = Rsp::params(&r, 0)?;
+        let attest = p.tpm2b()?.to_vec();
+        let start = p.o;
+        p.u16()?; // sigAlg
+        p.u16()?; // hash
+        p.tpm2b()?; // r
+        p.tpm2b()?; // s
+        Ok((attest, r[start..p.o].to_vec()))
+    }
+
+    /// The whole contents of an NV index (at most `max` bytes), read with the index's own
+    /// (empty) authorization, or the owner's when the index does not allow that.
+    pub fn nv_read_all(&mut self, index: u32, max: usize) -> Result<Vec<u8>, Error> {
+        let mut c = Cmd::new(ST_NO_SESSIONS, CC_NV_READ_PUBLIC);
+        c.u32(index);
+        let r = self.command(c.done())?;
+        let mut p = Rsp::params(&r, 0)?;
+        let mut pubp = Rsp { b: p.tpm2b()?, o: 0 };
+        if pubp.u32()? != index {
+            return Err(Error::Protocol("NV_ReadPublic: another index"));
+        }
+        pubp.u16()?; // nameAlg
+        pubp.u32()?; // attributes
+        pubp.tpm2b()?; // authPolicy
+        let size = usize::from(pubp.u16()?);
+        if size > max {
+            return Err(Error::Protocol("NV index larger than expected"));
+        }
+        let mut out = Vec::with_capacity(size);
+        let mut auth = index;
+        while out.len() < size {
+            let n = (size - out.len()).min(512);
+            let mut c = Cmd::new(ST_SESSIONS, CC_NV_READ);
+            c.u32(auth).u32(index).pw();
+            c.u16(n as u16).u16(out.len() as u16);
+            let r = match self.command(c.done()) {
+                Err(Error::Tpm(_)) if auth == index && out.is_empty() => {
+                    auth = RH_OWNER;
+                    continue;
+                }
+                r => r?,
+            };
+            let mut p = Rsp::params(&r, 0)?;
+            let data = p.tpm2b()?;
+            if data.len() != n {
+                return Err(Error::Protocol("NV_Read: short data"));
+            }
+            out.extend_from_slice(data);
+        }
+        Ok(out)
+    }
+
+    /// TPM2_ActivateCredential: the secret a verifier encrypted to the EK `ek` for the object `ak`
+    /// (`blob`: `TPM2B_ID_OBJECT`, `secret`: `TPM2B_ENCRYPTED_SECRET`, each with its size). The EK's
+    /// policy is satisfied with a policy session and PolicySecret(TPM_RH_ENDORSEMENT).
+    pub fn activate_credential(&mut self, ak: u32, ek: u32, blob: &[u8], secret: &[u8]) -> Result<[u8; 32], Error> {
+        let mut c = Cmd::new(ST_NO_SESSIONS, CC_START_AUTH_SESSION);
+        c.u32(RH_NULL).u32(RH_NULL); // unsalted, unbound
+        c.tpm2b(&[0x5A; 16]).u16(0).u8(SE_POLICY).u16(ALG_NULL).u16(SHA256_ALG);
+        let r = self.command(c.done())?;
+        let session = be32(&r, 10).ok_or(SHORT)?;
+        let res = self.activate_in(session, ak, ek, blob, secret);
+        if res.is_err() {
+            self.flush(session); // on success the TPM ended the session (continueSession clear)
+        }
+        res
+    }
+
+    fn activate_in(&mut self, session: u32, ak: u32, ek: u32, blob: &[u8], secret: &[u8]) -> Result<[u8; 32], Error> {
+        let mut c = Cmd::new(ST_SESSIONS, CC_POLICY_SECRET);
+        c.u32(RH_ENDORSEMENT).u32(session).pw();
+        c.u16(0).u16(0).u16(0).u32(0); // nonceTPM, cpHashA, policyRef, expiration
+        self.command(c.done())?;
+        let mut c = Cmd::new(ST_SESSIONS, CC_ACTIVATE_CREDENTIAL);
+        c.u32(ak).u32(ek);
+        c.u32(9 + 9).u32(RS_PW).u16(0).u8(0).u16(0); // the AK: empty password
+        c.u32(session).u16(0).u8(0).u16(0); // the EK: the policy session
+        c.bytes(blob).bytes(secret);
+        let r = self.command(c.done())?;
+        let mut p = Rsp::params(&r, 0)?;
+        p.tpm2b()?.try_into().map_err(|_| Error::Protocol("ActivateCredential: not 32 bytes"))
     }
 }
 
@@ -284,7 +483,8 @@ impl Transport for Tis {
             return Err(Error::Protocol("TPM expects more command bytes"));
         }
         m.w32(TIS_STS, STS_GO);
-        wait(10_000 * MS, || m.r32(TIS_STS) & (STS_VALID | STS_DATA) == STS_VALID | STS_DATA)?;
+        // Key creation (CreatePrimary of an RSA EK) can take tens of seconds on slow TPMs.
+        wait(60_000 * MS, || m.r32(TIS_STS) & (STS_VALID | STS_DATA) == STS_VALID | STS_DATA)?;
         let mut got = 0;
         let mut want = 10;
         while got < want {
@@ -307,67 +507,104 @@ impl Transport for Tis {
     }
 }
 
+/// How a CRB command is started (the TPM2 table's start method).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrbStart {
+    /// Method 7: the start register.
+    Register,
+    /// Method 2: the ACPI `_DSM` only; the firmware TPM has no locality or idle states to drive.
+    Acpi,
+    /// Method 8: the start register, then the `_DSM`.
+    Both,
+}
+
 /// CRB interface, locality 0: command and response buffers named by the control area.
 pub struct Crb {
+    /// The control area (the TPM2 table's address: `CTRL_REQ` first).
     ctl: Mmio,
+    /// The locality registers, 0x40 below the control area (not with method 2).
+    loc: Option<Mmio>,
     cmd: Mmio,
     cmd_len: usize,
     rsp: Mmio,
     rsp_len: usize,
+    start: CrbStart,
 }
 
+// Control area (TCG PC Client Platform TPM Profile, CRB), from the table's address.
+const CRB_CTRL_REQ: usize = 0x00;
+const CRB_CTRL_STS: usize = 0x04;
+const CRB_CTRL_START: usize = 0x0C;
+const CRB_CMD_SIZE: usize = 0x18;
+const CRB_CMD_LO: usize = 0x1C;
+const CRB_CMD_HI: usize = 0x20;
+const CRB_RSP_SIZE: usize = 0x24;
+const CRB_RSP_PA: usize = 0x28;
+const CRB_CTRL_LEN: u64 = 0x30;
+// Locality registers, at control area - 0x40.
 const CRB_LOC_CTRL: usize = 0x08;
 const CRB_LOC_STS: usize = 0x0C;
-const CRB_CTRL_REQ: usize = 0x40;
-const CRB_CTRL_STS: usize = 0x44;
-const CRB_CTRL_START: usize = 0x4C;
-const CRB_CMD_SIZE: usize = 0x58;
-const CRB_CMD_LO: usize = 0x5C;
-const CRB_CMD_HI: usize = 0x60;
-const CRB_RSP_SIZE: usize = 0x64;
-const CRB_RSP_PA: usize = 0x68;
+/// The buffers are mapped up to this size (commands and responses here are smaller).
+const CRB_BUF_MAX: usize = 4096;
 
 impl Crb {
-    fn probe(control: u64) -> Option<Crb> {
-        if control == 0 || !control.is_multiple_of(4) {
+    fn probe(control: u64, start: CrbStart) -> Option<Crb> {
+        if control < 0x40 || !control.is_multiple_of(4) {
             return None;
         }
-        let ctl = Mmio::map(control, 0x80);
+        let ctl = Mmio::map(control, CRB_CTRL_LEN);
         let cmd_pa = u64::from(ctl.r32(CRB_CMD_LO)) | u64::from(ctl.r32(CRB_CMD_HI)) << 32;
         let rsp_pa = u64::from(ctl.r32(CRB_RSP_PA)) | u64::from(ctl.r32(CRB_RSP_PA + 4)) << 32;
         let (cl, rl) = (ctl.r32(CRB_CMD_SIZE) as usize, ctl.r32(CRB_RSP_SIZE) as usize);
-        if cmd_pa == 0 || rsp_pa == 0 || !(128..=4096).contains(&cl) || !(128..=4096).contains(&rl) {
+        if cmd_pa == 0 || rsp_pa == 0 || cl < 128 || rl < 128 {
             return None;
         }
+        let (cl, rl) = (cl.min(CRB_BUF_MAX), rl.min(CRB_BUF_MAX));
         // SAFETY: the buffers are TPM device memory named by its control area.
         if unsafe { ffi::pmm_range_is_ram(cmd_pa, cl as u64) || ffi::pmm_range_is_ram(rsp_pa, rl as u64) } {
             return None; // never let a device name RAM the kernel owns
         }
-        Some(Crb { ctl, cmd: Mmio::map(cmd_pa, cl as u64), cmd_len: cl, rsp: Mmio::map(rsp_pa, rl as u64), rsp_len: rl })
+        let loc = (start != CrbStart::Acpi).then(|| Mmio::map(control - 0x40, 0x10));
+        Some(Crb { ctl, loc, cmd: Mmio::map(cmd_pa, cl as u64), cmd_len: cl, rsp: Mmio::map(rsp_pa, rl as u64), rsp_len: rl, start })
     }
 }
 
 impl Transport for Crb {
     fn name(&self) -> &'static str {
-        "CRB"
+        match self.start {
+            CrbStart::Register => "CRB",
+            CrbStart::Acpi => "CRB, ACPI start",
+            CrbStart::Both => "CRB + ACPI start",
+        }
     }
     fn exchange(&mut self, cmd: &[u8], rsp: &mut [u8]) -> Result<usize, Error> {
         let c = &self.ctl;
         if cmd.len() > self.cmd_len {
             return Err(Error::Protocol("command larger than the CRB buffer"));
         }
-        c.w32(CRB_LOC_CTRL, 1); // requestAccess
-        wait(750 * MS, || c.r32(CRB_LOC_STS) & 1 != 0)?;
-        c.w32(CRB_CTRL_REQ, 1); // cmdReady
-        wait(2000 * MS, || c.r32(CRB_CTRL_REQ) & 1 == 0)?;
+        if let Some(l) = &self.loc {
+            l.w32(CRB_LOC_CTRL, 1); // requestAccess
+            wait(750 * MS, || l.r32(CRB_LOC_STS) & 1 != 0)?;
+            c.w32(CRB_CTRL_REQ, 1); // cmdReady
+            wait(2000 * MS, || c.r32(CRB_CTRL_REQ) & 1 == 0)?;
+        }
         if c.r32(CRB_CTRL_STS) & 1 != 0 {
             return Err(Error::Protocol("CRB reports a fatal error"));
         }
         for (i, b) in cmd.iter().enumerate() {
             self.cmd.w8(i, *b);
         }
-        c.w32(CRB_CTRL_START, 1);
-        wait(10_000 * MS, || c.r32(CRB_CTRL_START) & 1 == 0)?;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if self.start != CrbStart::Acpi {
+            c.w32(CRB_CTRL_START, 1);
+        }
+        if self.start != CrbStart::Register {
+            crate::dev::acpi::tpm_start().map_err(Error::Protocol)?;
+        }
+        wait(60_000 * MS, || c.r32(CRB_CTRL_START) & 1 == 0)?;
+        if c.r32(CRB_CTRL_STS) & 1 != 0 {
+            return Err(Error::Protocol("CRB reports a fatal error"));
+        }
         for (i, b) in rsp.iter_mut().take(10).enumerate() {
             *b = self.rsp.r8(i);
         }
@@ -378,13 +615,14 @@ impl Transport for Crb {
         for (i, b) in rsp.iter_mut().enumerate().take(n).skip(10) {
             *b = self.rsp.r8(i);
         }
-        c.w32(CRB_CTRL_REQ, 2); // goIdle
-        c.w32(CRB_LOC_CTRL, 2); // relinquish
+        if let Some(l) = &self.loc {
+            c.w32(CRB_CTRL_REQ, 2); // goIdle
+            l.w32(CRB_LOC_CTRL, 2); // relinquish
+        }
         Ok(n)
     }
 }
 
-/// The TPM named by ACPI, if any: (transport, how it was found) or a reason there is none.
 /// The ACPI TPM2 table's bytes (untrusted; also the fuzzing entry point): start method and
 /// control area address.
 pub fn parse_tpm2(tb: &[u8]) -> Result<(u32, u64), &'static str> {
@@ -396,6 +634,7 @@ pub fn parse_tpm2(tb: &[u8]) -> Result<(u32, u64), &'static str> {
     Ok((method, control))
 }
 
+/// The TPM named by ACPI, if any, or a reason there is none.
 pub fn probe() -> Result<Box<dyn Transport>, &'static str> {
     let mut len = 0u32;
     // SAFETY: returns a mapped, checksum-verified table of `len` bytes, or NULL.
@@ -405,28 +644,36 @@ pub fn probe() -> Result<Box<dyn Transport>, &'static str> {
     }
     // SAFETY: the table is `len` bytes, mapped read-only for ever.
     let (method, control) = parse_tpm2(unsafe { core::slice::from_raw_parts(t, len as usize) })?;
+    let crb = |s| Crb::probe(control, s).map(|t| Box::new(t) as Box<dyn Transport>).ok_or("CRB control area invalid");
     match method {
+        2 => crb(CrbStart::Acpi),
         6 => Tis::probe().map(|t| Box::new(t) as Box<dyn Transport>).ok_or("TIS interface not responding"),
-        7 => Crb::probe(control).map(|t| Box::new(t) as Box<dyn Transport>).ok_or("CRB control area invalid"),
+        7 => crb(CrbStart::Register),
+        8 => crb(CrbStart::Both),
         _ => {
-            // Named in the log: which method a real machine uses decides the future work
-            // (2 = ACPI, 8 = CRB + ACPI, 11 = CRB + SMC, 12/13 = Pluton).
+            // Named in the log: 11 = CRB + Arm SMC, 12/13 = Pluton.
             crate::kprintln!("TPM: ACPI TPM2 table: start method {}, control area {:#x}", method, control);
-            Err("unsupported start method (ACPI start methods need AML)")
+            Err("unsupported start method")
         }
     }
 }
 
-// ---- simulator (selftest) ---------------------------------------------------------------------------
+// ---- simulator (tests) ------------------------------------------------------------------------------
 
-/// A software TPM answering the four commands, for testing the command layer and the log
-/// replay. `fault` breaks responses on purpose.
+/// A software TPM for testing the command layer, the log replay and attestation: the commands
+/// above, with the fixed TEST endorsement key and certificate of `doscrypt::testkeys` and a fixed
+/// attestation key. `fault` breaks responses on purpose. Never in a release kernel.
 #[cfg(ktest)]
 pub struct Sim {
     pub pcrs: [[u8; 32]; 24],
     started: bool,
     pub fault: SimFault,
     pub commands: u32,
+    /// Loaded objects: (handle, is the EK).
+    objects: Vec<(u32, bool)>,
+    /// Policy sessions: (handle, PolicySecret(endorsement) done).
+    sessions: Vec<(u32, bool)>,
+    next: u32,
 }
 
 #[cfg(ktest)]
@@ -438,10 +685,233 @@ pub enum SimFault {
     Timeout,
 }
 
+/// The simulator's attestation private key (P-256, big-endian; a test key).
+#[cfg(ktest)]
+fn sim_ak_secret() -> [u8; 32] {
+    doscrypt::sha2::sha256(b"D-OS simulated TPM attestation key (test only)")
+}
+
+#[cfg(ktest)]
+fn sim_ak_public() -> Vec<u8> {
+    let p = doscrypt::p256::sim::public(&sim_ak_secret());
+    let (a, n) = doscrypt::tpm::sim::ak_public(&p.x(), &p.y());
+    a[..n].to_vec()
+}
+
+#[cfg(ktest)]
+fn sim_ek_public() -> Vec<u8> {
+    let (a, n) = doscrypt::tpm::sim::ek_public(&doscrypt::testkeys::EK_N);
+    a[..n].to_vec()
+}
+
 #[cfg(ktest)]
 impl Sim {
     pub fn new() -> Sim {
-        Sim { pcrs: [[0; 32]; 24], started: false, fault: SimFault::None, commands: 0 }
+        Sim { pcrs: [[0; 32]; 24], started: false, fault: SimFault::None, commands: 0, objects: Vec::new(), sessions: Vec::new(), next: 0 }
+    }
+
+    /// Objects and sessions still loaded (tests check nothing leaks).
+    pub fn loaded(&self) -> usize {
+        self.objects.len() + self.sessions.len()
+    }
+
+    /// The answer to one well-formed command: (response code, parameters, with sessions).
+    fn run(&mut self, cmd: &[u8]) -> (u32, Vec<u8>) {
+        use doscrypt::sha2::{Sha256, sha256};
+        const VALUE: u32 = 0x1C4;
+        const HANDLE: u32 = 0x18B;
+        let cc = be32(cmd, 6).unwrap_or(0);
+        let mut out = Vec::new();
+        let put16 = |o: &mut Vec<u8>, v: u16| o.extend_from_slice(&v.to_be_bytes());
+        let put32 = |o: &mut Vec<u8>, v: u32| o.extend_from_slice(&v.to_be_bytes());
+        let tpm2b = |o: &mut Vec<u8>, v: &[u8]| {
+            o.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            o.extend_from_slice(v);
+        };
+        // Parameters start after the handles and (with sessions) the authorization area.
+        let handles = match cc {
+            CC_PCR_EXTEND | CC_CREATE_PRIMARY | CC_QUOTE | CC_READ_PUBLIC | CC_NV_READ_PUBLIC | CC_FLUSH_CONTEXT => 1,
+            CC_NV_READ | CC_POLICY_SECRET | CC_ACTIVATE_CREDENTIAL | CC_START_AUTH_SESSION => 2,
+            _ => 0,
+        };
+        let mut at = 10 + 4 * handles;
+        let mut auth: &[u8] = &[];
+        if be16(cmd, 0) == Some(ST_SESSIONS) {
+            let n = be32(cmd, at).unwrap_or(u32::MAX) as usize;
+            let Some(a) = cmd.get(at + 4..at + 4 + n) else { return (VALUE, out) };
+            auth = a;
+            at += 4 + n;
+        }
+        let h = |i: usize| be32(cmd, 10 + 4 * i).unwrap_or(0);
+        let mut p = Rsp { b: cmd, o: at };
+        match cc {
+            CC_STARTUP => {
+                if self.started {
+                    return (RC_INITIALIZE, out);
+                }
+                self.started = true;
+            }
+            CC_GET_CAPABILITY => {
+                out.push(0); // moreData
+                for v in [CAP_TPM_PROPERTIES, 1, PT_MANUFACTURER, u32::from_be_bytes(*b"DOSS")] {
+                    put32(&mut out, v);
+                }
+            }
+            CC_PCR_EXTEND => {
+                let pcr = h(0) as usize;
+                if pcr >= 24 || be32(cmd, at) != Some(1) || be16(cmd, at + 4) != Some(SHA256_ALG) || cmd.len() < at + 6 + 32 {
+                    return (VALUE, out);
+                }
+                let mut s = Sha256::new();
+                s.update(&self.pcrs[pcr]);
+                s.update(&cmd[at + 6..at + 38]);
+                self.pcrs[pcr] = s.finish();
+            }
+            CC_PCR_READ => {
+                let sel = cmd.get(17..20).unwrap_or(&[0, 0, 0]);
+                let Some(pcr) = (0..24).find(|i| sel[i / 8] & (1 << (i % 8)) != 0) else { return (VALUE, out) };
+                put32(&mut out, 1); // update counter
+                put32(&mut out, 1);
+                put16(&mut out, SHA256_ALG);
+                out.push(3);
+                out.extend_from_slice(&cmd[17..20]);
+                put32(&mut out, 1);
+                tpm2b(&mut out, &self.pcrs[pcr]);
+            }
+            CC_CREATE_PRIMARY => {
+                let (Ok(_), Ok(template)) = (p.tpm2b(), p.tpm2b()) else { return (VALUE, out) };
+                let is_ek = template == &doscrypt::tpm::ek_template().0[..doscrypt::tpm::ek_template().1];
+                let is_ak = template == &doscrypt::tpm::ak_template().0[..doscrypt::tpm::ak_template().1];
+                if h(0) != RH_ENDORSEMENT || !(is_ek || is_ak) {
+                    return (VALUE, out);
+                }
+                let public = if is_ek { sim_ek_public() } else { sim_ak_public() };
+                self.next += 1;
+                let handle = 0x8000_0000 + self.next;
+                self.objects.push((handle, is_ek));
+                put32(&mut out, handle);
+                tpm2b(&mut out, &public);
+                tpm2b(&mut out, &[]); // creationData
+                tpm2b(&mut out, &[]); // creationHash
+                put16(&mut out, 0x8021);
+                put32(&mut out, RH_ENDORSEMENT);
+                tpm2b(&mut out, &[]);
+                tpm2b(&mut out, &name_of(&public));
+            }
+            CC_READ_PUBLIC => {
+                let Some(&(_, ek)) = self.objects.iter().find(|o| o.0 == h(0)) else { return (HANDLE, out) };
+                let public = if ek { sim_ek_public() } else { sim_ak_public() };
+                tpm2b(&mut out, &public);
+                tpm2b(&mut out, &name_of(&public));
+                tpm2b(&mut out, &name_of(&public)); // qualifiedName (not checked)
+            }
+            CC_FLUSH_CONTEXT => {
+                let n = self.loaded();
+                self.objects.retain(|o| o.0 != h(0));
+                self.sessions.retain(|s| s.0 != h(0));
+                if self.loaded() == n {
+                    return (HANDLE, out);
+                }
+            }
+            CC_QUOTE => {
+                if !self.objects.iter().any(|o| o.0 == h(0) && !o.1) {
+                    return (HANDLE, out);
+                }
+                let (Ok(extra), Ok(ALG_NULL), Ok(1), Ok(SHA256_ALG), Ok(3), Ok(sel)) = (p.tpm2b(), p.u16(), p.u32(), p.u16(), p.bytes(1).map(|b| b[0]), p.bytes(3)) else {
+                    return (VALUE, out);
+                };
+                let bits = u32::from(sel[0]) | u32::from(sel[1]) << 8 | u32::from(sel[2]) << 16;
+                let mut s = Sha256::new();
+                for i in 0..24 {
+                    if bits & (1 << i) != 0 {
+                        s.update(&self.pcrs[i]);
+                    }
+                }
+                let (info, n) = doscrypt::tpm::sim::quote_info(&name_of(&sim_ak_public()), extra, bits, &s.finish());
+                let digest = sha256(&info[..n]);
+                let d = sim_ak_secret();
+                let mut k = sha256(&[&d[..], &digest[..]].concat());
+                let (r, sg) = loop {
+                    if let Some(rs) = doscrypt::p256::sim::sign_prehash(&d, &k, &digest) {
+                        break rs;
+                    }
+                    k = sha256(&k);
+                };
+                let (sig, sn) = doscrypt::tpm::sim::ecdsa_signature(&r, &sg);
+                tpm2b(&mut out, &info[..n]);
+                out.extend_from_slice(&sig[..sn]);
+            }
+            CC_NV_READ_PUBLIC => {
+                if h(0) != EK_CERT_NV_RSA {
+                    return (HANDLE, out);
+                }
+                let mut nv = Vec::new();
+                put32(&mut nv, EK_CERT_NV_RSA);
+                put16(&mut nv, SHA256_ALG);
+                put32(&mut nv, 0x0006_2002); // PPWRITE..., AUTHREAD, NO_DA, WRITTEN: illustrative
+                tpm2b(&mut nv, &[]);
+                put16(&mut nv, doscrypt::testkeys::EK_CERT.len() as u16);
+                tpm2b(&mut out, &nv);
+                tpm2b(&mut out, &[0; 34]);
+            }
+            CC_NV_READ => {
+                let cert = &doscrypt::testkeys::EK_CERT[..];
+                let (Ok(n), Ok(off)) = (p.u16(), p.u16()) else { return (VALUE, out) };
+                let (n, off) = (usize::from(n), usize::from(off));
+                if h(1) != EK_CERT_NV_RSA || off + n > cert.len() || n > 1024 {
+                    return (VALUE, out);
+                }
+                tpm2b(&mut out, &cert[off..off + n]);
+            }
+            CC_START_AUTH_SESSION => {
+                let (Ok(nonce), Ok(salt), Ok(kind)) = (p.tpm2b(), p.tpm2b(), p.bytes(1)) else { return (VALUE, out) };
+                if nonce.len() < 16 || !salt.is_empty() || kind[0] != SE_POLICY || h(0) != RH_NULL || h(1) != RH_NULL {
+                    return (VALUE, out);
+                }
+                self.next += 1;
+                let handle = 0x0300_0000 + self.next;
+                self.sessions.push((handle, false));
+                put32(&mut out, handle);
+                tpm2b(&mut out, &[0xA5; 16]);
+            }
+            CC_POLICY_SECRET => {
+                if h(0) != RH_ENDORSEMENT {
+                    return (VALUE, out);
+                }
+                let Some(s) = self.sessions.iter_mut().find(|s| s.0 == h(1)) else { return (HANDLE, out) };
+                s.1 = true;
+                tpm2b(&mut out, &[]); // timeout
+                put16(&mut out, 0x8025);
+                put32(&mut out, RH_ENDORSEMENT);
+                tpm2b(&mut out, &[]);
+            }
+            CC_ACTIVATE_CREDENTIAL => {
+                // Sessions: the AK's password, then the EK's policy session (used up).
+                let policy = be32(auth, 9).unwrap_or(0);
+                let ok = auth.len() == 18 && be32(auth, 0) == Some(RS_PW) && self.sessions.iter().any(|s| s.0 == policy && s.1);
+                self.sessions.retain(|s| s.0 != policy);
+                let ak = self.objects.iter().any(|o| o.0 == h(0) && !o.1);
+                let ek = self.objects.iter().any(|o| o.0 == h(1) && o.1);
+                if !ok {
+                    return (0x9A2, out); // TPM_RC_POLICY_FAIL (session 2)
+                }
+                if !ak || !ek {
+                    return (HANDLE, out);
+                }
+                let start = p.o;
+                let (Ok(_), Ok(_)) = (p.tpm2b(), p.tpm2b()) else { return (VALUE, out) };
+                let blob_end = start + 2 + usize::from(be16(cmd, start).unwrap_or(0));
+                let (blob, secret) = (&cmd[start..blob_end], &cmd[blob_end..p.o]);
+                let name = name_of(&sim_ak_public());
+                let t = &doscrypt::testkeys::EK_N;
+                match doscrypt::tpm::sim::open_credential(t, &doscrypt::testkeys::EK_D, &name, blob, secret) {
+                    Some(c) => tpm2b(&mut out, &c),
+                    None => return (0x0A1, out), // TPM_RC_INTEGRITY-ish
+                }
+            }
+            _ => return (0x143, out), // TPM_RC_COMMAND_CODE
+        }
+        (0, out)
     }
 }
 
@@ -451,81 +921,43 @@ impl Transport for Sim {
         "simulator"
     }
     fn exchange(&mut self, cmd: &[u8], rsp: &mut [u8]) -> Result<usize, Error> {
-        use doscrypt::sha2::Sha256;
         self.commands += 1;
         if self.fault == SimFault::Timeout {
             return Err(Error::Timeout);
         }
-        let mut out = [0u8; 128];
-        let mut n = 10;
-        let mut rc = 0u32;
         let size = be32(cmd, 2).unwrap_or(0) as usize;
-        let cc = be32(cmd, 6).unwrap_or(0);
-        if size != cmd.len() {
-            rc = 0x95; // TPM_RC_COMMAND_SIZE
-        } else {
-            match cc {
-                CC_STARTUP => {
-                    if self.started {
-                        rc = RC_INITIALIZE;
-                    }
-                    self.started = true;
+        let (rc, params) = if size != cmd.len() { (0x95, Vec::new()) } else { self.run(cmd) };
+        // Responses to commands with sessions: handle(s), parameterSize, parameters, one empty
+        // session response per session; errors are headers only.
+        let sessions = be16(cmd, 0) == Some(ST_SESSIONS) && rc == 0;
+        let handles = match be32(cmd, 6).unwrap_or(0) {
+            CC_CREATE_PRIMARY | CC_START_AUTH_SESSION => 4,
+            _ => 0,
+        };
+        let mut out = Vec::with_capacity(params.len() + 32);
+        let tag = if self.fault == SimFault::BadTag { 0x1234 } else if sessions { ST_SESSIONS } else { ST_NO_SESSIONS };
+        out.extend_from_slice(&tag.to_be_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&rc.to_be_bytes());
+        if rc == 0 {
+            if sessions {
+                let nsess = if be32(cmd, 6) == Some(CC_ACTIVATE_CREDENTIAL) { 2 } else { 1 };
+                out.extend_from_slice(&params[..handles]);
+                out.extend_from_slice(&((params.len() - handles) as u32).to_be_bytes());
+                out.extend_from_slice(&params[handles..]);
+                for _ in 0..nsess {
+                    out.extend_from_slice(&[0, 0, 0, 0, 0]);
                 }
-                CC_GET_CAPABILITY => {
-                    let vals = [0u32, CAP_TPM_PROPERTIES, 1, PT_MANUFACTURER, u32::from_be_bytes(*b"DOSS")];
-                    out[10] = 0; // moreData
-                    n = 11;
-                    for v in &vals[1..] {
-                        out[n..n + 4].copy_from_slice(&v.to_be_bytes());
-                        n += 4;
-                    }
-                }
-                CC_PCR_EXTEND => {
-                    let pcr = be32(cmd, 10).unwrap_or(99) as usize;
-                    let auth = be32(cmd, 14).unwrap_or(0) as usize;
-                    let at = 18 + auth;
-                    if pcr >= 24 || be32(cmd, at) != Some(1) || be16(cmd, at + 4) != Some(SHA256_ALG) || cmd.len() < at + 6 + 32 {
-                        rc = 0x1C4; // TPM_RC_VALUE-ish
-                    } else {
-                        let mut h = Sha256::new();
-                        h.update(&self.pcrs[pcr]);
-                        h.update(&cmd[at + 6..at + 38]);
-                        self.pcrs[pcr] = h.finish();
-                        out[10..14].copy_from_slice(&0u32.to_be_bytes()); // parameterSize
-                        n = 14;
-                    }
-                }
-                CC_PCR_READ => {
-                    let sel = cmd.get(17..20).unwrap_or(&[0, 0, 0]);
-                    let pcr = (0..24).find(|i| sel[i / 8] & (1 << (i % 8)) != 0);
-                    match pcr {
-                        Some(p) => {
-                            let mut w = |b: &[u8]| {
-                                out[n..n + b.len()].copy_from_slice(b);
-                                n += b.len();
-                            };
-                            w(&1u32.to_be_bytes()); // update counter
-                            w(&1u32.to_be_bytes());
-                            w(&SHA256_ALG.to_be_bytes());
-                            w(&[3]);
-                            w(&cmd[17..20]);
-                            w(&1u32.to_be_bytes());
-                            w(&32u16.to_be_bytes());
-                            w(&self.pcrs[p]);
-                        }
-                        None => rc = 0x1C4,
-                    }
-                }
-                _ => rc = 0x143, // TPM_RC_COMMAND_CODE
+            } else {
+                out.extend_from_slice(&params);
             }
         }
-        if rc != 0 {
-            n = 10;
-        }
-        out[0..2].copy_from_slice(&(if self.fault == SimFault::BadTag { 0x1234u16 } else { ST_NO_SESSIONS }).to_be_bytes());
+        let n = out.len();
         out[2..6].copy_from_slice(&(n as u32).to_be_bytes());
-        out[6..10].copy_from_slice(&rc.to_be_bytes());
         let give = if self.fault == SimFault::Truncated { 6 } else { n };
+        if give > rsp.len() {
+            return Err(Error::Protocol("response too large"));
+        }
         rsp[..give].copy_from_slice(&out[..give]);
         Ok(give)
     }

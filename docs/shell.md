@@ -37,7 +37,9 @@ line editor cannot reach a file, and the shell cannot draw outside the terminal'
   its cursor ports. Mapping it takes the screen from the kernel; kernel lines then go to serial
   and the log service only, and a panic takes the screen back. Only changed cells are drawn.
 - **Keys** (`proto::INPUT_KEY`, `proto::key`): characters plus named keys (arrows, Home/End,
-  PgUp/PgDn, Insert/Delete) with Shift/Ctrl/Alt, from PS/2, USB and virtio keyboards.
+  PgUp/PgDn, Insert/Delete) with Shift/Ctrl/Alt, from PS/2, USB and virtio keyboards. A keyboard
+  plugged in while another is in use types nothing until accepted with Ctrl+Alt+Insert on the
+  keyboard in use ([hardware.md](hardware.md)).
 - **Editing**: insert anywhere, Backspace/Delete, Left/Right, Home/End (Ctrl+A/E), history
   (Up/Down, 100 lines), Tab (the shell completes commands and paths), Escape clears, Ctrl+C
   cancels the line or stops the running command, Ctrl+L clears. PgUp/PgDn scroll back through

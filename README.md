@@ -30,7 +30,7 @@ is no GUI yet.
 - Capability objects, quotas, ring-3 processes, IPC (channels, shared-memory rings, fast
   call/reply, zero-copy memory), a versioned ABI
 - User-space drivers: PCI/PCIe, MSI-X, Intel VT-d and AMD-Vi IOMMUs, virtio, AHCI, NVMe, PS/2,
-  USB keyboards (xHCI)
+  USB (xHCI): keyboards, mice, mass storage, USB 2 and USB 3 hubs
 - Storage: GPT, FAT32, and DFS (copy-on-write B+tree with BLAKE3 checksums and snapshots); files
   are handles; per-app namespaces; disks are read-only by default
 - A service manager: each service gets exactly the capabilities its signed manifest lists, and is

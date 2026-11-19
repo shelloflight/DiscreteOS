@@ -105,7 +105,9 @@ pub mod nr {
     // ABI v10: D-CMPL's Linux server (mmap, clone)
     pub const PROCESS_VMAR: u64 = 69;
     pub const THREAD_CREATE_STOPPED: u64 = 70;
-    pub const COUNT: u64 = 71;
+    // ABI v12: hardware-rooted attestation
+    pub const ATTEST_ACTIVATE: u64 = 71;
+    pub const COUNT: u64 = 72;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -829,6 +831,30 @@ fn attest(nonce: u64, buf: u64, cap: u64) -> KResult<i64> {
     Ok(r.len() as i64)
 }
 
+/// attest_activate(challenge, out): answer a verifier's credential challenge with the TPM
+/// (security/attest.rs): `challenge` is the credential blob (`TPM2B_ID_OBJECT`) followed by the
+/// encrypted secret (`TPM2B_ENCRYPTED_SECRET`), `doscrypt::tpm::CHALLENGE` bytes; the 32-byte
+/// credential goes to `out`. `NOT_SUPPORTED` without a TPM attestation key, `ACCESS_DENIED` when
+/// the TPM refuses (the challenge is for another TPM or key). No right: like a report, the answer
+/// only proves which TPM this machine has.
+fn attest_activate(challenge: u64, out: u64) -> KResult<i64> {
+    use doscrypt::tpm::{ID_OBJECT, SECRET};
+    use crate::security::attest::{self, ActivateError};
+    let mut c = [0u8; ID_OBJECT + SECRET];
+    uaccess::copy_from_user(&mut c, challenge)?;
+    uaccess::check(out, 32)?;
+    let mut blob = [0u8; ID_OBJECT];
+    let mut secret = [0u8; SECRET];
+    blob.copy_from_slice(&c[..ID_OBJECT]);
+    secret.copy_from_slice(&c[ID_OBJECT..]);
+    let cred = attest::activate(&blob, &secret).map_err(|e| match e {
+        ActivateError::NoTpm => Status::NotSupported,
+        ActivateError::Refused => Status::AccessDenied,
+    })?;
+    uaccess::copy_to_user(out, &cred)?;
+    Ok(32)
+}
+
 /// process_read_memory / process_write_memory: copy between the caller's memory and another
 /// process's (a supervisor serving a forwarded syscall, a debugger). Needs `MANAGE`. Only what is
 /// mapped there with the matching permission (read / write) can be reached, through the VMO
@@ -1066,6 +1092,7 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
         nr::VMO_VERIFY => vmo_verify(u, a[0], a[1]),
         nr::VMO_ALLOW_UNSIGNED => vmo_allow_unsigned(u, a[0], a[1]),
         nr::ATTEST => attest(a[0], a[1], a[2]),
+        nr::ATTEST_ACTIVATE => attest_activate(a[0], a[1]),
         nr::SYSTEM_POWER => system_power(u, a[0], a[1]),
         nr::MEASURE => measure(u, a[0], a[1], a[2], a[3]),
         nr::KLOG_READ => klog_read(u, a[0], a[1], a[2], a[3]),

@@ -1,19 +1,32 @@
-//! xHCI (USB 3) host controller driver (`xhci.ddrv`): USB keyboards through the HID boot
-//! protocol, on a root port or behind USB 2 hubs (up to five tiers). Up to `MAX_KBDS` keyboards at
-//! once, each with its own interrupt ring: a PC often has several devices that offer a boot
-//! keyboard interface (receivers, lighting controllers), and the real keyboard must not be left
-//! unprobed behind one of them. Hubs stay configured, other devices are disabled again. Every port
-//! stays watched, so a keyboard plugged in later, or again, is picked up.
+//! xHCI (USB 3) host controller driver (`xhci.ddrv`): USB keyboards, mice and storage, on root
+//! ports or behind USB 2 and USB 3 hubs (up to five tiers).
+//!
+//! - **Keyboards** (HID boot protocol): up to `MAX_KBDS` at once, each with its own interrupt
+//!   ring (a PC often has several devices that offer a boot keyboard interface: receivers,
+//!   lighting controllers, and the real keyboard must not be left unprobed behind one of them).
+//!   Keys are diffed between reports and go through the same US keymap as the other keyboards;
+//!   a held key repeats (after 500 ms, 30 per second); the Caps Lock LED follows the state. Each
+//!   keyboard is named in its KEY messages (its slot), so the device manager can tell them apart
+//!   (trust.rs).
+//! - **Mice**: the HID report descriptor is parsed for relative X, Y, wheel and buttons (report
+//!   protocol); a boot mouse whose descriptor says nothing usable falls back to the boot protocol.
+//!   Movements go to the device manager (POINTER). Absolute pointers (tablets) are left unused.
+//!   A receiver with a keyboard and a mouse interface gets both.
+//! - **Storage**: USB mass storage, bulk-only transport with SCSI commands (INQUIRY, TEST UNIT
+//!   READY, READ CAPACITY 10/16, READ/WRITE 10/16, SYNCHRONIZE CACHE), 512-byte sectors, LUN 0;
+//!   served like any block device (DISK, then requests on the channel the device manager
+//!   attaches; blkserve.rs). Read-only unless the driver was started with `rw`. A stalled
+//!   endpoint is reset and its halt cleared; a disk that stops answering is dropped.
+//! - **Hubs**: USB 2 hubs (transaction translators for low/full-speed devices behind high-speed
+//!   hubs) and USB 3 hubs (SET_HUB_DEPTH, SuperSpeed port status); their ports are polled once a
+//!   second. Other devices are disabled again. Every port stays watched, so a device plugged in
+//!   later, or again, is picked up.
 //!
 //! Bring-up: firmware ownership taken (USB legacy support capability, SMIs off), controller
 //! reset, one command ring, one interrupter with a one-segment event ring (MSI-X entry 0 or MSI),
 //! device context array. Per device: Enable Slot, Address Device (route string, and the
 //! transaction translator for low/full-speed devices behind a high-speed hub), descriptors read on
-//! endpoint 0. A keyboard: SET_CONFIGURATION, the interrupt-IN endpoint configured,
-//! SET_PROTOCOL(boot), SET_IDLE(0); eight 8-byte reports stay queued on the interrupt ring; keys
-//! are diffed between reports and go through the same US keymap as the other keyboards. A hub:
-//! configured, its slot marked as a hub, its ports powered, then polled (port status) for
-//! connections.
+//! endpoint 0, then the device's endpoints configured.
 //!
 //! Connections are debounced, and a device that keeps reconnecting is left alone after its third
 //! identical probe (until its port has been empty for two seconds): unconfigured devices on some
@@ -21,16 +34,15 @@
 //! once.
 //!
 //! Everything the controller and the devices write is untrusted: event TRB pointers must point
-//! into our rings, descriptor lengths are bounded by what was read, every wait has a deadline,
-//! and an impossible value ends the driver (it is restarted). All rings, contexts and buffers are
-//! pinned for the device: with an IOMMU it reaches nothing else.
+//! into our rings, descriptor and report lengths are bounded by what was read, every wait has a
+//! deadline, and an impossible value ends the driver (it is restarted). All rings, contexts and
+//! buffers are pinned for the device: with an IOMMU it reaches nothing else.
 //!
-//! Not supported yet: USB 3 hubs (their USB 2 half is used), key repeat, LEDs, mice and storage
-//! (HID report parsing, bulk transfers), isochronous endpoints, more than one interrupter. Hub
-//! ports are polled (once a second) rather than watched through the hubs' status endpoints.
+//! Not supported: isochronous endpoints (audio, video), USB Attached SCSI, sectors other than 512
+//! bytes, more than one interrupter, Num Lock and Scroll Lock (no keymap state for them).
 
 use libd::handle::sleep;
-use libd::proto::{self, HEADER, Header};
+use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
 use libd::sys::{self, Handle};
 use libd::{Dma, Mapping, Port, Startup, println};
 
@@ -100,6 +112,10 @@ const T_DISABLE_SLOT: u32 = 10;
 const T_ADDRESS_DEVICE: u32 = 11;
 const T_CONFIGURE_EP: u32 = 12;
 const T_EVALUATE_CTX: u32 = 13;
+const T_RESET_EP: u32 = 14;
+const T_SET_TR_DEQ: u32 = 16;
+const TRB_CH: u32 = 1 << 4;
+const CC_STALL: u32 = 6;
 const E_TRANSFER: u32 = 32;
 const E_COMMAND: u32 = 33;
 const E_PORT: u32 = 34;
@@ -111,6 +127,11 @@ const F_PORT_RESET: u8 = 4;
 const F_PORT_POWER: u8 = 8;
 const F_C_PORT_CONNECTION: u8 = 16;
 const F_C_PORT_RESET: u8 = 20;
+// USB 3 hubs (USB 3.2 10.16): the change bits beyond the USB 2 ones, and their clear features.
+const F_C_PORT_LINK_STATE: u8 = 25;
+const F_C_PORT_CONFIG_ERROR: u8 = 26;
+const F_C_BH_PORT_RESET: u8 = 29;
+const REQ_SET_HUB_DEPTH: u8 = 12;
 const HS_CONNECTION: u16 = 1 << 0;
 const HS_ENABLE: u16 = 1 << 1;
 const HS_LOW_SPEED: u16 = 1 << 9;
@@ -140,6 +161,21 @@ const SLOT_PAGES: u64 = 2 * MAX_SLOTS as u64;
 const SCRATCH_ARRAY: u64 = 0x800;
 const MAX_SCRATCH: u32 = 31;
 
+/// Pages from here are in fun_mem: mouse rings and reports, then per disk its two bulk rings,
+/// the command/status page and the data pages.
+const PG_FUN: u64 = PG_SLOTS + SLOT_PAGES;
+const MAX_MICE: usize = 2;
+const PG_MOUSE: u64 = PG_FUN; // the interrupt ring of mouse i: PG_MOUSE + i
+const PG_MOUSE_REPORT: u64 = PG_FUN + MAX_MICE as u64; // 64 bytes per report, REPORTS per mouse
+const MAX_DISKS: usize = 2;
+const DATA_PAGES: u64 = 8; // one transfer: 64 sectors
+const DISK_PAGES: u64 = 3 + DATA_PAGES;
+const PG_DISK: u64 = PG_MOUSE_REPORT + 1; // disk i: PG_DISK + DISK_PAGES * i
+const FUN_PAGES: u64 = MAX_MICE as u64 + 1 + DISK_PAGES * MAX_DISKS as u64;
+/// Offsets in a disk's command page: the CBW, then the CSW.
+const CBW: u64 = 0;
+const CSW: u64 = 512;
+
 const REPORTS: usize = 8;
 const MAX_HUBS: usize = 8;
 /// Hub ports used per hub (a route string nibble holds 1-15).
@@ -157,11 +193,16 @@ const MAX_STRIKES: u8 = 2;
 const GONE_FOR: u64 = 2_000 * MS;
 const HUB_POLL: u64 = 1_000 * MS;
 const SETTLE_TICK: u64 = 50 * MS;
+/// Key repeat: delay, then interval.
+const REPEAT_DELAY: u64 = 500 * MS;
+const REPEAT_EVERY: u64 = 33 * MS;
 
 const ADDR_FAILED: &str = "Address Device failed";
 
 const KEY_IRQ: u64 = 1;
 const KEY_CTL: u64 = 2;
+/// Port key of disk i's attached channel: KEY_DISK + i.
+const KEY_DISK: u64 = 16;
 
 macro_rules! say {
     ($x:expr, $($t:tt)*) => { println!("xhci {}: {}", $x.tag(), format_args!($($t)*)) };
@@ -256,7 +297,7 @@ impl Ident {
     }
     fn kind(&self) -> &'static str {
         match (self.class, self.sub, self.proto) {
-            (9, _, _) => "hub (not usable: USB 3 or too deep)",
+            (9, _, _) => "hub (not usable: too deep)",
             (3, 1, 1) => "keyboard (no usable boot interface)",
             (3, _, 2) => "mouse",
             (3, _, _) => "HID device",
@@ -292,12 +333,14 @@ struct PortState {
     gone_since: u64,
 }
 
-/// A configured USB 2 hub.
+/// A configured hub (USB 2, or the SuperSpeed half of a USB 3 hub).
 #[derive(Clone, Copy)]
 struct Hub {
     slot: u32,
     loc: Loc,
     ports: u32,
+    /// A USB 3 hub (SuperSpeed port status and features).
+    ss: bool,
     /// Stopped answering (its parent reports the unplug).
     dead: bool,
     ps: [PortState; HUB_PORTS as usize],
@@ -310,20 +353,137 @@ struct Kbd {
     id: Ident,
     slot: u32,
     loc: Loc,
+    iface: u8,
     dci: u32,
     intr: Ring,
     /// Report buffer of each interrupt-ring position (u8::MAX: none queued there).
     buf_at: [u8; RING_TRBS as usize],
     last: [u8; 8],
     keys: Keys,
+    /// The key held down: (key value, its usage, when it repeats next).
+    repeat: Option<(u32, u8, u64)>,
+    /// Caps Lock as the keyboard's LED shows it; `leds_due`: the LED must be updated.
+    leds_caps: bool,
+    leds_due: bool,
 }
 
-/// Result of a probe. The keyboard is large but short-lived (moved into `Xhci::kbds`).
+/// Where a value is in a HID report (bits after the report id).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct Field {
+    bit: u16,
+    size: u8,
+    signed: bool,
+}
+
+impl Field {
+    /// The value in report `r` (little-endian bit order, as HID reports are).
+    fn get(&self, r: &[u8]) -> i32 {
+        let mut v: u32 = 0;
+        for i in 0..u16::from(self.size.min(32)) {
+            let b = self.bit + i;
+            let byte = r.get(usize::from(b / 8)).copied().unwrap_or(0);
+            v |= u32::from((byte >> (b % 8)) & 1) << i;
+        }
+        let n = u32::from(self.size.clamp(1, 32));
+        if self.signed && n < 32 && v & (1 << (n - 1)) != 0 { (v | !((1u32 << n) - 1)) as i32 } else { v as i32 }
+    }
+}
+
+/// How a mouse reports: from its report descriptor, or the boot protocol's fixed layout.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct MouseFormat {
+    /// The report id of the pointer report (0: the device uses no ids).
+    id: u8,
+    /// One bit per button, from `buttons.bit` (size = how many).
+    buttons: Field,
+    x: Field,
+    y: Field,
+    wheel: Option<Field>,
+    boot: bool,
+}
+
+const BOOT_MOUSE: MouseFormat = MouseFormat {
+    id: 0,
+    buttons: Field { bit: 0, size: 3, signed: false },
+    x: Field { bit: 8, size: 8, signed: true },
+    y: Field { bit: 16, size: 8, signed: true },
+    wheel: None,
+    boot: true,
+};
+
+/// A mouse being served.
+struct Mouse {
+    /// Which of the `MAX_MICE` (its interrupt ring page, its report buffers).
+    idx: usize,
+    id: Ident,
+    slot: u32,
+    loc: Loc,
+    dci: u32,
+    /// Bytes asked for per report (the endpoint's max packet, at most 64).
+    len: u32,
+    intr: Ring,
+    buf_at: [u8; RING_TRBS as usize],
+    fmt: MouseFormat,
+    buttons: u32,
+}
+
+/// A USB disk (bulk-only mass storage) being served.
+struct UsbDisk {
+    /// Which of the `MAX_DISKS` (its pages, its unit number).
+    idx: usize,
+    id: Ident,
+    slot: u32,
+    loc: Loc,
+    iface: u8,
+    in_ep: u8,
+    out_ep: u8,
+    in_ring: Ring,
+    out_ring: Ring,
+    mps: u32,
+    tag: u32,
+    sectors: u64,
+    model: [u8; 40],
+    model_len: usize,
+    /// The channel the device manager attached for this unit (0: none yet).
+    ch: Handle,
+}
+
+impl UsbDisk {
+    fn in_dci(&self) -> u32 {
+        u32::from(self.in_ep) * 2 + 1
+    }
+    fn out_dci(&self) -> u32 {
+        u32::from(self.out_ep) * 2
+    }
+    fn page(&self, i: u64) -> u64 {
+        PG_DISK + DISK_PAGES * self.idx as u64 + i
+    }
+}
+
+/// Result of a probe. Keyboards, mice and disks are large but short-lived (moved into `Xhci`).
 #[allow(clippy::large_enum_variant)]
 enum Found {
-    Keyboard(Kbd),
-    Hub(u32, Ident),
+    /// A keyboard, a mouse, or both on one device (a receiver).
+    Input(Option<Kbd>, Option<Mouse>),
+    Disk(UsbDisk),
+    /// A hub: ports, identity, USB 3.
+    Hub(u32, Ident, bool),
     Other(Ident),
+}
+
+/// An interface of the configuration, as far as this driver uses it.
+#[derive(Clone, Copy, Default)]
+struct Iface {
+    num: u8,
+    class: u8,
+    sub: u8,
+    proto: u8,
+    /// Interrupt or bulk IN endpoint: (number, max packet, interval, max burst).
+    ep_in: Option<(u8, u32, u8, u8)>,
+    /// Bulk OUT endpoint: (number, max packet, max burst).
+    ep_out: Option<(u8, u32, u8)>,
+    /// HID: the report descriptor's length.
+    hid_len: u16,
 }
 
 struct Xhci {
@@ -333,6 +493,8 @@ struct Xhci {
     db: u64,
     mem: Dma,
     slot_mem: Dma,
+    /// Mouse rings and reports, disk rings, commands and data.
+    fun_mem: Dma,
     _scratch: Option<Dma>,
     irq: Handle,
     tag: [u8; 16],
@@ -351,10 +513,18 @@ struct Xhci {
     hubs: [Option<Hub>; MAX_HUBS],
     root: [PortState; 64],
     kbds: [Option<Kbd>; MAX_KBDS],
+    mice: [Option<Mouse>; MAX_MICE],
+    disks: [Option<UsbDisk>; MAX_DISKS],
+    /// The control channel to the device manager (KEY, POINTER, DISK messages).
+    ctl: Handle,
+    /// Disks may be written (started with `rw`).
+    writable: bool,
+    /// Block requests served.
+    requests: u64,
     /// Root port status changes seen (bit p-1).
     port_events: u64,
     /// Keyboard transfer events seen while waiting for something else.
-    deferred: [Trb; REPORTS * 2],
+    deferred: [Trb; REPORTS * 4],
     ndeferred: usize,
     next_poll: u64,
     /// Completion code of the last failed command or transfer.
@@ -391,7 +561,13 @@ impl Xhci {
     }
     /// The buffer holding page, and the page's offset in it.
     fn page(&self, page: u64) -> (&Dma, u64) {
-        if page >= PG_SLOTS { (&self.slot_mem, (page - PG_SLOTS) * 4096) } else { (&self.mem, page * 4096) }
+        if page >= PG_FUN {
+            (&self.fun_mem, (page - PG_FUN) * 4096)
+        } else if page >= PG_SLOTS {
+            (&self.slot_mem, (page - PG_SLOTS) * 4096)
+        } else {
+            (&self.mem, page * 4096)
+        }
     }
     fn addr(&self, page: u64, off: u64) -> u64 {
         let (m, o) = self.page(page);
@@ -454,10 +630,16 @@ impl Xhci {
     }
 
     /// Wait for the event `want` accepts. Root port changes seen meanwhile are noted, keyboard
-    /// reports kept for the main loop, the rest dropped.
+    /// and mouse reports kept for the main loop, the rest dropped.
     fn wait_event(&mut self, ms: u64, mut want: impl FnMut(&Trb) -> bool) -> Option<Trb> {
         let deadline = sys::clock_ns() + ms * MS;
-        let kbds: [(u32, u32); MAX_KBDS] = core::array::from_fn(|i| self.kbds[i].as_ref().map_or((0, 0), |k| (k.slot, k.dci)));
+        let mut eps = [(0u32, 0u32); MAX_KBDS + MAX_MICE];
+        for (i, k) in self.kbds.iter().enumerate() {
+            eps[i] = k.as_ref().map_or((0, 0), |k| (k.slot, k.dci));
+        }
+        for (i, m) in self.mice.iter().enumerate() {
+            eps[MAX_KBDS + i] = m.as_ref().map_or((0, 0), |m| (m.slot, m.dci));
+        }
         loop {
             while let Some(e) = self.poll_event() {
                 if want(&e) {
@@ -470,7 +652,7 @@ impl Xhci {
                             self.port_events |= 1 << (p - 1);
                         }
                     }
-                    E_TRANSFER if kbds.iter().any(|&k| k.0 != 0 && (e.slot(), e.endpoint()) == k) && self.ndeferred < self.deferred.len() => {
+                    E_TRANSFER if eps.iter().any(|&k| k.0 != 0 && (e.slot(), e.endpoint()) == k) && self.ndeferred < self.deferred.len() => {
                         self.deferred[self.ndeferred] = e;
                         self.ndeferred += 1;
                     }
@@ -635,8 +817,9 @@ impl Xhci {
         self.control(slot, [0x23, if set { 3 } else { 1 }, feature, 0, port as u8, 0, 0, 0], 0)
     }
 
-    /// Reset hub port `port`; the speed of the device there.
-    fn hub_reset(&mut self, slot: u32, port: u32) -> Result<u32, &'static str> {
+    /// Reset hub port `port`; the speed of the device there. On a USB 3 hub every device is
+    /// SuperSpeed (its USB 2 half has the others).
+    fn hub_reset(&mut self, slot: u32, port: u32, ss: bool) -> Result<u32, &'static str> {
         self.hub_feature(slot, port, true, F_PORT_RESET).map_err(|_| "hub port reset refused")?;
         let deadline = sys::clock_ns() + 500 * MS;
         let status = loop {
@@ -654,6 +837,9 @@ impl Xhci {
             return Err("hub port did not enable");
         }
         sleep(20 * MS); // reset recovery (USB 2.0 7.1.7.5: 10 ms)
+        if ss {
+            return Ok(4);
+        }
         Ok(if status & HS_LOW_SPEED != 0 {
             2
         } else if status & HS_HIGH_SPEED != 0 {
@@ -683,7 +869,7 @@ impl Xhci {
             Loc { root: port, speed: (self.portsc(port) >> 10) & 0xF, ..Loc::default() }
         } else {
             let hub = self.hub_index(parent).and_then(|i| self.hubs[i]).ok_or("hub gone")?;
-            let speed = self.hub_reset(parent, port)?;
+            let speed = self.hub_reset(parent, port, hub.ss)?;
             hub.loc.child(parent, port, speed)
         };
         let slot = self.command(Trb { param: 0, status: 0, control: T_ENABLE_SLOT << 10 }).map_err(|_| "Enable Slot failed")?.slot();
@@ -728,6 +914,20 @@ impl Xhci {
             for k in self.kbds.iter_mut() {
                 if let Some(k) = k.take_if(|k| k.slot == s) {
                     println!("xhci: keyboard {:04x}:{:04x} on port {} unplugged", k.id.vid, k.id.pid, k.loc);
+                    proto::send(self.ctl, proto::KEYBOARD_GONE, u64::from(s), 0);
+                }
+            }
+            for m in self.mice.iter_mut() {
+                if let Some(m) = m.take_if(|m| m.slot == s) {
+                    println!("xhci: mouse {:04x}:{:04x} on port {} unplugged", m.id.vid, m.id.pid, m.loc);
+                }
+            }
+            for d in self.disks.iter_mut() {
+                if let Some(d) = d.take_if(|d| d.slot == s) {
+                    println!("xhci: disk {:04x}:{:04x} on port {} unplugged", d.id.vid, d.id.pid, d.loc);
+                    if d.ch != 0 {
+                        sys::handle_close(d.ch); // the storage service sees the disk go
+                    }
                 }
             }
             self.disable_slot(s);
@@ -775,8 +975,11 @@ impl Xhci {
         let total = u16::from_le_bytes([self.desc(2), self.desc(3)]).min(1024);
         let got = u64::from(self.get_descriptor(slot, 2, total).map_err(|_| "configuration unreadable")?);
         let cfg_value = self.desc(5);
-        // Find a boot keyboard interface (class 3, subclass 1, protocol 1) and its interrupt-IN endpoint.
-        let (mut iface, mut in_kbd, mut ep, mut first_if) = (None, false, None, true);
+        // The interfaces (alternate setting 0) and their endpoints.
+        let mut ifs = [Iface::default(); 8];
+        let (mut nif, mut cur, mut first_if) = (0usize, None::<usize>, true);
+        // The last endpoint seen (for its SuperSpeed companion): (interface, IN).
+        let mut last_ep: Option<(usize, bool)> = None;
         let mut o = 0u64;
         while o + 2 <= got {
             let len = u64::from(self.desc(o));
@@ -785,90 +988,277 @@ impl Xhci {
                 break;
             }
             let b = |i: u64| self.desc(o + i);
-            if ty == 4 && len >= 9 {
-                if first_if && id.class == 0 {
-                    (id.class, id.sub, id.proto) = (b(5), b(6), b(7));
+            match ty {
+                4 if len >= 9 => {
+                    if first_if && id.class == 0 {
+                        (id.class, id.sub, id.proto) = (b(5), b(6), b(7));
+                    }
+                    first_if = false;
+                    cur = None;
+                    last_ep = None;
+                    if b(3) == 0 && nif < ifs.len() {
+                        ifs[nif] = Iface { num: b(2), class: b(5), sub: b(6), proto: b(7), ..Iface::default() };
+                        cur = Some(nif);
+                        nif += 1;
+                    }
                 }
-                first_if = false;
-                in_kbd = b(3) == 0 && (b(5), b(6), b(7)) == (3, 1, 1) && ep.is_none();
-                if in_kbd {
-                    iface = Some(b(2));
+                0x21 if len >= 9 && b(6) == 0x22 => {
+                    if let Some(c) = cur {
+                        ifs[c].hid_len = u16::from_le_bytes([b(7), b(8)]);
+                    }
                 }
-            } else if ty == 5 && len >= 7 && in_kbd && ep.is_none() && b(2) & 0x80 != 0 && b(3) & 3 == 3 {
-                ep = Some((b(2) & 0x0F, u32::from(u16::from_le_bytes([b(4), b(5)]) & 0x7FF), b(6)));
+                5 if len >= 7 => {
+                    last_ep = None;
+                    let Some(c) = cur else {
+                        o += len;
+                        continue;
+                    };
+                    let (addr, attr) = (b(2), b(3) & 3);
+                    let mps = u32::from(u16::from_le_bytes([b(4), b(5)]) & 0x7FF);
+                    let input = addr & 0x80 != 0;
+                    let f = &mut ifs[c];
+                    let usable = (attr == 3 && input && f.class == 3) || (attr == 2 && f.class == 8);
+                    if usable && input && f.ep_in.is_none() {
+                        f.ep_in = Some((addr & 0x0F, mps, b(6), 0));
+                        last_ep = Some((c, true));
+                    } else if usable && !input && attr == 2 && f.ep_out.is_none() {
+                        f.ep_out = Some((addr & 0x0F, mps, 0));
+                        last_ep = Some((c, false));
+                    }
+                }
+                0x30 if len >= 6 => {
+                    // SuperSpeed endpoint companion: the endpoint's max burst.
+                    match last_ep {
+                        Some((c, true)) => {
+                            if let Some(e) = ifs[c].ep_in.as_mut() {
+                                e.3 = b(2).min(15);
+                            }
+                        }
+                        Some((c, false)) => {
+                            if let Some(e) = ifs[c].ep_out.as_mut() {
+                                e.2 = b(2).min(15);
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                _ => {}
             }
             o += len;
         }
-        if id.class == 9 && loc.speed <= 3 && loc.depth < MAX_DEPTH {
+        if id.class == 9 && loc.depth < MAX_DEPTH {
             return self.setup_hub(slot, loc, cfg_value, id);
         }
-        let (Some(iface), Some((epn, ep_mps, interval))) = (iface, ep) else {
-            return Ok(Found::Other(id));
-        };
-        if epn == 0 || ep_mps == 0 {
-            return Err("bad keyboard endpoint descriptor");
+        let ifs = &ifs[..nif];
+        let ok_ep = |e: Option<(u8, u32, u8, u8)>| e.is_some_and(|e| e.0 != 0 && e.1 != 0);
+        let kbd = ifs.iter().find(|f| (f.class, f.sub, f.proto) == (3, 1, 1) && ok_ep(f.ep_in)).copied();
+        let mouse = ifs.iter().find(|f| f.class == 3 && (f.sub, f.proto) != (1, 1) && ok_ep(f.ep_in)).copied();
+        let disk = ifs.iter().find(|f| (f.class, f.sub, f.proto) == (8, 6, 0x50) && ok_ep(f.ep_in) && f.ep_out.is_some_and(|e| e.0 != 0 && e.1 != 0)).copied();
+        if kbd.is_some() || mouse.is_some() {
+            return self.setup_input(slot, loc, cfg_value, id, kbd, mouse);
         }
-        let Some(idx) = self.kbds.iter().position(Option::is_none) else {
-            return Ok(Found::Other(id)); // MAX_KBDS keyboards served already
-        };
-        self.control(slot, [0, 9, cfg_value, 0, 0, 0, 0, 0], 0).map_err(|_| "SET_CONFIGURATION failed")?;
-        // The interrupt-IN endpoint: device context index 2 * n + 1.
-        let dci = u32::from(epn) * 2 + 1;
-        let exp = if loc.speed <= 2 {
-            // Full / low speed: bInterval in 1 ms frames -> 2^exp * 125 us.
+        if let Some(d) = disk {
+            return self.setup_storage(slot, loc, cfg_value, id, d);
+        }
+        Ok(Found::Other(id))
+    }
+
+    /// The interrupt interval exponent of an endpoint (2^exp * 125 us).
+    fn interval_exp(loc: &Loc, interval: u8) -> u32 {
+        if loc.speed <= 2 {
+            // Full / low speed: bInterval in 1 ms frames.
             (32 - (u32::from(interval.max(1)) * 8).leading_zeros() - 1).clamp(3, 10)
         } else {
             u32::from(interval.clamp(1, 16)) - 1
-        };
-        self.clear_page(PG_IN);
-        self.clear_page(PG_INTR + idx as u64);
-        self.ctx_w(PG_IN, 0, 1, 1 | 1 << dci);
-        self.slot_ctx(&loc, dci, 0, 0);
+        }
+    }
+
+    /// Endpoint context `dci` of the input context: type (2 bulk OUT, 6 bulk IN, 7 interrupt IN),
+    /// max packet, interval, max burst, its ring.
+    #[allow(clippy::too_many_arguments)]
+    fn ep_ctx(&self, dci: u32, ty: u32, mps: u32, exp: u32, burst: u32, ring_page: u64) {
         let e = u64::from(dci) + 1;
+        self.clear_page(ring_page);
         self.ctx_w(PG_IN, e, 0, exp << 16);
-        self.ctx_w(PG_IN, e, 1, 3 << 1 | 7 << 3 | ep_mps << 16);
-        let ring = self.addr(PG_INTR + idx as u64, 0) | 1;
+        self.ctx_w(PG_IN, e, 1, 3 << 1 | ty << 3 | burst << 8 | mps << 16);
+        let ring = self.addr(ring_page, 0) | 1;
         self.ctx_w(PG_IN, e, 2, ring as u32);
         self.ctx_w(PG_IN, e, 3, (ring >> 32) as u32);
-        self.ctx_w(PG_IN, e, 4, ep_mps | ep_mps << 16);
+        let esit = if ty == 7 { mps * (burst + 1) } else { 0 };
+        self.ctx_w(PG_IN, e, 4, (if ty == 7 { mps } else { 3072 }) | esit << 16);
+    }
+
+    /// A keyboard, a mouse, or both (one device, e.g. a receiver): configure the device and the
+    /// interrupt endpoints, choose the protocols, queue the first reports.
+    fn setup_input(&mut self, slot: u32, loc: Loc, cfg_value: u8, id: Ident, kbd: Option<Iface>, mouse: Option<Iface>) -> Result<Found, &'static str> {
+        let kidx = kbd.and_then(|_| self.kbds.iter().position(Option::is_none));
+        let midx = mouse.and_then(|_| self.mice.iter().position(Option::is_none));
+        self.control(slot, [0, 9, cfg_value, 0, 0, 0, 0, 0], 0).map_err(|_| "SET_CONFIGURATION failed")?;
+        // A mouse: its report descriptor, or the boot protocol if it offers that.
+        let mut fmt = None;
+        if let (Some(m), Some(_)) = (mouse, midx) {
+            let len = m.hid_len.min(1024);
+            if len > 0 {
+                let l = len.to_le_bytes();
+                if let Ok(got) = self.control(slot, [0x81, 6, 0, 0x22, m.num, 0, l[0], l[1]], len) {
+                    let mut d = [0u8; 1024];
+                    let n = (got as usize).min(d.len());
+                    for (i, x) in d.iter_mut().enumerate().take(n) {
+                        *x = self.desc(i as u64);
+                    }
+                    fmt = parse_mouse(&d[..n]);
+                }
+            }
+            if fmt.is_none() && (m.sub, m.proto) == (1, 2) {
+                fmt = Some(BOOT_MOUSE);
+            }
+        }
+        let use_kbd = kbd.zip(kidx);
+        let use_mouse = mouse.zip(midx).zip(fmt).map(|((m, i), f)| (m, i, f));
+        if use_kbd.is_none() && use_mouse.is_none() {
+            return Ok(Found::Other(id));
+        }
+        self.clear_page(PG_IN);
+        let mut add = 1u32;
+        let mut top = 1;
+        if let Some((k, i)) = use_kbd {
+            let (epn, mps, interval, _) = k.ep_in.unwrap_or_default();
+            let dci = u32::from(epn) * 2 + 1;
+            self.ep_ctx(dci, 7, mps, Self::interval_exp(&loc, interval), 0, PG_INTR + i as u64);
+            add |= 1 << dci;
+            top = top.max(dci);
+        }
+        if let Some((m, i, _)) = use_mouse {
+            let (epn, mps, interval, _) = m.ep_in.unwrap_or_default();
+            let dci = u32::from(epn) * 2 + 1;
+            if add & (1 << dci) != 0 {
+                return Err("keyboard and mouse share an endpoint");
+            }
+            self.ep_ctx(dci, 7, mps, Self::interval_exp(&loc, interval), 0, PG_MOUSE + i as u64);
+            add |= 1 << dci;
+            top = top.max(dci);
+        }
+        self.ctx_w(PG_IN, 0, 1, add);
+        self.slot_ctx(&loc, top, 0, 0);
         let cfg = Trb { param: self.addr(PG_IN, 0), status: 0, control: T_CONFIGURE_EP << 10 | slot << 24 };
         self.command(cfg).map_err(|_| "Configure Endpoint failed")?;
-        self.control(slot, [0x21, 0x0B, 0, 0, iface, 0, 0, 0], 0).map_err(|_| "SET_PROTOCOL(boot) failed")?;
-        // Reports only on change. Optional: a device that stalls it still works (endpoint 0 is
-        // not used again).
-        let _ = self.control(slot, [0x21, 0x0A, 0, 0, iface, 0, 0, 0], 0);
-        let mut k = Kbd {
+        let mut kb = None;
+        if let Some((k, idx)) = use_kbd {
+            self.control(slot, [0x21, 0x0B, 0, 0, k.num, 0, 0, 0], 0).map_err(|_| "SET_PROTOCOL(boot) failed")?;
+            // Reports only on change. Optional: a device that stalls it still works.
+            let _ = self.control(slot, [0x21, 0x0A, 0, 0, k.num, 0, 0, 0], 0);
+            let dci = u32::from(k.ep_in.unwrap_or_default().0) * 2 + 1;
+            let mut x = Kbd {
+                idx,
+                id,
+                slot,
+                loc,
+                iface: k.num,
+                dci,
+                intr: Ring::new(PG_INTR + idx as u64),
+                buf_at: [u8::MAX; RING_TRBS as usize],
+                last: [0; 8],
+                keys: Keys::default(),
+                repeat: None,
+                leds_caps: false,
+                leds_due: false,
+            };
+            for b in 0..REPORTS as u8 {
+                self.queue_report(&mut x, b);
+            }
+            self.ring_doorbell(slot, dci);
+            kb = Some(x);
+        }
+        let mut ms = None;
+        if let Some((m, idx, f)) = use_mouse {
+            // Boot-capable interfaces: the protocol chosen explicitly (firmware may have left boot).
+            if m.sub == 1 {
+                let p = if f.boot { 0 } else { 1 };
+                let _ = self.control(slot, [0x21, 0x0B, p, 0, m.num, 0, 0, 0], 0);
+            }
+            let _ = self.control(slot, [0x21, 0x0A, 0, 0, m.num, 0, 0, 0], 0);
+            let (epn, mps, _, _) = m.ep_in.unwrap_or_default();
+            let dci = u32::from(epn) * 2 + 1;
+            let mut x = Mouse {
+                idx,
+                id,
+                slot,
+                loc,
+                dci,
+                len: mps.min(64),
+                intr: Ring::new(PG_MOUSE + idx as u64),
+                buf_at: [u8::MAX; RING_TRBS as usize],
+                fmt: f,
+                buttons: 0,
+            };
+            for b in 0..REPORTS as u8 {
+                self.queue_mouse_report(&mut x, b);
+            }
+            self.ring_doorbell(slot, dci);
+            ms = Some(x);
+        }
+        Ok(Found::Input(kb, ms))
+    }
+
+    /// USB mass storage (bulk-only transport, SCSI): configure the bulk endpoints, then ask the
+    /// device what it is and how big.
+    fn setup_storage(&mut self, slot: u32, loc: Loc, cfg_value: u8, id: Ident, f: Iface) -> Result<Found, &'static str> {
+        let Some(idx) = self.disks.iter().position(Option::is_none) else {
+            return Ok(Found::Other(id)); // MAX_DISKS served already
+        };
+        let ((ie, imps, _, iburst), (oe, omps, oburst)) = (f.ep_in.unwrap_or_default(), f.ep_out.unwrap_or_default());
+        self.control(slot, [0, 9, cfg_value, 0, 0, 0, 0, 0], 0).map_err(|_| "SET_CONFIGURATION failed")?;
+        let mut d = UsbDisk {
             idx,
             id,
             slot,
             loc,
-            dci,
-            intr: Ring::new(PG_INTR + idx as u64),
-            buf_at: [u8::MAX; RING_TRBS as usize],
-            last: [0; 8],
-            keys: Keys::default(),
+            iface: f.num,
+            in_ep: ie,
+            out_ep: oe,
+            in_ring: Ring::new(0),
+            out_ring: Ring::new(0),
+            mps: imps.min(omps),
+            tag: 0,
+            sectors: 0,
+            model: [0; 40],
+            model_len: 0,
+            ch: 0,
         };
-        for b in 0..REPORTS as u8 {
-            self.queue_report(&mut k, b);
-        }
-        self.ring_doorbell(slot, dci);
-        Ok(Found::Keyboard(k))
+        d.in_ring = Ring::new(d.page(0));
+        d.out_ring = Ring::new(d.page(1));
+        self.clear_page(PG_IN);
+        self.ep_ctx(d.in_dci(), 6, imps, 0, u32::from(iburst), d.page(0));
+        self.ep_ctx(d.out_dci(), 2, omps, 0, u32::from(oburst), d.page(1));
+        self.ctx_w(PG_IN, 0, 1, 1 | 1 << d.in_dci() | 1 << d.out_dci());
+        self.slot_ctx(&loc, d.in_dci().max(d.out_dci()), 0, 0);
+        let cfg = Trb { param: self.addr(PG_IN, 0), status: 0, control: T_CONFIGURE_EP << 10 | slot << 24 };
+        self.command(cfg).map_err(|_| "Configure Endpoint (storage) failed")?;
+        self.disk_init(&mut d)?;
+        Ok(Found::Disk(d))
     }
 
-    /// A USB 2 hub: configure it, tell the controller it is a hub (ports, think time), power its
-    /// ports; they are probed once power is good and the connections have settled.
+    /// A hub: configure it, tell the controller it is a hub (ports, think time), power its ports;
+    /// they are probed once power is good and the connections have settled. A USB 3 hub (on a
+    /// SuperSpeed link) also learns its depth, for the route strings of the packets it forwards.
     fn setup_hub(&mut self, slot: u32, loc: Loc, cfg_value: u8, id: Ident) -> Result<Found, &'static str> {
         let i = self.hubs.iter().position(|h| h.is_none()).ok_or("too many hubs")?;
+        let ss = loc.speed >= 4;
         self.control(slot, [0, 9, cfg_value, 0, 0, 0, 0, 0], 0).map_err(|_| "SET_CONFIGURATION failed")?;
-        if self.control(slot, [0xA0, 6, 0, 0x29, 0, 0, 9, 0], 9).map_err(|_| "hub descriptor unreadable")? < 7 {
+        let (ty, want) = if ss { (0x2A, 12) } else { (0x29, 9) };
+        if self.control(slot, [0xA0, 6, 0, ty, 0, 0, want, 0], u16::from(want)).map_err(|_| "hub descriptor unreadable")? < 7 {
             return Err("hub descriptor too short");
         }
         let ports = u32::from(self.desc(2)).min(HUB_PORTS);
         if ports == 0 {
             return Err("hub without ports");
         }
-        let ttt = (u32::from(self.desc(3)) >> 5) & 3;
+        let ttt = if ss { 0 } else { (u32::from(self.desc(3)) >> 5) & 3 };
         let power_good = u64::from(self.desc(5)) * 2 * MS;
+        if ss {
+            // Depth below the root port: 0 for a hub on a root port.
+            self.control(slot, [0x20, REQ_SET_HUB_DEPTH, loc.depth as u8, 0, 0, 0, 0, 0], 0).map_err(|_| "SET_HUB_DEPTH failed")?;
+        }
         self.clear_page(PG_IN);
         self.ctx_w(PG_IN, 0, 1, 1);
         self.slot_ctx(&loc, 1, ports, ttt);
@@ -878,8 +1268,249 @@ impl Xhci {
             self.hub_feature(slot, p, true, F_PORT_POWER).map_err(|_| "hub port power refused")?;
         }
         let ready = PortState { pending: true, changed_at: sys::clock_ns() + power_good.max(DEBOUNCE), ..PortState::default() };
-        self.hubs[i] = Some(Hub { slot, loc, ports, dead: false, ps: [ready; HUB_PORTS as usize] });
-        Ok(Found::Hub(ports, id))
+        self.hubs[i] = Some(Hub { slot, loc, ports, ss, dead: false, ps: [ready; HUB_PORTS as usize] });
+        Ok(Found::Hub(ports, id, ss))
+    }
+
+    // ---- mass storage (bulk-only transport) -----------------------------------------------------
+
+    /// One transfer on a bulk endpoint of `d`: `len` bytes at `off` of page `page` (several pages
+    /// if `off` is 0), one TRB per page. Ok(bytes moved) or Err(completion code, 0 = timeout).
+    fn bulk(&mut self, d: &mut UsbDisk, input: bool, page: u64, off: u64, len: u32) -> Result<u32, u32> {
+        let (dci, mut ring) = if input {
+            (d.in_dci(), core::mem::replace(&mut d.in_ring, Ring::new(0)))
+        } else {
+            (d.out_dci(), core::mem::replace(&mut d.out_ring, Ring::new(0)))
+        };
+        let r = self.bulk_on(d.slot, dci, &mut ring, page, off, len, d.mps);
+        if input {
+            d.in_ring = ring;
+        } else {
+            d.out_ring = ring;
+        }
+        if let Err(c) = r {
+            self.last_cc = c;
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bulk_on(&mut self, slot: u32, dci: u32, ring: &mut Ring, page: u64, off: u64, len: u32, mps: u32) -> Result<u32, u32> {
+        let n = (len as usize).div_ceil(4096).clamp(1, DATA_PAGES as usize);
+        let mut at = [0u64; DATA_PAGES as usize];
+        let mut lens = [0u32; DATA_PAGES as usize];
+        for k in 0..n {
+            let l = (len - (k as u32) * 4096).min(4096);
+            let last = k == n - 1;
+            // TD Size: packets still to come after this TRB (at most 31).
+            let left = len - (k as u32) * 4096 - l;
+            let td = left.div_ceil(mps.max(1)).min(31);
+            let ctl = T_NORMAL << 10 | TRB_ISP | if last { TRB_IOC } else { TRB_CH };
+            lens[k] = l;
+            at[k] = self.enqueue(ring, Trb { param: self.addr(page + k as u64, if k == 0 { off } else { 0 }), status: l | td << 17, control: ctl });
+        }
+        self.ring_doorbell(slot, dci);
+        let last = at[n - 1];
+        let e = self.wait_event(5000, |e| e.ty() == E_TRANSFER && e.slot() == slot && e.endpoint() == dci).ok_or(0u32)?;
+        match e.code() {
+            CC_SUCCESS if e.param == last => Ok(len),
+            CC_SUCCESS | CC_SHORT => {
+                let k = at[..n].iter().position(|&a| a == e.param).ok_or(0u32)?;
+                let moved = (k as u32) * 4096 + lens[k].saturating_sub(e.status & 0xFF_FFFF);
+                if e.param != last {
+                    // The end of the TD may still report.
+                    let _ = self.wait_event(20, |x| x.ty() == E_TRANSFER && x.slot() == slot && x.param == last);
+                }
+                Ok(moved)
+            }
+            c => Err(c),
+        }
+    }
+
+    /// A halted (stalled) endpoint: reset it, move its dequeue pointer past what was queued, and
+    /// clear the device's halt.
+    fn clear_halt(&mut self, d: &mut UsbDisk, input: bool) {
+        let (dci, ep, ring) = if input { (d.in_dci(), d.in_ep | 0x80, &d.in_ring) } else { (d.out_dci(), d.out_ep, &d.out_ring) };
+        let deq = self.addr(ring.page, u64::from(ring.enq) * 16) | u64::from(ring.cycle);
+        let _ = self.command(Trb { param: 0, status: 0, control: T_RESET_EP << 10 | dci << 16 | d.slot << 24 });
+        let _ = self.command(Trb { param: deq, status: 0, control: T_SET_TR_DEQ << 10 | dci << 16 | d.slot << 24 });
+        let _ = self.control(d.slot, [0x02, 1, 0, 0, ep, 0, 0, 0], 0);
+    }
+
+    /// Bulk-only reset recovery (BOT 5.3.4): the class reset, then both halts cleared.
+    fn reset_recovery(&mut self, d: &mut UsbDisk) {
+        let _ = self.control(d.slot, [0x21, 0xFF, 0, 0, d.iface, 0, 0, 0], 0);
+        self.clear_halt(d, true);
+        self.clear_halt(d, false);
+    }
+
+    /// One SCSI command through the bulk-only transport: CBW, data (`len` bytes in the disk's data
+    /// pages, in or out), CSW. Ok(residue); Err when the command failed or the transport broke.
+    fn bot(&mut self, d: &mut UsbDisk, cdb: &[u8], len: u32, input: bool) -> Result<u32, &'static str> {
+        d.tag = d.tag.wrapping_add(1);
+        let cmd = d.page(2);
+        {
+            let (m, base) = self.page(cmd);
+            let m = &m.map;
+            let o = base + CBW;
+            m.w32(o, 0x4342_5355);
+            m.w32(o + 4, d.tag);
+            m.w32(o + 8, len);
+            m.w8(o + 12, if input { 0x80 } else { 0 });
+            m.w8(o + 13, 0); // LUN 0
+            m.w8(o + 14, cdb.len().min(16) as u8);
+            for i in 0..16u64 {
+                m.w8(o + 15 + i, cdb.get(i as usize).copied().unwrap_or(0));
+            }
+        }
+        if self.bulk(d, false, cmd, CBW, 31).is_err() {
+            self.reset_recovery(d);
+            return Err("command block refused");
+        }
+        if len > 0 {
+            match self.bulk(d, input, d.page(3), 0, len) {
+                Ok(_) => {}
+                Err(CC_STALL) => self.clear_halt(d, input),
+                Err(_) => {
+                    self.reset_recovery(d);
+                    return Err("data transfer failed");
+                }
+            }
+        }
+        let mut got = self.bulk(d, true, cmd, CSW, 13);
+        if got == Err(CC_STALL) {
+            self.clear_halt(d, true);
+            got = self.bulk(d, true, cmd, CSW, 13);
+        }
+        if got != Ok(13) {
+            self.reset_recovery(d);
+            return Err("no command status");
+        }
+        let (m, base) = self.page(cmd);
+        let o = base + CSW;
+        let (sig, tag, residue, status) = (m.map.r32(o), m.map.r32(o + 4), m.map.r32(o + 8), m.map.r8(o + 12));
+        if sig != 0x5342_5355 || tag != d.tag {
+            self.reset_recovery(d);
+            return Err("bad command status");
+        }
+        match status {
+            0 => Ok(residue),
+            1 => Err("command failed"),
+            _ => {
+                self.reset_recovery(d);
+                Err("phase error")
+            }
+        }
+    }
+
+    /// INQUIRY, TEST UNIT READY (until ready, bounded), READ CAPACITY.
+    fn disk_init(&mut self, d: &mut UsbDisk) -> Result<(), &'static str> {
+        self.bot(d, &[0x12, 0, 0, 0, 36, 0], 36, true)?;
+        let data = d.page(3);
+        let mut model = [0u8; 40];
+        let mut n = 0;
+        let (m, base) = self.page(data);
+        // Vendor (8-15) and product (16-31), spaces trimmed.
+        for i in 8..32u64 {
+            let c = m.map.r8(base + i);
+            if i == 16 && n > 0 && model[n - 1] != b' ' {
+                model[n] = b' ';
+                n += 1;
+            }
+            if (b' '..=b'~').contains(&c) && !(c == b' ' && (n == 0 || model[n - 1] == b' ')) {
+                model[n] = c;
+                n += 1;
+            }
+        }
+        while n > 0 && model[n - 1] == b' ' {
+            n -= 1;
+        }
+        (d.model, d.model_len) = (model, n);
+        let mut ready = false;
+        for _ in 0..20 {
+            if self.bot(d, &[0, 0, 0, 0, 0, 0], 0, false).is_ok() {
+                ready = true;
+                break;
+            }
+            let _ = self.bot(d, &[0x03, 0, 0, 0, 18, 0], 18, true); // REQUEST SENSE clears the condition
+            sleep(100 * MS);
+        }
+        if !ready {
+            return Err("medium not ready");
+        }
+        self.bot(d, &[0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0], 8, true)?;
+        let (m, base) = self.page(data);
+        let be32 = |o: u64| u32::from_be_bytes([m.map.r8(base + o), m.map.r8(base + o + 1), m.map.r8(base + o + 2), m.map.r8(base + o + 3)]);
+        let (mut last, mut bl) = (u64::from(be32(0)), be32(4));
+        if last == 0xFFFF_FFFF {
+            self.bot(d, &[0x9E, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0], 32, true)?;
+            let (m, base) = self.page(data);
+            let be32 = |o: u64| u32::from_be_bytes([m.map.r8(base + o), m.map.r8(base + o + 1), m.map.r8(base + o + 2), m.map.r8(base + o + 3)]);
+            last = u64::from(be32(0)) << 32 | u64::from(be32(4));
+            bl = be32(8);
+        }
+        if bl != 512 {
+            return Err("sector size is not 512 bytes");
+        }
+        d.sectors = last.checked_add(1).ok_or("bad capacity")?;
+        Ok(())
+    }
+
+    /// Read (`out`) or write (`data`) `count` sectors at `lba` on disk `unit`.
+    fn disk_io(&mut self, unit: usize, lba: u64, count: u64, out: Option<&mut [u8]>, data: Option<&[u8]>) -> Result<(), i32> {
+        let Some(mut d) = self.disks.get_mut(unit).and_then(Option::take) else { return Err(sys::ERR_BAD_STATE as i32) };
+        let r = self.disk_io_on(&mut d, lba, count, out, data);
+        self.disks[unit] = Some(d);
+        self.requests += 1;
+        r
+    }
+
+    fn disk_io_on(&mut self, d: &mut UsbDisk, lba: u64, count: u64, out: Option<&mut [u8]>, data: Option<&[u8]>) -> Result<(), i32> {
+        let write = data.is_some();
+        let bytes = count as usize * 512;
+        if count == 0 || count > DATA_PAGES * 8 {
+            return Err(sys::ERR_INVALID_ARGS as i32);
+        }
+        if let Some(src) = data {
+            let base = (d.page(3) - PG_FUN) as usize * 4096;
+            self.fun_mem.map.bytes_mut()[base..base + bytes].copy_from_slice(&src[..bytes]);
+        }
+        let mut cdb = [0u8; 16];
+        let len = if lba + count <= 1 << 32 {
+            cdb[0] = if write { 0x2A } else { 0x28 };
+            cdb[2..6].copy_from_slice(&(lba as u32).to_be_bytes());
+            cdb[7..9].copy_from_slice(&(count as u16).to_be_bytes());
+            10
+        } else {
+            cdb[0] = if write { 0x8A } else { 0x88 };
+            cdb[2..10].copy_from_slice(&lba.to_be_bytes());
+            cdb[10..14].copy_from_slice(&(count as u32).to_be_bytes());
+            16
+        };
+        match self.bot(d, &cdb[..len], bytes as u32, !write) {
+            Ok(0) => {}
+            Ok(_) => return Err(sys::ERR_OUT_OF_RANGE as i32), // short: the device did less
+            Err(why) => {
+                say!(self, "disk on port {}: {} at sector {} ({})", d.loc, if write { "write" } else { "read" }, lba, why);
+                return Err(sys::ERR_BAD_STATE as i32);
+            }
+        }
+        if let Some(out) = out {
+            let base = (d.page(3) - PG_FUN) as usize * 4096;
+            out[..bytes].copy_from_slice(&self.fun_mem.map.bytes()[base..base + bytes]);
+        }
+        Ok(())
+    }
+
+    fn disk_flush(&mut self, unit: usize) -> Result<(), i32> {
+        let Some(mut d) = self.disks.get_mut(unit).and_then(Option::take) else { return Err(sys::ERR_BAD_STATE as i32) };
+        // SYNCHRONIZE CACHE (10); a device without a cache may refuse it: not an error.
+        let r = self.bot(&mut d, &[0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0], 0, false);
+        self.disks[unit] = Some(d);
+        match r {
+            Ok(_) | Err("command failed") => Ok(()),
+            Err(_) => Err(sys::ERR_BAD_STATE as i32),
+        }
     }
 
     /// Probe (`parent`, `port`) and record the outcome: report it once, serve a keyboard, and
@@ -887,12 +1518,14 @@ impl Xhci {
     fn probe_port(&mut self, parent: u32, port: u32, now: u64) {
         let r = self.probe(parent, port);
         let at = match &r {
-            Ok(Found::Keyboard(k)) => k.loc,
+            Ok(Found::Input(Some(k), _)) => k.loc,
+            Ok(Found::Input(None, Some(m))) => m.loc,
+            Ok(Found::Disk(d)) => d.loc,
             _ => self.loc_of(parent, port),
         };
         let key = match &r {
-            Ok(Found::Keyboard(_)) => 0,
-            Ok(Found::Hub(_, id)) | Ok(Found::Other(id)) => id.key(),
+            Ok(Found::Input(..)) | Ok(Found::Disk(_)) => 0,
+            Ok(Found::Hub(_, id, _)) | Ok(Found::Other(id)) => id.key(),
             Err(_) => u32::MAX,
         };
         let Some(ps) = self.port_state(parent, port) else { return };
@@ -904,12 +1537,40 @@ impl Xhci {
             (ps.ignored, ps.gone_since) = (true, 0);
         }
         match r {
-            Ok(Found::Keyboard(k)) => {
-                say!(self, "keyboard ready on port {} (USB HID boot protocol, US layout, slot {}): {:04x}:{:04x}", at, k.slot, k.id.vid, k.id.pid);
-                let i = k.idx;
-                self.kbds[i] = Some(k);
+            Ok(Found::Input(k, m)) => {
+                if let Some(k) = k {
+                    say!(self, "keyboard ready on port {} (USB HID boot protocol, US layout, slot {}): {:04x}:{:04x}", at, k.slot, k.id.vid, k.id.pid);
+                    let i = k.idx;
+                    self.kbds[i] = Some(k);
+                }
+                if let Some(m) = m {
+                    let f = m.fmt;
+                    say!(
+                        self,
+                        "mouse ready on port {} (USB HID {} protocol, {} buttons{}, slot {}): {:04x}:{:04x}",
+                        at,
+                        if f.boot { "boot" } else { "report" },
+                        f.buttons.size,
+                        if f.wheel.is_some() { ", wheel" } else { "" },
+                        m.slot,
+                        m.id.vid,
+                        m.id.pid
+                    );
+                    let i = m.idx;
+                    self.mice[i] = Some(m);
+                }
             }
-            Ok(Found::Hub(n, id)) if !repeat => say!(self, "port {}: hub {:04x}:{:04x}, {} ports", at, id.vid, id.pid, n),
+            Ok(Found::Disk(d)) => {
+                let model = core::str::from_utf8(&d.model[..d.model_len]).unwrap_or("?");
+                say!(self, "disk ready on port {}: {} MiB, \"{}\" (USB mass storage, unit {}, slot {}): {:04x}:{:04x}", at, d.sectors / 2048, model, d.idx, d.slot, d.id.vid, d.id.pid);
+                let mut m = [0u8; HEADER + 40];
+                Header { txid: 0, op: proto::DISK, status: 0, a: d.idx as u64, b: d.sectors }.put(&mut m);
+                m[HEADER..HEADER + d.model_len].copy_from_slice(&d.model[..d.model_len]);
+                sys::channel_write(self.ctl, &m[..HEADER + d.model_len]);
+                let i = d.idx;
+                self.disks[i] = Some(d);
+            }
+            Ok(Found::Hub(n, id, ss)) if !repeat => say!(self, "port {}: hub {:04x}:{:04x}, {} ports{}", at, id.vid, id.pid, n, if ss { " (USB 3)" } else { "" }),
             Ok(Found::Other(id)) if !repeat => say!(self, "port {}: {} {:04x}:{:04x} (left unused)", at, id.kind(), id.vid, id.pid),
             Err(e) if !repeat => say!(self, "port {}: device not set up ({}, completion code {})", at, e, self.last_cc),
             _ => {}
@@ -999,9 +1660,17 @@ impl Xhci {
                 }
                 return;
             };
-            for b in 0..5u8 {
+            let ss = self.hubs[h].is_some_and(|x| x.ss);
+            for b in 0..8u8 {
+                let feature = match b {
+                    0..=4 => F_C_PORT_CONNECTION + b,
+                    5 if ss => F_C_BH_PORT_RESET,
+                    6 if ss => F_C_PORT_LINK_STATE,
+                    7 if ss => F_C_PORT_CONFIG_ERROR,
+                    _ => continue,
+                };
                 if chg & (1 << b) != 0 {
-                    let _ = self.hub_feature(slot, port, false, F_C_PORT_CONNECTION + b);
+                    let _ = self.hub_feature(slot, port, false, feature);
                 }
             }
             let connected = st & HS_CONNECTION != 0;
@@ -1040,23 +1709,25 @@ impl Xhci {
     }
 
     /// How long the main loop may sleep: briefly while connections settle, a second while hubs
-    /// are polled or ports are left alone, otherwise until an interrupt.
-    fn wake_after(&self) -> u64 {
+    /// are polled or ports are left alone, until the next key repeat, otherwise until an interrupt.
+    fn wake_after(&self, now: u64) -> u64 {
+        let repeat = self.kbds.iter().flatten().filter_map(|k| k.repeat.map(|r| r.2.saturating_sub(now).max(MS))).min();
         let live = |h: &&Hub| !h.dead;
         let hubs = self.hubs.iter().flatten().filter(live);
-        {
+        let base = {
             let root = self.root[..self.ports as usize].iter().any(|p| p.pending);
             if root || hubs.clone().any(|h| h.ps[..h.ports as usize].iter().any(|p| p.pending)) {
-                return SETTLE_TICK;
+                SETTLE_TICK
+            } else if hubs.count() > 0 || self.root[..self.ports as usize].iter().any(|p| p.ignored) {
+                HUB_POLL
+            } else {
+                sys::WAIT_FOREVER
             }
-        }
-        if hubs.count() > 0 || self.root[..self.ports as usize].iter().any(|p| p.ignored) {
-            return HUB_POLL;
-        }
-        sys::WAIT_FOREVER
+        };
+        repeat.map_or(base, |r| r.min(base))
     }
 
-    // ---- keyboard reports -----------------------------------------------------------------------
+    // ---- keyboard and mouse reports -------------------------------------------------------------
 
     fn queue_report(&self, k: &mut Kbd, buf: u8) {
         let pos = k.intr.enq as usize;
@@ -1067,25 +1738,40 @@ impl Xhci {
         k.intr = r;
     }
 
-    /// A finished report transfer: diff it against the last one, send the characters, requeue.
-    fn report(&mut self, k: &mut Kbd, e: &Trb, ch: Handle) -> Result<(), &'static str> {
-        let base = self.addr(PG_INTR + k.idx as u64, 0);
+    fn queue_mouse_report(&self, m: &mut Mouse, buf: u8) {
+        let pos = m.intr.enq as usize;
+        let t = Trb { param: self.addr(PG_MOUSE_REPORT, report_off(m.idx, buf)), status: m.len, control: T_NORMAL << 10 | TRB_IOC | TRB_ISP };
+        m.buf_at[pos] = buf;
+        let mut r = core::mem::replace(&mut m.intr, Ring::new(PG_MOUSE + m.idx as u64));
+        self.enqueue(&mut r, t);
+        m.intr = r;
+    }
+
+    /// The report buffer a transfer event on an interrupt ring finished, after checking the event
+    /// points at a TRB of that ring that has one queued.
+    fn finished(&self, ring_page: u64, buf_at: &mut [u8; RING_TRBS as usize], e: &Trb) -> Result<u8, &'static str> {
+        let base = self.addr(ring_page, 0);
         if e.param < base || e.param >= base + u64::from(RING_TRBS - 1) * 16 || !(e.param - base).is_multiple_of(16) {
             return Err("transfer event for a TRB that is not ours");
         }
-        let pos = ((e.param - base) / 16) as usize;
-        let buf = core::mem::replace(&mut k.buf_at[pos], u8::MAX);
+        let buf = core::mem::replace(&mut buf_at[((e.param - base) / 16) as usize], u8::MAX);
         if usize::from(buf) >= REPORTS {
             return Err("transfer event for a TRB that is not queued");
         }
-        let got = 8u32.saturating_sub(e.status & 0xFF_FFFF);
         match e.code() {
-            CC_SUCCESS | CC_SHORT => {}
+            CC_SUCCESS | CC_SHORT => Ok(buf),
             c => {
-                println!("xhci: keyboard: report transfer failed with completion code {}", c);
-                return Err("keyboard transfer failed (device gone?)");
+                println!("xhci: report transfer failed with completion code {}", c);
+                Err("transfer failed (device gone?)")
             }
         }
+    }
+
+    /// A finished keyboard report: diff it against the last one, send the keys, note the key to
+    /// repeat and whether the LEDs changed, requeue.
+    fn report(&mut self, k: &mut Kbd, e: &Trb, ch: Handle) -> Result<(), &'static str> {
+        let buf = self.finished(PG_INTR + k.idx as u64, &mut k.buf_at, e)?;
+        let got = 8u32.saturating_sub(e.status & 0xFF_FFFF);
         if got >= 3 {
             self.reports += 1;
             let mut r = [0u8; 8];
@@ -1094,10 +1780,23 @@ impl Xhci {
             }
             // Rollover (too many keys): every key slot reads 1; keep the last state.
             if r[2] != 1 {
-                for c in diff(&mut k.keys, &k.last, &r) {
-                    proto::send(ch, proto::KEY, u64::from(c), 0);
+                let (typed, n, held) = diff(&mut k.keys, &k.last, &r);
+                for &c in &typed[..n] {
+                    proto::send(ch, proto::KEY, u64::from(c), u64::from(k.slot));
+                }
+                let now = sys::clock_ns();
+                match held {
+                    Some((u, v)) => k.repeat = Some((v, u, now + REPEAT_DELAY)),
+                    None => {
+                        if k.repeat.is_some_and(|(_, u, _)| !r[2..].contains(&u)) {
+                            k.repeat = None;
+                        }
+                    }
                 }
                 k.last = r;
+                if k.keys.caps() != k.leds_caps {
+                    k.leds_due = true;
+                }
             }
         }
         self.queue_report(k, buf);
@@ -1105,16 +1804,85 @@ impl Xhci {
         Ok(())
     }
 
+    /// The keyboard's LEDs follow Caps Lock (SET_REPORT, output report: bit 1 Caps Lock).
+    fn set_leds(&mut self, i: usize) {
+        let Some((slot, iface, caps)) = self.kbds[i].as_ref().map(|k| (k.slot, k.iface, k.keys.caps())) else { return };
+        if let Some(k) = self.kbds[i].as_mut() {
+            (k.leds_caps, k.leds_due) = (caps, false);
+        }
+        self.mem.map.w8(PG_DESC * 4096, if caps { 2 } else { 0 });
+        if self.control(slot, [0x21, 0x09, 0, 0x02, iface, 0, 1, 0], 1).is_err() {
+            say!(self, "keyboard in slot {}: LED report refused (completion code {})", slot, self.last_cc);
+        }
+    }
+
+    /// A finished mouse report: the movement, wheel and buttons to the device manager; requeue.
+    fn mouse_report(&mut self, m: &mut Mouse, e: &Trb, ch: Handle) -> Result<(), &'static str> {
+        let buf = self.finished(PG_MOUSE + m.idx as u64, &mut m.buf_at, e)?;
+        let got = m.len.saturating_sub(e.status & 0xFF_FFFF) as usize;
+        let mut r = [0u8; 64];
+        let base = report_off(m.idx, buf);
+        let (mem, off) = self.page(PG_MOUSE_REPORT);
+        for (i, x) in r.iter_mut().enumerate().take(got.min(64)) {
+            *x = mem.map.r8(off + base + i as u64);
+        }
+        let f = m.fmt;
+        let data = if f.id != 0 {
+            if got == 0 || r[0] != f.id {
+                None // another report of the device (e.g. a receiver's keyboard keys)
+            } else {
+                Some(&r[1..got.min(64)])
+            }
+        } else {
+            Some(&r[..got.min(64)])
+        };
+        if let Some(d) = data
+            && !d.is_empty()
+        {
+            self.reports += 1;
+            let (dx, dy) = (f.x.get(d), f.y.get(d));
+            let wheel = f.wheel.map_or(0, |w| w.get(d)).clamp(-127, 127);
+            let buttons = (f.buttons.get(d) as u32) & 0xFF;
+            if dx != 0 || dy != 0 || wheel != 0 || buttons != m.buttons {
+                m.buttons = buttons;
+                let a = u64::from(dx as u32) | u64::from(dy as u32) << 32;
+                let b = u64::from(buttons) | u64::from(wheel as i8 as u8) << 8 | (m.idx as u64) << 16;
+                proto::send(ch, proto::POINTER, a, b);
+            }
+        }
+        self.queue_mouse_report(m, buf);
+        self.ring_doorbell(m.slot, m.dci);
+        Ok(())
+    }
+
     fn on_event(&mut self, e: Trb, ch: Handle) {
         match e.ty() {
             E_TRANSFER => {
-                let Some(i) = self.kbds.iter().position(|k| k.as_ref().is_some_and(|k| (e.slot(), e.endpoint()) == (k.slot, k.dci))) else { return };
-                let Some(mut k) = self.kbds[i].take() else { return };
-                match self.report(&mut k, &e, ch) {
-                    Ok(()) => self.kbds[i] = Some(k),
-                    Err(why) => {
-                        say!(self, "keyboard {:04x}:{:04x} on port {}: {}", k.id.vid, k.id.pid, k.loc, why);
-                        self.disable_slot(k.slot);
+                let at = (e.slot(), e.endpoint());
+                if let Some(i) = self.kbds.iter().position(|k| k.as_ref().is_some_and(|k| at == (k.slot, k.dci))) {
+                    let Some(mut k) = self.kbds[i].take() else { return };
+                    match self.report(&mut k, &e, ch) {
+                        Ok(()) => {
+                            let due = k.leds_due;
+                            self.kbds[i] = Some(k);
+                            if due {
+                                self.set_leds(i);
+                            }
+                        }
+                        Err(why) => {
+                            say!(self, "keyboard {:04x}:{:04x} on port {}: {}", k.id.vid, k.id.pid, k.loc, why);
+                            proto::send(ch, proto::KEYBOARD_GONE, u64::from(k.slot), 0);
+                            self.drop_slot(k.slot);
+                        }
+                    }
+                } else if let Some(i) = self.mice.iter().position(|m| m.as_ref().is_some_and(|m| at == (m.slot, m.dci))) {
+                    let Some(mut m) = self.mice[i].take() else { return };
+                    match self.mouse_report(&mut m, &e, ch) {
+                        Ok(()) => self.mice[i] = Some(m),
+                        Err(why) => {
+                            say!(self, "mouse {:04x}:{:04x} on port {}: {}", m.id.vid, m.id.pid, m.loc, why);
+                            self.drop_slot(m.slot);
+                        }
                     }
                 }
             }
@@ -1125,6 +1893,33 @@ impl Xhci {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A device whose transfers failed: everything on its slot ends (a receiver's other
+    /// interface too), the slot is disabled.
+    fn drop_slot(&mut self, slot: u32) {
+        for k in self.kbds.iter_mut() {
+            if k.take_if(|k| k.slot == slot).is_some() {
+                proto::send(self.ctl, proto::KEYBOARD_GONE, u64::from(slot), 0);
+            }
+        }
+        for m in self.mice.iter_mut() {
+            let _ = m.take_if(|m| m.slot == slot);
+        }
+        self.disable_slot(slot);
+    }
+
+    /// Held keys that are due repeat (each keyboard on its own).
+    fn repeat_keys(&mut self, ch: Handle, now: u64) {
+        for k in self.kbds.iter_mut().flatten() {
+            if let Some((v, u, next)) = k.repeat
+                && now >= next
+            {
+                proto::send(ch, proto::KEY, u64::from(v), u64::from(k.slot));
+                let next = if next + REPEAT_EVERY > now { next + REPEAT_EVERY } else { now + REPEAT_EVERY };
+                k.repeat = Some((v, u, next));
+            }
         }
     }
 
@@ -1139,6 +1934,33 @@ impl Xhci {
             let Some(e) = self.poll_event() else { break };
             self.on_event(e, ch);
         }
+    }
+}
+
+/// The block-device view of the USB disks (blkserve.rs): unit = disk index.
+struct UsbDisks<'a>(&'a mut Xhci);
+
+impl crate::blkserve::Disk for UsbDisks<'_> {
+    fn units(&self) -> usize {
+        MAX_DISKS
+    }
+    fn capacity(&self, unit: usize) -> u64 {
+        self.0.disks.get(unit).and_then(|d| d.as_ref()).map_or(0, |d| d.sectors)
+    }
+    fn model(&self, unit: usize) -> &[u8] {
+        self.0.disks.get(unit).and_then(|d| d.as_ref()).map_or(&[], |d| &d.model[..d.model_len])
+    }
+    fn read(&mut self, unit: usize, lba: u64, count: u64, out: &mut [u8]) -> Result<(), i32> {
+        self.0.disk_io(unit, lba, count, Some(out), None)
+    }
+    fn write(&mut self, unit: usize, lba: u64, count: u64, data: &[u8]) -> Result<(), i32> {
+        self.0.disk_io(unit, lba, count, None, Some(data))
+    }
+    fn flush(&mut self, unit: usize) -> Result<(), i32> {
+        self.0.disk_flush(unit)
+    }
+    fn stats(&self) -> (u64, u64) {
+        (0, self.0.requests)
     }
 }
 
@@ -1178,10 +2000,12 @@ fn usage_code(u: u8) -> Option<u16> {
     }
 }
 
-/// Feed the change from `old` to `new` (boot reports) through `keys`; the key values typed.
-fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> impl Iterator<Item = u32> {
+/// Feed the change from `old` to `new` (boot reports) through `keys`: the key values typed (and
+/// how many), and the last newly pressed key that typed something (usage, value), to repeat.
+fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> ([u32; 8], usize, Option<(u8, u32)>) {
     let mut out = [0u32; 8];
     let mut n = 0;
+    let mut held = None;
     // Modifiers first: left/right control, shift and alt.
     let mods = [(0, keymap::CTRL), (1, keymap::LSHIFT), (2, keymap::ALT), (4, keymap::CTRL), (5, keymap::RSHIFT), (6, keymap::ALT)];
     for (bit, code) in mods {
@@ -1204,9 +2028,124 @@ fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> impl Iterator<Item = u
         {
             out[n] = c;
             n += 1;
+            held = Some((u, c));
         }
     }
-    out.into_iter().take(n)
+    (out, n, held)
+}
+
+/// Parse a HID report descriptor (HID 1.11, 6.2.2) for a relative pointer: X and Y (Generic
+/// Desktop 0x30, 0x31, relative), the wheel (0x38) and buttons (Button page) in one input report.
+/// None if there is no relative X and Y in one report (an absolute pointer, a keyboard, anything
+/// else). Bounded by the descriptor's length; long items are skipped; push/pop are not followed.
+fn parse_mouse(d: &[u8]) -> Option<MouseFormat> {
+    const IDS: usize = 8;
+    let (mut page, mut lmin, mut size, mut count, mut rid) = (0u32, 0i32, 0u32, 0u32, 0u8);
+    let mut usages = [0u32; 16];
+    let (mut nu, mut umin, mut umax) = (0usize, None::<u32>, None::<u32>);
+    // Input bits so far per report id, and what was found per report id.
+    let mut bits: [(u8, u32); IDS] = [(0, 0); IDS];
+    let mut found: [(u8, MouseFormat, u8); IDS] = [(0, MouseFormat::default(), 0); IDS]; // (id, format, have: 1 x, 2 y)
+    let slot = |t: &mut [(u8, u32); IDS], id: u8| -> Option<usize> {
+        match t.iter().position(|e| e.0 == id) {
+            Some(i) => Some(i),
+            None => {
+                let i = t.iter().position(|e| e.0 == 0 && e.1 == 0 && id != 0).or_else(|| (id == 0).then_some(0))?;
+                t[i].0 = id;
+                Some(i)
+            }
+        }
+    };
+    let mut o = 0;
+    while o < d.len() {
+        let b = d[o];
+        if b == 0xFE {
+            // Long item: size byte, tag byte, data.
+            let n = usize::from(*d.get(o + 1)?);
+            o += 3 + n;
+            continue;
+        }
+        let n = [0usize, 1, 2, 4][usize::from(b & 3)];
+        let data = d.get(o + 1..o + 1 + n)?;
+        o += 1 + n;
+        let mut u: u32 = 0;
+        for (i, &x) in data.iter().enumerate() {
+            u |= u32::from(x) << (8 * i);
+        }
+        let s = match n {
+            1 => i32::from(u as u8 as i8),
+            2 => i32::from(u as u16 as i16),
+            _ => u as i32,
+        };
+        match (b >> 2) & 3 {
+            0 => {
+                // Main: Input (8), Output (9), Collection (10), Feature (11), End Collection (12).
+                if b >> 4 == 8 {
+                    let i = slot(&mut bits, rid)?;
+                    let (constant, variable, relative) = (u & 1 != 0, u & 2 != 0, u & 4 != 0);
+                    let f = &mut found[i];
+                    f.0 = rid;
+                    for k in 0..count.min(64) {
+                        let bit = bits[i].1 + k * size;
+                        let usage = match (umin, umax) {
+                            (Some(a), Some(z)) if a <= z => a.saturating_add(k).min(z),
+                            _ if nu > 0 => usages[(k as usize).min(nu - 1)],
+                            _ => 0,
+                        };
+                        let full = if usage > 0xFFFF { usage } else { page << 16 | usage };
+                        if constant || !variable || bit > u32::from(u16::MAX) || size == 0 || size > 32 {
+                            continue;
+                        }
+                        let field = Field { bit: bit as u16, size: size as u8, signed: lmin < 0 };
+                        match full {
+                            0x0001_0030 if relative && f.2 & 1 == 0 => {
+                                f.1.x = field;
+                                f.2 |= 1;
+                            }
+                            0x0001_0031 if relative && f.2 & 2 == 0 => {
+                                f.1.y = field;
+                                f.2 |= 2;
+                            }
+                            0x0001_0038 if relative && f.1.wheel.is_none() => f.1.wheel = Some(field),
+                            x if x >> 16 == 9 && size == 1 => {
+                                // Buttons: the first run of one-bit button fields.
+                                let bt = &mut f.1.buttons;
+                                if bt.size == 0 {
+                                    *bt = Field { bit: bit as u16, size: 1, signed: false };
+                                } else if u32::from(bt.bit) + u32::from(bt.size) == bit && bt.size < 16 {
+                                    bt.size += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    bits[i].1 = bits[i].1.saturating_add(count.saturating_mul(size));
+                }
+                (nu, umin, umax) = (0, None, None);
+            }
+            1 => match b >> 4 {
+                0 => page = u & 0xFFFF,
+                1 => lmin = s,
+                7 => size = u,
+                8 => rid = u as u8,
+                9 => count = u,
+                _ => {}
+            },
+            2 => match b >> 4 {
+                0 if nu < usages.len() => {
+                    usages[nu] = u;
+                    nu += 1;
+                }
+                1 => umin = Some(if n == 4 { u } else { page << 16 | u }),
+                2 => umax = Some(if n == 4 { u } else { page << 16 | u }),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    let (id, mut fmt, _) = *found.iter().find(|f| f.2 == 3)?;
+    fmt.id = id;
+    Some(fmt)
 }
 
 pub fn main(s: *const Startup) -> i32 {
@@ -1299,6 +2238,7 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         db,
         mem: Dma::new(dev, PAGES * 4096, sys::DMA_DEVICE_READ | sys::DMA_DEVICE_WRITE).map_err(|_| "cannot pin controller memory")?,
         slot_mem: Dma::new(dev, SLOT_PAGES * 4096, sys::DMA_DEVICE_READ | sys::DMA_DEVICE_WRITE).map_err(|_| "cannot pin device contexts")?,
+        fun_mem: Dma::new(dev, FUN_PAGES * 4096, sys::DMA_DEVICE_READ | sys::DMA_DEVICE_WRITE).map_err(|_| "cannot pin mouse and disk memory")?,
         _scratch: None,
         irq: sys::device_interrupt(dev, 0).map_err(|_| "no interrupt")?,
         tag,
@@ -1315,8 +2255,13 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         hubs: [None; MAX_HUBS],
         root: [PortState::default(); 64],
         kbds: [const { None }; MAX_KBDS],
+        mice: [const { None }; MAX_MICE],
+        disks: [const { None }; MAX_DISKS],
+        ctl: ch,
+        writable: libd::args() == b"rw",
+        requests: 0,
         port_events: 0,
-        deferred: [Trb { param: 0, status: 0, control: 0 }; REPORTS * 2],
+        deferred: [Trb { param: 0, status: 0, control: 0 }; REPORTS * 4],
         ndeferred: 0,
         next_poll: 0,
         last_cc: 0,
@@ -1326,7 +2271,7 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         return Err("controller does not support 4 KiB pages");
     }
     let high = |m: &Dma| m.addrs[..m.pages].iter().any(|a| a >> 32 != 0);
-    if hcc & 1 == 0 && (high(&x.mem) || high(&x.slot_mem)) {
+    if hcc & 1 == 0 && (high(&x.mem) || high(&x.slot_mem) || high(&x.fun_mem)) {
         return Err("32-bit controller but DMA addresses above 4 GiB");
     }
     // Stop and reset.
@@ -1399,15 +2344,39 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         if info.flags & sys::DEV_FLAG_IOMMU != 0 { "confined by the IOMMU" } else { "NOT confined (no IOMMU)" }
     );
     proto::send(ch, proto::READY, 0, 0);
-    let mut msg = [0u8; 256];
+    let mut msg = [0u8; HEADER + MAX_SECTORS as usize * SECTOR];
+    let mut data = [0u8; MAX_SECTORS as usize * SECTOR];
     loop {
-        if let Some((key, _)) = port.wait(x.wake_after()) {
+        if let Some((key, _)) = port.wait(x.wake_after(sys::clock_ns())) {
             if key == KEY_CTL {
-                match sys::channel_read(ch, &mut msg, 0) {
-                    Ok(n) => {
-                        if let Some(h) = Header::get(&msg[..n as usize]) {
+                loop {
+                    let mut hs = [0 as Handle; 1];
+                    match sys::channel_read_h(ch, &mut msg, &mut hs, 0) {
+                        Ok((n, nh)) => {
+                            let Some(h) = Header::get(&msg[..n]) else { continue };
+                            if h.op == proto::BLK_ATTACH {
+                                // The channel the storage service will use for disk `a`.
+                                let u = h.a as usize;
+                                match x.disks.get_mut(u).and_then(|d| d.as_mut()) {
+                                    Some(d) if nh == 1 => {
+                                        if d.ch != 0 {
+                                            sys::handle_close(d.ch);
+                                        }
+                                        d.ch = hs[0];
+                                        port.arm(hs[0], sys::READABLE | sys::PEER_CLOSED, KEY_DISK + u as u64);
+                                    }
+                                    _ if nh == 1 => {
+                                        sys::handle_close(hs[0]);
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            if nh > 0 {
+                                sys::handle_close(hs[0]);
+                            }
                             let (st, a, b) = match h.op {
-                                proto::STATS => (0, sys::interrupt_ack(x.irq).unwrap_or(0), x.reports),
+                                proto::STATS => (0, sys::interrupt_ack(x.irq).unwrap_or(0), x.reports + x.requests),
                                 proto::TEST_CRASH => {
                                     // SAFETY: deliberately faults (test).
                                     unsafe { core::ptr::write_volatile(0x10 as *mut u32, 1) };
@@ -1419,11 +2388,14 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
                             Header { txid: h.txid, op: h.op, status: st, a, b }.put(&mut out);
                             sys::channel_write(ch, &out);
                         }
+                        Err(sys::ERR_SHOULD_WAIT) => break,
+                        Err(_) => return Ok(0), // the device manager is gone
                     }
-                    Err(sys::ERR_SHOULD_WAIT) => {}
-                    Err(_) => return Ok(0), // the device manager is gone
                 }
                 port.arm(ch, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
+            } else if (KEY_DISK..KEY_DISK + MAX_DISKS as u64).contains(&key) {
+                let u = (key - KEY_DISK) as usize;
+                serve_disk(&mut x, u, &port, key, &mut msg, &mut data);
             } else {
                 let _ = sys::interrupt_ack(x.irq);
                 x.bar.w32(x.rt + IMAN, IMAN_IE | IMAN_IP);
@@ -1434,7 +2406,34 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         let now = sys::clock_ns();
         x.root_changes(now);
         x.service(now);
-        x.drain(ch); // keyboard reports that arrived during hub requests
+        x.drain(ch); // keyboard and mouse reports that arrived during hub requests
+        x.repeat_keys(ch, sys::clock_ns());
     }
+}
+
+/// Requests on disk `u`'s attached channel, until it is empty (then it is watched again) or
+/// closed (the storage service let the disk go).
+fn serve_disk(x: &mut Xhci, u: usize, port: &Port, key: u64, msg: &mut [u8], data: &mut [u8]) {
+    let Some(ch) = x.disks[u].as_ref().map(|d| d.ch).filter(|&c| c != 0) else { return };
+    let writable = x.writable;
+    loop {
+        let n = match sys::channel_read(ch, msg, 0) {
+            Ok(n) => n as usize,
+            Err(sys::ERR_SHOULD_WAIT) => {
+                port.arm(ch, sys::READABLE | sys::PEER_CLOSED, key);
+                return;
+            }
+            Err(_) => {
+                sys::handle_close(ch);
+                if let Some(d) = x.disks[u].as_mut() {
+                    d.ch = 0;
+                }
+                return;
+            }
+        };
+        let Some(h) = Header::get(&msg[..n]) else { continue };
+        crate::blkserve::block_op(&mut UsbDisks(x), ch, u, &h, &msg[..n], data, writable);
+    }
+
 }
 

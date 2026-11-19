@@ -34,6 +34,7 @@ mod input;
 mod keymap;
 mod nvme;
 mod ps2;
+mod trust;
 mod virtio;
 mod xhci;
 
@@ -121,6 +122,10 @@ struct Mgr {
     input: [Handle; MAX_INPUT_CLIENTS],
     /// Block drivers may write (argument `rw` or `test`); otherwise they start read-only.
     writable: bool,
+    /// Which keyboards may type (trust.rs).
+    trust: trust::Trust,
+    /// Drivers whose pointer input has been reported once (bit = driver index).
+    pointer_seen: u64,
 }
 
 /// Which driver serves a device.
@@ -232,7 +237,25 @@ impl Mgr {
                         }
                         proto::KEY => {
                             let from = d.prog;
-                            self.key(h.a as u32, from, i);
+                            let k = h.a as u32;
+                            match self.trust.key((i, h.b as u32), k) {
+                                trust::Verdict::Pass => self.key(k, from, i),
+                                trust::Verdict::FirstInUse => {
+                                    println!("devmgr: keyboard {} {} in use", from, h.b);
+                                    self.key(k, from, i);
+                                }
+                                trust::Verdict::Held { first: true } => println!(
+                                    "devmgr: a new keyboard ({} {}) is typing: its input is held until it is accepted with Ctrl+Alt+Insert on a keyboard already in use",
+                                    from, h.b
+                                ),
+                                trust::Verdict::Held { first: false } => {}
+                                trust::Verdict::Accepted(n) => println!("devmgr: {} new keyboard(s) accepted", n),
+                            }
+                        }
+                        proto::KEYBOARD_GONE => self.trust.gone((i, h.a as u32)),
+                        proto::POINTER => {
+                            let from = d.prog;
+                            self.pointer(h.a, h.b, from, i);
                         }
                         proto::DISK => {
                             d.disks_due = d.disks_due.saturating_sub(1);
@@ -362,6 +385,28 @@ impl Mgr {
         }
     }
 
+    /// Pointer input from a driver: to every client of the input endpoint; the first from each
+    /// driver start is logged.
+    fn pointer(&mut self, a: u64, b: u64, from: &'static str, dev: usize) {
+        if self.pointer_seen & (1 << dev) == 0 {
+            self.pointer_seen |= 1 << dev;
+            println!(
+                "devmgr: pointer input from {}: moved ({}, {}), buttons {:#x}",
+                from,
+                a as u32 as i32,
+                (a >> 32) as u32 as i32,
+                b & 0xFF
+            );
+        }
+        let mut msg = [0u8; HEADER + 24];
+        Header { txid: 0, op: proto::INPUT_POINTER, status: 0, a, b: (b & 0xFFFF) | (dev as u64) << 32 }.put(&mut msg);
+        let n = from.len().min(24);
+        msg[HEADER..HEADER + n].copy_from_slice(&from.as_bytes()[..n]);
+        for ch in self.input.iter().copied().filter(|&c| c != 0) {
+            sys::channel_write(ch, &msg[..HEADER + n]);
+        }
+    }
+
     /// A key from an input driver: to every client of the input endpoint. Lines are also
     /// assembled here (silently) for the driver tests.
     fn key(&mut self, k: u32, from: &'static str, dev: usize) {
@@ -404,6 +449,9 @@ impl Mgr {
         d.ready = false;
         d.disks_due = 0;
         println!("devmgr: {}.ddrv exited with code {}{}", d.prog, code, exit_text(code));
+        self.trust.driver_gone(i);
+        self.pointer_seen &= !(1u64 << i);
+        let Some(d) = self.drv[i].as_mut() else { return };
         // Quiesce: no decode, no bus mastering, until the next instance has reset the device.
         if d.info.kind == sys::DEV_KIND_PCI {
             let _ = sys::config_write(d.dev, 0x04, 2, 0);
@@ -492,6 +540,8 @@ fn devmgr_main(s: *const Startup) -> i32 {
         stop: false,
         input: [0; MAX_INPUT_CLIENTS],
         writable,
+        trust: trust::Trust::new(),
+        pointer_seen: 0,
     };
     if !writable {
         println!("devmgr: disks are read-only (block drivers refuse writes)");

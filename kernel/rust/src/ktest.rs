@@ -254,6 +254,61 @@ mod selftest {
         }
         check!(t, measure::pcr(23) == measure::extend(&[0; 32], &[7; 32]));
         crate::kprintln!("  measured boot: Ed25519 vectors, TPM 2.0 commands vs the simulator (3 broken TPMs refused), log replay matches");
+        attestation_with_tpm(t);
+    }
+
+    /// Hardware-rooted attestation against the simulated TPM (TEST keys): the report carries a
+    /// quote for the nonce and the EK certificate; a verifier's challenge is answered by the TPM
+    /// and only for its own EK and AK.
+    fn attestation_with_tpm(t: &mut T) {
+        use crate::security::{attest, measure};
+        use crate::security::tpm::{Sim, Tpm};
+        use doscrypt::{attest as rep, testkeys, tpm as dtpm, x509};
+        let Ok(tpm) = Tpm::new(Box::new(Sim::new())) else {
+            check!(t, false);
+            return;
+        };
+        measure::attach_tpm(tpm);
+        let nonce = [0x6Bu8; 32];
+        let r = attest::report(&nonce);
+        check!(t, r.is_some());
+        let r = r.unwrap_or_default();
+        let ev = rep::tpm_evidence(&r);
+        check!(t, ev.is_some());
+        if let Some(ev) = ev {
+            let p = |o: usize| -> [u8; 32] { r[o..o + 32].try_into().unwrap_or([0; 32]) };
+            let pcrs = [(rep::PCR_KERNEL, p(120)), (rep::PCR_CODE, p(152))];
+            check!(t, dtpm::verify_quote(ev.ak_public, ev.quote, ev.quote_sig, &nonce, &pcrs).is_ok());
+            check!(t, dtpm::verify_quote(ev.ak_public, ev.quote, ev.quote_sig, &[0; 32], &pcrs).is_err());
+            let ca = x509::parse(&testkeys::CA_CERT);
+            let cert = x509::parse(ev.ek_cert);
+            check!(t, matches!((cert, ca), (Some(c), Some(ca)) if c.signed_by(&ca)));
+            check!(t, r[12] & (rep::F_TPM | rep::F_TPM_MATCH) as u8 == (rep::F_TPM | rep::F_TPM_MATCH) as u8);
+        }
+        // The challenge round: the right challenge opens, a damaged or foreign one does not.
+        let cred = [0x42u8; 32];
+        if let Some((blob, secret)) = rep::challenge(&r, &cred, &[1; 32], &[2; 32]) {
+            check!(t, attest::activate(&blob, &secret) == Ok(cred));
+            let mut bad = blob;
+            bad[10] ^= 1;
+            check!(t, attest::activate(&bad, &secret) == Err(attest::ActivateError::Refused));
+            // The same credential for another AK (another name) is refused too.
+            let ek = dtpm::parse_rsa_ek(ev.map_or(&[][..], |e| e.ek_public));
+            if let Some(ek) = ek {
+                let other = dtpm::make_credential(&ek, &[0x77; 34], &cred, &[3; 32], &[4; 32]);
+                check!(t, other.is_some_and(|(b, s)| attest::activate(&b, &s) == Err(attest::ActivateError::Refused)));
+            } else {
+                check!(t, false);
+            }
+            check!(t, attest::activate(&blob, &secret) == Ok(cred)); // still usable afterwards
+        } else {
+            check!(t, false);
+        }
+        attest::forget_tpm();
+        measure::detach_tpm();
+        check!(t, attest::activate(&[0; dtpm::ID_OBJECT], &[0; dtpm::SECRET]) == Err(attest::ActivateError::NoTpm));
+        attest::forget_tpm();
+        crate::kprintln!("  attestation: TPM quote for the nonce, EK certificate chain, credential challenge (foreign ones refused)");
     }
 
     #[unsafe(no_mangle)]

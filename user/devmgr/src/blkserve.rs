@@ -42,7 +42,7 @@ pub fn reply(ch: Handle, h: &Header, status: i32, a: u64, b: u64, payload: &[u8]
     sys::channel_write(ch, &buf[..HEADER + payload.len()]);
 }
 
-fn block_op(d: &mut impl Disk, ch: Handle, unit: usize, h: &Header, msg: &[u8], data: &mut [u8], writable: bool) {
+pub fn block_op(d: &mut impl Disk, ch: Handle, unit: usize, h: &Header, msg: &[u8], data: &mut [u8], writable: bool) {
     let cap = d.capacity(unit);
     if !writable && matches!(h.op, proto::BLK_WRITE | proto::BLK_FLUSH) {
         reply(ch, h, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);

@@ -46,6 +46,9 @@ static WORK: Event = Event::new(c"acpi.work", true);
 static DONE: Event = Event::new(c"acpi.done", true);
 static LOADED: AtomicBool = AtomicBool::new(false);
 static SLEEP_REQ: AtomicU32 = AtomicU32::new(0);
+/// TPM start requests (`tpm_start`): 1 = asked, then the answer: 2 done, 3 refused.
+static TPM_REQ: AtomicU32 = AtomicU32::new(0);
+static TPM_DONE: Event = Event::new(c"acpi.tpm", true);
 
 /// The SCI's registers (I/O ports), set before the SCI is routed.
 static SCI_VECTOR: AtomicU32 = AtomicU32::new(0);
@@ -442,6 +445,28 @@ pub extern "C" fn dkrnl_acpi_prepare_sleep(state: u32) {
     }
 }
 
+/// Start the command in the TPM's CRB buffer the ACPI way (TPM2 table start method 2 or 8): the
+/// TPM device's `_DSM` (UUID 6BBF6CAB-5463-4714-B7CD-F0203C0368D4, revision 1, function 1), run
+/// on the ACPI thread. Returns when the method has returned (it waits for the firmware TPM).
+/// Callers are serialised by the measurement lock, the TPM's only user.
+pub fn tpm_start() -> Result<(), &'static str> {
+    if !LOADED.load(Ordering::Acquire) {
+        return Err("AML not loaded");
+    }
+    TPM_REQ.store(1, Ordering::Release);
+    WORK.signal();
+    if !TPM_DONE.wait_timeout(10_000_000_000) {
+        return Err("TPM start method did not return in 10 s");
+    }
+    match TPM_REQ.swap(0, Ordering::AcqRel) {
+        2 => Ok(()),
+        _ => Err("TPM start method failed"),
+    }
+}
+
+/// The TPM start `_DSM` UUID in its ACPI buffer form (the first three fields little-endian).
+const TPM_START_UUID: [u8; 16] = [0xAB, 0x6C, 0xBF, 0x6B, 0x63, 0x54, 0x14, 0x47, 0xB7, 0xCD, 0xF0, 0x20, 0x3C, 0x03, 0x68, 0xD4];
+
 /// Called from `dkrnl_dev_irq` for every device vector: true if it was the SCI.
 pub fn sci_irq(vector: u32) -> bool {
     let v = SCI_VECTOR.load(Ordering::Acquire);
@@ -507,6 +532,8 @@ struct State {
     /// Per-GPE: (events this second, disabled for good).
     counts: Vec<(u32, bool)>,
     window: u64,
+    /// The TPM device's `_DSM` (MSFT0101), looked up on the first start request.
+    tpm_dsm: Option<Option<aml::NodeId>>,
 }
 
 impl State {
@@ -601,6 +628,31 @@ impl State {
         for &(port, half) in &self.pm1 {
             let en = inw(port + half);
             outw(port + half, en | (pending & PWRBTN) as u16);
+        }
+    }
+
+    fn tpm_start(&mut self) -> bool {
+        let dsm = *self.tpm_dsm.get_or_insert_with(|| {
+            let dev = self.aml.find_devices(&["MSFT0101"]).into_iter().next()?;
+            self.aml.child(dev, "_DSM")
+        });
+        let Some(dsm) = dsm else {
+            kprintln!("ACPI: TPM start: no MSFT0101 device with a _DSM");
+            return false;
+        };
+        let args = alloc::vec![Object::buffer(&TPM_START_UUID), Object::int(1), Object::int(1), Object::package(Vec::new())];
+        let r = self.aml.evaluate_node(dsm, args);
+        self.handle_notifies();
+        match r {
+            Ok(Object::Integer(0)) => true,
+            Ok(o) => {
+                kprintln!("ACPI: TPM start _DSM returned {}", o.type_name());
+                false
+            }
+            Err(e) => {
+                kprintln!("ACPI: TPM start _DSM: {}", e);
+                false
+            }
         }
     }
 
@@ -723,6 +775,7 @@ extern "C" fn worker() {
         fixed_button: flags & FLAG_PWR_BUTTON == 0 && flags & FLAG_HW_REDUCED == 0,
         counts: Vec::new(),
         window: 0,
+        tpm_dsm: None,
     };
     sci_setup(&mut st, fadt, flags);
     LOADED.store(true, Ordering::Release);
@@ -735,6 +788,9 @@ fn idle() -> ! {
         WORK.wait();
         if SLEEP_REQ.swap(0, Ordering::AcqRel) != 0 {
             DONE.signal();
+        }
+        if TPM_REQ.compare_exchange(1, 3, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            TPM_DONE.signal();
         }
     }
 }
@@ -819,6 +875,11 @@ fn serve(mut st: State) -> ! {
         if s != 0 {
             st.prepare_sleep(s - 1);
             DONE.signal();
+        }
+        if TPM_REQ.load(Ordering::Acquire) == 1 {
+            let ok = st.tpm_start();
+            TPM_REQ.store(if ok { 2 } else { 3 }, Ordering::Release);
+            TPM_DONE.signal();
         }
         let pm1 = PENDING_PM1.swap(0, Ordering::AcqRel);
         if pm1 != 0 {

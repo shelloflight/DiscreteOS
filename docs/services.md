@@ -151,11 +151,14 @@ reading plus the monotonic clock (no drift correction yet). `TIME_BASE` on `cloc
 reading (`libd::time::query`, `set_base`, `now`). The storage service stamps file times with
 it.
 
-### Keyboard input
+### Keyboard and pointer input
 
-The device manager sends every key from any keyboard driver to each client of `devmgr.input`
+The device manager sends every key from a keyboard in use to each client of `devmgr.input`
 (`proto::INPUT_KEY`: a character or a named key with modifiers, and the driver's name). The
-terminal turns them into edited lines for the shell ([shell.md](shell.md)).
+terminal turns them into edited lines for the shell ([shell.md](shell.md)). A keyboard plugged in
+while another is in use is held until accepted with Ctrl+Alt+Insert on one in use
+(`user/devmgr/src/trust.rs`, [hardware.md](hardware.md)). Mice send `proto::INPUT_POINTER`
+(relative movement, wheel, buttons); no client uses them yet.
 
 ### Tool manifests
 

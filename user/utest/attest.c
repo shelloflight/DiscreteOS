@@ -2,7 +2,8 @@
  * Remote attestation from ring 3 (docs/attestation.md).
  *
  *   test_attest()   (utest all) the attest syscall's contract: a report for our nonce, same key
- *                   for every report of this boot, refused buffers and pointers.
+ *                   for every report of this boot, refused buffers and pointers; attest_activate
+ *                   refuses challenges it cannot answer.
  *   attest_print()  (utest attest) what a program does for a remote party: take its nonce, get a
  *                   report, send it. Here "sending" is printing the report in hex on the log; the
  *                   test harness (build.ps1 Test-AttestReport) plays the remote verifier with
@@ -51,7 +52,8 @@ void test_attest(void)
     CHECK(memcmp(report, REPORT_MAGIC, 8) == 0);
     CHECK(memcmp(report + OFF_NONCE, n1, 32) == 0);
     uint32_t events = u32_at(report, OFF_COUNT);
-    CHECK(events >= 2 && (uint64_t)len == 188 + 92ull * events + 64);   /* kernel + attestation key at least */
+    uint32_t tpm = (uint64_t)len >= 188 + 92ull * events + 4 ? u32_at(report, 188 + 92 * events) : 0xFFFFFFFFu;
+    CHECK(events >= 2 && (uint64_t)len == 188 + 92ull * events + 4 + tpm + 64);   /* kernel + attestation key at least */
     int64_t len2 = dos_attest(n2, report2, sizeof(report2));
     CHECK(len2 >= len);
     CHECK(memcmp(report2 + OFF_NONCE, n2, 32) == 0);
@@ -64,8 +66,15 @@ void test_attest(void)
     EXPECT(dos_attest((const uint8_t *)KERNEL_ADDR, report, sizeof(report)), DOS_ERR_BAD_ADDRESS);
     EXPECT(dos_attest(n1, (void *)KERNEL_ADDR, sizeof(report)), DOS_ERR_BAD_ADDRESS);
     EXPECT(dos_attest(n1, (void *)UNMAPPED, sizeof(report)), DOS_ERR_BAD_ADDRESS);
-    dos_printf("utest: attest: %ld-byte report, %u events, same key for every report of this boot, bad buffers refused\n",
-               len, events);
+    /* attest_activate: a challenge that is not for this TPM is refused (no TPM: not supported). */
+    static uint8_t challenge[DOS_ATTEST_CHALLENGE];
+    uint8_t cred[32];
+    memset(challenge, 0x11, sizeof(challenge));
+    EXPECT(dos_attest_activate(challenge, cred), tpm ? DOS_ERR_ACCESS_DENIED : DOS_ERR_NOT_SUPPORTED);
+    EXPECT(dos_attest_activate((const uint8_t *)KERNEL_ADDR, cred), DOS_ERR_BAD_ADDRESS);
+    EXPECT(dos_attest_activate(challenge, (uint8_t *)KERNEL_ADDR), DOS_ERR_BAD_ADDRESS);
+    dos_printf("utest: attest: %ld-byte report, %u events, TPM evidence %u bytes, same key for every report of this boot, bad buffers and challenges refused\n",
+               len, events, tpm);
 }
 
 static void hex_line(const char *tag, const uint8_t *b, uint32_t n)

@@ -63,8 +63,10 @@ The kernel keeps a measurement log and software PCRs (SHA-256 bank, TPM extend r
 | 10 | every program the kernel verified (`.dsig` header) or allowed unsigned (content hash); every service manifest the service manager accepted or refused (`svc ...`, [services.md](services.md)) |
 
 On UEFI machines with a TPM, the loader also extends PCR 8 through TCG2. The kernel's TPM 2.0
-driver (ACPI `TPM2` table, TIS or CRB interface) replays the log into the TPM and mirrors every
-later measurement; if the TPM fails, the kernel's log stays authoritative. kdb `measure` prints the
+driver (ACPI `TPM2` table: TIS, or CRB started by register, by the TPM device's ACPI `_DSM` as AMD
+firmware TPMs need, or both) replays the log into the TPM and mirrors every later measurement; if
+the TPM fails, the kernel's log stays authoritative. The TPM also quotes PCRs 8 and 10 for remote
+attestation ([attestation.md](attestation.md)). kdb `measure` prints the
 log and PCRs.
 
 ## Tests
@@ -80,8 +82,8 @@ log and PCRs.
 ## Limitations
 
 - The loader is not signed for UEFI Secure Boot; BIOS has no hardware root of trust at all.
-- TPM: TIS/CRB are only exercised on real hardware; TPMs that need the ACPI start method (an AML
-  `_DSM`, AMD firmware TPMs) are not supported yet.
+- TPM: TIS and CRB are only exercised on real hardware (QEMU on Windows has no TPM); the command
+  layer and attestation are tested against the kernel's simulated TPM.
 - One compiled-in key; no revocation or rotation yet.
 - Verification is not constant-time (it handles public data only). Ed25519 signing is (the kernel signs
   attestation reports with its per-boot key).

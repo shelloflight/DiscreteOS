@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 11
+#define DOS_ABI_VERSION 12
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -116,6 +116,8 @@ enum {
     DOS_SYS_DISPLAY_INFO, DOS_SYS_PROCESS_HANDLES,
     /* ABI v10: D-CMPL's Linux server (mmap, clone) */
     DOS_SYS_PROCESS_VMAR, DOS_SYS_THREAD_CREATE_STOPPED,
+    /* ABI v12: hardware-rooted attestation */
+    DOS_SYS_ATTEST_ACTIVATE,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -371,7 +373,8 @@ static inline int64_t dos_vmo_verify(dos_handle_t vmo, dos_handle_t dsig) { retu
 static inline int64_t dos_vmo_allow_unsigned(dos_handle_t vmo, dos_handle_t vmex) { return DOS_SC(DOS_SYS_VMO_ALLOW_UNSIGNED, vmo, vmex, 0, 0, 0, 0); }
 
 /* ---- remote attestation (ABI v5; docs/attestation.md) ------------------------------------------ */
-#define DOS_ATTEST_MAX 23804u   /* the largest report (a full 256-event log) */
+#define DOS_ATTEST_MAX 26624u   /* the largest report (a full 256-event log, TPM evidence) */
+#define DOS_ATTEST_CHALLENGE 328u /* a TPM credential challenge: blob (70 bytes), then secret (258) */
 /* A signed report of what this machine runs, for a remote party's 32-byte nonce. Returns its
  * length, or DOS_ERR_BUFFER_TOO_SMALL (cap < length; nothing written). */
 #define DOS_POWER_OFF    1
@@ -448,6 +451,9 @@ struct dos_boot_time {
 };
 _Static_assert(sizeof(struct dos_boot_time) == 32, "dos_boot_time layout");
 static inline int64_t dos_attest(const uint8_t nonce[32], void *buf, uint64_t cap) { return DOS_SC(DOS_SYS_ATTEST, nonce, buf, cap, 0, 0, 0); }
+/* ABI v12: answer a verifier's TPM credential challenge (DOS_ATTEST_CHALLENGE bytes): 32 bytes to
+ * out. DOS_ERR_NOT_SUPPORTED without a TPM, DOS_ERR_ACCESS_DENIED when the TPM refuses. */
+static inline int64_t dos_attest_activate(const uint8_t *challenge, uint8_t out[32]) { return DOS_SC(DOS_SYS_ATTEST_ACTIVATE, challenge, out, 0, 0, 0, 0); }
 
 /* ---- storage (docs/storage.md; mirrors user/lib/libd/src/fs.rs) ---------------------------
  * Service messages start with a 32-byte header; VOLUME carries a channel to a volume's root. */

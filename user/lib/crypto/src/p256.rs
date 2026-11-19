@@ -294,7 +294,6 @@ impl Curve {
         Some(self.f.out_of_mont(&self.f.mul(&p.x, &self.f.sqr(&zi))))
     }
 
-    #[cfg(test)]
     fn affine(&self, p: &Jac) -> Option<(U256, U256)> {
         if is_zero(&p.z) {
             return None;
@@ -384,10 +383,14 @@ pub fn verify(key: &PublicKey, msg: &[u8], sig: &[u8; 64]) -> bool {
     }
 }
 
-// ---- test-only signing (fixed nonce k: never for real keys) -------------------------------------
+// ---- signing with a caller-chosen nonce: tests and the TPM simulator only ------------------------
 
 #[cfg(test)]
-pub(crate) mod testsign {
+pub(crate) use sim as testsign;
+
+/// Signing for the test TPM simulator and the tests: the caller picks the nonce `k`, nothing is
+/// constant-time. Never for a real key.
+pub mod sim {
     use super::*;
 
     /// Public key of the private scalar `d` (big-endian, 1 <= d < n).

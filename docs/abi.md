@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **11**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **12**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -33,6 +33,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 9 | the terminal and the shell (67-68): the `display` device and `display_info`; `process_handles` |
 | 10 | D-CMPL's Linux server (69-70): `process_vmar`, `thread_create_stopped`; `exception_resume` can end one thread (`EXIT_THREAD`) |
 | 11 | the POWER_BUTTON startup handle: an event the kernel signals on each power-button press ([acpi.md](acpi.md)) |
+| 12 | hardware-rooted attestation (71): `attest_activate`; reports carry TPM evidence (format 2) |
 
 ## Calling convention (x86-64)
 
@@ -147,6 +148,7 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 68 | process_handles | process, `struct dos_handle_entry *`, cap | handles it holds (at most 256 entries copied: type, rights, koid, name; never handle values) | INSPECT |
 | 69 | process_vmar | process | its root VMAR handle | MANAGE |
 | 70 | thread_create_stopped | process, entry, stack top, arg | thread handle; it stops with a `START` exception before its first instruction (`BAD_STATE` without an exception channel) | MANAGE |
+| 71 | attest_activate | challenge (328 bytes), out (32 bytes) | 32; `NOT_SUPPORTED` without a TPM, `ACCESS_DENIED` if the TPM refuses | |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.
@@ -240,7 +242,8 @@ Register sets from user space are validated (user addresses only, user-settable 
   and requires every byte past the signed size to be zero. `vmo_allow_unsigned` lets a VMEX holder
   run unsigned code. Both decisions are measured into PCR 10.
 - `attest` returns a signed report for the caller's nonce ([attestation.md](attestation.md));
-  `DOS_ATTEST_MAX` bytes hold any report.
+  `DOS_ATTEST_MAX` bytes hold any report. `attest_activate` answers a verifier's TPM credential
+  challenge (the hardware-rooted step).
 - `system_power` needs the POWER resource; nothing is flushed by the kernel ([power.md](power.md)).
 - The kernel log: every `log_write`/`log_record` becomes records attributed by the kernel to the
   writing process (koid and name; a program cannot write under another's name). `klog_read`
@@ -277,6 +280,6 @@ manager, which grants each to its driver.
 `user` (`utest all`: handles, rights, invalid pointers, memory, threads, spawn, user faults, kill,
 FPU state, IPC, ports, exceptions; `kasan-user` repeats it under KASAN), `fuzz` (ELF parser
 mutations and random syscalls), `smap`, `smep`, `compat`, `drivers` (`drivers-amd` on AMD-Vi),
-`keyboard`, `usbkbd` (`usbnokbd`: no keyboard; `usbhub`: behind two hubs; `usbplug`: hot-plug, a reconnecting device; `usbtwo`: two keyboards on one controller), `attest`, `poweroff`,
+`keyboard`, `usbkbd` (`usbnokbd`: a mouse and a tablet, no keyboard; `usbhub`: behind two hubs; `usbplug`: hot-plug, a reconnecting device; `usbtwo`: two keyboards on one controller; `usbrepeat`: key repeat and Caps Lock; `usbhold`: a new keyboard held; `usbstorage`, `usbstorage2`: a USB stick on a USB 3 port, behind a hub), `attest` (`attest-tpm`: with the simulated TPM), `poweroff`,
 `services` (MANIFEST and MEASURE handles, `measure`, manifest signatures, `klog_read` filtering,
 `log_record` levels), `time`, `time-uefi` (BOOT_TIME), `shell` (the display, `process_handles`).

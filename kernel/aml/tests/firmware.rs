@@ -269,3 +269,31 @@ fn fuzz_firmware_ssdts() {
         n * ssdts.len()
     );
 }
+
+/// A firmware TPM started the ACPI way (TPM2 start method 2, AMD): its device's `_DSM` with the TPM
+/// start UUID lists function 1 and runs it, as the kernel's CRB driver calls it for each command.
+#[test]
+fn firmware_tpm_start_method() {
+    let t = tables();
+    if t.is_empty() {
+        return;
+    }
+    let mut i = load_all(&t);
+    let Some(dev) = i.find_devices(&["MSFT0101"]).into_iter().next() else {
+        println!("aml firmware: no TPM device (MSFT0101)");
+        return;
+    };
+    let Some(dsm) = i.child(dev, "_DSM") else {
+        println!("aml firmware: TPM {} has no _DSM", i.path(dev));
+        return;
+    };
+    let uuid = [0xAB, 0x6C, 0xBF, 0x6B, 0x63, 0x54, 0x14, 0x47, 0xB7, 0xCD, 0xF0, 0x20, 0x3C, 0x03, 0x68, 0xD4];
+    let args = |f: u64| vec![Object::buffer(&uuid), Object::int(1), Object::int(f), Object::package(vec![])];
+    let funcs = i.evaluate_node(dsm, args(0)).expect("TPM start _DSM function 0");
+    let Object::Buffer(b) = &funcs else { panic!("function 0 returned {}", funcs.type_name()) };
+    let mask = b.borrow().first().copied().unwrap_or(0);
+    assert!(mask & 0b11 == 0b11, "function 1 (start) not listed: {mask:#x}");
+    let r = i.evaluate_node(dsm, args(1)).expect("TPM start _DSM function 1");
+    assert!(matches!(r, Object::Integer(0)), "start returned {}", r.type_name());
+    println!("aml firmware: TPM {}: start method _DSM lists functions {mask:#04x}, start returns 0", i.path(dev));
+}

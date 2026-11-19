@@ -48,6 +48,11 @@ pub struct Keys {
 }
 
 impl Keys {
+    /// Caps Lock is on (a keyboard's LED follows it).
+    pub fn caps(&self) -> bool {
+        self.caps
+    }
+
     /// A key went down (`down`) or up; the key value it produces, if any.
     pub fn key(&mut self, code: u16, down: bool) -> Option<u32> {
         match code {

@@ -131,6 +131,26 @@ pub fn snapshot(mut f: impl FnMut(&Event)) -> (usize, u64, [[u8; 32]; PCRS]) {
     (l.n, l.lost, l.pcrs)
 }
 
+/// Like `snapshot`, and `g(tpm, PCRs)` under the same lock when there is a TPM (attestation:
+/// the TPM quotes exactly the PCRs reported).
+pub fn snapshot_with_tpm<R>(
+    mut f: impl FnMut(&Event),
+    g: impl FnOnce(&mut Tpm, &[[u8; 32]; PCRS]) -> R,
+) -> (usize, u64, [[u8; 32]; PCRS], Option<R>) {
+    let mut l = LOG.lock();
+    for e in l.events.iter().take(l.n) {
+        f(e);
+    }
+    let pcrs = l.pcrs;
+    let r = l.tpm.as_mut().map(|t| g(t, &pcrs));
+    (l.n, l.lost, pcrs, r)
+}
+
+/// `f(tpm)` under the log lock; None without a TPM.
+pub fn with_tpm<R>(f: impl FnOnce(&mut Tpm) -> R) -> Option<R> {
+    LOG.lock().tpm.as_mut().map(f)
+}
+
 /// With a TPM: does every PCR the log touched match the hardware? (selftest, attestation)
 pub fn tpm_matches() -> Option<bool> {
     let mut l = LOG.lock();
@@ -147,5 +167,10 @@ pub fn tpm_present() -> bool {
 /// Test builds: drop the TPM (the selftest attaches a simulator and must leave no trace).
 #[cfg(ktest)]
 pub fn detach_tpm() {
-    LOG.lock().tpm = None;
+    let mut l = LOG.lock();
+    l.tpm = None;
+    let n = l.n;
+    for e in l.events.iter_mut().take(n) {
+        e.in_tpm = false; // the next TPM attached gets the whole log replayed
+    }
 }

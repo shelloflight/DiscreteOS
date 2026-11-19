@@ -1,4 +1,4 @@
-//! SHA-256 and SHA-512 (FIPS 180-4), streaming.
+//! SHA-256, SHA-384 and SHA-512 (FIPS 180-4), streaming.
 
 const K512: [u64; 80] = [
     0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc, 0x3956c25bf348b538, 0x59f111f1b605d019,
@@ -59,9 +59,26 @@ impl Default for Sha512 {
     }
 }
 
+const H384: [u64; 8] = [
+    0xcbbb9d5dc1059ed8, 0x629a292a367cd507, 0x9159015a3070dd17, 0x152fecd8f70e5939, 0x67332667ffc00b31, 0x8eb44a8768581511,
+    0xdb0c2e0d64f98fa7, 0x47b5481dbefa4fa4,
+];
+
 impl Sha512 {
     pub const fn new() -> Sha512 {
         Sha512 { h: H512, buf: [0; 128], n: 0, len: 0 }
+    }
+
+    /// SHA-384: SHA-512 with its own initial value, truncated to 48 bytes (`finish_384`).
+    pub const fn new_384() -> Sha512 {
+        Sha512 { h: H384, buf: [0; 128], n: 0, len: 0 }
+    }
+
+    pub fn finish_384(self) -> [u8; 48] {
+        let full = self.finish();
+        let mut out = [0u8; 48];
+        out.copy_from_slice(&full[..48]);
+        out
     }
 
     fn block(h: &mut [u64; 8], b: &[u8]) {
@@ -227,6 +244,12 @@ impl Sha256 {
         }
         out
     }
+}
+
+pub fn sha384(data: &[u8]) -> [u8; 48] {
+    let mut h = Sha512::new_384();
+    h.update(data);
+    h.finish_384()
 }
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {

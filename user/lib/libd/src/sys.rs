@@ -81,7 +81,7 @@ pub const TAG_BOOT_TIME: u32 = 12;
 pub const TAG_POWER_BUTTON: u32 = 13;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 11;
+pub const ABI_VERSION: u32 = 12;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -180,8 +180,9 @@ pub mod nr {
     pub const PROCESS_HANDLES: u64 = 68;
     pub const PROCESS_VMAR: u64 = 69;
     pub const THREAD_CREATE_STOPPED: u64 = 70;
+    pub const ATTEST_ACTIVATE: u64 = 71;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 71;
+    pub const COUNT: u64 = 72;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -763,6 +764,12 @@ pub fn process_write_memory(proc: Handle, addr: u64, data: &[u8]) -> i64 {
 /// A signed attestation report for `nonce` into `buf` (docs/attestation.md): its length.
 pub fn attest(nonce: &[u8; 32], buf: &mut [u8]) -> R {
     res(sc(nr::ATTEST, nonce.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0))
+}
+/// A TPM credential challenge's size (blob, then secret).
+pub const ATTEST_CHALLENGE: usize = 328;
+/// ABI v12: answer a verifier's TPM credential challenge (docs/attestation.md).
+pub fn attest_activate(challenge: &[u8; ATTEST_CHALLENGE], out: &mut [u8; 32]) -> R {
+    res(sc(nr::ATTEST_ACTIVATE, challenge.as_ptr() as u64, out.as_mut_ptr() as u64, 0, 0, 0, 0))
 }
 /// ABI v7, with the MEASURE resource: extend PCR 10 with `digest`, logged as `svc <text>`
 /// (printable ASCII, at most `MEASURE_TEXT` bytes).
