@@ -164,6 +164,18 @@ pub fn tpm_present() -> bool {
     LOG.lock().tpm.is_some()
 }
 
+/// `dkrnl_tpm_suspend`: save TPM state before ACPI S3 sleep (`TPM2_Shutdown(TPM_SU_STATE)`).
+#[unsafe(no_mangle)]
+pub extern "C" fn dkrnl_tpm_suspend() {
+    let mut l = LOG.lock();
+    if let Some(t) = l.tpm.as_mut()
+        && let Err(e) = t.shutdown_state()
+    {
+        l.tpm_errors += 1;
+        kprintln!("TPM: Shutdown(STATE) before S3 failed ({:?})", e);
+    }
+}
+
 /// `dkrnl_tpm_resume`: restore TPM state after ACPI S3 sleep (`TPM2_Startup(TPM_SU_STATE)`).
 #[unsafe(no_mangle)]
 pub extern "C" fn dkrnl_tpm_resume() {

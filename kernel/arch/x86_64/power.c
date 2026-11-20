@@ -18,6 +18,7 @@
 #include "acpi.h"
 #include "apic.h"
 #include "arch.h"
+#include "cet.h"
 #include "cpu.h"
 #include "cpupm.h"
 #include "ktime.h"
@@ -50,6 +51,10 @@ _Static_assert(sizeof(struct gas) == 12, "GAS layout");
 #define FADT_PM1B_EVT      60
 #define FADT_PM1A_CNT      64
 #define FADT_PM1B_CNT      68
+#define FADT_GPE0_BLK      80
+#define FADT_GPE1_BLK      84
+#define FADT_GPE0_LEN      92
+#define FADT_GPE1_LEN      93
 #define FADT_BOOT_ARCH     109
 #define FADT_FLAGS         112
 #define FADT_RESET_REG     116
@@ -60,6 +65,8 @@ _Static_assert(sizeof(struct gas) == 12, "GAS layout");
 #define FADT_X_PM1B_EVT    160
 #define FADT_X_PM1A_CNT    172
 #define FADT_X_PM1B_CNT    184
+#define FADT_X_GPE0_BLK    220
+#define FADT_X_GPE1_BLK    232
 #define FADT_SLEEP_CONTROL 244
 
 /* FACS field offsets (ACPI 6.5, table 5.15) */
@@ -71,7 +78,10 @@ _Static_assert(sizeof(struct gas) == 12, "GAS layout");
 #define BOOT_ARCH_8042     (1u << 1)
 
 #define WAK_STS     (1u << 15)   /* PM1 status (RW1C) */
+#define PWRBTN_STS  (1u << 8)
+#define PM1_ALL_STS 0xC731u      /* TMR, BM, GBL, PWRBTN, SLPBTN, RTC, PCIEXP_WAKE, WAK */
 #define SLP_EN      (1u << 13)   /* PM1 control */
+#define SLP_TYP_MASK (7u << 10)
 #define SCI_EN      (1u << 0)
 #define HWR_SLP_EN  (1u << 5)    /* sleep control register (hardware-reduced ACPI) */
 
@@ -85,11 +95,14 @@ static struct {
     uint8_t  typ_a, typ_b;
     bool     s3;               /* \_S3 found */
     uint8_t  s3_a, s3_b;
+    uint8_t  s0_a, s0_b;       /* \_S0 (working state; 0 when absent) */
     uint64_t facs_pa;          /* physical address of FACS (0 = none/invalid) */
     bool     hw_reduced;
     struct gas pm1a_evt, pm1b_evt;
     struct gas pm1a, pm1b;     /* control blocks (address 0 = absent) */
     struct gas sleep_ctl;      /* hardware-reduced ACPI */
+    struct gas gpe[2];         /* GPE0/GPE1 blocks: status bytes, then as many enable bytes */
+    uint8_t  gpe_len[2];
     uint32_t smi_cmd;
     uint8_t  acpi_enable;
     bool     reset_reg;
@@ -158,6 +171,46 @@ static bool gas_read16(const struct gas *g, uint16_t *out)
         return true;
     }
     return false;
+}
+
+/* The PM1 control value with SLP_TYP = typ and SLP_EN as asked; every other bit is kept as read.
+ * SCI_EN above all: clearing it hands ACPI events to SMM, where firmware may take the press
+ * that wakes the machine for a power-off request. */
+static uint16_t pm1_cnt_value(const struct gas *g, uint8_t typ, bool en)
+{
+    uint16_t cnt = 0;
+    (void)gas_read16(g, &cnt);
+    cnt = (uint16_t)((cnt & ~(SLP_TYP_MASK | SLP_EN)) | ((uint32_t)(typ & 7) << 10));
+    return en ? (uint16_t)(cnt | SLP_EN) : cnt;
+}
+
+/* Every GPE off and its status cleared before sleep, so no pending event wakes the machine at
+ * once. No wake GPE is armed: the power button (a fixed-feature wake source) wakes it. The ACPI
+ * thread re-enables the run-time GPEs after \_WAK. */
+static void gpe_quiesce(void)
+{
+    for (int b = 0; b < 2; b++) {
+        uint32_t half = pw.gpe_len[b] / 2u;
+        if (!pw.gpe[b].address || !half)
+            continue;
+        struct gas g = pw.gpe[b];
+        g.access_size = 1;
+        g.bit_width = 8;
+        for (uint32_t i = 0; i < half; i++) {
+            g.address = pw.gpe[b].address + half + i;
+            (void)gas_write(&g, 0, 1);              /* enable */
+            g.address = pw.gpe[b].address + i;
+            (void)gas_write(&g, 0xFF, 1);           /* status (write 1 to clear) */
+        }
+    }
+}
+
+static void pm1_clear_status(uint32_t bits)
+{
+    if (pw.pm1a_evt.address)
+        (void)gas_write(&pw.pm1a_evt, bits, 2);
+    if (pw.pm1b_evt.address)
+        (void)gas_write(&pw.pm1b_evt, bits, 2);
 }
 
 /* ---- \_S5 in AML -------------------------------------------------------------------------------- */
@@ -300,6 +353,21 @@ void power_init(void)
         if (x.address)
             pw.pm1b = x;
     }
+    if (len >= FADT_GPE1_LEN + 1) {
+        legacy_io_gas(&pw.gpe[0], rd32(f, FADT_GPE0_BLK));
+        legacy_io_gas(&pw.gpe[1], rd32(f, FADT_GPE1_BLK));
+        pw.gpe_len[0] = f[FADT_GPE0_LEN];
+        pw.gpe_len[1] = f[FADT_GPE1_LEN];
+        if (len >= FADT_X_GPE1_BLK + 12) {
+            struct gas x;
+            memcpy(&x, f + FADT_X_GPE0_BLK, sizeof(x));
+            if (x.address)
+                pw.gpe[0] = x;
+            memcpy(&x, f + FADT_X_GPE1_BLK, sizeof(x));
+            if (x.address)
+                pw.gpe[1] = x;
+        }
+    }
     if (len >= FADT_RESET_VALUE + 1 && (flags & FLAG_RESET_REG_SUP)) {
         memcpy(&pw.reset, f + FADT_RESET_REG, sizeof(pw.reset));
         pw.reset_value = f[FADT_RESET_VALUE];
@@ -328,6 +396,7 @@ void power_init(void)
     if (d && memcmp(d, "DSDT", 4) == 0 && dlen > 36) {
         pw.s5 = power_parse_s5(d + 36, dlen - 36, &pw.typ_a, &pw.typ_b) == 0;
         pw.s3 = power_parse_sx(d + 36, dlen - 36, "_S3_", &pw.s3_a, &pw.s3_b) == 0;
+        (void)power_parse_sx(d + 36, dlen - 36, "_S0_", &pw.s0_a, &pw.s0_b);
     }
 
     char off[96], rst[64];
@@ -415,13 +484,27 @@ void power_off(void)
         uint64_t f;
         __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
         if (pw.pm1b.address)
-            gas_write(&pw.pm1b, (uint32_t)pw.typ_b << 10 | SLP_EN, 2);
-        gas_write(&pw.pm1a, (uint32_t)pw.typ_a << 10 | SLP_EN, 2);
+            gas_write(&pw.pm1b, pm1_cnt_value(&pw.pm1b, pw.typ_b, true), 2);
+        gas_write(&pw.pm1a, pm1_cnt_value(&pw.pm1a, pw.typ_a, true), 2);
         if (f & (1u << 9))
             cpu_sti();
     }
     wait_ms(2000);
     kprintf("Power: ACPI S5 did not switch off\n");
+}
+
+/* Called from s3_wake_entry64 on the saved stack, interrupts and shadow stacks still off: the
+ * CPU state firmware reset that the wake path needs, the IDT first of all, so that a fault is
+ * reported instead of triple-faulting back into the firmware's resume path. Shadow stacks go on
+ * only after this (the GDT reload's far return would raise #CP with them on). Returns the
+ * shadow-stack restore token for `ssp` (0 when shadow stacks are off). */
+uint64_t s3_resume_cpu(uint64_t ssp);
+uint64_t s3_resume_cpu(uint64_t ssp)
+{
+    cpu_init_pat();
+    gdt_resume_cpu(&bsp_percpu);       /* GDT, TR, segment bases, XCR0, mitigations, SYSCALL */
+    idt_load();
+    return cet_ss ? cet_bsp_wake_token(ssp) : 0;
 }
 
 int power_suspend(void)
@@ -437,6 +520,7 @@ int power_suspend(void)
     if (!thread_set_affinity(THREAD_CPU(0)))
         return -1;
 
+    dkrnl_tpm_suspend();                        /* TPM2_Shutdown(STATE), for firmware's Startup(STATE) */
     dkrnl_acpi_prepare_sleep(3);
 
     /* Ensure ACPI mode is enabled before entering S3. */
@@ -488,25 +572,27 @@ int power_suspend(void)
     *(volatile uint64_t *)(facs + FACS_X_WAKE_VEC) = 0;
     __asm__ volatile("mfence" ::: "memory");
 
-    /* Clear WAK_STS (RW1C) before setting SLP_EN (ACPI 6.5, 16.1.6). */
-    if (pw.pm1a_evt.address)
-        gas_write(&pw.pm1a_evt, WAK_STS, 2);
-    if (pw.pm1b_evt.address)
-        gas_write(&pw.pm1b_evt, WAK_STS, 2);
-
     cpu_cli();
+    /* Nothing pending may wake the machine at once: GPEs off, fixed status (WAK_STS above all,
+     * ACPI 6.5, 16.1.6) cleared before SLP_EN. */
+    gpe_quiesce();
+    pm1_clear_status(PM1_ALL_STS);
     time_suspend();
-    uint16_t val_a = (uint16_t)(((uint16_t)pw.s3_a << 10) | SLP_EN);
-    uint16_t val_b = (uint16_t)(((uint16_t)pw.s3_b << 10) | SLP_EN);
+    uint16_t val_a = pm1_cnt_value(&pw.pm1a, pw.s3_a, true);
+    uint16_t val_b = pm1b_addr ? pm1_cnt_value(&pw.pm1b, pw.s3_b, true) : 0;
     int r = s3_enter(pm1a_addr, val_a, pm1b_addr, val_b, mmio_mask);
 
-    /* ---- BSP wake path (interrupts off) ---------------------------------------------------- */
+    /* ---- BSP wake path (interrupts off; s3_resume_cpu reloaded GDT and IDT) ------------------ */
     *(volatile uint32_t *)(facs + FACS_WAKE_VEC) = 0;
     smp_clear_s3_trampoline();
+    /* Back to S0 in PM1 control: firmware that reads SLP_TYP to tell a resume from a boot would
+     * otherwise take the next reset for another S3 resume. And drop the power-button press that
+     * woke the machine: once SCI is on again it would reach init as a shutdown request. */
+    if (pm1b_addr)
+        gas_write(&pw.pm1b, pm1_cnt_value(&pw.pm1b, pw.s0_b, false), 2);
+    gas_write(&pw.pm1a, pm1_cnt_value(&pw.pm1a, pw.s0_a, false), 2);
+    pm1_clear_status(PWRBTN_STS | WAK_STS);
 
-    cpu_init_pat();
-    gdt_resume_cpu(&bsp_percpu);
-    idt_load();
     time_resume();
     pic_disable();
     lapic_resume_bsp();

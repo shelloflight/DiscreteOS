@@ -21,7 +21,9 @@ void dkrnl_pci_suspend(void);
 void dkrnl_pci_resume(void);
 /* IOMMU resume (dev/iommu): restore VT-d / AMD-Vi DMA + interrupt remapping after S3 wake. */
 void dkrnl_iommu_resume(void);
-/* TPM resume (security/measure.rs): issue TPM2_Startup(TPM_SU_STATE) if a TPM is attached. */
+/* TPM across S3 (security/measure.rs): TPM2_Shutdown(TPM_SU_STATE) before sleep (interrupts on),
+ * TPM2_Startup(TPM_SU_STATE) after wake; nothing without a TPM. */
+void dkrnl_tpm_suspend(void);
 void dkrnl_tpm_resume(void);
 void dkrnl_objects_print(void);   /* live kernel objects per type (inspection) */
 /* Verified-boot report, PCR 8 measurement, TPM discovery (after dkrnl_init: needs ACPI) */

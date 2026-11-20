@@ -6,14 +6,19 @@
 ;
 ; Called on the BSP with interrupts off and all APs parked. Saves BSP CPU state
 ; (callee-saved GPRs, RSP, RFLAGS, CR0/CR3/CR4, EFER, FS/GS/KERNEL_GS bases, and
-; CET SSP when shadow stacks are active), flushes caches (WBINVD), and writes
-; SLP_TYP | SLP_EN to PM1b/PM1a.
+; CET SSP and S_CET when shadow stacks are active), flushes caches (WBINVD), and
+; writes PM1b/PM1a twice: SLP_TYP alone, then SLP_TYP | SLP_EN. The values come
+; from power.c and keep the register's other bits (SCI_EN above all).
 ;
 ; On S3 wake, firmware jumps to the real-mode trampoline at TRAMPOLINE_PHYS
 ; (0x8000), which enters 64-bit long mode and jumps to `s3_wake_entry64`. That
-; restores all saved CPU state and returns 0 to `power_suspend()` as if
-; `s3_enter` had returned normally. If hardware fails to enter S3, `s3_enter`
-; returns -1.
+; restores control registers, MSR bases and RSP, has `s3_resume_cpu` (power.c)
+; reload GDT, TR, IDT and the per-CPU MSRs, and only then turns shadow stacks
+; back on: the GDT reload uses a far return, which a live shadow stack would
+; reject (#CP), and with no IDT yet that is a triple fault inside the firmware's
+; resume path. Returns 0 to `power_suspend()` as if `s3_enter` had returned
+; normally. If hardware fails to enter S3, `s3_enter` returns -1 with no CPU
+; state touched.
 ; =============================================================================
 
 default rel
@@ -25,6 +30,7 @@ default rel
 %define MSR_KERNEL_GS_BASE 0xC0000102
 %define MSR_S_CET          0x6A2
 %define CR4_CET            (1 << 23)
+%define SLP_EN             (1 << 13)
 
 section .bss
 align 8
@@ -44,10 +50,11 @@ s3_fs_base:        resq 1
 s3_gs_base:        resq 1
 s3_kernel_gs_base: resq 1
 s3_ssp:            resq 1
+s3_s_cet:          resq 1
 
 section .text
 global s3_enter, s3_wake_entry64
-extern cet_ss, cet_bsp_wake_token
+extern cet_ss, s3_resume_cpu
 
 %macro RDMSR64 2
     mov ecx, %1
@@ -101,31 +108,39 @@ s3_enter:
     je .no_save_cet
     rdsspq rax
     mov [s3_ssp], rax
+    RDMSR64 MSR_S_CET, s3_s_cet
 .no_save_cet:
+
+    ; Step 1: SLP_TYP without SLP_EN (PM1b first when present), then flush, then step 2.
+    test r14, r14
+    jz .typ_a
+    mov rdx, r14
+    mov eax, r15d
+    and eax, ~SLP_EN
+    mov ecx, ebx
+    shr ecx, 1
+    call s3_pm1_write
+.typ_a:
+    mov rdx, r12
+    mov eax, r13d
+    and eax, ~SLP_EN
+    mov ecx, ebx
+    call s3_pm1_write
 
     wbinvd
 
-    ; Write PM1b_CNT first if present (ACPI 6.5, 16.1.6).
     test r14, r14
-    jz .do_pm1a
-    test ebx, 2
-    jnz .pm1b_mmio
+    jz .en_a
     mov rdx, r14
-    mov rax, r15
-    out dx, ax
-    jmp .do_pm1a
-.pm1b_mmio:
-    mov [r14], r15w
-
-.do_pm1a:
-    test ebx, 1
-    jnz .pm1a_mmio
+    mov eax, r15d
+    mov ecx, ebx
+    shr ecx, 1
+    call s3_pm1_write
+.en_a:
     mov rdx, r12
-    mov rax, r13
-    out dx, ax
-    jmp .wait_sleep
-.pm1a_mmio:
-    mov [r12], r13w
+    mov eax, r13d
+    mov ecx, ebx
+    call s3_pm1_write
 
 .wait_sleep:
     ; Give the chipset a short window to power down; if S3 does not happen, return -1.
@@ -142,6 +157,16 @@ s3_enter:
     mov r14, [s3_r14]
     mov r15, [s3_r15]
     mov eax, -1
+    ret
+
+; RDX = I/O port or mapped MMIO address, AX = value, ECX bit 0 = MMIO.
+s3_pm1_write:
+    test ecx, 1
+    jnz .mmio
+    out dx, ax
+    ret
+.mmio:
+    mov [rdx], ax
     ret
 
 ; -----------------------------------------------------------------------------
@@ -168,20 +193,19 @@ s3_wake_entry64:
 
     mov rsp, [s3_rsp]
 
-    cmp byte [cet_ss], 0
-    je .no_restore_cet
-    ; RSP % 16 == 8 (return address on stack); align to 16 before the C helper call.
+    ; GDT, TR, IDT, PAT, XCR0, syscall and mitigation MSRs (C, shadow stacks still off).
+    ; RSP % 16 == 8 (return address on stack); align to 16 before the call.
     sub rsp, 8
     mov rdi, [s3_ssp]
-    call cet_bsp_wake_token         ; writes restore token & CET MSRs, returns token VA in RAX
+    call s3_resume_cpu              ; returns the restore token VA (0 without shadow stacks)
     add rsp, 8
+
+    cmp byte [cet_ss], 0
+    je .no_restore_cet
+    mov r8, rax                     ; token VA, kept across wrmsr
     mov rdx, [s3_cr4]
     mov cr4, rdx                    ; enables CR4.CET
-    mov ecx, MSR_S_CET
-    mov r8, rax                     ; preserve token VA across wrmsr
-    mov eax, 1                      ; SH_STK_EN
-    xor edx, edx
-    wrmsr
+    WRMSR64 MSR_S_CET, s3_s_cet
     rstorssp [r8]
     mov eax, 1
     incsspq rax                     ; pop previous-SSP token -> SSP == s3_ssp

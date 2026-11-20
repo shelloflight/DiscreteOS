@@ -40,20 +40,28 @@ hardware-reduced sleep register), and if the machine is still running 2 s later,
 
 1. User space (`init`) syncs every volume provider (`svc::SYNC`) and asks `devmgr` (`svc::SUSPEND`)
    to quiesce PCI bus mastering and stop every user-space driver before entering S3.
-2. The kernel pins the caller to the BSP (CPU 0), runs `\_TTS(3)` and `\_PTS(3)` on the ACPI thread,
-   parks all APs in `cli; hlt` (draining their run queues and stopping the watchdog), and saves PCI
-   configuration headers (`dkrnl_pci_suspend`).
+2. The kernel pins the caller to the BSP (CPU 0), sends `TPM2_Shutdown(STATE)` if a TPM is
+   present (firmware's `TPM2_Startup(STATE)` on wake needs it), runs `\_TTS(3)` and `\_PTS(3)` on
+   the ACPI thread, parks all APs in `cli; hlt` (draining their run queues and stopping the
+   watchdog), and saves PCI configuration headers (`dkrnl_pci_suspend`).
 3. A real-mode waking trampoline is installed in low RAM and its address written to the FADT's FACS
-   32-bit waking vector; `WAK_STS` is cleared, `time_suspend` snapshots the monotonic clock, and
-   `s3_enter` saves BSP GPRs, control registers, EFER, segment bases, and CET SSP, flushes caches
-   (`wbinvd`), and writes `SLP_TYP | SLP_EN` to PM1b/PM1a.
-4. On wake, firmware jumps to the real-mode trampoline, which re-enters long mode on the BSP and
-   restores CPU state (PAT, GDT/TSS/IDT, SYSCALL, CET, monotonic TSC, LAPIC), PCI config space,
-   VT-d/AMD-Vi IOMMU DMA and interrupt remapping, and IOAPIC routes.
+   32-bit waking vector. With interrupts off, every GPE is disabled and its status cleared (no wake
+   GPE is armed: the power button wakes the machine), the PM1 fixed status bits are cleared,
+   `time_suspend` snapshots the monotonic clock, and `s3_enter` saves BSP GPRs, control registers,
+   EFER, segment bases and CET SSP/`S_CET`, flushes caches (`wbinvd`), and writes PM1b/PM1a
+   twice, `SLP_TYP` then `SLP_TYP | SLP_EN`, keeping every other PM1 control bit (`SCI_EN`) as read.
+4. On wake, firmware jumps to the real-mode trampoline, which re-enters long mode on the BSP.
+   `s3_wake_entry64` restores control registers and segment bases, reloads PAT, GDT/TSS, IDT,
+   XCR0, SYSCALL and mitigation MSRs (`s3_resume_cpu`) and only then re-enables CET shadow stacks
+   (the GDT reload's far return would raise `#CP` with them on). The kernel then sets PM1 control
+   back to `SLP_TYP` of `\_S0` (firmware that reads it would take a later reset for another
+   resume), clears `PWRBTN_STS` (the press that woke the machine is not a shutdown request), and
+   restores the monotonic TSC, LAPIC, PCI config space, VT-d/AMD-Vi DMA and interrupt remapping,
+   and IOAPIC routes.
 5. Interrupts are re-enabled, APs are restarted via INIT-SIPI-SIPI through `ap_resume_entry64`
    (restoring per-CPU GDT/TSS/IDT/CET/XSAVE/speculation state and timers), CPPC/HWP is re-applied,
-   ACPI `\_PIC(1)`, `\_WAK(3)`, `\_TTS(0)` and SCI sources are restored, and `TPM2_Startup(STATE)`
-   is issued if a TPM is present.
+   ACPI `\_PIC(1)`, `\_WAK(3)`, `\_TTS(0)` and SCI sources (run-time GPEs) are restored, and
+   `TPM2_Startup(STATE)` is issued if a TPM is present.
 6. `init` asks `devmgr` (`svc::RESUME`) to restart every driver and re-attach disks transparently.
 
 ## Resetting
@@ -137,6 +145,10 @@ missing MSRs are refused without a panic, CPPC and HWP are refused cleanly. `aml
 
 - S3 requires a 32-bit FACS waking vector and usable low RAM below 1 MiB (hardware-reduced ACPI /
   S0ix modern standby is not implemented).
+- Only the power button wakes from S3 (no `_PRW` wake GPEs are armed: no lid, keyboard or LAN wake).
+- The display is not re-initialised after S3: firmware does not restore the boot framebuffer's mode
+  on most real machines, so the screen can stay dark after a successful resume (the serial log and
+  the rest of the system keep working) until a native display driver exists.
 - Idle and performance use the first present processor's objects for every CPU; `_LPI`, `_CSD`
   and `_PSD` (dependency domains) are not used.
 - `_CPC` registers in system memory or PCC (platform communication channel) are not reached.

@@ -28,6 +28,7 @@ pub const SHA256_ALG: u16 = 0x000B;
 const ST_NO_SESSIONS: u16 = 0x8001;
 const ST_SESSIONS: u16 = 0x8002;
 const CC_STARTUP: u32 = 0x144;
+const CC_SHUTDOWN: u32 = 0x145;
 const CC_PCR_EXTEND: u32 = 0x182;
 const CC_PCR_READ: u32 = 0x17E;
 const CC_GET_CAPABILITY: u32 = 0x17A;
@@ -198,6 +199,15 @@ impl Tpm {
 
     pub fn interface(&self) -> &'static str {
         self.t.name()
+    }
+
+    /// Save the TPM's state before ACPI S3 sleep (`TPM2_Shutdown(TPM_SU_STATE)`). Without it the
+    /// firmware's `TPM2_Startup(TPM_SU_STATE)` on wake fails, and some firmware then refuses to
+    /// resume at all.
+    pub fn shutdown_state(&mut self) -> Result<(), Error> {
+        let mut c = Cmd::new(ST_NO_SESSIONS, CC_SHUTDOWN);
+        c.u16(1); // TPM_SU_STATE
+        self.command(c.done()).map(|_| ())
     }
 
     /// Re-initialise the TPM after ACPI S3 sleep, restoring saved state (`TPM_SU_STATE`).
@@ -762,6 +772,7 @@ impl Sim {
                 }
                 self.started = true;
             }
+            CC_SHUTDOWN => {}
             CC_GET_CAPABILITY => {
                 out.push(0); // moreData
                 for v in [CAP_TPM_PROPERTIES, 1, PT_MANUFACTURER, u32::from_be_bytes(*b"DOSS")] {

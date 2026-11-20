@@ -1258,6 +1258,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "watchdog:",
                 "did not enter sleep",
                 "suspend failed",
+                "TPM: Shutdown(STATE)",
                 "blocked DMA",
                 "blocked interrupt",
             ]),
