@@ -31,7 +31,7 @@ const USED: u64 = 512;
 pub struct Region {
     bar: usize,
     off: u64,
-    len: u64,
+    pub len: u64,
 }
 
 pub struct Virtio {

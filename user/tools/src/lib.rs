@@ -26,6 +26,7 @@ libd::entry!(dx_copy, copy);
 libd::entry!(dx_move, move_);
 libd::entry!(dx_delete, delete);
 libd::entry!(dx_make, make);
+libd::entry!(dx_create, create);
 
 /// Start a tool: (output, items). None if this is not a proper start.
 fn start(s: *const Startup, name: &'static str) -> Option<Out> {
@@ -269,4 +270,27 @@ fn make(s: *const Startup) -> i32 {
         }
         Err(e) => fail(&mut out, "make", it.shown, e),
     }
+}
+
+fn create(s: *const Startup) -> i32 {
+    let Some(mut out) = start(s, "create") else { return 1 };
+    let mut code = 0;
+    let mut any = false;
+    for it in tool::items().filter(|i| i.name == "file") {
+        any = true;
+        let dir = node(&it);
+        if it.rel.is_empty() {
+            code = fail(&mut out, "create", it.shown, fp::ERR_EXISTS);
+            continue;
+        }
+        match dir.open(it.rel.as_bytes(), fp::O_CREATE, fp::R_READ | fp::R_WRITE) {
+            Ok((_, fp::KIND_DIR, _)) => code = fail(&mut out, "create", it.shown, fp::ERR_IS_DIR),
+            Ok(_) => out.record(&Record::new().with("created", Value::Path(String::from(it.shown)))),
+            Err(e) => code = fail(&mut out, "create", it.shown, e),
+        }
+    }
+    if !any {
+        return fail(&mut out, "create", "no file", sys::ERR_INVALID_ARGS);
+    }
+    code
 }

@@ -134,13 +134,17 @@ pub fn build_qemu_args(env: &Env, opts: &QemuOpts<'_>) -> Result<Vec<String>, St
     } else {
         "intel-iommu,intremap=on,eim=on"
     };
+    let has_net = opts.extra.iter().any(|x| x == "-netdev");
     let mut a = vec![
         "-machine".into(),
         "q35".into(),
         "-device".into(),
         dev.into(),
-        "-nic".into(),
-        "none".into(),
+    ];
+    if !has_net {
+        a.extend(["-nic".into(), "none".into()]);
+    }
+    a.extend([
         "-drive".into(),
         format!("format=raw,file={},index=0,media=disk", opts.image.display()),
         "-cpu".into(),
@@ -150,7 +154,7 @@ pub fn build_qemu_args(env: &Env, opts: &QemuOpts<'_>) -> Result<Vec<String>, St
         "-m".into(),
         "256M".into(),
         "-no-reboot".into(),
-    ];
+    ]);
     if !opts.must_exit {
         a.push("-no-shutdown".into());
     }
@@ -460,6 +464,7 @@ fn detect_host_audiodev(qemu: &Path) -> &'static str {
     "none"
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_interactive(
     env: &Env,
     image: &Path,
@@ -467,6 +472,7 @@ pub fn run_interactive(
     uefi: bool,
     iommu: &str,
     audio: &str,
+    net: &str,
     debug: bool,
 ) -> Result<(), String> {
     let qemu = env.qemu()?;
@@ -491,6 +497,17 @@ pub fn run_interactive(
                 "-device".into(),
                 "usb-audio,bus=xhci.0,audiodev=snd0".into(),
             ]),
+            _ => {}
+        }
+    }
+    if net != "none" {
+        extra.extend(["-netdev".into(), "user,id=net0".into()]);
+        match net {
+            "virtio" => extra.extend([
+                "-device".into(),
+                "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on".into(),
+            ]),
+            "e1000e" => extra.extend(["-device".into(), "e1000e,netdev=net0".into()]),
             _ => {}
         }
     }

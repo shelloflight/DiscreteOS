@@ -13,6 +13,7 @@ description = "the command shell"
 log = true
 connect = ["terminal.session", "log.read", "clock.time"]
 audio = ["playback", "control"]
+net = ["client", "icmp", "control"]
 namespace = ["*"]
 manager = ["services", "power"]
 tools = true

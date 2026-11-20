@@ -56,7 +56,14 @@ fn test_abi() -> bool {
     check!(v >= i64::from(sys::ABI_VERSION), "kernel ABI v{} older than libd's v{}", v, sys::ABI_VERSION);
     check!(sys::status(sys::ERR_NOT_SIGNED) == "NOT_SIGNED" && sys::status(sys::ERR_BAD_ADDRESS) == "BAD_ADDRESS", "status names");
     check!(sys::status(-18) == "?" && sys::status(1) == "?", "unknown status names");
-    println!("ltest: abi: kernel v{}, libd v{}, {} syscalls bound, 18 status names", v, sys::ABI_VERSION, sys::nr::COUNT);
+    // ABI v14: kernel ChaCha20 CSPRNG (`SYS_GET_RANDOM`)
+    let mut r1 = [0u8; 32];
+    let mut r2 = [0u8; 32];
+    check!(sys::get_random(&mut r1, 0).is_ok() && sys::get_random(&mut r2, 0).is_ok(), "get_random failed");
+    check!(r1 != [0u8; 32] && r2 != [0u8; 32] && r1 != r2, "get_random non-random output");
+    check!(sys::sc(sys::nr::GET_RANDOM, 0xDEAD_BEEF, 32, 0, 0, 0, 0) == sys::ERR_BAD_ADDRESS, "get_random bad addr");
+    check!(sys::sc(sys::nr::GET_RANDOM, r1.as_mut_ptr() as u64, 8192, 0, 0, 0, 0) == sys::ERR_INVALID_ARGS, "get_random oversize");
+    println!("ltest: abi: kernel v{}, libd v{}, {} syscalls bound, 18 status names, csprng ok", v, sys::ABI_VERSION, sys::nr::COUNT);
     true
 }
 
@@ -545,6 +552,10 @@ fn main(s: *const Startup) -> i32 {
         return svc::audio_playonly();
     } else if a.starts_with(b"svc-audio-full") {
         return svc::audio_full();
+    } else if a.starts_with(b"svc-net-ungranted") {
+        return svc::net_ungranted();
+    } else if a.starts_with(b"svc-net-full") {
+        return svc::net_full();
     }
     let ok = test_abi()
         && test_handles()

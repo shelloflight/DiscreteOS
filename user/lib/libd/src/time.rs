@@ -31,8 +31,17 @@ pub struct Civil {
 
 const NS: i64 = 1_000_000_000;
 const DAY: i64 = 86_400;
+/// Unix timestamp (seconds since 1970-01-01 00:00:00 UTC) of the D-OS epoch (2000-01-01 00:00:00 UTC).
+pub const UNIX_EPOCH_OFFSET_SECS: i64 = 946_684_800;
 /// Days from 0000-03-01 (the proleptic Gregorian civil-days origin used below) to 2000-01-01.
 const EPOCH_DAYS: i64 = 730_425;
+
+impl Time {
+    /// Convert D-OS `Time` (ns since 2000-01-01 UTC) to Unix seconds (since 1970-01-01 UTC).
+    pub const fn to_unix_secs(self) -> i64 {
+        self.0.div_euclid(NS) + UNIX_EPOCH_OFFSET_SECS
+    }
+}
 
 /// Days since 0000-03-01 for a date (any year; months 1-12).
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {

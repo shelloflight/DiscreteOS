@@ -1,0 +1,17 @@
+# Network test service with NO net grant: must receive zero network endpoints and be refused.
+name = "svc-net-ungranted"
+image = "ltest.dx"
+args = "svc-net-ungranted"
+group = "test"
+after = ["net"]
+
+[grants]
+log = true
+
+[quota]
+memory = "8M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"

@@ -32,6 +32,7 @@ devices = ["pci", "platform:ps2"]   # "all", "pci", "pci:CC[SS[PP]]", "platform:
 programs = ["*.ddrv"]       # program images, by name or "*.dx" / "*.dsvc" / "*.ddrv"
 connect = ["storaged.disks"]
 audio = ["playback"]        # optional audio capabilities: "playback", "capture", "control"
+net = ["client"]            # optional network capabilities: "client", "icmp", "control"
 namespace = ["/system=system:r"]   # /<path>=<volume>:r | rw | rwa; or ["*"] / ["*:r"]: every volume
 manager = ["services", "power"]     # a channel to the manager: list/stop/restart services; power
 tools = false               # the tool manifests and their programs (the shell; docs/shell.md)
@@ -82,6 +83,7 @@ was configured to grant ([attestation.md](attestation.md)).
 | `programs` | each embedded program the names match (tag `PROGRAM`) |
 | `connect` | one channel per endpoint (`TAG_ENDPOINT + i`, names in the `TAG_ENDPOINT_NAMES` VMO; `libd::svc::endpoint`) |
 | `audio` | audio endpoints (`audio.playback`, `audio.capture`, `audio.control`); microphone capture requires explicit `capture` ([audio.md](audio.md)) |
+| `net` | network endpoints (`net.client`, `net.icmp`, `net.control`); no grant means no network access ([networking.md](networking.md)) |
 | `namespace` | each volume's root, narrowed to the rights granted, at its path ([storage.md](storage.md)); `*`: every volume at `/<volume>`, with at most the rights the volume has |
 | `manager` | a channel to the manager (`tool::TAG_MANAGER`): `MGR_LIST`, `MGR_STOP`, `MGR_RESTART`, `MGR_OBJECTS` with `services`; `MGR_POWER` with `power` (a clean shutdown, then the power) |
 | `tools` | every accepted tool manifest (`tool::TAG_TOOL_MANIFEST`, read-only) and each tool's program |
@@ -136,9 +138,11 @@ every volume provider, sends `SUSPEND` to `devmgr` to quiesce and stop drivers, 
 | `log` | log, kernel log | `log.read` |
 | `clock` | log, the `rtc` device, boot time | `clock.time` |
 | `storaged` | log, `clock.time` (file times) | `storaged.disks`, volumes |
-| `devmgr` | log, every PCI device and `ps2`, the `*.ddrv` drivers, `storaged.disks` | `devmgr.input` |
-| `terminal` | log, the `display` device, `devmgr.input` | `terminal.session` |
-| `shell` | log, `terminal.session`, `log.read`, `clock.time`, every volume, the manager (services, power), the tools | |
+| `devmgr` | log, every PCI device and `ps2`, the `*.ddrv` drivers, `storaged.disks` | `devmgr.input`, `devmgr.audio`, `devmgr.net` |
+| `audio` | log, `devmgr.audio`, `terminal.indicator` | `audio.playback`, `audio.capture`, `audio.control` |
+| `net` | log, `devmgr.net`, `clock.time` | `net.client`, `net.icmp`, `net.control` |
+| `terminal` | log, the `display` device, `devmgr.input` | `terminal.session`, `terminal.indicator` |
+| `shell` | log, `terminal.session`, `log.read`, `clock.time`, `audio.*`, `net.*`, every volume, the manager (services, power), the tools | |
 
 ### The log service
 

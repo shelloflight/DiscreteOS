@@ -85,6 +85,13 @@ pub const BLK_RING_SETUP: u32 = 15;
 pub const BLK_RING_DOORBELL: u32 = 16;
 /// Manager -> audio driver: serve audio unit `a` on the channel this message carries (no reply).
 pub const AUDIO_ATTACH: u32 = 17;
+/// Network driver -> manager: NIC announced.
+/// `a` = mac[0..6] in bits 0..47 | link_up in bit 48; `b` = mtu; payload = UTF-8 NIC name.
+pub const NET_DEV: u32 = 18;
+/// Network driver -> manager: link state changed; `a` = link_up (0 or 1).
+pub const NET_LINK: u32 = 19;
+/// Manager -> network driver: serve `net.dsvc` on the channel this message carries (no reply).
+pub const NET_ATTACH: u32 = 23;
 /// Manager -> driver (tests): fault on purpose (restart test).
 pub const TEST_CRASH: u32 = 20;
 /// Manager -> block driver (tests): point a request at memory the device was not given (the

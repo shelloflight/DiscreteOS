@@ -13,6 +13,7 @@ members = [
     "lib/libd",
     "log",
     "ltest",
+    "net",
     "shell",
     "storaged",
     "terminal",
@@ -23,6 +24,7 @@ exclude = [
     "lib/crypto",
     "lib/dman",
     "lib/fs",
+    "lib/net",
 ]
 
 [profile.dev]

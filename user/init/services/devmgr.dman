@@ -7,7 +7,7 @@ after = ["storaged"]
 description = "devices and their drivers"
 
 [provides]
-endpoints = ["input", "audio"]   # keyboard/pointer input and audio driver backend endpoints
+endpoints = ["input", "audio", "net"]   # keyboard/pointer input, audio, and network driver endpoints
 
 [grants]
 log = true

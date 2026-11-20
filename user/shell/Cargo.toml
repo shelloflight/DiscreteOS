@@ -17,6 +17,7 @@ bench = false
 libd = { path = "../lib/libd", features = ["alloc"] }
 dman = { path = "../lib/dman" }
 dosaudio = { path = "../lib/audio" }
+dosnet = { path = "../lib/net" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

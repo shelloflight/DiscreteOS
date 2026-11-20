@@ -379,3 +379,197 @@ pub fn audio_full() -> i32 {
     println!("svc-audio-full: PASSED (mic indicator, revoke, volume, hotplug switch, driver crash recovery x{})", restarts);
     0
 }
+
+pub fn net_ungranted() -> i32 {
+    use libd::net::{self, TcpStream};
+    check!(net::client_endpoint() == 0, "ungranted process received net.client");
+    check!(net::icmp_endpoint() == 0, "ungranted process received net.icmp");
+    check!(net::control_endpoint() == 0, "ungranted process received net.control");
+    check!(
+        TcpStream::connect(0, [10, 0, 2, 2], 80, 1000).err() == Some(sys::ERR_ACCESS_DENIED),
+        "TCP connect without grant not refused"
+    );
+    check!(
+        net::ping(0, [10, 0, 2, 2], 1, 1000).err() == Some(sys::ERR_ACCESS_DENIED),
+        "ICMP ping without grant not refused"
+    );
+    println!("svc-net-ungranted: PASSED (ungranted app refused)");
+    0
+}
+
+fn tls_exchange(
+    stream: &mut libd::net::TcpStream,
+    hostname: &str,
+    ca_der: alloc::vec::Vec<u8>,
+    now_unix: i64,
+) -> Result<(alloc::vec::Vec<u8>, &'static str, &'static str), dosnet::tls::TlsError> {
+    use dosnet::tls::{TlsClient, TlsError};
+    let mut rand160 = [0u8; 160];
+    libd::net::random_bytes(&mut rand160).map_err(|_| TlsError::Closed)?;
+    let mut tls = TlsClient::new(hostname, alloc::vec![ca_der], now_unix, &rand160);
+    let mut buf = [0u8; 4096];
+
+    let dl = sys::clock_ns() + 10_000_000_000;
+    while !tls.is_connected() {
+        let out = tls.take_tx();
+        if !out.is_empty() && stream.write_all(&out).is_err() {
+            return Err(TlsError::Closed);
+        }
+        if sys::clock_ns() >= dl {
+            return Err(TlsError::Closed);
+        }
+        let n = stream.read(&mut buf, 2_000).map_err(|_| TlsError::Closed)?;
+        if n == 0 {
+            return Err(TlsError::Closed);
+        }
+        tls.feed_rx(&buf[..n])?;
+    }
+    let cipher_name = tls.negotiated_cipher().map_or("?", |c| c.name());
+    let group_name = tls.negotiated_group().map_or("?", |g| g.name());
+    // Flush Client Finished + HTTP request.
+    tls.write_app(b"GET /tls HTTP/1.1\r\nHost: test.dos.local\r\n\r\n")?;
+    let out = tls.take_tx();
+    if !out.is_empty() && stream.write_all(&out).is_err() {
+        return Err(TlsError::Closed);
+    }
+    let mut resp = alloc::vec::Vec::new();
+    let dl = sys::clock_ns() + 5_000_000_000;
+    while resp.is_empty() && sys::clock_ns() < dl {
+        let n = stream.read(&mut buf, 2_000).map_err(|_| TlsError::Closed)?;
+        if n == 0 {
+            break;
+        }
+        tls.feed_rx(&buf[..n])?;
+        let mut plain = [0u8; 1024];
+        let m = tls.read_app(&mut plain);
+        if m > 0 {
+            resp.extend_from_slice(&plain[..m]);
+        }
+    }
+    tls.close();
+    let fin = tls.take_tx();
+    if !fin.is_empty() {
+        let _ = stream.write_all(&fin);
+    }
+    Ok((resp, cipher_name, group_name))
+}
+
+pub fn net_full() -> i32 {
+    use doscrypt::x509::VerifyError;
+    use dosnet::tls::TlsError;
+    use dosnet::tls::server::{TEST_CA_SEED, make_test_rsa_bundle};
+    use libd::net::{self, TcpStream};
+
+    let cli = net::client_endpoint();
+    let icmp = net::icmp_endpoint();
+    let ctl = net::control_endpoint();
+    check!(cli != 0 && icmp != 0 && ctl != 0, "missing net endpoints");
+
+    // 1. Wait for DHCP lease from QEMU user-net.
+    let dl = sys::clock_ns() + 15_000_000_000;
+    let mut st = net::NetStatus::empty();
+    while sys::clock_ns() < dl {
+        if let Ok(s) = net::status(ctl)
+            && s.dhcp_bound
+        {
+            st = s;
+            break;
+        }
+        libd::handle::sleep(100_000_000);
+    }
+    check!(st.dhcp_bound && st.ip != [0; 4], "DHCP did not bind in time");
+    println!(
+        "svc-net-full: dhcp OK ({}.{}.{}.{} via {})",
+        st.ip[0], st.ip[1], st.ip[2], st.ip[3], st.name_str()
+    );
+
+    // 2. Endpoint role separation check.
+    check!(
+        net::ping(cli, [10, 0, 2, 2], 1, 500).err() == Some(sys::ERR_ACCESS_DENIED),
+        "ICMP ping on net.client was not refused"
+    );
+    check!(
+        TcpStream::connect(icmp, [10, 0, 2, 100], 80, 500).err() == Some(sys::ERR_ACCESS_DENIED),
+        "TCP connect on net.icmp was not refused"
+    );
+
+    // 3. Configure local offline DNS server passed via DHCP bootfile (`dns:<port>`), then resolve.
+    if let Some(port_s) = st.bootfile_str().strip_prefix("dns:")
+        && let Ok(port) = port_s.parse::<u16>()
+    {
+        check!(net::set_dns(ctl, [10, 0, 2, 2], port).is_ok(), "set_dns failed");
+    }
+    let resolved = net::resolve(cli, "test.dos.local");
+    check!(resolved == Ok([10, 0, 2, 100]), "DNS resolve failed: {:?}", resolved);
+    println!("svc-net-full: dns OK (test.dos.local -> 10.0.2.100)");
+
+    // 4. ICMP ping to gateway 10.0.2.2.
+    let pong = net::ping(icmp, [10, 0, 2, 2], 1, 2_000);
+    check!(pong.is_ok(), "ICMP ping failed: {:?}", pong);
+    let (rtt, ttl) = pong.unwrap_or((0, 0));
+    println!("svc-net-full: icmp ping OK (rtt={} ms, ttl={})", rtt, ttl);
+
+    // 5. Plain TCP connection to 10.0.2.100:80.
+    let tcp = TcpStream::connect(cli, [10, 0, 2, 100], 80, 5_000);
+    check!(tcp.is_ok(), "TCP connect failed: {:?}", tcp.err());
+    if let Ok(mut s) = tcp {
+        check!(s.write_all(b"GET / HTTP/1.1\r\nHost: test.dos.local\r\n\r\n").is_ok(), "TCP write failed");
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf, 5_000).unwrap_or(0);
+        let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+        check!(text.contains("Hello from D-OS TCP test!"), "unexpected TCP body: '{}'", text);
+        s.close();
+    }
+    println!("svc-net-full: tcp OK");
+
+    // 6. TLS 1.3 handshake + encrypted HTTP GET against 10.0.2.100:443 (valid CA + SAN + UTC time).
+    let clock_ch = libd::svc::endpoint(b"clock.time");
+    let now_unix = if clock_ch != 0
+        && let Some(b) = libd::time::query(clock_ch)
+        && b.now().0 > 0
+    {
+        b.now().to_unix_secs()
+    } else {
+        1_795_000_000
+    };
+    let (ca_der, _, _) = make_test_rsa_bundle(
+        &TEST_CA_SEED,
+        &["test.dos.local"],
+        &[[10, 0, 2, 100]],
+        b"250101000000Z",
+        b"350101000000Z",
+    );
+    let tls_tcp = TcpStream::connect(cli, [10, 0, 2, 100], 443, 5_000);
+    check!(tls_tcp.is_ok(), "TLS TCP connect failed: {:?}", tls_tcp.err());
+    if let Ok(mut s) = tls_tcp {
+        let res = tls_exchange(&mut s, "test.dos.local", ca_der.clone(), now_unix);
+        check!(res.is_ok(), "TLS 1.3 handshake failed: {:?}", res.err());
+        let (body, cipher_name, group_name) = res.unwrap_or_default();
+        let text = core::str::from_utf8(&body).unwrap_or("");
+        check!(text.contains("Hello from D-OS TLS 1.3!"), "unexpected TLS body: '{}'", text);
+        check!(
+            cipher_name == "TLS_AES_256_GCM_SHA384" && group_name == "X25519MLKEM768",
+            "expected PQ hybrid AES-256-GCM, got {} / {}",
+            cipher_name,
+            group_name
+        );
+        s.close();
+        println!("svc-net-full: tls13 OK ({} + {})", cipher_name, group_name);
+    }
+
+    // 7. TLS 1.3 negative check: server on port 444 serves mismatched SAN (`wrong.dos.local`).
+    let bad_tcp = TcpStream::connect(cli, [10, 0, 2, 100], 444, 5_000);
+    check!(bad_tcp.is_ok(), "bad-TLS TCP connect failed: {:?}", bad_tcp.err());
+    if let Ok(mut s) = bad_tcp {
+        let res = tls_exchange(&mut s, "test.dos.local", ca_der, now_unix);
+        check!(
+            res == Err(TlsError::Certificate(VerifyError::HostnameMismatch)),
+            "mismatched SAN was not rejected: {:?}",
+            res
+        );
+        s.close();
+    }
+    println!("svc-net-full: tls13 bad-cert refused");
+    println!("svc-net-full: PASSED");
+    0
+}

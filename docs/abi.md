@@ -1,4 +1,4 @@
-# User ABI (version 13)
+# User ABI (version 14)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **13**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **14**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -35,6 +35,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 11 | the POWER_BUTTON startup handle: an event the kernel signals on each power-button press ([acpi.md](acpi.md)) |
 | 12 | hardware-rooted attestation (71): `attest_activate`; reports carry TPM evidence (format 2) |
 | 13 | demand paging (lazy VMO physical frame commit with upfront quota), `vmar_destroy` (72), and `system_power` action 3 (`POWER_SUSPEND`, ACPI S3) |
+| 14 | `get_random` (73): kernel Fast-Key-Erasure ChaCha20 CSPRNG seeded from `RDSEED`/`RDRAND` and `TPM2_GetRandom` |
 
 ## Calling convention (x86-64)
 
@@ -151,6 +152,7 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 70 | thread_create_stopped | process, entry, stack top, arg | thread handle; it stops with a `START` exception before its first instruction (`BAD_STATE` without an exception channel) | MANAGE |
 | 71 | attest_activate | challenge (328 bytes), out (32 bytes) | 32; `NOT_SUPPORTED` without a TPM, `ACCESS_DENIED` if the TPM refuses | |
 | 72 | vmar_destroy | vmar (non-root) | 0 (unmaps all mappings/descendants and reclaims address space; `INVALID_ARGS` on root, `BAD_STATE` if already destroyed) | MAP |
+| 73 | get_random | buf, len (<= 4096), flags (`0` or `DOS_RANDOM_STRICT`) | bytes written (`BAD_STATE` with `STRICT` if no hardware entropy) | |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.

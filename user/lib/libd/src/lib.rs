@@ -31,6 +31,7 @@ pub mod handle;
 #[cfg(feature = "alloc")]
 pub mod heap;
 pub mod log;
+pub mod net;
 pub mod proto;
 #[cfg(feature = "alloc")]
 pub mod rec;

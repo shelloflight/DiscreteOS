@@ -20,7 +20,6 @@
 
 use alloc::vec::Vec;
 
-use crate::ffi;
 use crate::security::measure;
 use crate::security::tpm::{self, Key, Tpm};
 use crate::sync::Mutex;
@@ -51,15 +50,10 @@ static STATE: Mutex<State> = Mutex::new(c"attest", State { ak: None, flags: 0, f
 /// Boot (dkrnl_security_init, after the kernel's own measurement): make this boot's key and
 /// measure it. `kernel_verified`: the loader checked the kernel's signature.
 pub fn init(firmware: u32, kernel_verified: bool) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b"D-OS attestation key seed");
-    for _ in 0..8 {
-        // SAFETY: reads the CPU's random number generator (RDSEED/RDRAND, TSC fallback).
-        h.update(&unsafe { ffi::cpu_random64() }.to_le_bytes());
-    }
-    let mut seed = h.finish();
+    let mut seed = [0u8; 32];
+    let _ = crate::security::csprng::fill_bytes(&mut seed, 0);
     let key = SigningKey::from_seed(&seed);
-    seed.fill(0);
+    doscrypt::ct::wipe_bytes(&mut seed);
     let public = key.public();
     measure::measure(attest::PCR_KERNEL, &attest::ak_digest(&public), attest::AK_EVENT, false);
     let mut s = STATE.lock();

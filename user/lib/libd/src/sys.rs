@@ -81,7 +81,7 @@ pub const TAG_BOOT_TIME: u32 = 12;
 pub const TAG_POWER_BUTTON: u32 = 13;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 13;
+pub const ABI_VERSION: u32 = 14;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -183,8 +183,9 @@ pub mod nr {
     pub const THREAD_CREATE_STOPPED: u64 = 70;
     pub const ATTEST_ACTIVATE: u64 = 71;
     pub const VMAR_DESTROY: u64 = 72;
+    pub const GET_RANDOM: u64 = 73;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 73;
+    pub const COUNT: u64 = 74;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -870,4 +871,21 @@ pub const BOOT_TIME_MAGIC: u32 = 0x4D49_5444;
 /// `POWER_OFF`, `POWER_REBOOT`, or `POWER_SUSPEND` with the POWER resource.
 pub fn system_power(power: Handle, action: u64) -> i64 {
     sc(nr::SYSTEM_POWER, u64::from(power), action, 0, 0, 0, 0)
+}
+
+/// `get_random` flag: refuse unless hardware entropy (RDSEED, RDRAND, or TPM) seeded the kernel CSPRNG.
+pub const RANDOM_STRICT: u64 = 1 << 0;
+
+/// ABI v14: fill `out` from the kernel's Fast-Key-Erasure ChaCha20 CSPRNG.
+pub fn get_random(out: &mut [u8], flags: u64) -> Result<(), i64> {
+    for chunk in out.chunks_mut(4096) {
+        let r = sc(nr::GET_RANDOM, chunk.as_mut_ptr() as u64, chunk.len() as u64, flags, 0, 0, 0);
+        if r < 0 {
+            return Err(r);
+        }
+        if r as usize != chunk.len() {
+            return Err(ERR_BAD_STATE);
+        }
+    }
+    Ok(())
 }

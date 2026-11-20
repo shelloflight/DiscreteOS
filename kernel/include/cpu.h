@@ -103,6 +103,7 @@ struct cpu_info {
     uint32_t max_leaf, max_ext_leaf;
     bool     apic, x2apic, tsc_deadline, invariant_tsc, rdrand, hypervisor;
     bool     rdrand_broken;          /* CPUID says RDRAND, but it failed the boot self-check */
+    bool     rdseed;                 /* CPUID 7 EBX[18]: RDSEED hardware entropy instruction */
     bool     nx, smep, smap, umip;
     bool     cet_ss, cet_ibt;     /* CET shadow stacks / indirect branch tracking supported (use: cet.c) */
     bool     pat;                    /* PAT: entry 1 is write-combining (cpu_init_pat), VMM_WC */
@@ -156,6 +157,10 @@ void cpu_print_info(void);
 /* 64 random bits: RDRAND when available and sane, otherwise a mixed TSC value (weak; logged at
  * boot). RDRAND results of all-ones or zero are refused (AMD erratum: ~0 with CF=1). */
 uint64_t cpu_random64(void);
+
+/* 64 bits from hardware entropy (RDSEED preferred, else verified RDRAND). Returns true iff
+ * hardware entropy succeeded (never falls back to TSC). */
+bool cpu_hw_random64(uint64_t *out);
 
 /* TSC value captured by entry.asm on the very first kernel instruction. */
 extern uint64_t kernel_entry_tsc;

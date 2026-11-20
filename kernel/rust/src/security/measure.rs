@@ -89,9 +89,13 @@ pub fn measure(pcr: u8, digest: &[u8; 32], text: &str, in_tpm: bool) {
     l.n += 1;
 }
 
-/// A TPM was found: replay what it does not have yet, then use it for every new event.
-/// Returns the number of events replayed.
-pub fn attach_tpm(t: Tpm) -> usize {
+/// A TPM was found: replay what it does not have yet, seed the kernel CSPRNG from TPM2_GetRandom,
+/// then use it for every new event. Returns the number of events replayed.
+pub fn attach_tpm(mut t: Tpm) -> usize {
+    if let Ok(ent) = t.get_random(32) {
+        crate::security::csprng::mix_tpm_entropy(&ent);
+        kprintln!("CSPRNG: mixed {} bytes from TPM2_GetRandom", ent.len());
+    }
     let mut l = LOG.lock();
     l.tpm = Some(t);
     let mut replayed = 0;

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::build::{BuildOpts, build_image, build_shared};
 use crate::img::{self, KERNEL_LBA, SECTOR_SIZE};
+use crate::nettest::NetTestServer;
 use crate::qemu::{
     QemuOpts, bochs_capture, convert_to_qemu_keys, get_test_disk, many_device_args, qemu_capture,
 };
@@ -40,6 +41,7 @@ enum HostTest {
     Crypto,
     Manifest,
     Audio,
+    Net,
     Aml,
     Kaslr,
     Static,
@@ -66,6 +68,7 @@ struct TestCase {
     tamper: bool,
     usb_disk: Option<&'static str>,
     audio_wav: bool,
+    net_server: bool,
     bochs: Option<&'static str>,
     bochs_strict_msr: bool,
     qemu_extra: Vec<String>,
@@ -96,6 +99,7 @@ impl TestCase {
             tamper: false,
             usb_disk: None,
             audio_wav: false,
+            net_server: false,
             bochs: None,
             bochs_strict_msr: false,
             qemu_extra: Vec::new(),
@@ -146,6 +150,7 @@ impl TestCase {
     fn tamper(mut self) -> Self { self.tamper = true; self }
     fn usb_disk(mut self, s: &'static str) -> Self { self.usb_disk = Some(s); self }
     fn audio_wav(mut self) -> Self { self.audio_wav = true; self }
+    fn net_server(mut self) -> Self { self.net_server = true; self }
     fn bochs(mut self, model: &'static str) -> Self { self.bochs = Some(model); self }
     fn bochs_strict_msr(mut self) -> Self { self.bochs_strict_msr = true; self }
     fn qemu(mut self, items: &[&str]) -> Self {
@@ -224,6 +229,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "@~15000",
         "run /boot/README.TXT",
         "copy /boot/README.TXT notes",
+        "create notes/empty.txt",
+        "touch notes/touched.txt",
         "list notes | where size > 10 | pick name size",
         "show notes/README.TXT",
         "move notes/README.TXT notes/readme.txt",
@@ -233,7 +240,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "tasks | where kind = service | where state = running | count",
         "log | where source = shell | take 1",
         "objects | where type = channel | count",
-        "delete notes/readme.txt notes",
+        "delete notes/empty.txt notes/touched.txt notes/readme.txt notes",
         "go /syst<tab>",
         "time",
         "power off",
@@ -242,7 +249,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
     let mut shell_expect: Vec<&str> = vec![
         "terminal: display 80x25 VGA text",
         "init: sys volume:",
-        "shell: ready: 5 place(s): /boot (read-write), /data (read-write), /esp (read-write), /sys (read), /system (read-write); 6 tool(s)",
+        "shell: ready: 5 place(s): /boot (read-write), /data (read-write), /esp (read-write), /sys (read), /system (read-write); 7 tool(s)",
         "terminal| / > places",
         "terminal|  place",
         "terminal| data > make notes",
@@ -261,6 +268,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "terminal| L2: 0 checks failed",
         "terminal| x run: /boot/README.TXT is not a program D-CMPL runs",
         "terminal| v copied /data/notes/README.TXT (58 B)",
+        "terminal| v created /data/notes/empty.txt",
+        "terminal| v created /data/notes/touched.txt",
         "terminal|  README.TXT",
         "terminal| D-OS boot volume (FAT32). Written by dosimg on the host.",
         "terminal| v moved /data/notes/README.TXT to /data/notes/readme.txt",
@@ -269,6 +278,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "terminal|   usage: copy <from> <to>",
         "terminal|  count",
         "shell: ready: 5 place(s)",
+        "terminal| v deleted /data/notes/empty.txt",
+        "terminal| v deleted /data/notes/touched.txt",
         "terminal| v deleted /data/notes/readme.txt",
         "terminal| v deleted /data/notes",
         "terminal| system > time",
@@ -1361,6 +1372,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::host_case("crypto-host", HostTest::Crypto),
         TestCase::host_case("manifest-host", HostTest::Manifest),
         TestCase::host_case("audio-host", HostTest::Audio),
+        TestCase::host_case("net-host", HostTest::Net),
         TestCase::host_case("aml-host", HostTest::Aml),
 
         TestCase::boot("audio-hda")
@@ -1370,13 +1382,28 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             .timeout(60)
             .must_exit()
             .keys_vec(
-                convert_to_qemu_keys(&["audio", "audio tone 440 800", "@~400", "power off"], 400),
+                convert_to_qemu_keys(
+                    &[
+                        "audio",
+                        "audio vol 42",
+                        "audio mute",
+                        "audio unmute",
+                        "audio vol 100",
+                        "audio tone 440 800",
+                        "@~400",
+                        "power off",
+                    ],
+                    400,
+                ),
                 "shell: ready",
             )
             .expect(&[
                 "hda: controller ready on pci-",
                 "devmgr: hda.ddrv ready",
                 "audio: backend 'HDA",
+                "terminal| v volume set to 42%",
+                "terminal| v output muted",
+                "terminal| v output unmuted (42%)",
                 "terminal| v played 440 Hz tone for 800 ms",
                 "Power: switching off",
             ])
@@ -1463,6 +1490,74 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "audio test services did not finish"])
             .post(PostCheck::AudioWav(660)),
+
+        TestCase::boot("net-virtio")
+            .def("NET")
+            .net_server()
+            .qemu(&["-device", "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on"])
+            .timeout(90)
+            .must_exit()
+            .expect(&[
+                "virtio-net: ready on pci-",
+                "net: dhcp bound 10.0.2.15",
+                "svc-net-ungranted: PASSED (ungranted app refused)",
+                "svc-net-full: dhcp OK",
+                "svc-net-full: dns OK (test.dos.local -> 10.0.2.100)",
+                "svc-net-full: icmp ping OK",
+                "svc-net-full: tcp OK",
+                "svc-net-full: tls13 OK",
+                "svc-net-full: tls13 bad-cert refused",
+                "svc-net-full: PASSED",
+                "init: net test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
+
+        TestCase::boot("net-e1000e")
+            .def("NET")
+            .net_server()
+            .qemu(&["-device", "e1000e,netdev=net0"])
+            .timeout(90)
+            .must_exit()
+            .expect(&[
+                "e1000e: ready on pci-",
+                "net: dhcp bound 10.0.2.15",
+                "svc-net-ungranted: PASSED (ungranted app refused)",
+                "svc-net-full: dhcp OK",
+                "svc-net-full: dns OK (test.dos.local -> 10.0.2.100)",
+                "svc-net-full: icmp ping OK",
+                "svc-net-full: tcp OK",
+                "svc-net-full: tls13 OK",
+                "svc-net-full: tls13 bad-cert refused",
+                "svc-net-full: PASSED",
+                "init: net test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
+
+        TestCase::boot("net-shell")
+            .def("SHELL")
+            .qemu(&[
+                "-netdev",
+                "user,id=net0",
+                "-device",
+                "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on",
+            ])
+            .timeout(90)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(&["@~1500", "net", "ping 10.0.2.2 2", "power off"], 600),
+                "net: dhcp bound 10.0.2.15",
+            )
+            .expect(&[
+                "virtio-net: ready on pci-",
+                "net: dhcp bound 10.0.2.15",
+                "terminal|  virtio-net",
+                "terminal| PING 10.0.2.2 (10.0.2.2): 2 request(s)",
+                "terminal| v ping 10.0.2.2: 2/2 received (0% loss)",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
 
         TestCase::boot("uefi-badsig")
             .uefi()
@@ -1774,6 +1869,14 @@ pub fn run_test_suite(
                 ),
             ]);
         }
+
+        let _net_srv = if tc.net_server {
+            let srv = NetTestServer::start()?;
+            extra.splice(0..0, ["-netdev".into(), srv.netdev_arg()]);
+            Some(srv)
+        } else {
+            None
+        };
 
         let limit = tc.timeout.max(default_timeout);
         let cap = if let Some(bochs_model) = tc.bochs {
@@ -2496,6 +2599,7 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
         HostTest::Dosfs => host_cargo_test(env, "user/lib/fs", &[], &[]),
         HostTest::Manifest => host_cargo_test(env, "user/lib/dman", &["--", "--nocapture"], &["test result", "FAILED", "panicked", "dman fuzz"]),
         HostTest::Audio => host_cargo_test(env, "user/lib/audio", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
+        HostTest::Net => host_cargo_test(env, "user/lib/net", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Aml => host_aml_test(env),
         HostTest::Crypto => host_crypto_test(env),
         HostTest::Kaslr => host_kaslr_test(env),
@@ -3001,10 +3105,11 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     let cargo = env.cargo()?;
     let clippy_dir = env.build.join("clippy");
     let cargo_env = env.cargo_env_pairs();
-    let standalone: [(&str, &[&str]); 7] = [
+    let standalone: [(&str, &[&str]); 8] = [
         ("kernel/rust", &[]),
         ("kernel/aml", &["--all-targets"]),
         ("user/lib/audio", &["--all-targets"]),
+        ("user/lib/net", &["--all-targets"]),
         ("user/lib/crypto", &["--all-targets"]),
         ("user/lib/fs", &["--all-targets"]),
         ("user/lib/dman", &["--all-targets"]),
@@ -3043,6 +3148,7 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     let user_pkgs = [
         ("libd", &["--features", "capi"][..]),
         ("audio", &[]),
+        ("net", &[]),
         ("init", &[]),
         ("log", &[]),
         ("clock", &[]),

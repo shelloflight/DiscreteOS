@@ -43,6 +43,9 @@ const BOOTSTRAP_PROGS: &[&str] = &[
     "hda.ddrv",
     "virtio-snd.ddrv",
     "usbaudio.ddrv",
+    "virtio-net.ddrv",
+    "e1000e.ddrv",
+    "r8169.ddrv",
 ];
 
 /// Service manifests that stay embedded in `kernel.bin` to mount `sys:`.
@@ -51,6 +54,7 @@ const BOOTSTRAP_MANIFESTS: &[&str] = &["clock.dman", "storaged.dman", "devmgr.dm
 /// Non-bootstrap programs placed (with `.dsig` signatures) on the immutable `sys` DFS volume.
 const SYS_BIN_PROGS: &[&str] = &[
     "audio.dsvc",
+    "net.dsvc",
     "log.dx",
     "terminal.dx",
     "shell.dx",
@@ -62,6 +66,7 @@ const SYS_BIN_PROGS: &[&str] = &[
     "move.dx",
     "delete.dx",
     "make.dx",
+    "create.dx",
 ];
 
 fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
@@ -74,7 +79,7 @@ fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
             "utest.dx" | "dcmpl.dx" | "w1.exe" | "w1_32.exe" | "w1fault.exe" | "w1bad.exe" | "l1" | "w2.exe" | "l2"
         ),
         Some("LIBD") => matches!(name, "ltest.dx" | "ctest.dx"),
-        Some("SERVICES" | "TIME" | "AUDIO") => name == "ltest.dx",
+        Some("SERVICES" | "TIME" | "AUDIO" | "NET") => name == "ltest.dx",
         Some("STORAGE" | "READONLY") => name == "fstest.dx",
         Some("HWBENCH") => matches!(name, "utest.dx" | "fstest.dx"),
         _ => false,
@@ -127,6 +132,21 @@ fn build_sys_files(
         let sig_dst = format!("tools/{stem}.dsig");
         files.push((dst, m));
         files.push((sig_dst, sig));
+    }
+
+    // Compile the curated in-tree public TLS root CA bundle into compact binary DER (`sys:/certs/roots.der`).
+    let roots_pem = env.root.join("user").join("init").join("certs").join("roots.pem");
+    if roots_pem.is_file() {
+        let pem = fs::read(&roots_pem).map_err(|e| format!("read {}: {e}", roots_pem.display()))?;
+        let ders = dosnet::roots::parse_pem_bundle(&pem);
+        if ders.is_empty() {
+            return Err(format!("{} contained no valid certificates", roots_pem.display()));
+        }
+        let refs: Vec<&[u8]> = ders.iter().map(Vec::as_slice).collect();
+        let bundle = dosnet::roots::encode_der_bundle(&refs);
+        let roots_der = sig_dir.join("roots.der");
+        write_if_changed(&roots_der, &bundle)?;
+        files.push(("certs/roots.der".to_string(), roots_der));
     }
 
     files.sort_by(|a, b| a.0.cmp(&b.0));
@@ -450,6 +470,7 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         Some("SERVICES") => Some("test"),
         Some("TIME") => Some("time"),
         Some("AUDIO") => Some("audio"),
+        Some("NET") => Some("net"),
         _ => None,
     } {
         manifests.extend(collect_files(&man_dir.join(sub), "dman", false));

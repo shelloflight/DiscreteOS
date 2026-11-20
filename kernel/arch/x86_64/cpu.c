@@ -54,6 +54,7 @@ void cpu_init(void)
     if (cpu.max_leaf >= 7) {
         cpuid(7, 0, r);
         cpu.smep = bit(r[1], 7);
+        cpu.rdseed = bit(r[1], 18);
         cpu.smap = bit(r[1], 20);
         cpu.umip = bit(r[2], 2);
         cpu.cet_ss = bit(r[2], 7);
@@ -188,6 +189,29 @@ static void rdrand_check(void)
         }
         prev = v;
     }
+}
+
+static bool rdseed64(uint64_t *out)
+{
+    for (int i = 0; i < 16; i++) {
+        uint64_t v;
+        uint8_t ok;
+        __asm__ volatile("rdseed %0; setc %1" : "=r"(v), "=qm"(ok));
+        if (ok && v != 0 && v != ~0ull) {
+            *out = v;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool cpu_hw_random64(uint64_t *out)
+{
+    if (cpu.rdseed && rdseed64(out))
+        return true;
+    if (cpu.rdrand && rdrand64(out))
+        return true;
+    return false;
 }
 
 uint64_t cpu_random64(void)

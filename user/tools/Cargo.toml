@@ -23,4 +23,4 @@ unsafe_op_in_unsafe_fn = "deny"
 undocumented_unsafe_blocks = "warn"
 
 [package.metadata.dos]
-dx = ["list", "show", "copy", "move", "delete", "make"]
+dx = ["list", "show", "copy", "move", "delete", "make", "create"]

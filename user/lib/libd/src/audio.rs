@@ -65,6 +65,8 @@ pub const FLAG_CAPTURE: u32 = 1 << 1;
 pub const FLAG_PLUGGED: u32 = 1 << 2;
 pub const FLAG_ELD_VALID: u32 = 1 << 3;
 pub const FLAG_INTERNAL: u32 = 1 << 4;
+/// Flag bit in `OP_SET_VOL` `Header::b`: toggle mute while saving/restoring pre-mute volume.
+pub const VOL_FLAG_MUTE_ONLY: u64 = 1 << 16;
 
 /// Fixed-size binary device descriptor returned by `OP_LIST_DEVICES` (64 bytes each).
 #[derive(Clone, Copy, Debug)]

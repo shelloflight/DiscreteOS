@@ -17,6 +17,8 @@ bench = false
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
 dosaudio = { path = "../lib/audio" }
+doscrypt = { path = "../lib/crypto" }
+dosnet = { path = "../lib/net", features = ["tls-server"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

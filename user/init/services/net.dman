@@ -1,0 +1,24 @@
+# Network service: in-tree Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, and TCP stack.
+# Provides capability-separated endpoints (`client`, `icmp`, `control`).
+name = "net"
+image = "net.dsvc"
+group = "system"
+after = ["devmgr", "clock"]
+description = "in-tree TCP/IP, DHCP, and DNS networking service"
+
+[provides]
+endpoints = ["client", "icmp", "control"]
+
+[grants]
+log = true
+connect = ["devmgr.net", "clock.time"]
+
+[quota]
+memory = "32M"
+handles = 256
+threads = 4
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

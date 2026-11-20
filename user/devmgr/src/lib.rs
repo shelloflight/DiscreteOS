@@ -30,19 +30,24 @@
 mod ahci;
 mod blk;
 mod blkserve;
+mod e1000e;
 mod hda;
 mod input;
 mod keymap;
+mod net_drv;
 mod nvme;
 mod ps2;
+mod r8169;
 mod trust;
 mod usbaudio;
 mod virtio;
+mod virtio_net;
 mod virtio_snd;
 mod xhci;
 
 use libd::audio;
 use libd::fs;
+use libd::net;
 use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
 use libd::svc;
 use libd::sys::{self, DeviceInfo, Handle};
@@ -58,10 +63,14 @@ libd::entry!(ddrv_xhci, xhci::main);
 libd::entry!(ddrv_hda, hda::main);
 libd::entry!(ddrv_virtio_snd, virtio_snd::main);
 libd::entry!(ddrv_usbaudio, usbaudio::main);
+libd::entry!(ddrv_virtio_net, virtio_net::main);
+libd::entry!(ddrv_e1000e, e1000e::main);
+libd::entry!(ddrv_r8169, r8169::main);
 
 const MAX_DRIVERS: usize = 24;
 const MAX_DISKS: usize = 16;
 const MAX_AUDIO: usize = 32;
+const MAX_NET: usize = 8;
 const MAX_INPUT_CLIENTS: usize = 8;
 /// Port key of the control channel from the service manager.
 const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
@@ -86,6 +95,17 @@ struct AudioDev {
     rate: u32,
     channels: u8,
     format: u8,
+    name: [u8; 40],
+    name_len: usize,
+}
+
+/// A network interface a driver announced (kept to hand over again when `net.dsvc` connects/restarts).
+#[derive(Clone, Copy)]
+struct NetDev {
+    drv: usize,
+    mac: [u8; 6],
+    link_up: bool,
+    mtu: u16,
     name: [u8; 40],
     name_len: usize,
 }
@@ -141,6 +161,9 @@ struct Mgr {
     /// Channel to the audio service (`devmgr.audio` endpoint; 0 until connected).
     audio_svc: Handle,
     known_audio: [Option<AudioDev>; MAX_AUDIO],
+    /// Channel to the network service (`devmgr.net` endpoint; 0 until connected).
+    net_svc: Handle,
+    known_net: [Option<NetDev>; MAX_NET],
     /// Control channel from the service manager (0: started without one).
     mgr: Handle,
     /// SHUTDOWN received.
@@ -160,9 +183,13 @@ struct Mgr {
 /// Which driver serves a device.
 fn driver_for(i: &DeviceInfo) -> Option<&'static str> {
     match (i.kind, i.vendor, i.device) {
+        (sys::DEV_KIND_PCI, 0x1AF4, 0x1041) => Some("virtio-net"),
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1042) => Some("virtio-blk"),
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1052) => Some("virtio-input"),
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1059) => Some("virtio-snd"),
+        // By vendor + Ethernet class (02.00): Intel GbE (e1000e) and Realtek GbE/2.5GbE (r8169).
+        (sys::DEV_KIND_PCI, 0x8086, _) if (i.class, i.subclass) == (0x02, 0x00) => Some("e1000e"),
+        (sys::DEV_KIND_PCI, 0x10EC, _) if (i.class, i.subclass) == (0x02, 0x00) => Some("r8169"),
         // By class: AHCI (01.06.01), NVMe (01.08.02), Intel HD Audio (04.03.*), xHCI (0C.03.30).
         _ if i.kind == sys::DEV_KIND_PCI && (i.class, i.subclass, i.progif) == (1, 6, 1) => Some("ahci"),
         _ if i.kind == sys::DEV_KIND_PCI && (i.class, i.subclass, i.progif) == (1, 8, 2) => Some("nvme"),
@@ -321,6 +348,13 @@ impl Mgr {
                         proto::USB_AUDIO_ATTACH if hnd != 0 => {
                             self.spawn_usb_audio(h.a, h.b, hnd);
                         }
+                        proto::NET_DEV => {
+                            let payload = &buf[HEADER..n];
+                            self.net_dev(i, h.a, h.b, payload);
+                        }
+                        proto::NET_LINK => {
+                            self.net_link(i, h.a != 0);
+                        }
                         _ => {}
                     }
                 }
@@ -389,6 +423,21 @@ impl Mgr {
                                 }
                             }
                             println!("devmgr: audio service connected: {} endpoint(s) attached", attached);
+                        }
+                        Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"net" && handle != 0 => {
+                            if self.net_svc != 0 {
+                                sys::handle_close(self.net_svc);
+                            }
+                            self.net_svc = handle;
+                            let known = self.known_net;
+                            let mut attached = 0u32;
+                            for nrec in known.iter().flatten() {
+                                if self.drv[nrec.drv].as_ref().is_some_and(|d| d.proc != 0 && d.ch != 0) {
+                                    self.attach_net_to_svc(*nrec);
+                                    attached += 1;
+                                }
+                            }
+                            println!("devmgr: network service connected: {} interface(s) attached", attached);
                         }
                         Some(h) if h.op == svc::SUSPEND => {
                             if handle != 0 {
@@ -576,6 +625,63 @@ impl Mgr {
         }
         if self.audio_svc != 0 {
             proto::send(self.audio_svc, audio::BACKEND_GONE, u64::from(dev_key), 0);
+        }
+    }
+
+    fn net_dev(&mut self, i: usize, a: u64, b: u64, name: &[u8]) {
+        let mac = net::unpack_mac(a);
+        let link_up = ((a >> 48) & 1) != 0;
+        let mtu = (b as u16).clamp(576, 1500);
+        let mut rec = NetDev {
+            drv: i,
+            mac,
+            link_up,
+            mtu,
+            name: [0; 40],
+            name_len: name.len().min(40),
+        };
+        rec.name[..rec.name_len].copy_from_slice(&name[..rec.name_len]);
+        let slot = self.known_net.iter().position(|x| x.is_some_and(|x| x.drv == i));
+        if let Some(s) = slot.or_else(|| self.known_net.iter().position(|x| x.is_none())) {
+            self.known_net[s] = Some(rec);
+        }
+        if self.net_svc != 0 {
+            self.attach_net_to_svc(rec);
+        }
+    }
+
+    fn attach_net_to_svc(&self, rec: NetDev) {
+        let Some(d) = self.drv[rec.drv].as_ref() else { return };
+        if d.ch == 0 || self.net_svc == 0 {
+            return;
+        }
+        let Ok((mine, theirs)) = sys::channel_pair() else {
+            println!("devmgr: out of handles attaching network interface");
+            return;
+        };
+        let mut m = [0u8; HEADER];
+        Header { txid: 0, op: proto::NET_ATTACH, status: 0, a: 0, b: 0 }.put(&mut m);
+        if sys::channel_write_h(d.ch, &m, &[sys::MsgHandle { handle: theirs, rights: sys::RIGHTS_SAME }]) < 0 {
+            sys::handle_close(mine);
+            return;
+        }
+        let a = net::pack_mac(rec.mac) | (u64::from(rec.link_up) << 48) | ((rec.drv as u64 & 0xFF) << 56);
+        let mut msg = [0u8; HEADER + 40];
+        Header { txid: 0, op: net::BACKEND_ADD, status: 0, a, b: u64::from(rec.mtu) }.put(&mut msg);
+        msg[HEADER..HEADER + rec.name_len].copy_from_slice(&rec.name[..rec.name_len]);
+        let _ = sys::channel_write_h(
+            self.net_svc,
+            &msg[..HEADER + rec.name_len],
+            &[sys::MsgHandle { handle: mine, rights: sys::RIGHTS_SAME }],
+        );
+    }
+
+    fn net_link(&mut self, i: usize, link_up: bool) {
+        if let Some(rec) = self.known_net.iter_mut().flatten().find(|x| x.drv == i) {
+            rec.link_up = link_up;
+        }
+        if self.net_svc != 0 {
+            proto::send(self.net_svc, net::BACKEND_LINK, i as u64, u64::from(link_up));
         }
     }
 
@@ -847,6 +953,8 @@ fn devmgr_main(s: *const Startup) -> i32 {
         known: [None; MAX_DISKS],
         audio_svc: 0,
         known_audio: [None; MAX_AUDIO],
+        net_svc: 0,
+        known_net: [None; MAX_NET],
         mgr: libd::startup_handle(proto::TAG_CONTROL),
         stop: false,
         suspended: false,

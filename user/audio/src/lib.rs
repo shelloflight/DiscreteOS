@@ -86,6 +86,7 @@ struct Backend {
     ch: Handle,
     online: bool,
     volume: u8,
+    saved_volume: u8,
     muted: bool,
 }
 
@@ -500,6 +501,7 @@ impl AudioSvc {
                                     ch: hnd,
                                     online: true,
                                     volume: 100,
+                                    saved_volume: 100,
                                     muted: false,
                                 });
                             }
@@ -942,23 +944,41 @@ impl AudioSvc {
                     return;
                 }
                 let target = if h.a == 0 { self.active_out_id } else { Some(h.a as u32) };
+                let mute_only = (h.b & audio::VOL_FLAG_MUTE_ONLY) != 0;
                 let vol = (h.b & 0xFF).min(100) as u8;
                 let muted = ((h.b >> 8) & 1) != 0;
                 if let Some(id) = target
                     && let Some(b) = self.backend_by_id_mut(id)
                 {
-                    b.volume = vol;
-                    b.muted = muted;
+                    if mute_only {
+                        if muted {
+                            if !b.muted {
+                                b.saved_volume = b.volume;
+                            }
+                            b.muted = true;
+                        } else {
+                            if b.muted {
+                                b.volume = b.saved_volume;
+                            }
+                            b.muted = false;
+                        }
+                    } else {
+                        b.volume = vol;
+                        b.saved_volume = vol;
+                        b.muted = muted;
+                    }
+                    let out_vol = b.volume;
+                    let out_muted = b.muted;
                     let bch = if b.online { b.ch } else { 0 };
-                    println!("audio: volume on '{}' set to {}%{}", b.name, vol, if muted { " (muted)" } else { "" });
+                    println!("audio: volume on '{}' set to {}%{}", b.name, out_vol, if out_muted { " (muted)" } else { "" });
                     if bch != 0 {
                         let mut dreq = [0u8; HEADER];
-                        Header { txid: 0, op: audio::DRV_SET_VOL, status: 0, a: u64::from(vol), b: u64::from(muted) }
+                        Header { txid: 0, op: audio::DRV_SET_VOL, status: 0, a: u64::from(out_vol), b: u64::from(out_muted) }
                             .put(&mut dreq);
                         let mut drep = [0u8; HEADER];
                         let _ = sys::channel_call(bch, &dreq, &mut drep, 500_000_000);
                     }
-                    Self::reply(ch, h, 0, u64::from(id), u64::from(vol));
+                    Self::reply(ch, h, 0, u64::from(id), u64::from(out_vol));
                 } else {
                     Self::reply(ch, h, sys::ERR_BAD_STATE as i32, 0, 0);
                 }

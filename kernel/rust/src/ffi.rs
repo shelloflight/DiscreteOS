@@ -170,6 +170,7 @@ unsafe extern "C" {
 
     // cpu.h
     pub fn cpu_random64() -> u64;
+    pub fn cpu_hw_random64(out: *mut u64) -> bool;
 
     // ktime.h (timers)
     pub fn timer_start_oneshot(t: *mut RawKtimer, delay_ns: u64, f: KtimerFn, ctx: *mut c_void);

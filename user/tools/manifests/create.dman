@@ -1,0 +1,12 @@
+# create: create one or more empty files (like touch).
+kind = "tool"
+name = "create"
+image = "create.dx"
+aliases = ["touch"]
+description = "create an empty file"
+
+[parameters]
+file = "path:write,create,many"
+
+[about]
+file = "the file(s) to create"

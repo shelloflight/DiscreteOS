@@ -28,7 +28,7 @@ Use `.\dbuild.ps1` on Windows or `./dbuild.sh` on Linux:
 
 ```sh
 ./dbuild.sh                           # build build/discrete.img (BIOS + UEFI, 64 MiB GPT image)
-./dbuild.sh run                       # build and boot in QEMU, serial on this console (--uefi, --smp N, --iommu amd, --audio hda|virtio|usb|none)
+./dbuild.sh run                       # build and boot in QEMU, serial on this console (--uefi, --smp N, --iommu amd, --audio hda|virtio|usb|none, --net virtio|e1000e|none)
 ./dbuild.sh debug                     # boot paused with a GDB stub on localhost:1234
 ./dbuild.sh test                      # run the full test suite (repro + QEMU/Bochs + host + static)
 ./dbuild.sh test --case boot,uefi     # selected cases only
@@ -57,9 +57,9 @@ Outputs: `build/discrete.img`, `build/kernel.elf` (with symbols, for GDB), `buil
    `KTEST_*` kernel variants in parallel;
 3. boots each case in QEMU (or Bochs for CET/strict-MSR) and checks the serial log: required lines
    must appear, forbidden lines (`KERNEL PANIC`, `FAIL`, ...) must not;
-4. runs the host cases: `cargo test` for `dosfs`, `doscrypt`, `dman`, and `aml`, the loaders' KASLR
-   and C crypto checks, and static analysis (`clang --analyze` over all C, `clippy -D warnings` over
-   all Rust crates);
+4. runs the host cases: `cargo test` for `dosfs`, `dosaudio`, `dosnet`, `doscrypt`, `dman`, and
+   `aml`, the loaders' KASLR and C crypto checks, and static analysis (`clang --analyze` over all C,
+   `clippy -D warnings` over all Rust crates);
 5. writes **`build/test-report.md`**: result per case, commit, tool versions. Attach it to your
    pull request.
 
@@ -71,8 +71,8 @@ Main test groups (see `tools/dbuild/src/test.rs` for the full list):
 | Protections fire | `stackprot`, `cet`, `cet-cp`, `cet-user`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `spec-intel`, `kaslr`, ... |
 | Kernel | `selftest`, `sched`, `cpupm`, `cpupm-bochs`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench`, `profile` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
-| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `services`, `shell`, `time`, `time-uefi`, `attest`, `attest-tpm`, `powerbutton`, `poweroff`, `poweroff-uefi`, `reboot`, `hwbench`, `kdb` |
-| Host | `storage-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |
+| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `services`, `shell`, `audio-hda`, `audio-virtio`, `audio-usb`, `audio-sec`, `net-virtio`, `net-e1000e`, `net-shell`, `time`, `time-uefi`, `attest`, `attest-tpm`, `powerbutton`, `poweroff`, `poweroff-uefi`, `reboot`, `hwbench`, `kdb` |
+| Host | `storage-host`, `audio-host`, `net-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |
 
 ## Adding a test
 

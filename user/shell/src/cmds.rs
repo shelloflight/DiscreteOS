@@ -32,7 +32,10 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "wait", aliases: &[], usage: "wait <job>", description: "wait for a job and show its output" },
     Builtin { name: "log", aliases: &[], usage: "log [source]", description: "the system log (every record, or one source's)" },
     Builtin { name: "time", aliases: &["date"], usage: "time", description: "the date and time (UTC) and the time since boot" },
-    Builtin { name: "audio", aliases: &["sound"], usage: "audio [vol <0-100%> | mute [on|off] | out <id|auto> | tone [hz] [ms] | mic <on|off>]", description: "audio devices, volume, output switching and test tone" },
+    Builtin { name: "audio", aliases: &["sound"], usage: "audio [vol <0-100%> | mute [on|off] | unmute | out <id|auto> | tone [hz] [ms] | mic <on|off>]", description: "audio devices, volume, mute/unmute, output switching and test tone" },
+    Builtin { name: "net", aliases: &["ip"], usage: "net", description: "network interface, IP address, gateway, DNS and counters" },
+    Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
+    Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
     Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
 ];
@@ -53,6 +56,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let max_args = match b.name {
         "help" | "go" | "objects" | "log" => 1,
         "end" | "restart" | "wait" | "power" => 1,
+        "ping" | "tls" => 2,
         "audio" => 3,
         _ => 0,
     };
@@ -73,6 +77,9 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "log" => log(sh, arg),
         "time" => clock(sh),
         "audio" => audio_cmd(sh, args),
+        "net" => net_cmd(sh),
+        "ping" => ping_cmd(sh, args),
+        "tls" => tls_cmd(sh, args),
         "power" => power(sh, arg),
         _ => {
             sh.clear();
@@ -499,7 +506,6 @@ fn audio_cmd(sh: &Shell, args: &[String]) -> Res {
             let mut devs = [DeviceEntry::empty(); 16];
             let n = audio::list_devices(sh.audio_ctl, &mut devs).unwrap_or(0);
             let active = devs[..n].iter().find(|d| d.active_out);
-            let cur_vol = active.map_or(100, |d| d.volume);
             let cur_muted = active.is_some_and(|d| d.muted);
             let muted = match args.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
                 None => !cur_muted,
@@ -507,10 +513,20 @@ fn audio_cmd(sh: &Shell, args: &[String]) -> Res {
                 Some("off" | "0" | "false") => false,
                 Some(_) => return Err(String::from("audio: usage: audio mute [on|off]")),
             };
-            let b = u64::from(cur_vol) | (u64::from(muted) << 8);
-            audio::control_call(sh.audio_ctl, audio::OP_SET_VOL, 0, b)
+            let b = audio::VOL_FLAG_MUTE_ONLY | (u64::from(muted) << 8);
+            let rep = audio::control_call(sh.audio_ctl, audio::OP_SET_VOL, 0, b)
                 .map_err(|e| format!("audio: {}", sys::status(e)))?;
-            sh.write(&show::ok_line(if muted { "output muted" } else { "output unmuted" }));
+            if muted {
+                sh.write(&show::ok_line("output muted"));
+            } else {
+                sh.write(&show::ok_line(&format!("output unmuted ({}%)", rep.b)));
+            }
+            Ok(Vec::new())
+        }
+        Some("unmute") => {
+            let rep = audio::control_call(sh.audio_ctl, audio::OP_SET_VOL, 0, audio::VOL_FLAG_MUTE_ONLY)
+                .map_err(|e| format!("audio: {}", sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("output unmuted ({}%)", rep.b)));
             Ok(Vec::new())
         }
         Some("out") => {
@@ -572,6 +588,242 @@ fn audio_cmd(sh: &Shell, args: &[String]) -> Res {
             sh.write(&show::ok_line(&format!("played {} Hz tone for {} ms", hz, ms)));
             Ok(Vec::new())
         }
-        _ => Err(String::from("audio: usage: audio [vol <0-100%> | mute [on|off] | out <id|auto> | tone [hz] [ms] | mic <on|off>]")),
+        _ => Err(String::from("audio: usage: audio [vol <0-100%> | mute [on|off] | unmute | out <id|auto> | tone [hz] [ms] | mic <on|off>]")),
     }
+}
+
+fn fmt_ip(ip: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+}
+
+fn net_cmd(sh: &Shell) -> Res {
+    let ch = if sh.net_ctl != 0 {
+        sh.net_ctl
+    } else if sh.net_client != 0 {
+        sh.net_client
+    } else {
+        sh.net_icmp
+    };
+    if ch == 0 {
+        return Err(String::from("net: no network capability granted to this session"));
+    }
+    let st = libd::net::status(ch).map_err(|e| format!("net: {}", sys::status(e)))?;
+    if st.name_len == 0 {
+        sh.write("no network interface attached\n");
+        return Ok(Vec::new());
+    }
+    let mac = format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        st.mac[0], st.mac[1], st.mac[2], st.mac[3], st.mac[4], st.mac[5]
+    );
+    let state = if st.dhcp_bound {
+        "up (dhcp)"
+    } else if st.link_up {
+        "link up (acquiring dhcp)"
+    } else {
+        "down"
+    };
+    Ok(alloc::vec![
+        Record::new()
+            .with("interface", Value::Text(String::from(st.name_str())))
+            .with("state", text(state))
+            .with("ip", Value::Text(fmt_ip(st.ip)))
+            .with("gateway", Value::Text(fmt_ip(st.gateway)))
+            .with("dns", Value::Text(fmt_ip(st.dns)))
+            .with("mac", Value::Text(mac))
+            .with("rx", Value::Int(st.rx_packets as i64))
+            .with("tx", Value::Int(st.tx_packets as i64)),
+    ])
+}
+
+fn ping_cmd(sh: &Shell, args: &[String]) -> Res {
+    let Some(host) = args.first().map(String::as_str) else {
+        return Err(String::from("ping: usage: ping <host> [count]"));
+    };
+    if sh.net_icmp == 0 {
+        return Err(String::from("ping: no network ICMP capability granted to this session"));
+    }
+    let count: u16 = match args.get(1) {
+        Some(s) => s
+            .parse::<u16>()
+            .ok()
+            .filter(|&n| (1..=16).contains(&n))
+            .ok_or_else(|| String::from("ping: count must be between 1 and 16"))?,
+        None => 4,
+    };
+    let ip = libd::net::resolve(sh.net_icmp, host)
+        .map_err(|e| format!("ping: cannot resolve '{}': {}", host, sys::status(e)))?;
+    let ip_s = fmt_ip(ip);
+    sh.write(&format!("PING {} ({}): {} request(s)\n", host, ip_s, count));
+
+    let mut rs = Vec::new();
+    let mut recv = 0u16;
+    let mut min_ms = u32::MAX;
+    let mut max_ms = 0u32;
+    let mut sum_ms = 0u64;
+
+    for seq in 1..=count {
+        match libd::net::ping(sh.net_icmp, ip, seq, 2_000) {
+            Ok((rtt, ttl)) => {
+                recv += 1;
+                min_ms = min_ms.min(rtt);
+                max_ms = max_ms.max(rtt);
+                sum_ms += u64::from(rtt);
+                rs.push(
+                    Record::new()
+                        .with("host", Value::Text(ip_s.clone()))
+                        .with("seq", Value::Int(i64::from(seq)))
+                        .with("ttl", Value::Int(i64::from(ttl)))
+                        .with("rtt", Value::Text(format!("{} ms", rtt)))
+                        .with("status", text("reply")),
+                );
+            }
+            Err(e) => {
+                rs.push(
+                    Record::new()
+                        .with("host", Value::Text(ip_s.clone()))
+                        .with("seq", Value::Int(i64::from(seq)))
+                        .with("ttl", text("-"))
+                        .with("rtt", text("-"))
+                        .with("status", Value::Text(String::from(sys::status(e)))),
+                );
+            }
+        }
+        if seq < count {
+            libd::handle::sleep(200_000_000);
+        }
+    }
+    let loss = (u32::from(count - recv) * 100) / u32::from(count);
+    if recv > 0 {
+        let avg = sum_ms / u64::from(recv);
+        sh.write(&show::ok_line(&format!(
+            "ping {}: {}/{} received ({}% loss), rtt min/avg/max = {}/{}/{} ms",
+            ip_s, recv, count, loss, min_ms, avg, max_ms
+        )));
+    } else {
+        sh.write(&show::err_line(&format!(
+            "ping {}: 0/{} received (100% loss)",
+            ip_s, count
+        )));
+    }
+    Ok(rs)
+}
+
+fn load_system_roots(sh: &Shell) -> Result<Vec<Vec<u8>>, String> {
+    let (node, _) = sh.open("tls", "/sys/certs/roots.der", 0, fp::R_READ)?;
+    let st = node.stat().map_err(|e| format!("tls: stat /sys/certs/roots.der: {}", sys::status(e)))?;
+    let size = st.size as usize;
+    if size == 0 || size > 512 * 1024 {
+        return Err(String::from("tls: /sys/certs/roots.der has invalid size"));
+    }
+    let mut raw = alloc::vec![0u8; size];
+    let mut off = 0usize;
+    while off < size {
+        let n = node
+            .read(off as u64, &mut raw[off..])
+            .map_err(|e| format!("tls: read /sys/certs/roots.der: {}", sys::status(e)))?;
+        if n == 0 {
+            break;
+        }
+        off += n;
+    }
+    dosnet::roots::parse_der_bundle(&raw[..off])
+        .ok_or_else(|| String::from("tls: malformed root CA bundle /sys/certs/roots.der"))
+}
+
+fn tls_cmd(sh: &Shell, args: &[String]) -> Res {
+    let Some(host) = args.first().map(String::as_str) else {
+        return Err(String::from("tls: usage: tls <host> [port]"));
+    };
+    if sh.net_client == 0 {
+        return Err(String::from("tls: no network client capability granted to this session"));
+    }
+    let port: u16 = match args.get(1) {
+        Some(s) => s
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p > 0)
+            .ok_or_else(|| String::from("tls: port must be between 1 and 65535"))?,
+        None => 443,
+    };
+    let roots = load_system_roots(sh)?;
+    let root_count = roots.len();
+    let now_unix = if sh.clock != 0
+        && let Some(b) = time::query(sh.clock)
+        && b.now().0 > 0
+    {
+        b.now().to_unix_secs()
+    } else {
+        return Err(String::from("tls: UTC clock unavailable (cannot verify certificate expiry)"));
+    };
+    let ip = libd::net::resolve(sh.net_client, host)
+        .map_err(|e| format!("tls: cannot resolve '{}': {}", host, sys::status(e)))?;
+    let ip_s = fmt_ip(ip);
+    let mut stream = libd::net::TcpStream::connect(sh.net_client, ip, port, 10_000)
+        .map_err(|e| format!("tls: connect {}:{} failed: {}", ip_s, port, sys::status(e)))?;
+
+    let mut rand160 = [0u8; 160];
+    libd::net::random_bytes(&mut rand160)
+        .map_err(|e| format!("tls: kernel CSPRNG refused: {}", sys::status(e)))?;
+
+    let mut client = dosnet::tls::TlsClient::new_with_options(
+        host,
+        roots,
+        Vec::new(),
+        Some(b"http/1.1"),
+        now_unix,
+        &rand160,
+    );
+    let mut buf = [0u8; 4096];
+    let dl = sys::clock_ns() + 15_000_000_000;
+    while !client.is_connected() {
+        let out = client.take_tx();
+        if !out.is_empty() {
+            stream
+                .write_all(&out)
+                .map_err(|e| format!("tls: write failed: {}", sys::status(e)))?;
+        }
+        if sys::clock_ns() >= dl {
+            stream.close();
+            return Err(String::from("tls: handshake timed out"));
+        }
+        let n = stream
+            .read(&mut buf, 5_000)
+            .map_err(|e| format!("tls: read failed: {}", sys::status(e)))?;
+        if n == 0 {
+            stream.close();
+            return Err(String::from("tls: peer closed connection during handshake"));
+        }
+        if let Err(e) = client.feed_rx(&buf[..n]) {
+            stream.close();
+            return Err(format!("tls: handshake rejected: {:?}", e));
+        }
+    }
+    let out = client.take_tx();
+    if !out.is_empty() {
+        let _ = stream.write_all(&out);
+    }
+    let cipher = client.negotiated_cipher().map_or("?", |c| c.name());
+    let group = client.negotiated_group().map_or("?", |g| g.name());
+    client.close();
+    let fin = client.take_tx();
+    if !fin.is_empty() {
+        let _ = stream.write_all(&fin);
+    }
+    stream.close();
+
+    sh.write(&show::ok_line(&format!(
+        "TLS 1.3 verified {} ({}:{}): {} / {} ({} system roots)",
+        host, ip_s, port, cipher, group, root_count
+    )));
+    Ok(alloc::vec![
+        Record::new()
+            .with("host", Value::Text(String::from(host)))
+            .with("ip", Value::Text(ip_s))
+            .with("port", Value::Int(i64::from(port)))
+            .with("protocol", text("TLS 1.3"))
+            .with("cipher", text(cipher))
+            .with("group", text(group))
+            .with("roots", Value::Int(root_count as i64)),
+    ])
 }

@@ -178,6 +178,10 @@ pub struct Manifest {
     pub audio_playback: bool,
     pub audio_capture: bool,
     pub audio_control: bool,
+    /// Network capabilities (`grants.net`: `client`, `icmp`, `control`).
+    pub net_client: bool,
+    pub net_icmp: bool,
+    pub net_control: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
@@ -305,6 +309,7 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "manager", Want::Strings),
     ("grants", "tools", Want::Bool),
     ("grants", "audio", Want::Strings),
+    ("grants", "net", Want::Strings),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -359,6 +364,9 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         audio_playback: false,
         audio_capture: false,
         audio_control: false,
+        net_client: false,
+        net_icmp: false,
+        net_control: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -536,6 +544,29 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                             }
                         }
                     }
+                    "grants.net" => {
+                        for s in &list {
+                            let ep = match s.as_str() {
+                                "client" => {
+                                    m.net_client = true;
+                                    "client"
+                                }
+                                "icmp" => {
+                                    m.net_icmp = true;
+                                    "icmp"
+                                }
+                                "control" => {
+                                    m.net_control = true;
+                                    "control"
+                                }
+                                _ => return Err(invalid("unknown net right (client, icmp, control)", s)),
+                            };
+                            let c = Connect { service: "net".to_string(), endpoint: ep.to_string() };
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
+                            }
+                        }
+                    }
                     _ => return Err(bad("known")),
                 }
             }
@@ -617,6 +648,19 @@ pub fn summary(m: &Manifest) -> String {
             parts.push("control");
         }
         add(&format!("audio ({})", parts.join(", ")));
+    }
+    if m.net_client || m.net_icmp || m.net_control {
+        let mut parts: Vec<&str> = Vec::new();
+        if m.net_client {
+            parts.push("client");
+        }
+        if m.net_icmp {
+            parts.push("icmp");
+        }
+        if m.net_control {
+            parts.push("control");
+        }
+        add(&format!("net ({})", parts.join(", ")));
     }
     if s.is_empty() {
         s.push_str("nothing");

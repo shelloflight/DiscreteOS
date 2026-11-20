@@ -17,15 +17,23 @@
 //! attestation reports with a per-boot key). Verification handles only public data and is not.
 #![no_std]
 
+pub mod aes_gcm;
 pub mod attest;
+pub mod chacha20;
+pub mod ct;
 pub mod dsig;
 pub mod ed25519;
+pub mod hkdf;
+pub mod mlkem;
 pub mod p256;
+pub mod p384;
 pub mod rsa;
 pub mod sha2;
+pub mod sha3;
 pub mod sym;
 pub mod testkeys;
 pub mod tpm;
+pub mod x25519;
 pub mod x509;
 
 #[cfg(test)]
@@ -34,3 +42,5 @@ mod tests;
 mod tests_ek;
 #[cfg(test)]
 mod tests_hw;
+#[cfg(test)]
+mod tests_tls;

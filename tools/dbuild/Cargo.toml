@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 dosfs = { path = "../../user/lib/fs" }
 doscrypt = { path = "../../user/lib/crypto" }
+dosnet = { path = "../../user/lib/net", features = ["tls-server"] }
 
 [profile.release]
 opt-level = 2

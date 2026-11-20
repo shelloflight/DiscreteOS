@@ -119,7 +119,7 @@ pub fn records(rs: &[Record], cols: usize) -> String {
         return String::new();
     }
     // Results of the file tools: `✓ copied /data/b.txt (1.2 KiB)`.
-    const DONE: [&str; 4] = ["copied", "moved", "deleted", "made"];
+    const DONE: [&str; 5] = ["copied", "moved", "deleted", "made", "created"];
     if rs.iter().all(|r| r.fields.first().is_some_and(|(n, _)| DONE.contains(&n.as_str()))) {
         let mut s = String::new();
         for r in rs {

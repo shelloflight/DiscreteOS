@@ -32,6 +32,7 @@ const CC_SHUTDOWN: u32 = 0x145;
 const CC_PCR_EXTEND: u32 = 0x182;
 const CC_PCR_READ: u32 = 0x17E;
 const CC_GET_CAPABILITY: u32 = 0x17A;
+const CC_GET_RANDOM: u32 = 0x17B;
 const CC_CREATE_PRIMARY: u32 = 0x131;
 const CC_FLUSH_CONTEXT: u32 = 0x165;
 const CC_QUOTE: u32 = 0x158;
@@ -238,6 +239,20 @@ impl Tpm {
         }
         rsp.truncate(got);
         Ok(rsp)
+    }
+
+    /// Request up to `n` bytes (capped at 48 per TPM 2.0 spec) of hardware entropy (`TPM2_GetRandom`).
+    pub fn get_random(&mut self, n: usize) -> Result<Vec<u8>, Error> {
+        let want = n.clamp(1, 48) as u16;
+        let mut c = Cmd::new(ST_NO_SESSIONS, CC_GET_RANDOM);
+        c.u16(want);
+        let r = self.command(c.done())?;
+        let mut p = Rsp::params(&r, 0)?;
+        let bytes = p.tpm2b()?;
+        if bytes.is_empty() {
+            return Err(Error::Protocol("empty GetRandom"));
+        }
+        Ok(bytes.to_vec())
     }
 
     pub fn pcr_extend(&mut self, pcr: u32, digest: &[u8; 32]) -> Result<(), Error> {
@@ -906,6 +921,17 @@ impl Sim {
                 put16(&mut out, 0x8025);
                 put32(&mut out, RH_ENDORSEMENT);
                 tpm2b(&mut out, &[]);
+            }
+            CC_GET_RANDOM => {
+                let Ok(n) = p.u16() else { return (VALUE, out) };
+                let take = usize::from(n).min(48);
+                let mut rnd = vec![0u8; take];
+                for chunk in rnd.chunks_mut(8) {
+                    // SAFETY: simulator entropy source for ktest.
+                    let v = unsafe { ffi::cpu_random64() }.to_le_bytes();
+                    chunk.copy_from_slice(&v[..chunk.len()]);
+                }
+                tpm2b(&mut out, &rnd);
             }
             CC_ACTIVATE_CREDENTIAL => {
                 // Sessions: the AK's password, then the EK's policy session (used up).

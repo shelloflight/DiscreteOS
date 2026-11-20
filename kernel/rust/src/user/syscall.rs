@@ -109,7 +109,9 @@ pub mod nr {
     pub const ATTEST_ACTIVATE: u64 = 71;
     // ABI v13: demand paging and child VMAR destruction
     pub const VMAR_DESTROY: u64 = 72;
-    pub const COUNT: u64 = 73;
+    // ABI v14: kernel ChaCha20 CSPRNG
+    pub const GET_RANDOM: u64 = 73;
+    pub const COUNT: u64 = 74;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -239,6 +241,27 @@ const DEV_FLAG_MSIX: u32 = 1 << 2;
 /// device_dma_map flags: what the device may do with the pages.
 const DMA_DEVICE_READ: u64 = 1 << 0;
 const DMA_DEVICE_WRITE: u64 = 1 << 1;
+
+fn get_random(buf: u64, len: u64, flags: u64) -> KResult<i64> {
+    if len == 0 {
+        return Ok(0);
+    }
+    if len > crate::security::csprng::MAX_CALL_BYTES as u64 {
+        return Err(Status::InvalidArgs);
+    }
+    let n = len as usize;
+    let mut tmp = [0u8; 256];
+    let mut off = 0usize;
+    while off < n {
+        let take = (n - off).min(tmp.len());
+        crate::security::csprng::fill_bytes(&mut tmp[..take], flags)?;
+        let res = uaccess::copy_to_user(buf.checked_add(off as u64).ok_or(Status::BadAddress)?, &tmp[..take]);
+        doscrypt::ct::wipe_bytes(&mut tmp[..take]);
+        res?;
+        off += take;
+    }
+    Ok(n as i64)
+}
 
 fn device_info(u: &UserThread, dh: u64, out: u64) -> KResult<i64> {
     use crate::object::device::Kind;
@@ -1116,6 +1139,7 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
         nr::LOG_RECORD => log_record(u, a[0], a[1], a[2], a[3]),
         nr::DISPLAY_INFO => display_info(u, a[0], a[1]),
         nr::PROCESS_HANDLES => process_handles(u, a[0], a[1], a[2]),
+        nr::GET_RANDOM => get_random(a[0], a[1], a[2]),
         #[cfg(ktest)]
         nr::KTEST_SMAP => {
             // SAFETY: test builds only: makes the kernel fault on purpose (SMAP).

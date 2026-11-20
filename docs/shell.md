@@ -24,7 +24,7 @@ data ▸ copy report.txt /backup
 | Process | Holds | Does not hold |
 |---|---|---|
 | `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge) |
-| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone |
+| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone |
 | a tool | an output channel, one node per path argument with the rights its manifest declares, the log | the namespace, endpoints, anything else of the shell |
 
 The terminal and the shell are separate so that neither gets the other's authority: a bug in the
@@ -59,9 +59,10 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
 ## The shell
 
 - **Names**: plain words, with the familiar names as aliases (`list`/`ls`/`dir`, `show`/`cat`,
-  `copy`/`cp`, `move`/`mv`, `delete`/`rm`, `make`/`mkdir`, `tasks`/`ps`, `end`/`kill`,
-  `time`/`date`, `go`/`cd`). An unknown command suggests the closest name. `help` lists
-  everything; `help <command>` shows its usage and, for a tool, the rights each parameter gives.
+  `copy`/`cp`, `move`/`mv`, `delete`/`rm`, `make`/`mkdir`, `create`/`touch`, `tasks`/`ps`,
+  `end`/`kill`, `time`/`date`, `go`/`cd`, `net`/`ip`). An unknown command suggests the closest
+  name. `help` lists everything; `help <command>` shows its usage and, for a tool, the rights each
+  parameter gives.
 - **Places**: there is no global root. `/` is the list of the session's places (`/data`,
   `/system`, ...); `places` shows them with their rights and sizes. The prompt is the current place
   (`data/notes ▸`). Relative names resolve in the current place; absolute paths go exactly there;
@@ -76,8 +77,11 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
 - **Built-ins** (they use the session's own grants): `go`, `places`, `tasks` (services through the
   manager, and jobs), `objects [job | service]` (handles held, through `process_handles`),
   `end`/`restart` (services through the manager), `log [source]`, `time`, `audio` (devices,
-  volume, routing, test tone, mic policy; [audio.md](audio.md)), `power off | restart | sleep`
-  (the manager stops every service cleanly first), `clear`, `run <tool> [arguments]`.
+  volume, mute/unmute, routing, test tone, mic policy; [audio.md](audio.md)), `net` (`ip`, link
+  and IPv4 status), `ping <host> [count]` (DNS + ICMP echo), `tls <host> [port]` (TLS 1.3
+  handshake & certificate verification against `/sys/certs/roots.der`;
+  [networking.md](networking.md)), `power off | restart | sleep` (the manager stops every service
+  cleanly first), `clear`, `run <tool> [arguments]`.
 - **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
   (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place
   (with the session's rights there) as its working directory, an output channel and the wall
@@ -117,7 +121,8 @@ Parameter kinds: `path`, `text`, `number`; flags `read`, `write` (includes read)
 An optional path left out is the current place. A path outside the namespace, or write access to
 a read-only place, is refused by the shell before the tool starts. The tools: `list`, `show`,
 `copy`, `move` (a rename in one directory, atomic on DFS; between directories files are copied,
-then the original deleted), `delete` (files and empty directories), `make`.
+then the original deleted), `delete` (files and empty directories), `make`, `create` (`touch`,
+creates empty files without truncating existing ones).
 
 Trade-offs: a written path hands the tool its whole directory (storaged's rights are per node, so
 a tool may touch the neighbours of a file it creates); tools get the log for their crash reports.

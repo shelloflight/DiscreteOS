@@ -62,7 +62,8 @@ The shell provides the `audio` built-in (`sound` alias):
 
 - `audio` — list audio devices, kinds, active/plugged states, and volumes
 - `audio vol <0-100%> [id]` — set per-device volume (defaults to active output)
-- `audio mute [on|off]` — toggle, mute, or unmute active output
+- `audio mute [on|off]` — toggle, mute, or unmute active output (saves current volume before muting)
+- `audio unmute` — unmute active output and restore the volume saved before muting
 - `audio out <id|auto>` — select a specific output device or return to automatic switching
 - `audio tone [freq] [duration]` — play a test sine tone (default 440 Hz, 500 ms; accepts units such as `500Hz`, `1.5kHz`, `1000ms`, `2s`)
 - `audio mic <on|off>` — allow or revoke microphone capture globally

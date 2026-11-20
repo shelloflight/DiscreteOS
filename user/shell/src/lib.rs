@@ -96,6 +96,9 @@ pub struct Shell {
     pub clock: Handle,
     pub audio_play: Handle,
     pub audio_ctl: Handle,
+    pub net_client: Handle,
+    pub net_icmp: Handle,
+    pub net_ctl: Handle,
     pub jobs: Vec<Job>,
     next_job: u32,
     /// The job whose output the terminal is waiting for.
@@ -872,6 +875,9 @@ fn main(s: *const Startup) -> i32 {
         clock: svc::endpoint(b"clock.time"),
         audio_play: svc::endpoint(b"audio.playback"),
         audio_ctl: svc::endpoint(b"audio.control"),
+        net_client: svc::endpoint(b"net.client"),
+        net_icmp: svc::endpoint(b"net.icmp"),
+        net_ctl: svc::endpoint(b"net.control"),
         jobs: Vec::new(),
         next_job: 1,
         fg: None,
@@ -935,6 +941,9 @@ fn main(s: *const Startup) -> i32 {
                                     b"clock.time" => &mut sh.clock,
                                     b"audio.playback" => &mut sh.audio_play,
                                     b"audio.control" => &mut sh.audio_ctl,
+                                    b"net.client" => &mut sh.net_client,
+                                    b"net.icmp" => &mut sh.net_icmp,
+                                    b"net.control" => &mut sh.net_ctl,
                                     _ => {
                                         sys::handle_close(handle);
                                         continue;

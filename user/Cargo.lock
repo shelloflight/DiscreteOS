@@ -49,6 +49,13 @@ name = "dosfs"
 version = "0.1.0"
 
 [[package]]
+name = "dosnet"
+version = "0.1.0"
+dependencies = [
+ "doscrypt",
+]
+
+[[package]]
 name = "fstest"
 version = "0.1.0"
 dependencies = [
@@ -80,6 +87,16 @@ name = "ltest"
 version = "0.1.0"
 dependencies = [
  "dosaudio",
+ "doscrypt",
+ "dosnet",
+ "libd",
+]
+
+[[package]]
+name = "net"
+version = "0.1.0"
+dependencies = [
+ "dosnet",
  "libd",
 ]
 
@@ -89,6 +106,7 @@ version = "0.1.0"
 dependencies = [
  "dman",
  "dosaudio",
+ "dosnet",
  "libd",
 ]
 

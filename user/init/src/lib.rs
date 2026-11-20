@@ -271,6 +271,7 @@ fn main(s: *const Startup) -> i32 {
         }
         "time test" => return time_test(),
         "audio test" => return audio_test(),
+        "net test" => return net_test(),
         _ => {}
     }
 
@@ -441,6 +442,27 @@ fn audio_test() -> i32 {
     }
     m.shutdown();
     println!("init: audio test: PASSED");
+    let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
+    println!("init: power: system_power returned {}", r);
+    1
+}
+
+/// Networking capability, DHCP, DNS, ICMP ping, TCP, and TLS 1.3 verification test.
+fn net_test() -> i32 {
+    let Some(mut m) = start_system(&[], &[Group::System, Group::Test], true) else {
+        return 1;
+    };
+    let state = |m: &Mgr, name: &str| m.find(name).map(|i| m.svcs[i].state);
+    let ok = m.run_until(45 * SEC, |m| {
+        matches!(state(m, "svc-net-ungranted"), Some(State::Done(_)))
+            && matches!(state(m, "svc-net-full"), Some(State::Done(_)))
+    });
+    check!(ok, "net test services did not finish in time");
+    for s in ["svc-net-ungranted", "svc-net-full"] {
+        check!(state(&m, s) == Some(State::Done(0)), "{} ended with {:?}", s, state(&m, s));
+    }
+    m.shutdown();
+    println!("init: net test: PASSED");
     let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
     println!("init: power: system_power returned {}", r);
     1

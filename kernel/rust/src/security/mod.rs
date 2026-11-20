@@ -10,6 +10,7 @@
 //! - TPM 2.0 ([`tpm`]): found through ACPI; every measurement goes there too ([`measure`]).
 
 pub mod attest;
+pub mod csprng;
 pub mod measure;
 pub mod tpm;
 
@@ -89,6 +90,8 @@ pub unsafe extern "C" fn dkrnl_security_init(firmware: u32, flags: u32, kernel_d
         kprintln!("Verified boot: warning: OFF (the loader did not verify the kernel)");
         measure::measure(measure::PCR_KERNEL, &[0; 32], "kernel (unverified)", false);
     }
+    // Kernel CSPRNG (before attestation key creation so the boot AK uses ChaCha20 CSPRNG).
+    csprng::init();
     // Remote attestation: this boot's key, measured right after the kernel (attest.rs).
     let ak = attest::init(firmware, flags & BOOT_KERNEL_VERIFIED != 0);
     // The attest-tpm test: the simulated TPM (TEST keys) stands in for hardware.
