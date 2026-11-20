@@ -23,8 +23,8 @@ public Root CAs compiled to `sys:/certs/roots.der`), `user/net` (`net.dsvc`),
 | Component | Role |
 |---|---|
 | `virtio-net.ddrv` | VirtIO 1.0+ network adapter (PCI `1AF4:1041`): modern PCI transport, RX/TX virtqueues with 12-byte `virtio_net_hdr`, link status detection, MSI-X interrupts, IOMMU-confined DMA buffers. |
-| `e1000e.ddrv` | Intel PRO/1000 / e1000e Ethernet (PCI `8086:*` class `02.00`): MMIO BAR0 register access, RAL/RAH MAC read, 64-entry TX/RX descriptor rings, link-up detection, MSI/legacy interrupt handling. |
-| `r8169.ddrv` | Realtek RTL8168/8169/8125 Gigabit Ethernet (PCI `10EC:*` class `02.00`): MMIO register access, chip reset, 64-entry TX/RX descriptor rings, link status polling, interrupt handling. |
+| `e1000e.ddrv` | Intel Gigabit & 2.5GbE Ethernet (PCI `8086:*` class `02.00`): supports classic `e1000e`/`e1000` (82574L, I217/I218/I219) plus `igb` (I210/I211/I350) and `igc` (I225-V/I226-V 2.5GbE) extended queue registers (`0xC000`/`0xE000`, `SRRCTL`, `RXDCTL`/`TXDCTL` queue enable, `EIMS`/`IVAR`), dynamic link polling, and IOMMU-confined 24-entry TX/RX rings. |
+| `r8169.ddrv` | Realtek Gigabit / 2.5GbE / 5GbE Ethernet (PCI `10EC:*` class `02.00`): supports RTL8111/8168/8169 and RTL8125/8125B/8125D/8126/8127 (auto-detected via PCI device ID / `TxConfig` XID), with 8125-specific TX doorbell (`0x90`), 32-bit IMR/ISR (`0x38`/`0x3C`), `RX_FETCH_DFLT_8125`, `MISC.RXDV_GATED_EN` clearing, dynamic link polling, and IOMMU-confined 24-entry TX/RX rings. |
 | `net.dsvc` | Owns the `dosnet::NetStack` state machine, runs automatic DHCPv4 configuration when a NIC attaches, manages client TCP/UDP/DNS/ICMP requests over shared `IoRing` channels, and enforces capability boundaries across endpoints. |
 | `dosnet` | Pure-Rust `no_std` network stack (`#![forbid(unsafe_code)]`): strict bounds-checked Ethernet II, ARP, IPv4, ICMPv4, UDP, DHCPv4, DNS (with compression-pointer loop and depth protection), RFC 9293 TCP, and strict TLS 1.3. |
 

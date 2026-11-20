@@ -44,6 +44,11 @@ impl NetBridge {
         let _ = sys::channel_write(ctl, &msg[..HEADER + nl]);
     }
 
+    /// Notify `devmgr` (and `net.dsvc`) when carrier link state changes (`proto::NET_LINK`).
+    pub fn send_link(ctl: Handle, link_up: bool) {
+        proto::send(ctl, proto::NET_LINK, u64::from(link_up), 0);
+    }
+
     /// Drain messages on `ctl` from `devmgr` (`NET_ATTACH`, `STATS`, `TEST_CRASH`).
     /// Returns `false` if the control channel closed (driver should exit).
     pub fn poll_ctl(&mut self, ctl: Handle, port: &Port, irqs: u64) -> bool {

@@ -462,14 +462,20 @@ pub fn build_dhcp_packet(
 
     // Option 53: DHCP Message Type
     b.extend_from_slice(&[53, 1, msg_type]);
+    // Option 61: Client Identifier (type 1 = Ethernet + 6-byte MAC)
+    b.extend_from_slice(&[61, 7, 1, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]]);
+    // Option 57: Maximum DHCP Message Size (1500 bytes)
+    b.extend_from_slice(&[57, 2, 0x05, 0xDC]);
     if let Some(ip) = requested_ip {
         b.extend_from_slice(&[50, 4, ip[0], ip[1], ip[2], ip[3]]);
     }
     if let Some(sid) = server_id {
         b.extend_from_slice(&[54, 4, sid[0], sid[1], sid[2], sid[3]]);
     }
-    // Option 55: Parameter Request List (subnet, router, DNS)
-    b.extend_from_slice(&[55, 3, 1, 3, 6]);
+    // Option 12: Host Name ("discrete-os")
+    b.extend_from_slice(b"\x0c\x0bdiscrete-os");
+    // Option 55: Parameter Request List (subnet, router, DNS, lease time)
+    b.extend_from_slice(&[55, 4, 1, 3, 6, 51]);
     // Option 255: End
     b.push(255);
     if b.len() < 300 {

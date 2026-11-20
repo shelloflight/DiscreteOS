@@ -55,6 +55,7 @@ struct NicPipe {
     tx_in_flight: u32,
     tx_next_id: u32,
     link_up: bool,
+    dhcp_offer_logged: bool,
     dhcp_logged: bool,
     stack: NetStack,
 }
@@ -123,6 +124,7 @@ impl NicPipe {
             tx_in_flight: 0,
             tx_next_id: 1,
             link_up,
+            dhcp_offer_logged: false,
             dhcp_logged: false,
             stack,
         })
@@ -373,7 +375,17 @@ impl NetSvc {
                             if let Some(nic) = self.nic.as_mut()
                                 && nic.drv_key == drv_key
                             {
+                                let was_up = nic.link_up;
                                 nic.link_up = up;
+                                if up && !was_up {
+                                    println!("net: '{}' link up", nic.name);
+                                    if nic.stack.dhcp_state != DhcpState::Bound {
+                                        nic.stack.start_dhcp(now_ms());
+                                        nic.flush_tx();
+                                    }
+                                } else if !up && was_up {
+                                    println!("net: '{}' link down", nic.name);
+                                }
                             }
                         }
                         net::BACKEND_GONE => {
@@ -788,6 +800,10 @@ impl NetSvc {
             nic.drain_rx(now);
             nic.stack.tick(now);
 
+            if !nic.dhcp_offer_logged && nic.stack.dhcp_state == DhcpState::Requesting {
+                nic.dhcp_offer_logged = true;
+                println!("net: dhcp offer received on '{}'", nic.name);
+            }
             if !nic.dhcp_logged && nic.stack.dhcp_state == DhcpState::Bound {
                 nic.dhcp_logged = true;
                 println!(

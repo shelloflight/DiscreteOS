@@ -95,6 +95,48 @@ fn wire_round_trips_and_dns_loops() {
     assert_eq!((parsed.msg_type, parsed.your_ip), (DHCP_OFFER, [10, 0, 2, 15]));
     assert_ne!(DHCP_DISCOVER, DHCP_REQUEST);
     assert_ne!(DHCP_OFFER, DHCP_ACK);
+
+    // DHCP real-router quirk resilience: OFFER with zero siaddr/Option 54 (falls back to ip.src),
+    // ACK omitting Option 3/6 (falls back to OFFER router/DNS), and Requesting timeout reset.
+    let mut st = NetStack::new(mac, 0x7777);
+    st.start_dhcp(100);
+    let disc_frame = st.poll_tx().expect("expected DHCP discover");
+    let disc_eth = EthFrame::parse(&disc_frame).unwrap();
+    let disc_ip = Ipv4Packet::parse(disc_eth.payload).unwrap();
+    let disc_udp = UdpPacket::parse(disc_ip.src, disc_ip.dst, disc_ip.payload).unwrap();
+    let xid = u32::from_be_bytes([disc_udp.payload[4], disc_udp.payload[5], disc_udp.payload[6], disc_udp.payload[7]]);
+    // Build an OFFER with siaddr=0, no Option 54, router=192.168.1.1, dns=192.168.1.1.
+    let mut off = vec![0u8; 240];
+    off[0] = 2;
+    off[1] = 1;
+    off[2] = 6;
+    off[4..8].copy_from_slice(&xid.to_be_bytes());
+    off[16..20].copy_from_slice(&[192, 168, 1, 50]);
+    off[28..34].copy_from_slice(&mac);
+    off[236..240].copy_from_slice(&[99, 130, 83, 99]);
+    off.extend_from_slice(&[53, 1, DHCP_OFFER, 1, 4, 255, 255, 255, 0, 3, 4, 192, 168, 1, 1, 6, 4, 1, 1, 1, 1, 255]);
+    let off_udp = build_udp([192, 168, 1, 1], [255, 255, 255, 255], 67, 68, &off).unwrap();
+    let off_ip = build_ipv4([192, 168, 1, 1], [255, 255, 255, 255], PROTO_UDP, 1, 64, &off_udp).unwrap();
+    let off_eth = build_eth([0xFF; 6], [0xAA; 6], ETH_TYPE_IPV4, &off_ip);
+    st.on_rx_frame(&off_eth, 120);
+    assert_eq!(st.dhcp_state, DhcpState::Requesting);
+    assert!(st.poll_tx().is_some()); // DHCP REQUEST sent
+    // Send ACK with router/DNS omitted -> should inherit OFFER's router/DNS.
+    let mut ack = vec![0u8; 240];
+    ack[0] = 2;
+    ack[1] = 1;
+    ack[2] = 6;
+    ack[4..8].copy_from_slice(&xid.to_be_bytes());
+    ack[16..20].copy_from_slice(&[192, 168, 1, 50]);
+    ack[28..34].copy_from_slice(&mac);
+    ack[236..240].copy_from_slice(&[99, 130, 83, 99]);
+    ack.extend_from_slice(&[53, 1, DHCP_ACK, 1, 4, 255, 255, 255, 0, 255]);
+    let ack_udp = build_udp([192, 168, 1, 1], [192, 168, 1, 50], 67, 68, &ack).unwrap();
+    let ack_ip = build_ipv4([192, 168, 1, 1], [192, 168, 1, 50], PROTO_UDP, 2, 64, &ack_udp).unwrap();
+    let ack_eth = build_eth(mac, [0xAA; 6], ETH_TYPE_IPV4, &ack_ip);
+    st.on_rx_frame(&ack_eth, 140);
+    assert_eq!(st.dhcp_state, DhcpState::Bound);
+    assert_eq!((st.ip, st.gateway, st.dns_server), ([192, 168, 1, 50], [192, 168, 1, 1], [1, 1, 1, 1]));
 }
 
 #[test]

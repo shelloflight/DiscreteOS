@@ -91,6 +91,9 @@ pub struct NetStack {
     dhcp_xid: u32,
     dhcp_server: Ipv4Addr,
     dhcp_offered: Ipv4Addr,
+    dhcp_offer_router: Option<Ipv4Addr>,
+    dhcp_offer_dns: Option<Ipv4Addr>,
+    dhcp_retries: u8,
     dhcp_last_tx_ms: u64,
     arp: ArpTable,
     tx_queue: VecDeque<Vec<u8>>,
@@ -123,6 +126,9 @@ impl NetStack {
             dhcp_xid: 0,
             dhcp_server: IP_UNSPECIFIED,
             dhcp_offered: IP_UNSPECIFIED,
+            dhcp_offer_router: None,
+            dhcp_offer_dns: None,
+            dhcp_retries: 0,
             dhcp_last_tx_ms: 0,
             arp: ArpTable::new(),
             tx_queue: VecDeque::new(),
@@ -248,6 +254,9 @@ impl NetStack {
     pub fn start_dhcp(&mut self, now_ms: u64) {
         self.dhcp_xid = self.next_rand().max(1);
         self.dhcp_state = DhcpState::Discovering;
+        self.dhcp_offer_router = None;
+        self.dhcp_offer_dns = None;
+        self.dhcp_retries = 0;
         self.dhcp_last_tx_ms = now_ms;
         self.send_dhcp_discover(now_ms);
     }
@@ -260,19 +269,24 @@ impl NetStack {
     }
 
     fn send_dhcp_request(&mut self, now_ms: u64) {
+        let server = if self.dhcp_server != IP_UNSPECIFIED {
+            Some(self.dhcp_server)
+        } else {
+            None
+        };
         let dhcp = build_dhcp_packet(
             DHCP_REQUEST,
             self.dhcp_xid,
             self.mac,
             Some(self.dhcp_offered),
-            Some(self.dhcp_server),
+            server,
         );
         if let Some(udp) = build_udp(IP_UNSPECIFIED, IP_BROADCAST, 68, 67, &dhcp) {
             self.send_ipv4(IP_UNSPECIFIED, IP_BROADCAST, PROTO_UDP, &udp, now_ms);
         }
     }
 
-    fn handle_dhcp(&mut self, payload: &[u8], now_ms: u64) {
+    fn handle_dhcp(&mut self, src_ip: Ipv4Addr, payload: &[u8], now_ms: u64) {
         let Some(msg) = parse_dhcp(payload, self.mac) else {
             return;
         };
@@ -280,21 +294,30 @@ impl NetStack {
             return;
         }
         match (self.dhcp_state, msg.msg_type) {
-            (DhcpState::Discovering, DHCP_OFFER) => {
+            (DhcpState::Discovering, DHCP_OFFER) if msg.your_ip != IP_UNSPECIFIED => {
                 self.dhcp_offered = msg.your_ip;
-                self.dhcp_server = msg.server_ip;
+                self.dhcp_server = if msg.server_ip != IP_UNSPECIFIED {
+                    msg.server_ip
+                } else {
+                    src_ip
+                };
+                self.dhcp_offer_router = msg.router;
+                self.dhcp_offer_dns = msg.dns;
+                self.dhcp_retries = 0;
                 self.dhcp_state = DhcpState::Requesting;
                 self.dhcp_last_tx_ms = now_ms;
                 self.send_dhcp_request(now_ms);
             }
-            (DhcpState::Requesting, DHCP_ACK) => {
+            (DhcpState::Requesting, DHCP_ACK) if msg.your_ip != IP_UNSPECIFIED => {
                 self.ip = msg.your_ip;
                 self.netmask = msg.subnet_mask;
-                if let Some(gw) = msg.router {
+                if let Some(gw) = msg.router.or(self.dhcp_offer_router) {
                     self.gateway = gw;
                 }
-                if let Some(dns) = msg.dns {
+                if let Some(dns) = msg.dns.or(self.dhcp_offer_dns) {
                     self.dns_server = dns;
+                } else if self.gateway != IP_UNSPECIFIED {
+                    self.dns_server = self.gateway;
                 }
                 if !msg.bootfile.is_empty() {
                     self.bootfile = msg.bootfile;
@@ -609,8 +632,8 @@ impl NetStack {
         let Some(udp) = UdpPacket::parse(ip.src, ip.dst, ip.payload) else {
             return;
         };
-        if udp.dst_port == 68 && udp.src_port == 67 {
-            self.handle_dhcp(udp.payload, now_ms);
+        if udp.dst_port == 68 {
+            self.handle_dhcp(ip.src, udp.payload, now_ms);
             return;
         }
         if let Some(pos) = self.dns_pending.iter().position(|d| d.local_port == udp.dst_port) {
@@ -684,8 +707,13 @@ impl NetStack {
                 self.send_dhcp_discover(now_ms);
             }
             DhcpState::Requesting if now_ms.saturating_sub(self.dhcp_last_tx_ms) >= 1_500 => {
-                self.dhcp_last_tx_ms = now_ms;
-                self.send_dhcp_request(now_ms);
+                if self.dhcp_retries >= 4 {
+                    self.start_dhcp(now_ms);
+                } else {
+                    self.dhcp_retries += 1;
+                    self.dhcp_last_tx_ms = now_ms;
+                    self.send_dhcp_request(now_ms);
+                }
             }
             _ => {}
         }
