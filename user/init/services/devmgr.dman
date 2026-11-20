@@ -7,7 +7,7 @@ after = ["storaged"]
 description = "devices and their drivers"
 
 [provides]
-endpoints = ["input", "audio", "net"]   # keyboard/pointer input, audio, and network driver endpoints
+endpoints = ["input", "audio", "net", "gpu"]   # keyboard/pointer input, audio, network, and GPU driver endpoints
 
 [grants]
 log = true
@@ -16,7 +16,7 @@ programs = ["*.ddrv"]
 connect = ["storaged.disks"]
 
 [quota]
-memory = "96M"
+memory = "160M"
 handles = 2048
 threads = 48
 

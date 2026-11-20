@@ -28,25 +28,31 @@
 #![no_std]
 
 mod ahci;
+mod amdgpu;
 mod blk;
 mod blkserve;
 mod e1000e;
+mod gpu_drv;
 mod hda;
 mod input;
 mod keymap;
 mod net_drv;
+mod nvgpu;
 mod nvme;
 mod ps2;
 mod r8169;
 mod trust;
 mod usbaudio;
 mod virtio;
+mod virtio_gpu;
 mod virtio_net;
 mod virtio_snd;
+mod xe;
 mod xhci;
 
 use libd::audio;
 use libd::fs;
+use libd::gpu;
 use libd::net;
 use libd::proto::{self, HEADER, Header, MAX_SECTORS, SECTOR};
 use libd::svc;
@@ -66,11 +72,16 @@ libd::entry!(ddrv_usbaudio, usbaudio::main);
 libd::entry!(ddrv_virtio_net, virtio_net::main);
 libd::entry!(ddrv_e1000e, e1000e::main);
 libd::entry!(ddrv_r8169, r8169::main);
+libd::entry!(ddrv_virtio_gpu, virtio_gpu::main);
+libd::entry!(ddrv_amdgpu, amdgpu::main);
+libd::entry!(ddrv_xe, xe::main);
+libd::entry!(ddrv_nvgpu, nvgpu::main);
 
-const MAX_DRIVERS: usize = 24;
+const MAX_DRIVERS: usize = 28;
 const MAX_DISKS: usize = 16;
 const MAX_AUDIO: usize = 32;
 const MAX_NET: usize = 8;
+const MAX_GPU: usize = 8;
 const MAX_INPUT_CLIENTS: usize = 8;
 /// Port key of the control channel from the service manager.
 const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
@@ -106,6 +117,16 @@ struct NetDev {
     mac: [u8; 6],
     link_up: bool,
     mtu: u16,
+    name: [u8; 40],
+    name_len: usize,
+}
+
+/// A GPU adapter a driver announced (kept to hand over again when `gpu.dsvc` connects/restarts).
+#[derive(Clone, Copy)]
+struct GpuDev {
+    drv: usize,
+    a: u64,
+    b: u64,
     name: [u8; 40],
     name_len: usize,
 }
@@ -164,6 +185,9 @@ struct Mgr {
     /// Channel to the network service (`devmgr.net` endpoint; 0 until connected).
     net_svc: Handle,
     known_net: [Option<NetDev>; MAX_NET],
+    /// Channel to the GPU service (`devmgr.gpu` endpoint; 0 until connected).
+    gpu_svc: Handle,
+    known_gpu: [Option<GpuDev>; MAX_GPU],
     /// Control channel from the service manager (0: started without one).
     mgr: Handle,
     /// SHUTDOWN received.
@@ -185,8 +209,13 @@ fn driver_for(i: &DeviceInfo) -> Option<&'static str> {
     match (i.kind, i.vendor, i.device) {
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1041) => Some("virtio-net"),
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1042) => Some("virtio-blk"),
+        (sys::DEV_KIND_PCI, 0x1AF4, 0x1050) => Some("virtio-gpu"),
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1052) => Some("virtio-input"),
         (sys::DEV_KIND_PCI, 0x1AF4, 0x1059) => Some("virtio-snd"),
+        // Modern PCI display controllers (class 03.*): AMD RDNA, Intel Xe/i915, NVIDIA Open-GSP.
+        (sys::DEV_KIND_PCI, 0x1002, _) if i.class == 0x03 => Some("amdgpu"),
+        (sys::DEV_KIND_PCI, 0x8086, _) if i.class == 0x03 => Some("xe"),
+        (sys::DEV_KIND_PCI, 0x10DE, _) if i.class == 0x03 => Some("nvgpu"),
         // By vendor + Ethernet class (02.00): Intel GbE (e1000e) and Realtek GbE/2.5GbE (r8169).
         (sys::DEV_KIND_PCI, 0x8086, _) if (i.class, i.subclass) == (0x02, 0x00) => Some("e1000e"),
         (sys::DEV_KIND_PCI, 0x10EC, _) if (i.class, i.subclass) == (0x02, 0x00) => Some("r8169"),
@@ -235,7 +264,8 @@ impl Mgr {
             sys::SpawnHandle { handle: dev, rights: sys::RIGHTS_SAME, tag: sys::TAG_DEVICE, reserved: 0 },
             sys::SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: proto::TAG_CONTROL, reserved: 0 },
         ];
-        let limits = sys::Limits { memory: 8 << 20, handles: 256, threads: 4 };
+        let is_gpu = matches!(d.prog, "virtio-gpu" | "amdgpu" | "xe" | "nvgpu");
+        let limits = sys::Limits { memory: if is_gpu { 24 << 20 } else { 8 << 20 }, handles: 256, threads: 4 };
         let args: &[u8] = if self.writable { b"rw" } else { b"" };
         match sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), d.image, &name[..n + 5], args, &hs, &limits) {
             Ok(p) => {
@@ -355,6 +385,13 @@ impl Mgr {
                         proto::NET_LINK => {
                             self.net_link(i, h.a != 0);
                         }
+                        proto::GPU_DEV => {
+                            let payload = &buf[HEADER..n];
+                            self.gpu_dev(i, h.a, h.b, payload);
+                        }
+                        proto::GPU_GONE => {
+                            self.gpu_gone(i);
+                        }
                         _ => {}
                     }
                 }
@@ -438,6 +475,21 @@ impl Mgr {
                                 }
                             }
                             println!("devmgr: network service connected: {} interface(s) attached", attached);
+                        }
+                        Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"gpu" && handle != 0 => {
+                            if self.gpu_svc != 0 {
+                                sys::handle_close(self.gpu_svc);
+                            }
+                            self.gpu_svc = handle;
+                            let known = self.known_gpu;
+                            let mut attached = 0u32;
+                            for grec in known.iter().flatten() {
+                                if self.drv[grec.drv].as_ref().is_some_and(|d| d.proc != 0 && d.ch != 0) {
+                                    self.attach_gpu_to_svc(*grec);
+                                    attached += 1;
+                                }
+                            }
+                            println!("devmgr: gpu service connected: {} adapter(s) attached", attached);
                         }
                         Some(h) if h.op == svc::SUSPEND => {
                             if handle != 0 {
@@ -682,6 +734,62 @@ impl Mgr {
         }
         if self.net_svc != 0 {
             proto::send(self.net_svc, net::BACKEND_LINK, i as u64, u64::from(link_up));
+        }
+    }
+
+    fn gpu_dev(&mut self, i: usize, a: u64, b: u64, name: &[u8]) {
+        let mut rec = GpuDev {
+            drv: i,
+            a,
+            b,
+            name: [0; 40],
+            name_len: name.len().min(40),
+        };
+        rec.name[..rec.name_len].copy_from_slice(&name[..rec.name_len]);
+        let slot = self.known_gpu.iter().position(|x| x.is_some_and(|x| x.drv == i));
+        if let Some(s) = slot.or_else(|| self.known_gpu.iter().position(|x| x.is_none())) {
+            self.known_gpu[s] = Some(rec);
+        }
+        if self.gpu_svc != 0 {
+            self.attach_gpu_to_svc(rec);
+        }
+    }
+
+    fn attach_gpu_to_svc(&self, rec: GpuDev) {
+        let Some(d) = self.drv[rec.drv].as_ref() else { return };
+        if d.ch == 0 || self.gpu_svc == 0 {
+            return;
+        }
+        let Ok((mine, theirs)) = sys::channel_pair() else {
+            println!("devmgr: out of handles attaching gpu adapter");
+            return;
+        };
+        let mut m = [0u8; HEADER];
+        Header { txid: 0, op: proto::GPU_ATTACH, status: 0, a: 0, b: 0 }.put(&mut m);
+        if sys::channel_write_h(d.ch, &m, &[sys::MsgHandle { handle: theirs, rights: sys::RIGHTS_SAME }]) < 0 {
+            sys::handle_close(mine);
+            return;
+        }
+        // Payload: 4-byte stable driver key (`rec.drv`) followed by adapter name.
+        let mut msg = [0u8; HEADER + 4 + 40];
+        Header { txid: 0, op: gpu::BACKEND_ADD, status: 0, a: rec.a, b: rec.b }.put(&mut msg);
+        msg[HEADER..HEADER + 4].copy_from_slice(&(rec.drv as u32).to_le_bytes());
+        msg[HEADER + 4..HEADER + 4 + rec.name_len].copy_from_slice(&rec.name[..rec.name_len]);
+        let _ = sys::channel_write_h(
+            self.gpu_svc,
+            &msg[..HEADER + 4 + rec.name_len],
+            &[sys::MsgHandle { handle: mine, rights: sys::RIGHTS_SAME }],
+        );
+    }
+
+    fn gpu_gone(&mut self, i: usize) {
+        for slot in &mut self.known_gpu {
+            if slot.is_some_and(|x| x.drv == i) {
+                *slot = None;
+            }
+        }
+        if self.gpu_svc != 0 {
+            proto::send(self.gpu_svc, gpu::BACKEND_GONE, i as u64, 0);
         }
     }
 
@@ -955,6 +1063,8 @@ fn devmgr_main(s: *const Startup) -> i32 {
         known_audio: [None; MAX_AUDIO],
         net_svc: 0,
         known_net: [None; MAX_NET],
+        gpu_svc: 0,
+        known_gpu: [None; MAX_GPU],
         mgr: libd::startup_handle(proto::TAG_CONTROL),
         stop: false,
         suspended: false,

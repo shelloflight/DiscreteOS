@@ -182,6 +182,10 @@ pub struct Manifest {
     pub net_client: bool,
     pub net_icmp: bool,
     pub net_control: bool,
+    /// GPU & display capabilities (`grants.gpu`: `query`, `display`, `render`).
+    pub gpu_query: bool,
+    pub gpu_display: bool,
+    pub gpu_render: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
@@ -310,6 +314,7 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "tools", Want::Bool),
     ("grants", "audio", Want::Strings),
     ("grants", "net", Want::Strings),
+    ("grants", "gpu", Want::Strings),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -367,6 +372,9 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         net_client: false,
         net_icmp: false,
         net_control: false,
+        gpu_query: false,
+        gpu_display: false,
+        gpu_render: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -567,6 +575,29 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                             }
                         }
                     }
+                    "grants.gpu" => {
+                        for s in &list {
+                            let ep = match s.as_str() {
+                                "query" => {
+                                    m.gpu_query = true;
+                                    "query"
+                                }
+                                "display" => {
+                                    m.gpu_display = true;
+                                    "display"
+                                }
+                                "render" => {
+                                    m.gpu_render = true;
+                                    "render"
+                                }
+                                _ => return Err(invalid("unknown gpu right (query, display, render)", s)),
+                            };
+                            let c = Connect { service: "gpu".to_string(), endpoint: ep.to_string() };
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
+                            }
+                        }
+                    }
                     _ => return Err(bad("known")),
                 }
             }
@@ -661,6 +692,19 @@ pub fn summary(m: &Manifest) -> String {
             parts.push("control");
         }
         add(&format!("net ({})", parts.join(", ")));
+    }
+    if m.gpu_query || m.gpu_display || m.gpu_render {
+        let mut parts: Vec<&str> = Vec::new();
+        if m.gpu_query {
+            parts.push("query");
+        }
+        if m.gpu_display {
+            parts.push("display");
+        }
+        if m.gpu_render {
+            parts.push("render");
+        }
+        add(&format!("gpu ({})", parts.join(", ")));
     }
     if s.is_empty() {
         s.push_str("nothing");

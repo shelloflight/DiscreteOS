@@ -99,6 +99,7 @@ pub struct Shell {
     pub net_client: Handle,
     pub net_icmp: Handle,
     pub net_ctl: Handle,
+    pub gpu_query: Handle,
     pub jobs: Vec<Job>,
     next_job: u32,
     /// The job whose output the terminal is waiting for.
@@ -878,6 +879,7 @@ fn main(s: *const Startup) -> i32 {
         net_client: svc::endpoint(b"net.client"),
         net_icmp: svc::endpoint(b"net.icmp"),
         net_ctl: svc::endpoint(b"net.control"),
+        gpu_query: svc::endpoint(b"gpu.query"),
         jobs: Vec::new(),
         next_job: 1,
         fg: None,
@@ -944,6 +946,7 @@ fn main(s: *const Startup) -> i32 {
                                     b"net.client" => &mut sh.net_client,
                                     b"net.icmp" => &mut sh.net_icmp,
                                     b"net.control" => &mut sh.net_ctl,
+                                    b"gpu.query" => &mut sh.gpu_query,
                                     _ => {
                                         sys::handle_close(handle);
                                         continue;

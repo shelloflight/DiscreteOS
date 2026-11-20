@@ -556,6 +556,12 @@ fn main(s: *const Startup) -> i32 {
         return svc::net_ungranted();
     } else if a.starts_with(b"svc-net-full") {
         return svc::net_full();
+    } else if a.starts_with(b"svc-gpu-ungranted") {
+        return svc::gpu_ungranted();
+    } else if a.starts_with(b"svc-gpu-queryonly") {
+        return svc::gpu_queryonly();
+    } else if a.starts_with(b"svc-gpu-full") {
+        return svc::gpu_full();
     }
     let ok = test_abi()
         && test_handles()

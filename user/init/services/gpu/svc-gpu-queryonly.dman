@@ -1,0 +1,18 @@
+# GPU test service with query-only grant: can list adapters/modes, refused on display/render ops.
+name = "svc-gpu-queryonly"
+image = "ltest.dx"
+args = "svc-gpu-queryonly"
+group = "test"
+after = ["gpu", "svc-gpu-ungranted"]
+
+[grants]
+log = true
+gpu = ["query"]
+
+[quota]
+memory = "8M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"

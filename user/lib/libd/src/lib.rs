@@ -27,6 +27,7 @@ pub mod capi;
 pub mod audio;
 pub mod chan;
 pub mod fs;
+pub mod gpu;
 pub mod handle;
 #[cfg(feature = "alloc")]
 pub mod heap;
@@ -262,8 +263,21 @@ impl Mapping {
 
     /// Map an existing VMO (e.g. a device BAR) read/write.
     pub fn of(vmo: Handle, len: u64) -> Result<Mapping, i64> {
+        Self::of_range(vmo, 0, len)
+    }
+
+    /// Map a page-aligned slice `[vmo_off, vmo_off + len)` of an existing VMO read/write
+    /// (for large GPU VRAM BARs such as 16 GiB Resizable BAR).
+    pub fn of_range(vmo: Handle, vmo_off: u64, len: u64) -> Result<Mapping, i64> {
         let len = len.div_ceil(sys::PAGE) * sys::PAGE;
-        let addr = sys::vmar_map(root_vmar(), sys::ANY, vmo, 0, len, sys::RIGHT_READ | sys::RIGHT_WRITE)?;
+        let addr = sys::vmar_map(root_vmar(), sys::ANY, vmo, vmo_off, len, sys::RIGHT_READ | sys::RIGHT_WRITE)?;
+        Ok(Mapping { vmo, addr, len })
+    }
+
+    /// Map an existing VMO read-only (e.g. an untrusted client framebuffer VMO).
+    pub fn of_ro(vmo: Handle, len: u64) -> Result<Mapping, i64> {
+        let len = len.div_ceil(sys::PAGE) * sys::PAGE;
+        let addr = sys::vmar_map(root_vmar(), sys::ANY, vmo, 0, len, sys::RIGHT_READ)?;
         Ok(Mapping { vmo, addr, len })
     }
 

@@ -36,6 +36,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "net", aliases: &["ip"], usage: "net", description: "network interface, IP address, gateway, DNS and counters" },
     Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
     Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
+    Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id]]", description: "GPU adapters, modes, EDID, VRAM, and IOMMU status" },
     Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
 ];
@@ -56,7 +57,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let max_args = match b.name {
         "help" | "go" | "objects" | "log" => 1,
         "end" | "restart" | "wait" | "power" => 1,
-        "ping" | "tls" => 2,
+        "ping" | "tls" | "gpu" => 2,
         "audio" => 3,
         _ => 0,
     };
@@ -80,6 +81,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "net" => net_cmd(sh),
         "ping" => ping_cmd(sh, args),
         "tls" => tls_cmd(sh, args),
+        "gpu" => gpu_cmd(sh, args),
         "power" => power(sh, arg),
         _ => {
             sh.clear();
@@ -826,4 +828,92 @@ fn tls_cmd(sh: &Shell, args: &[String]) -> Res {
             .with("group", text(group))
             .with("roots", Value::Int(root_count as i64)),
     ])
+}
+
+fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
+    use libd::gpu::{self, AdapterInfo, ModeEntry};
+    if sh.gpu_query == 0 {
+        return Err(String::from("gpu: no gpu.query grant in this session"));
+    }
+    if let Some(sub) = args.first().map(String::as_str) {
+        if sub != "modes" {
+            return Err(String::from("gpu: usage: gpu [modes [id]]"));
+        }
+        let id = match args.get(1) {
+            Some(s) => s.parse::<u32>().map_err(|_| format!("gpu: invalid adapter id '{}'", s))?,
+            None => 0,
+        };
+        let mut modes = [ModeEntry::default(); 16];
+        let n = gpu::get_modes(sh.gpu_query, id, &mut modes)
+            .map_err(|e| format!("gpu: get_modes failed ({})", sys::status(e)))?;
+        let mut rs = Vec::new();
+        for m in &modes[..n] {
+            let mut flags = String::new();
+            if (m.flags & gpu::MODE_FLAG_CURRENT) != 0 {
+                flags.push_str("current");
+            }
+            if (m.flags & gpu::MODE_FLAG_PREFERRED) != 0 {
+                if !flags.is_empty() {
+                    flags.push(' ');
+                }
+                flags.push_str("preferred");
+            }
+            rs.push(
+                Record::new()
+                    .with("mode", Value::Text(format!("{}x{}", m.width, m.height)))
+                    .with("refresh", Value::Text(format!("{}.{:02} Hz", m.refresh_mhz / 1000, (m.refresh_mhz % 1000) / 10)))
+                    .with("flags", Value::Text(flags)),
+            );
+        }
+        return Ok(rs);
+    }
+    let mut adapters = [AdapterInfo::empty(); 8];
+    let n = gpu::list_adapters(sh.gpu_query, &mut adapters)
+        .map_err(|e| format!("gpu: list_adapters failed ({})", sys::status(e)))?;
+    if n == 0 {
+        sh.write(&show::ok_line("no graphics adapters detected (VGA text mode)"));
+        return Ok(Vec::new());
+    }
+    let mut rs = Vec::new();
+    for a in &adapters[..n] {
+        let pci = if a.vendor != 0 {
+            format!("{:04x}:{:04x}", a.vendor, a.device)
+        } else {
+            String::from("platform")
+        };
+        let mut features = Vec::new();
+        if (a.caps & gpu::CAP_IOMMU) != 0 {
+            features.push("iommu");
+        }
+        if (a.caps & gpu::CAP_WC) != 0 {
+            features.push("wc");
+        }
+        if (a.caps & gpu::CAP_EDID) != 0 {
+            features.push("edid");
+        }
+        if (a.caps & gpu::CAP_HW_CURSOR) != 0 {
+            features.push("cursor");
+        }
+        if (a.caps & gpu::CAP_PAGE_FLIP) != 0 {
+            features.push("flip");
+        }
+        if (a.caps & gpu::CAP_VIRGL_3D) != 0 {
+            features.push("virgl3d");
+        }
+        if (a.caps & gpu::CAP_GSP_RPC) != 0 {
+            features.push("gsp");
+        }
+        rs.push(
+            Record::new()
+                .with("id", Value::Int(i64::from(a.id)))
+                .with("driver", text(a.kind_name()))
+                .with("name", Value::Text(String::from(a.name_str())))
+                .with("pci", Value::Text(pci))
+                .with("mode", Value::Text(format!("{}x{}", a.width, a.height)))
+                .with("vram", Value::Size(u64::from(a.vram_mib) << 20))
+                .with("features", Value::Text(features.join(",")))
+                .with("frames", Value::Int(a.frames as i64)),
+        );
+    }
+    Ok(rs)
 }

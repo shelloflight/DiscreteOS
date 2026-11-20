@@ -42,6 +42,7 @@ enum HostTest {
     Manifest,
     Audio,
     Net,
+    Gpu,
     Aml,
     Kaslr,
     Static,
@@ -1373,6 +1374,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::host_case("manifest-host", HostTest::Manifest),
         TestCase::host_case("audio-host", HostTest::Audio),
         TestCase::host_case("net-host", HostTest::Net),
+        TestCase::host_case("gpu-host", HostTest::Gpu),
         TestCase::host_case("aml-host", HostTest::Aml),
 
         TestCase::boot("audio-hda")
@@ -1555,6 +1557,88 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "terminal|  virtio-net",
                 "terminal| PING 10.0.2.2 (10.0.2.2): 2 request(s)",
                 "terminal| v ping 10.0.2.2: 2/2 received (0% loss)",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
+
+        TestCase::boot("gpu-virtio")
+            .def("GPU")
+            .qemu(&["-device", "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1024,yres=768"])
+            .timeout(90)
+            .must_exit()
+            .expect(&[
+                "virtio-gpu: ready on pci-",
+                "1024x768",
+                "IOMMU=true",
+                "gpu: adapter #",
+                "svc-gpu-ungranted: PASSED (ungranted app refused)",
+                "svc-gpu-queryonly: PASSED (query ok, display/render refused)",
+                "svc-gpu-full: adapter OK",
+                "svc-gpu-full: scanout OK",
+                "svc-gpu-full: cursor OK",
+                "svc-gpu-full: modeset OK (800x600 -> 1024x768)",
+                "svc-gpu-full: cs-validation OK",
+                "devmgr: restarting virtio-gpu.ddrv",
+                "reconnected (restart 1)",
+                "svc-gpu-full: crash-recovery OK",
+                "svc-gpu-full: PASSED",
+                "init: gpu test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
+
+        TestCase::boot("gpu-virtio-amd")
+            .def("GPU")
+            .iommu("amd")
+            .qemu(&["-device", "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1024,yres=768"])
+            .timeout(90)
+            .must_exit()
+            .expect(&[
+                "IOMMU: AMD-Vi, 1 unit(s)",
+                "virtio-gpu: ready on pci-",
+                "IOMMU=true",
+                "svc-gpu-ungranted: PASSED (ungranted app refused)",
+                "svc-gpu-queryonly: PASSED (query ok, display/render refused)",
+                "svc-gpu-full: scanout OK",
+                "svc-gpu-full: crash-recovery OK",
+                "svc-gpu-full: PASSED",
+                "init: gpu test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
+
+        TestCase::boot("gpu-gop")
+            .def("GPU")
+            .uefi()
+            .timeout(90)
+            .must_exit()
+            .expect(&[
+                "D-OS: GOP framebuffer",
+                "gpu: adapter #1 'GOP Framebuffer' (gop,",
+                "svc-gpu-ungranted: PASSED (ungranted app refused)",
+                "svc-gpu-queryonly: PASSED (query ok, display/render refused)",
+                "svc-gpu-full: adapter OK (#1 gop GOP Framebuffer",
+                "svc-gpu-full: scanout OK",
+                "svc-gpu-full: PASSED",
+                "init: gpu test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
+
+        TestCase::boot("gpu-shell")
+            .def("SHELL")
+            .qemu(&["-device", "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1024,yres=768"])
+            .timeout(90)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(&["gpu", "gpu modes", "power off"], 500),
+                "shell: ready",
+            )
+            .expect(&[
+                "virtio-gpu: ready on pci-",
+                "terminal|   1  virtio-gpu",
+                "1af4:1050",
+                "1024x768",
                 "Power: switching off",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
@@ -2600,6 +2684,7 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
         HostTest::Manifest => host_cargo_test(env, "user/lib/dman", &["--", "--nocapture"], &["test result", "FAILED", "panicked", "dman fuzz"]),
         HostTest::Audio => host_cargo_test(env, "user/lib/audio", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Net => host_cargo_test(env, "user/lib/net", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
+        HostTest::Gpu => host_cargo_test(env, "user/lib/gpu", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Aml => host_aml_test(env),
         HostTest::Crypto => host_crypto_test(env),
         HostTest::Kaslr => host_kaslr_test(env),
@@ -3105,11 +3190,12 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     let cargo = env.cargo()?;
     let clippy_dir = env.build.join("clippy");
     let cargo_env = env.cargo_env_pairs();
-    let standalone: [(&str, &[&str]); 8] = [
+    let standalone: [(&str, &[&str]); 9] = [
         ("kernel/rust", &[]),
         ("kernel/aml", &["--all-targets"]),
         ("user/lib/audio", &["--all-targets"]),
         ("user/lib/net", &["--all-targets"]),
+        ("user/lib/gpu", &["--all-targets"]),
         ("user/lib/crypto", &["--all-targets"]),
         ("user/lib/fs", &["--all-targets"]),
         ("user/lib/dman", &["--all-targets"]),
@@ -3149,6 +3235,7 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
         ("libd", &["--features", "capi"][..]),
         ("audio", &[]),
         ("net", &[]),
+        ("gpu", &[]),
         ("init", &[]),
         ("log", &[]),
         ("clock", &[]),

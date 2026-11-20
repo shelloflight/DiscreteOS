@@ -14,6 +14,7 @@ log = true
 connect = ["terminal.session", "log.read", "clock.time"]
 audio = ["playback", "control"]
 net = ["client", "icmp", "control"]
+gpu = ["query"]
 namespace = ["*"]
 manager = ["services", "power"]
 tools = true

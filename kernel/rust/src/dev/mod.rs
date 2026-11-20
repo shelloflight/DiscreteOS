@@ -40,12 +40,22 @@ pub fn devices() -> &'static [KRef<DeviceObj>] {
 }
 
 /// Does [start, end) of physical memory hold a BAR of a device other than `me`?
+/// A PCI display controller (`class == 0x03`) may map its own VRAM BAR even when the boot
+/// framebuffer (`platform:display`) lies inside it; non-display PCI devices never may.
 pub fn page_shared(me: &DeviceObj, start: u64, end: u64) -> bool {
+    let me_is_display = me.pci().is_some_and(|f| f.class == 0x03);
     devices().iter().filter(|d| !core::ptr::eq(&***d, me)).any(|d| match &d.kind {
         Kind::Pci(f) => f.bars.iter().any(|b| b.kind == pci::BarKind::Memory && b.addr < end && start < b.addr.saturating_add(b.size)),
-        // The screen's framebuffer usually lies inside the graphics card's BAR: whoever has the
-        // display owns those pages, so the card's BAR cannot be mapped by a driver.
-        Kind::Platform(p) => p.mem.1 != 0 && p.mem.0 < end && start < p.mem.0.saturating_add(p.mem.1),
+        Kind::Platform(p) if !me_is_display => p.mem.1 != 0 && p.mem.0 < end && start < p.mem.0.saturating_add(p.mem.1),
+        Kind::Platform(_) => false,
+    })
+}
+
+/// Does [start, end) overlap the platform boot display framebuffer?
+pub fn overlaps_display(start: u64, end: u64) -> bool {
+    devices().iter().any(|d| match &d.kind {
+        Kind::Platform(p) if p.display.is_some() && p.mem.1 != 0 => p.mem.0 < end && start < p.mem.0.saturating_add(p.mem.1),
+        _ => false,
     })
 }
 

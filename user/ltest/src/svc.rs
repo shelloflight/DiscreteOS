@@ -573,3 +573,226 @@ pub fn net_full() -> i32 {
     println!("svc-net-full: PASSED");
     0
 }
+
+// ---- GPU & display service tests (`gpu-virtio`, `gpu-virtio-amd`, `gpu-gop`) --------------------
+
+pub fn gpu_ungranted() -> i32 {
+    use libd::gpu;
+    check!(
+        gpu::query_endpoint() == 0 && gpu::display_endpoint() == 0 && gpu::render_endpoint() == 0,
+        "ungranted process received a gpu endpoint"
+    );
+    println!("svc-gpu-ungranted: PASSED (ungranted app refused)");
+    0
+}
+
+pub fn gpu_queryonly() -> i32 {
+    use libd::gpu;
+    let q = gpu::query_endpoint();
+    check!(q != 0, "missing gpu.query endpoint");
+    check!(gpu::display_endpoint() == 0 && gpu::render_endpoint() == 0, "query-only got display/render");
+    let mut adapters = [gpu::AdapterInfo::empty(); 8];
+    let dl = sys::clock_ns() + 10_000_000_000;
+    let mut count = 0usize;
+    while sys::clock_ns() < dl {
+        if let Ok(n) = gpu::list_adapters(q, &mut adapters)
+            && n > 0
+        {
+            count = n;
+            break;
+        }
+        libd::handle::sleep(100_000_000);
+    }
+    check!(count > 0, "no gpu adapters found");
+    let id = adapters[0].id;
+    // Query-only endpoint must be refused on display, render, and crash-driver operations.
+    check!(gpu::set_mode(q, id, 800, 600) == Err(sys::ERR_ACCESS_DENIED), "set_mode not refused on query");
+    check!(gpu::present(q, id, 1, 0, 0, 64, 64) == Err(sys::ERR_ACCESS_DENIED), "present not refused on query");
+    check!(gpu::ctx_create(q, id) == Err(sys::ERR_ACCESS_DENIED), "ctx_create not refused on query");
+    check!(gpu::crash_driver(q, id) == Err(sys::ERR_ACCESS_DENIED), "crash_driver not refused on query");
+    println!("svc-gpu-queryonly: PASSED (query ok, display/render refused)");
+    0
+}
+
+pub fn gpu_full() -> i32 {
+    use libd::gpu::{self, AdapterInfo, ModeEntry};
+
+    let q = gpu::query_endpoint();
+    let disp = gpu::display_endpoint();
+    let rnd = gpu::render_endpoint();
+    check!(q != 0 && disp != 0 && rnd != 0, "missing gpu endpoints");
+
+    // 1. Discover adapters (prefer PCI GPU if present, else GOP baseline).
+    let mut adapters = [AdapterInfo::empty(); 8];
+    let dl = sys::clock_ns() + 15_000_000_000;
+    let mut chosen: Option<AdapterInfo> = None;
+    while sys::clock_ns() < dl {
+        if let Ok(n) = gpu::list_adapters(q, &mut adapters)
+            && n > 0
+        {
+            if let Some(&pci) = adapters[..n].iter().find(|a| a.online && a.kind != gpu::KIND_GOP) {
+                chosen = Some(pci);
+                break;
+            }
+            if let Some(&gop) = adapters[..n].iter().find(|a| a.online && a.kind == gpu::KIND_GOP) {
+                // Give PCI drivers a short moment to settle if any are starting.
+                if chosen.is_none() {
+                    chosen = Some(gop);
+                }
+                if sys::clock_ns() + 13_000_000_000 < dl {
+                    break;
+                }
+            }
+        }
+        libd::handle::sleep(100_000_000);
+    }
+    let ad = match chosen {
+        Some(a) => a,
+        None => {
+            println!("ltest: FAIL: no online gpu adapter");
+            return 1;
+        }
+    };
+    let id = ad.id;
+    println!(
+        "svc-gpu-full: adapter OK (#{} {} {} {}x{} caps={:#x})",
+        id,
+        ad.kind_name(),
+        ad.name_str(),
+        ad.width,
+        ad.height,
+        ad.caps
+    );
+
+    // 2. Role separation between display and render endpoints.
+    check!(gpu::ctx_create(disp, id) == Err(sys::ERR_ACCESS_DENIED), "ctx_create on display not refused");
+    check!(gpu::set_mode(rnd, id, ad.width, ad.height) == Err(sys::ERR_ACCESS_DENIED), "set_mode on render not refused");
+
+    // 3. Query modes.
+    let mut modes = [ModeEntry::default(); 16];
+    let mcount = gpu::get_modes(q, id, &mut modes).unwrap_or(0);
+    check!(mcount >= 1, "no display modes reported");
+    let (w, h) = (ad.width.max(640), ad.height.max(480));
+    let pitch = w * 4;
+    let fb_size = u64::from(pitch) * u64::from(h);
+
+    // 4. Allocate framebuffer VMO, draw a deterministic RGB pattern, attach & present full + partial damage.
+    let Ok(mut fb) = libd::Mapping::new(fb_size) else {
+        println!("ltest: FAIL: fb VMO alloc failed");
+        return 1;
+    };
+    {
+        let bytes = fb.bytes_mut();
+        for y in 0..h as usize {
+            let color: u32 = match (y * 4) / (h as usize) {
+                0 => 0x001E_3A5F,
+                1 => 0x0022_8B22,
+                2 => 0x00B8_860B,
+                _ => 0x0033_3344,
+            };
+            let row = y * pitch as usize;
+            let px = color.to_le_bytes();
+            for x in 0..w as usize {
+                let o = row + x * 4;
+                bytes[o..o + 4].copy_from_slice(&px);
+            }
+        }
+    }
+    let fb_id = match gpu::attach_fb(disp, id, fb.vmo, w, h, pitch, gpu::FMT_XRGB8888) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("ltest: FAIL: attach_fb failed: {}", sys::status(e));
+            return 1;
+        }
+    };
+    check!(gpu::set_mode(disp, id, w, h).is_ok(), "set_mode failed");
+    let f1 = gpu::present(disp, id, fb_id, 0, 0, w, h);
+    check!(f1 == Ok(1), "first present failed: {:?}", f1);
+    let f2 = gpu::present(disp, id, fb_id, 32, 32, 128, 128);
+    check!(f2 == Ok(2), "partial damage present failed: {:?}", f2);
+    println!("svc-gpu-full: scanout OK ({}x{}, 2 frames presented)", w, h);
+
+    // 5. PCI VirtIO-GPU specific checks: cursor, mode switch, CS validation, and crash-recovery.
+    if ad.kind == gpu::KIND_VIRTIO_GPU {
+        check!((ad.caps & gpu::CAP_IOMMU) != 0, "virtio-gpu not IOMMU confined");
+        // Hardware cursor (64x64 ARGB8888)
+        let Ok(mut cur) = libd::Mapping::new(64 * 64 * 4) else {
+            println!("ltest: FAIL: cursor VMO alloc failed");
+            return 1;
+        };
+        cur.bytes_mut().fill(0xFF);
+        check!(gpu::set_cursor(disp, id, cur.vmo, 4, 4).is_ok(), "set_cursor failed");
+        check!(gpu::move_cursor(disp, id, 160, 120).is_ok(), "move_cursor failed");
+        println!("svc-gpu-full: cursor OK");
+
+        // Dynamic mode switch: 800x600 -> back to native
+        let Ok(fb2) = libd::Mapping::new(800 * 600 * 4) else {
+            println!("ltest: FAIL: mode-switch fb alloc failed");
+            return 1;
+        };
+        let fb2_id = match gpu::attach_fb(disp, id, fb2.vmo, 800, 600, 800 * 4, gpu::FMT_XRGB8888) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("ltest: FAIL: attach_fb 800x600 failed: {}", sys::status(e));
+                return 1;
+            }
+        };
+        check!(gpu::set_mode(disp, id, 800, 600).is_ok(), "set_mode 800x600 failed");
+        check!(gpu::present(disp, id, fb2_id, 0, 0, 800, 600).is_ok(), "present 800x600 failed");
+        check!(gpu::set_mode(disp, id, w, h).is_ok(), "restore mode failed");
+        println!("svc-gpu-full: modeset OK (800x600 -> {}x{})", w, h);
+
+        // Render context + VirGL CS validator check
+        let ctx_id = match gpu::ctx_create(rnd, id) {
+            Ok(c) => c,
+            Err(e) => {
+                println!("ltest: FAIL: ctx_create failed: {}", sys::status(e));
+                return 1;
+            }
+        };
+        let bad_cs = [0xFE, 0x00, 0x00, 0x00]; // unknown VirGL opcode
+        check!(
+            gpu::submit_cmd(rnd, id, ctx_id, gpu::ENGINE_VIRGL_3D, &bad_cs) == Err(sys::ERR_INVALID_ARGS),
+            "malformed VirGL CS was not rejected"
+        );
+        let mut nop = [0u32; 1];
+        dosgpu::virtio::virgl_cmd_nop(&mut nop);
+        let r = gpu::submit_cmd(rnd, id, ctx_id, gpu::ENGINE_VIRGL_3D, &nop[0].to_le_bytes());
+        check!(
+            r.is_ok() || r == Err(sys::ERR_NOT_SUPPORTED),
+            "unexpected VirGL NOP submit result: {:?}",
+            r
+        );
+        check!(gpu::ctx_destroy(rnd, id, ctx_id).is_ok(), "ctx_destroy failed");
+        println!("svc-gpu-full: cs-validation OK");
+
+        // Driver crash + automatic restart recovery
+        check!(gpu::crash_driver(disp, id).is_ok(), "crash_driver failed");
+        let rec_dl = sys::clock_ns() + 15_000_000_000;
+        let mut recovered = false;
+        while sys::clock_ns() < rec_dl {
+            if let Ok(n) = gpu::list_adapters(q, &mut adapters)
+                && let Some(cur_ad) = adapters[..n].iter().find(|a| a.id == id)
+                && cur_ad.online
+                && cur_ad.restarts >= 1
+            {
+                recovered = true;
+                break;
+            }
+            libd::handle::sleep(100_000_000);
+        }
+        check!(recovered, "virtio-gpu.ddrv did not reconnect after crash");
+        let fb3_id = match gpu::attach_fb(disp, id, fb.vmo, w, h, pitch, gpu::FMT_XRGB8888) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("ltest: FAIL: post-restart attach_fb failed: {}", sys::status(e));
+                return 1;
+            }
+        };
+        check!(gpu::present(disp, id, fb3_id, 0, 0, w, h).is_ok(), "post-restart present failed");
+        println!("svc-gpu-full: crash-recovery OK");
+    }
+
+    println!("svc-gpu-full: PASSED");
+    0
+}

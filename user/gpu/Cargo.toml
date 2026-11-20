@@ -1,0 +1,26 @@
+# D-OS GPU & display service (`gpu.dsvc`): GOP framebuffer baseline + PCI GPU driver manager.
+[package]
+name = "gpu"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata.dos]
+dsvc = ["gpu"]
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+dosgpu = { path = "../lib/gpu" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

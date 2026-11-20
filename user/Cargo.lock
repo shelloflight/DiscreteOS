@@ -29,6 +29,7 @@ name = "devmgr"
 version = "0.1.0"
 dependencies = [
  "dosaudio",
+ "dosgpu",
  "libd",
 ]
 
@@ -49,6 +50,10 @@ name = "dosfs"
 version = "0.1.0"
 
 [[package]]
+name = "dosgpu"
+version = "0.1.0"
+
+[[package]]
 name = "dosnet"
 version = "0.1.0"
 dependencies = [
@@ -59,6 +64,14 @@ dependencies = [
 name = "fstest"
 version = "0.1.0"
 dependencies = [
+ "libd",
+]
+
+[[package]]
+name = "gpu"
+version = "0.1.0"
+dependencies = [
+ "dosgpu",
  "libd",
 ]
 
@@ -88,6 +101,7 @@ version = "0.1.0"
 dependencies = [
  "dosaudio",
  "doscrypt",
+ "dosgpu",
  "dosnet",
  "libd",
 ]

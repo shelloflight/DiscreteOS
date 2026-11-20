@@ -473,6 +473,7 @@ pub fn run_interactive(
     iommu: &str,
     audio: &str,
     net: &str,
+    gpu: &str,
     debug: bool,
 ) -> Result<(), String> {
     let qemu = env.qemu()?;
@@ -510,6 +511,20 @@ pub fn run_interactive(
             "e1000e" => extra.extend(["-device".into(), "e1000e,netdev=net0".into()]),
             _ => {}
         }
+    }
+    match gpu {
+        "virtio" => extra.extend([
+            "-device".into(),
+            "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on".into(),
+        ]),
+        "virtio-vga" => extra.extend([
+            "-vga".into(),
+            "none".into(),
+            "-device".into(),
+            "virtio-vga,disable-legacy=on,iommu_platform=on,edid=on".into(),
+        ]),
+        "none" => extra.extend(["-vga".into(), "none".into()]),
+        _ => {}
     }
     let opts = QemuOpts {
         image,

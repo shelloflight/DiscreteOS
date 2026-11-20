@@ -43,6 +43,7 @@ fn print_help() {
            --iommu <intel|amd>     Emulated IOMMU, default intel (run, debug)\n\
            --audio <hda|virtio|usb|none>  Emulated audio device, default hda for run (run, debug)\n\
            --net <virtio|e1000e|none>     Emulated NIC with user-net, default virtio for run (run, debug)\n\
+           --gpu <std|virtio|virtio-vga|none>  Emulated GPU, default std (run, debug)\n\
            --case <a,b,...>        Run only selected test cases (test)\n\
            --timeout <secs>        Min timeout per case, default 15 (test)\n\
            --no-repro              Skip the reproducible-build check (test)\n\
@@ -137,6 +138,7 @@ fn run() -> Result<(), String> {
             let mut iommu = "intel".to_string();
             let mut audio = if cmd == "debug" { "none".to_string() } else { "hda".to_string() };
             let mut net = if cmd == "debug" { "none".to_string() } else { "virtio".to_string() };
+            let mut gpu = "std".to_string();
             let mut i = 0;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -176,6 +178,16 @@ fn run() -> Result<(), String> {
                             return Err("--net must be 'virtio', 'e1000e', or 'none'".into());
                         }
                     }
+                    "--gpu" | "-Gpu" => {
+                        i += 1;
+                        gpu = rest
+                            .get(i)
+                            .ok_or("--gpu needs std, virtio, virtio-vga, or none")?
+                            .clone();
+                        if !matches!(gpu.as_str(), "std" | "virtio" | "virtio-vga" | "none") {
+                            return Err("--gpu must be 'std', 'virtio', 'virtio-vga', or 'none'".into());
+                        }
+                    }
                     other => return Err(format!("unknown {cmd} option '{other}'")),
                 }
                 i += 1;
@@ -192,7 +204,7 @@ fn run() -> Result<(), String> {
                     jobs: cpus,
                 },
             )?;
-            run_interactive(&env, &res.image, smp, uefi, &iommu, &audio, &net, cmd == "debug")
+            run_interactive(&env, &res.image, smp, uefi, &iommu, &audio, &net, &gpu, cmd == "debug")
         }
         "test" => {
             let mut cases: Vec<String> = Vec::new();

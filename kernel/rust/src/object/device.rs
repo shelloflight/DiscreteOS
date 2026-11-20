@@ -201,11 +201,11 @@ impl DeviceObj {
             return Err(Status::AccessDenied);
         }
         if let Kind::Platform(p) = &self.kind {
-            // The screen: its framebuffer usually lies inside the graphics card's BAR (that PCI
-            // function gets no driver). Mapped write-combining; from now on the kernel writes its
-            // console to serial only (a panic takes the screen back).
+            // The screen: its framebuffer usually lies inside the graphics card's BAR.
+            // Mapped write-combining; from now on the kernel writes its console to serial only
+            // (a panic takes the screen back).
             let display = p.display.is_some();
-            let v = Vmo::create_device(acct, start, (end - start) / PAGE, self.name(), display, |_| false)?;
+            let v = Vmo::create_device(acct, start, (end - start) / PAGE, self.name(), display, [(0, 0); 2])?;
             if display {
                 // SAFETY: plain call; takes the console lock.
                 unsafe { ffi::console_release_screen() };
@@ -216,22 +216,41 @@ impl DeviceObj {
             return Err(Status::AccessDenied);
         }
         let f = self.pci().ok_or(Status::NotSupported)?;
-        let hidden = |page: u64| -> bool {
-            let Some(m) = f.msix else { return false };
-            let pa = start + page * PAGE;
-            let overlaps = |bar: u8, off: u32, len: u64| {
-                u64::from(bar) == i && {
-                    let s = (b.addr + u64::from(off)) & !(PAGE - 1);
-                    let e = (b.addr + u64::from(off) + len).div_ceil(PAGE) * PAGE;
-                    pa >= s && pa < e
-                }
-            };
-            overlaps(m.table_bar, m.table_off, u64::from(m.count) * 16)
-                || overlaps(m.pba_bar, m.pba_off, u64::from(m.count).div_ceil(64) * 8)
+        let page_range = |bar: u8, off: u32, len: u64| -> (u64, u64) {
+            if u64::from(bar) != i || len == 0 {
+                return (0, 0);
+            }
+            let s = (b.addr + u64::from(off)) & !(PAGE - 1);
+            let e = (b.addr + u64::from(off) + len).div_ceil(PAGE) * PAGE;
+            let lo = s.saturating_sub(start) / PAGE;
+            let hi = e.saturating_sub(start) / PAGE;
+            (lo, hi)
         };
+        let hidden = match f.msix {
+            Some(m) => [
+                page_range(m.table_bar, m.table_off, u64::from(m.count) * 16),
+                page_range(m.pba_bar, m.pba_off, u64::from(m.count).div_ceil(64) * 8),
+            ],
+            None => [(0, 0); 2],
+        };
+        // Large prefetchable BARs (>= 16 MiB) on PCI display controllers are VRAM/framebuffer
+        // apertures and are mapped write-combining; register/control BARs remain uncached.
+        let wc = f.class == 0x03 && b.prefetch && b.size >= (16 << 20);
         let mut nm = crate::fmtbuf::FmtBuf::<32>::new();
         let _ = core::fmt::Write::write_fmt(&mut nm, format_args!("{}.bar{}", self.name(), i));
-        Vmo::create_device(acct, start, (end - start) / PAGE, core::str::from_utf8(nm.as_bytes()).unwrap_or("bar"), false, hidden)
+        let v = Vmo::create_device(
+            acct,
+            start,
+            (end - start) / PAGE,
+            core::str::from_utf8(nm.as_bytes()).unwrap_or("bar"),
+            wc,
+            hidden,
+        )?;
+        if f.class == 0x03 && crate::dev::overlaps_display(start, end) {
+            // SAFETY: plain call; takes the console lock.
+            unsafe { ffi::console_release_screen() };
+        }
+        Ok(v)
     }
 
     fn io_port(&self, bar: u64, off: u64, size: u64) -> KResult<u16> {

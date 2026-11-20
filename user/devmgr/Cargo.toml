@@ -18,7 +18,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [package.metadata.dos]
-ddrv = ["ps2", "virtio-blk", "virtio-input", "ahci", "nvme", "xhci", "hda", "virtio-snd", "usbaudio", "virtio-net", "e1000e", "r8169"]
+ddrv = ["ps2", "virtio-blk", "virtio-input", "ahci", "nvme", "xhci", "hda", "virtio-snd", "usbaudio", "virtio-net", "e1000e", "r8169", "virtio-gpu", "amdgpu", "xe", "nvgpu"]
 
 [lib]
 crate-type = ["staticlib"]
@@ -29,6 +29,7 @@ bench = false
 [dependencies]
 libd = { path = "../lib/libd" }
 dosaudio = { path = "../lib/audio" }
+dosgpu = { path = "../lib/gpu" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

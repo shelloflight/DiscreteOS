@@ -1,0 +1,25 @@
+# GPU & display service: GOP framebuffer baseline and isolated IOMMU-confined PCI GPU drivers.
+# Provides capability-separated endpoints (`query`, `display`, `render`).
+name = "gpu"
+image = "gpu.dsvc"
+group = "system"
+after = ["devmgr"]
+description = "GPU drivers, modesetting, and display scanout service"
+
+[provides]
+endpoints = ["query", "display", "render"]
+
+[grants]
+log = true
+devices = ["platform:display"]
+connect = ["devmgr.gpu"]
+
+[quota]
+memory = "32M"
+handles = 256
+threads = 4
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

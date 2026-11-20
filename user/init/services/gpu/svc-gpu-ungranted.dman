@@ -1,0 +1,17 @@
+# GPU test service with NO gpu grant: must receive zero GPU endpoints.
+name = "svc-gpu-ungranted"
+image = "ltest.dx"
+args = "svc-gpu-ungranted"
+group = "test"
+after = ["gpu"]
+
+[grants]
+log = true
+
+[quota]
+memory = "8M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"

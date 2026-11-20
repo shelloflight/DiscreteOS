@@ -62,8 +62,10 @@ impl OnceName {
     }
 }
 
-/// Upper bound for one VMO (1 GiB): keeps the frame list allocation bounded.
+/// Upper bound for one anonymous RAM VMO (1 GiB): keeps the frame list allocation bounded.
 pub const MAX_SIZE: u64 = 1 << 30;
+/// Upper bound for one device MMIO/VRAM VMO (64 GiB): covers Resizable BAR GPUs in O(1) memory.
+pub const MAX_DEVICE_SIZE: u64 = 64 << 30;
 const PAGE: u64 = 4096;
 
 /// Shared read-only zero page for reading uncommitted VMO pages without allocating RAM.
@@ -88,10 +90,15 @@ pub struct Vmo {
     /// `SEALED` bit + number of writers (see the module comment).
     wstate: AtomicU64,
     name: OnceName,
-    /// Device memory (MMIO): `frames` are not RAM and are not owned, except `dummy`.
+    /// Device memory (MMIO): `frames` is empty; physical pages come from `dev_phys + idx * PAGE`
+    /// unless `idx` lies in one of `dev_hidden` (which maps to `dummy`).
     device: bool,
-    /// Device memory mapped write-combining (the display) instead of uncached.
+    /// Device memory mapped write-combining (display / GPU VRAM) instead of uncached.
     wc: bool,
+    /// Physical base of a device VMO (page aligned, 0 for RAM VMOs).
+    dev_phys: u64,
+    /// Up to two hidden page-index ranges `[start, end)` in a device VMO (MSI-X table and PBA).
+    dev_hidden: [(u64, u64); 2],
     /// The zero page standing in for hidden device pages (0 = none); owned and freed.
     dummy: u64,
     _charge: Charge,
@@ -126,49 +133,56 @@ impl Vmo {
             name: OnceName::new(name),
             device: false,
             wc: false,
+            dev_phys: 0,
+            dev_hidden: [(0, 0); 2],
             dummy: 0,
             _charge: charge,
         };
         KRef::try_new(vmo).map_err(|_| Status::NoMemory)
     }
 
-    /// A device VMO over `pages` pages of MMIO starting at `phys` (page aligned). Page `i` is
-    /// hidden (backed by a private zero page) when `hide(i)`. One page is charged to `acct` (the
-    /// frame list and the zero page); the device memory itself is not RAM and is not charged.
-    pub fn create_device(acct: &KRef<Account>, phys: u64, pages: u64, name: &str, wc: bool, hide: impl Fn(u64) -> bool) -> KResult<KRef<Vmo>> {
-        if pages == 0 || pages > MAX_SIZE / PAGE || !phys.is_multiple_of(PAGE) {
+    /// A device VMO over `pages` pages of MMIO/VRAM starting at `phys` (page aligned), in O(1)
+    /// memory regardless of BAR size. Page indices inside either `[start, end)` range of `hidden`
+    /// are backed by a private zero page. One page is charged to `acct`; device memory itself is
+    /// not RAM and is not charged.
+    pub fn create_device(
+        acct: &KRef<Account>,
+        phys: u64,
+        pages: u64,
+        name: &str,
+        wc: bool,
+        hidden: [(u64, u64); 2],
+    ) -> KResult<KRef<Vmo>> {
+        if pages == 0 || pages > MAX_DEVICE_SIZE / PAGE || !phys.is_multiple_of(PAGE) {
             return Err(Status::InvalidArgs);
         }
         let charge = Charge::new(acct, Res::Memory, PAGE)?;
-        let mut frames = Vec::new();
-        frames.try_reserve_exact(pages as usize).map_err(|_| Status::NoMemory)?;
-        let mut vmo = Vmo {
+        let has_hidden = hidden.iter().any(|&(s, e)| s < e && s < pages);
+        let dummy = if has_hidden {
+            // SAFETY: plain PMM call; 0 means out of memory.
+            let p = unsafe { ffi::pmm_alloc_zeroed() };
+            if p == 0 {
+                return Err(Status::NoMemory);
+            }
+            p
+        } else {
+            0
+        };
+        let vmo = Vmo {
             header: Header::new(ObjType::Vmo),
             size: pages * PAGE,
-            frames,
+            frames: Vec::new(),
             executable: AtomicBool::new(false),
             trust: AtomicU8::new(0),
             wstate: AtomicU64::new(0),
             name: OnceName::new(name),
             device: true,
             wc,
-            dummy: 0,
+            dev_phys: phys,
+            dev_hidden: hidden,
+            dummy,
             _charge: charge,
         };
-        for i in 0..pages {
-            if hide(i) {
-                if vmo.dummy == 0 {
-                    // SAFETY: plain PMM call; 0 means out of memory.
-                    vmo.dummy = unsafe { ffi::pmm_alloc_zeroed() };
-                    if vmo.dummy == 0 {
-                        return Err(Status::NoMemory);
-                    }
-                }
-                vmo.frames.push(AtomicU64::new(vmo.dummy));
-            } else {
-                vmo.frames.push(AtomicU64::new(phys + i * PAGE));
-            }
-        }
         KRef::try_new(vmo).map_err(|_| Status::NoMemory)
     }
 
@@ -287,6 +301,15 @@ impl Vmo {
 
     /// Physical address of page `idx`, or `0` if not yet committed.
     pub fn frame_at(&self, idx: usize) -> u64 {
+        if self.device {
+            let p = idx as u64;
+            if (p >= self.dev_hidden[0].0 && p < self.dev_hidden[0].1)
+                || (p >= self.dev_hidden[1].0 && p < self.dev_hidden[1].1)
+            {
+                return self.dummy;
+            }
+            return self.dev_phys + p * PAGE;
+        }
         self.frames[idx].load(Ordering::Acquire)
     }
 

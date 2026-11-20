@@ -258,8 +258,18 @@ impl Function {
         match (self.vendor, self.device) {
             (0x1AF4, 0x1041) => return "virtio-net",
             (0x1AF4, 0x1042) => return "virtio-blk",
+            (0x1AF4, 0x1050) => return "virtio-gpu",
             (0x1AF4, 0x1052) => return "virtio-input",
+            (0x1AF4, 0x1059) => return "virtio-snd",
             _ => {}
+        }
+        if self.class == 0x03 {
+            match self.vendor {
+                0x1002 => return "AMD GPU",
+                0x8086 => return "Intel GPU",
+                0x10DE => return "NVIDIA GPU",
+                _ => return "display",
+            }
         }
         match (self.class, self.subclass) {
             (0x01, 0x00) => "SCSI storage",

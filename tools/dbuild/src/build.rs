@@ -46,6 +46,10 @@ const BOOTSTRAP_PROGS: &[&str] = &[
     "virtio-net.ddrv",
     "e1000e.ddrv",
     "r8169.ddrv",
+    "virtio-gpu.ddrv",
+    "amdgpu.ddrv",
+    "xe.ddrv",
+    "nvgpu.ddrv",
 ];
 
 /// Service manifests that stay embedded in `kernel.bin` to mount `sys:`.
@@ -55,6 +59,7 @@ const BOOTSTRAP_MANIFESTS: &[&str] = &["clock.dman", "storaged.dman", "devmgr.dm
 const SYS_BIN_PROGS: &[&str] = &[
     "audio.dsvc",
     "net.dsvc",
+    "gpu.dsvc",
     "log.dx",
     "terminal.dx",
     "shell.dx",
@@ -79,7 +84,7 @@ fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
             "utest.dx" | "dcmpl.dx" | "w1.exe" | "w1_32.exe" | "w1fault.exe" | "w1bad.exe" | "l1" | "w2.exe" | "l2"
         ),
         Some("LIBD") => matches!(name, "ltest.dx" | "ctest.dx"),
-        Some("SERVICES" | "TIME" | "AUDIO" | "NET") => name == "ltest.dx",
+        Some("SERVICES" | "TIME" | "AUDIO" | "NET" | "GPU") => name == "ltest.dx",
         Some("STORAGE" | "READONLY") => name == "fstest.dx",
         Some("HWBENCH") => matches!(name, "utest.dx" | "fstest.dx"),
         _ => false,
@@ -471,6 +476,7 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         Some("TIME") => Some("time"),
         Some("AUDIO") => Some("audio"),
         Some("NET") => Some("net"),
+        Some("GPU") => Some("gpu"),
         _ => None,
     } {
         manifests.extend(collect_files(&man_dir.join(sub), "dman", false));

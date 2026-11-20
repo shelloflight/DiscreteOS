@@ -12,6 +12,7 @@ const SEEDS: &[&[u8]] = &[
     DEVMGR,
     include_bytes!("../../../init/services/audio.dman"),
     include_bytes!("../../../init/services/net.dman"),
+    include_bytes!("../../../init/services/gpu.dman"),
     include_bytes!("../../../init/services/log.dman"),
     include_bytes!("../../../init/services/clock.dman"),
     include_bytes!("../../../init/services/terminal.dman"),
@@ -22,6 +23,9 @@ const SEEDS: &[&[u8]] = &[
     include_bytes!("../../../init/services/test/svc-badcap.dman"),
     include_bytes!("../../../init/services/net/svc-net-ungranted.dman"),
     include_bytes!("../../../init/services/net/svc-net-full.dman"),
+    include_bytes!("../../../init/services/gpu/svc-gpu-ungranted.dman"),
+    include_bytes!("../../../init/services/gpu/svc-gpu-queryonly.dman"),
+    include_bytes!("../../../init/services/gpu/svc-gpu-full.dman"),
     include_bytes!("../../../init/services/disk/hello.dman"),
 ];
 
@@ -46,7 +50,7 @@ fn the_system_manifests_parse() {
     assert_eq!(d.after, vec!["storaged".to_string()]);
     assert_eq!(d.devices, vec![DeviceSel::AllPci, DeviceSel::Platform("ps2".into())]);
     assert!(d.devices[0].matches(true, 1, 6, 1, "") && !d.devices[0].matches(false, 0, 0, 0, "rtc") && !d.devices[1].matches(false, 0, 0, 0, "rtc"));
-    assert_eq!(d.endpoints, vec!["input".to_string(), "audio".to_string(), "net".to_string()]);
+    assert_eq!(d.endpoints, vec!["input".to_string(), "audio".to_string(), "net".to_string(), "gpu".to_string()]);
     assert_eq!(d.programs, vec!["*.ddrv".to_string()]);
     assert_eq!(d.connect, vec![Connect { service: "storaged".into(), endpoint: "disks".into() }]);
     assert_eq!(summary(&d), "log, 2 device selector(s), programs *.ddrv, storaged.disks");
@@ -56,9 +60,13 @@ fn the_system_manifests_parse() {
     let nt = parse(include_bytes!("../../../init/services/net.dman")).unwrap();
     assert_eq!((nt.name.as_str(), nt.image.as_str()), ("net", "net.dsvc"));
     assert_eq!(nt.endpoints, vec!["client".to_string(), "icmp".to_string(), "control".to_string()]);
+    let gp = parse(include_bytes!("../../../init/services/gpu.dman")).unwrap();
+    assert_eq!((gp.name.as_str(), gp.image.as_str()), ("gpu", "gpu.dsvc"));
+    assert_eq!(gp.endpoints, vec!["query".to_string(), "display".to_string(), "render".to_string()]);
     let sh = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
     assert!(sh.audio_playback && sh.audio_control && !sh.audio_capture);
     assert!(sh.net_client && sh.net_icmp && sh.net_control);
+    assert!(sh.gpu_query && !sh.gpu_display && !sh.gpu_render);
     let l = parse(include_bytes!("../../../init/services/log.dman")).unwrap();
     assert!(l.kernel_log && !l.boot_time && l.endpoints == vec!["read".to_string()]);
     assert_eq!(summary(&l), "log, kernel log");
@@ -295,9 +303,10 @@ fn the_shell_manifest_grants_its_session() {
     let s = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
     assert!(s.tools && s.manage_services && s.manage_power && s.log && s.vmex);
     assert_eq!(s.namespace, vec![NsGrant { path: "*".into(), volume: "*".into(), rights: NS_READ | NS_WRITE }]);
-    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, audio.playback, audio.control, net.client, net.icmp, net.control, every volume, VMEX, manager (services, power), tools, audio (playback, control), net (client, icmp, control)");
+    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, audio.playback, audio.control, net.client, net.icmp, net.control, gpu.query, every volume, VMEX, manager (services, power), tools, audio (playback, control), net (client, icmp, control), gpu (query)");
     assert!(refused("name = \"x\"\nimage = \"x.dx\"\ngroup = \"test\"\n[grants]\naudio = [\"root\"]\n").contains("unknown audio right"));
     assert!(refused("name = \"x\"\nimage = \"x.dx\"\ngroup = \"test\"\n[grants]\nnet = [\"raw\"]\n").contains("unknown net right"));
+    assert!(refused("name = \"x\"\nimage = \"x.dx\"\ngroup = \"test\"\n[grants]\ngpu = [\"root\"]\n").contains("unknown gpu right"));
     let t = parse(include_bytes!("../../../init/services/terminal.dman")).unwrap();
     assert_eq!(t.devices, vec![DeviceSel::Platform("display".into())]);
     assert!(!t.tools && !t.manage_services && t.namespace.is_empty());

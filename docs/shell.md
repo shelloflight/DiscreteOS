@@ -24,7 +24,7 @@ data ▸ copy report.txt /backup
 | Process | Holds | Does not hold |
 |---|---|---|
 | `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge) |
-| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone |
+| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting |
 | a tool | an output channel, one node per path argument with the rights its manifest declares, the log | the namespace, endpoints, anything else of the shell |
 
 The terminal and the shell are separate so that neither gets the other's authority: a bug in the
@@ -80,7 +80,8 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   volume, mute/unmute, routing, test tone, mic policy; [audio.md](audio.md)), `net` (`ip`, link
   and IPv4 status), `ping <host> [count]` (DNS + ICMP echo), `tls <host> [port]` (TLS 1.3
   handshake & certificate verification against `/sys/certs/roots.der`;
-  [networking.md](networking.md)), `power off | restart | sleep` (the manager stops every service
+  [networking.md](networking.md)), `gpu [modes [id]]` (`display`, GPU adapters, modes, EDID, VRAM,
+  and IOMMU status; [graphics.md](graphics.md)), `power off | restart | sleep` (the manager stops every service
   cleanly first), `clear`, `run <tool> [arguments]`.
 - **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
   (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place

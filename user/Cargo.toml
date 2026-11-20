@@ -9,6 +9,7 @@ members = [
     "dcmpl",
     "devmgr",
     "fstest",
+    "gpu",
     "init",
     "lib/libd",
     "log",
@@ -24,6 +25,7 @@ exclude = [
     "lib/crypto",
     "lib/dman",
     "lib/fs",
+    "lib/gpu",
     "lib/net",
 ]
 

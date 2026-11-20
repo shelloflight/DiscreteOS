@@ -92,6 +92,15 @@ pub const NET_DEV: u32 = 18;
 pub const NET_LINK: u32 = 19;
 /// Manager -> network driver: serve `net.dsvc` on the channel this message carries (no reply).
 pub const NET_ATTACH: u32 = 23;
+/// GPU driver -> manager: GPU adapter announced.
+/// `a` = `gpu::pack_dev_a(kind, vendor, device, vram_mib)`;
+/// `b` = `gpu::pack_dev_b(width, height, caps)`;
+/// payload = UTF-8 adapter name.
+pub const GPU_DEV: u32 = 24;
+/// Manager -> GPU driver: serve `gpu.dsvc` on the channel this message carries (no reply).
+pub const GPU_ATTACH: u32 = 25;
+/// GPU driver -> manager: GPU adapter removed/offline.
+pub const GPU_GONE: u32 = 26;
 /// Manager -> driver (tests): fault on purpose (restart test).
 pub const TEST_CRASH: u32 = 20;
 /// Manager -> block driver (tests): point a request at memory the device was not given (the
