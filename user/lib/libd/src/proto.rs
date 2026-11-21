@@ -79,6 +79,8 @@ pub mod key {
     pub const F10: u32 = 0x119;
     pub const F11: u32 = 0x11A;
     pub const F12: u32 = 0x11B;
+    /// The Super key on its own: pressed, and released (`RELEASE` set).
+    pub const META: u32 = 0x11C;
     pub const SHIFT: u32 = 1 << 16;
     pub const CTRL: u32 = 1 << 17;
     pub const ALT: u32 = 1 << 18;

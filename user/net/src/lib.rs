@@ -15,6 +15,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -211,6 +212,7 @@ struct PendingPingCall {
     txid: u32,
     ping_id: u16,
     seq: u16,
+    dst: dosnet::Ipv4Addr,
     deadline_ms: u64,
 }
 
@@ -600,6 +602,7 @@ impl NetSvc {
                     txid: h.txid,
                     ping_id: pid,
                     seq,
+                    dst: ip,
                     deadline_ms: now.saturating_add(u64::from(timeout)),
                 });
             }
@@ -872,6 +875,16 @@ impl NetSvc {
         while i < self.pending_pings.len() {
             if now >= self.pending_pings[i].deadline_ms {
                 let p = self.pending_pings.remove(i);
+                // Say where it failed: the first hop never answered ARP (no unicast frames
+                // reach us, or a wrong gateway), or the echo went out and nothing came back.
+                if let Some(nic) = self.nic.as_ref() {
+                    let (hop, mac) = nic.stack.next_hop_mac(p.dst, now);
+                    let why = match mac {
+                        Some(m) => format!("echo sent to {} via {} ({}), no reply", fmt_ipv4(p.dst), fmt_ipv4(hop), fmt_mac(m)),
+                        None => format!("no ARP reply from {} (the first hop to {})", fmt_ipv4(hop), fmt_ipv4(p.dst)),
+                    };
+                    println!("net: ping seq {} timed out: {}; frames rx {} tx {}", p.seq, why, nic.stack.rx_packets, nic.stack.tx_packets);
+                }
                 Self::reply(p.ch, p.txid, net::OP_PING, sys::ERR_TIMED_OUT as i32, 0, 0);
             } else {
                 i += 1;

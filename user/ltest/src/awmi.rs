@@ -7,7 +7,9 @@
 //!   isolation by readback, click-to-focus and key routing, verified identity and trust tier,
 //!   keyboard snapping, workspaces, a second (virtual) output, indicators (the microphone through
 //!   a real capture stream), close requests, and the exclusive input grab with real keys and
-//!   pointer events typed by the host; then ends the session.
+//!   pointer events typed by the host; then ends the session. Before the client windows: the
+//!   shared fonts (read-only), launcher registration and the Super-tap launcher, the settings
+//!   (theme, text size, motion; admin only) and the frame readback.
 
 use libd::awmi::{self, Event, Window, WindowInfo};
 use libd::proto::key;
@@ -104,6 +106,7 @@ pub fn client(name: &str, color: u32, title: &[u8], retitle: Option<&[u8]>, want
                 check!(active, "the session ended before the close request");
                 continue;
             }
+            Event::Launch { .. } | Event::Settings { .. } => continue,
         };
         check!(win == w.id, "received an event for window {} (ours is {})", win, w.id);
         match ev {
@@ -203,6 +206,54 @@ pub fn full() -> i32 {
     check!(outputs >= 1 && st.active && st.width >= 640 && st.height >= 480, "session not active: {:?}", st);
     let (sw, sh) = (st.width as i32, st.height as i32);
     println!("svc-awmi-full: session OK ({} output(s), {}x{}, {}.{:03} Hz)", outputs, sw, sh, st.refresh_mhz / 1000, st.refresh_mhz % 1000);
+
+    // 2b. The UI foundation: vector fonts shared read-only, the launcher, the settings.
+    check!(st.fonts, "the compositor has no vector fonts (sys:/fonts)");
+    match awmi::fonts(win) {
+        Ok(map) => {
+            let b = map.bytes();
+            check!(b.len() >= 16 && &b[..4] == b"DFNT", "the font pack has no DFNT header");
+            // The pack is read-only for window programs.
+            check!(sys::vmo_write(map.vmo, 0, b"X") < 0 && sys::vmar_map(libd::root_vmar(), sys::ANY, map.vmo, 0, sys::PAGE, sys::RIGHT_READ | sys::RIGHT_WRITE).is_err(), "the shared font pack is writable");
+            println!("svc-awmi-full: fonts OK ({} KiB pack, read-only)", map.len / 1024);
+        }
+        Err(e) => {
+            println!("ltest: svc FAIL: fonts: {}", sys::status(e));
+            return 1;
+        }
+    }
+    check!(awmi::fonts(query).is_err(), "fonts over awmi.query not refused");
+    check!(awmi::register_app(win, 0, b"Probe").is_ok(), "launcher registration refused");
+    check!(awmi::register_app(win, 9, b"Too many").is_err(), "an out-of-range launcher entry was accepted");
+    check!(awmi::register_app(query, 0, b"Probe").is_err(), "launcher registration over awmi.query not refused");
+    let apps = awmi::status(admin).map(|s| s.apps).unwrap_or(0);
+    check!(apps >= 1, "no launcher entries registered");
+    let (h0, painted) = awmi::test_frame(admin).unwrap_or((0, 0));
+    check!(painted > 0, "the desktop frame is empty (dock not drawn)");
+    let _ = awmi::test_key(admin, key::META, true);
+    let _ = awmi::test_key(admin, key::META, false);
+    check!(awmi::status(admin).is_ok_and(|s| s.launcher_open), "a Super tap did not open the launcher");
+    let (h1, _) = awmi::test_frame(admin).unwrap_or((0, 0));
+    check!(h1 != h0, "the launcher was not drawn");
+    let _ = awmi::test_key(admin, 0x1B, true);
+    check!(awmi::status(admin).is_ok_and(|s| !s.launcher_open), "Escape did not close the launcher");
+    check!(awmi::set_settings(query, 1, awmi::SET_THEME).is_err(), "settings over awmi.query not refused");
+    check!(awmi::set_settings(win, 1, awmi::SET_THEME).is_err(), "settings over awmi.window not refused");
+    let now = awmi::set_settings(admin, 1 | 150 << 8 | 1 << 24, awmi::SET_THEME | awmi::SET_TEXT_SCALE | awmi::SET_MOTION);
+    check!(now == Ok(1 | 150 << 8 | 1 << 24), "settings not applied: {:?}", now);
+    let mut told = false;
+    let dl = sys::clock_ns() + 5 * SEC;
+    while !told && sys::clock_ns() < dl {
+        if let Ok(Some(Event::Settings { settings, theme })) = awmi::next_event(win, SEC / 4) {
+            told = settings == 1 | 150 << 8 | 1 << 24 && theme[..4] != [0; 4];
+        }
+    }
+    check!(told, "window programs were not told the settings");
+    let (h2, _) = awmi::test_frame(admin).unwrap_or((0, 0));
+    check!(h2 != h0, "the high-contrast theme did not change the frame");
+    let back = awmi::set_settings(admin, 100 << 8, awmi::SET_THEME | awmi::SET_TEXT_SCALE | awmi::SET_MOTION);
+    check!(back == Ok(100 << 8), "settings not restored: {:?}", back);
+    println!("svc-awmi-full: launcher & settings OK ({} entries; theme, text size and motion sent to window programs)", apps);
 
     // 3. Both clients' windows, each in its own colour at its own place.
     let deadline = sys::clock_ns() + 30 * SEC;

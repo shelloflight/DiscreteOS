@@ -2,11 +2,16 @@
 //! strict surface/input isolation, and damage-tracked compositing.
 
 use crate::dock::{DockHit, DockLayout, DockTrayState, DockWindowEntry, MAX_DOCK_WINDOWS};
-use crate::font::GLYPH_W;
 use crate::geom::{DamageSet, Point, Rect};
+use crate::launcher::{LaunchTarget, Launcher, OPEN_NS, Outcome, Setting, UiSettings};
 use crate::pixel::{CURSOR_H, CURSOR_W, Canvas, WinIcon};
 use crate::proto::{MAX_IDENTITY_BYTES, MAX_TITLE_BYTES, TrustTier, sanitize_label, win_flags, win_state};
+use crate::text::{TextRender, TextRole};
 use crate::theme::{ChromeMetrics, DockConfig, Theme};
+
+/// The Super key on its own (`proto::key::META`): pressed and released (`RELEASE`) events.
+pub const KEY_META: u32 = 0x11C;
+const KEY_F1: u32 = 0x110;
 
 pub const MAX_OUTPUTS: usize = 8;
 pub const MAX_WINDOWS: usize = 64;
@@ -362,6 +367,10 @@ pub enum WmAction {
     Configure { owner: u32, window_id: u32 },
     /// User pressed `Super+Esc` or `Ctrl+Alt+Esc`: exit GUI session back to shell.
     ExitSession,
+    /// The user opened a program's launcher entry: send it `EVT_LAUNCH`.
+    Launch { owner: u32, app: u8 },
+    /// The user picked a built-in action in the launcher.
+    Setting(Setting),
 }
 
 /// Client surface pixel provider callback for compositing.
@@ -390,6 +399,19 @@ pub struct WmState {
     pub drag: DragOp,
     pub damage: DamageSet,
     cascade_step: i32,
+    /// The launcher (tap `Super`, `Alt+F1`).
+    pub launcher: Launcher,
+    /// Theme, text size, motion (applied by `apply_settings`).
+    pub settings: UiSettings,
+    /// Monotonic time (ns), set by the compositor before input and compositing (animations).
+    pub now_ns: u64,
+    /// Line height and average character width of body text (layout of the dock and launcher).
+    pub line_h: u32,
+    pub char_w: u32,
+    /// `Super` went down with no other key since: its release opens the launcher.
+    super_tap: bool,
+    /// When the current snap preview appeared (its fade-in).
+    snap_since: u64,
 }
 
 impl Default for WmState {
@@ -427,7 +449,99 @@ impl WmState {
             drag: DragOp::None,
             damage: DamageSet::new(),
             cascade_step: 0,
+            launcher: Launcher::new(),
+            settings: UiSettings::DEFAULT,
+            now_ns: 0,
+            line_h: 16,
+            char_w: 8,
+            super_tap: false,
+            snap_since: 0,
         }
+    }
+
+    /// Apply new settings: the theme, and chrome sized for the text (line height `line_h`,
+    /// average character width `char_w`, both from the compositor's text engine).
+    pub fn apply_settings(&mut self, settings: UiSettings, theme: Theme, line_h: u32, char_w: u32) {
+        self.settings = settings;
+        self.theme = theme;
+        self.line_h = line_h.clamp(8, 96);
+        self.char_w = char_w.clamp(4, 48);
+        self.chrome = ChromeMetrics::for_line_height(self.line_h);
+        self.dock_cfg = DockConfig::for_line_height(self.line_h);
+        // Snapped and maximized windows follow the new work area.
+        let snapped: [Option<(u32, SnapState)>; MAX_WINDOWS] =
+            core::array::from_fn(|i| self.windows[i].as_ref().filter(|w| w.snap != SnapState::Floating).map(|w| (w.id, w.snap)));
+        for (id, snap) in snapped.into_iter().flatten() {
+            let center = self.window(id).map(|w| Point::new(w.frame.x + w.frame.w as i32 / 2, w.frame.y + w.frame.h as i32 / 2));
+            let Some(out) = center.and_then(|c| self.layout.output_at(c)) else { continue };
+            let work = self.layout.work_area(out, self.dock_cfg);
+            if let Some(w) = self.window_mut(id) {
+                w.frame = snap.target_rect(work);
+            }
+        }
+        self.damage_all();
+    }
+
+    pub fn toggle_launcher(&mut self) {
+        if self.launcher.open {
+            self.launcher.hide();
+        } else {
+            self.launcher.show(self.now_ns);
+            self.drag = DragOp::None;
+        }
+        self.damage_launcher_output();
+    }
+
+    fn damage_launcher_output(&mut self) {
+        if let Some(p) = self.layout.primary() {
+            self.damage.add(p.bounds);
+        }
+    }
+
+    /// An animation is running (the compositor keeps drawing frames).
+    pub fn animating(&self) -> bool {
+        if self.settings.reduce_motion {
+            return false;
+        }
+        let since = |t: u64| self.now_ns.saturating_sub(t) < OPEN_NS;
+        (self.launcher.open && since(self.launcher.opened_at))
+            || (matches!(self.drag, DragOp::Move { snap_preview: Some(_), .. }) && since(self.snap_since))
+    }
+
+    /// Damage what animates this frame.
+    pub fn tick(&mut self) {
+        if !self.animating() {
+            return;
+        }
+        if self.launcher.open {
+            // Only the sliding panel changes while it opens (the dim is drawn once).
+            if let Some(p) = self.layout.primary() {
+                let r = self.launcher.rects(p.bounds.w, p.bounds.h, self.line_h).panel;
+                self.damage.add(Rect::new(p.bounds.x + r.x, p.bounds.y + r.y, r.w, r.h + 16));
+            }
+        } else if let DragOp::Move { snap_preview: Some(s), .. } = self.drag
+            && let Some(out) = self.layout.output_at(self.pointer)
+        {
+            let work = self.layout.work_area(out, self.dock_cfg);
+            self.damage.add(s.target_rect(work));
+        }
+    }
+
+    /// 0-255 progress of an animation that started at `since`.
+    fn progress(&self, since: u64) -> u32 {
+        if self.settings.reduce_motion {
+            return 255;
+        }
+        (self.now_ns.saturating_sub(since).min(OPEN_NS) * 255 / OPEN_NS) as u32
+    }
+
+    /// Register program `owner`'s launcher entry.
+    pub fn register_app(&mut self, owner: u32, app: u8, label: &[u8], identity: &[u8], trust: TrustTier) -> bool {
+        let ok = self.launcher.register(owner, app, label, identity, trust);
+        if ok && self.launcher.open {
+            self.damage_launcher_output();
+        }
+        ok
     }
 
     pub fn damage_all(&mut self) {
@@ -601,6 +715,7 @@ impl WmState {
 
     /// Destroy all windows belonging to a disconnected client.
     pub fn remove_client(&mut self, owner: u32) {
+        self.launcher.remove_owner(owner);
         let mut removed = false;
         for slot in &mut self.windows {
             if slot.as_ref().is_some_and(|w| w.owner == owner)
@@ -787,6 +902,49 @@ impl WmState {
         let has_ctrl = (key_val & CTRL) != 0;
         let has_shift = (key_val & SHIFT) != 0;
 
+        // Super alone: a tap (down and up with nothing between) opens or closes the launcher.
+        // It is the window manager's key: programs never see it.
+        if base == KEY_META {
+            if pressed {
+                self.super_tap = true;
+            } else if core::mem::take(&mut self.super_tap) {
+                self.toggle_launcher();
+            }
+            return WmAction::None;
+        }
+        if pressed {
+            self.super_tap = false;
+        }
+        if pressed && base == KEY_F1 && has_alt && !has_ctrl {
+            self.toggle_launcher();
+            return WmAction::None;
+        }
+        if self.launcher.open {
+            if !pressed {
+                return WmAction::None;
+            }
+            if base == 0x1B && (has_super || (has_ctrl && has_alt)) {
+                self.launcher.hide();
+                return WmAction::ExitSession;
+            }
+            let outcome = self.launcher.key(base);
+            self.damage_launcher_output();
+            return match outcome {
+                Outcome::Changed => WmAction::None,
+                Outcome::Close => {
+                    self.launcher.hide();
+                    WmAction::None
+                }
+                Outcome::Activate(t) => {
+                    self.launcher.hide();
+                    match t {
+                        LaunchTarget::App { owner, app } => WmAction::Launch { owner, app },
+                        LaunchTarget::Setting(s) => WmAction::Setting(s),
+                    }
+                }
+            };
+        }
+
         if pressed {
             // Exit GUI session back to shell: Super+Esc or Ctrl+Alt+Esc.
             if base == 0x1B && (has_super || (has_ctrl && has_alt)) {
@@ -880,6 +1038,33 @@ impl WmState {
         let left_pressed = (buttons & 1) != 0 && (prev_buttons & 1) == 0;
         let left_released = (buttons & 1) == 0 && (prev_buttons & 1) != 0;
 
+        // The open launcher is modal: the pointer selects and opens its rows, a click elsewhere
+        // closes it, and nothing reaches the windows meanwhile.
+        if self.launcher.open {
+            let Some(prim) = self.layout.primary() else { return WmAction::None };
+            let local = Point::new(next.x - prim.bounds.x, next.y - prim.bounds.y);
+            let rects = self.launcher.rects(prim.bounds.w, prim.bounds.h, self.line_h);
+            let (inside, hit) = self.launcher.hit(&rects, local);
+            if let Some((idx, target)) = hit {
+                if self.launcher.sel != idx {
+                    self.launcher.sel = idx;
+                    self.damage.add(rects.panel.translate(prim.bounds.x, prim.bounds.y));
+                }
+                if left_pressed {
+                    self.launcher.hide();
+                    self.damage.add(prim.bounds);
+                    return match target {
+                        LaunchTarget::App { owner, app } => WmAction::Launch { owner, app },
+                        LaunchTarget::Setting(s) => WmAction::Setting(s),
+                    };
+                }
+            } else if left_pressed && !inside {
+                self.launcher.hide();
+                self.damage.add(prim.bounds);
+            }
+            return WmAction::None;
+        }
+
         // Active drag completion on button release.
         if left_released {
             match self.drag {
@@ -925,6 +1110,7 @@ impl WmState {
                     }
                     if preview != old_snap {
                         self.damage_all();
+                        self.snap_since = self.now_ns;
                         self.drag = DragOp::Move { window_id, grab_dx, grab_dy, snap_preview: preview };
                     }
                     return WmAction::None;
@@ -1092,10 +1278,11 @@ impl WmState {
         }
     }
 
+    /// The dock lists the windows of the active workspace only (each workspace has its own dock).
     fn dock_windows(&self) -> ([DockWindowEntry; MAX_DOCK_WINDOWS], usize) {
         let mut entries = [DockWindowEntry::default(); MAX_DOCK_WINDOWS];
         let mut n = 0usize;
-        for w in self.windows.iter().flatten() {
+        for w in self.windows.iter().flatten().filter(|w| w.workspace == self.active_workspace) {
             if n >= MAX_DOCK_WINDOWS {
                 break;
             }
@@ -1117,15 +1304,15 @@ impl WmState {
         (entries, n)
     }
 
-    fn dock_layout_for(&self, out: Output) -> DockLayout {
+    pub(crate) fn dock_layout_for(&self, out: Output) -> DockLayout {
         let (entries, n) = self.dock_windows();
-        DockLayout::compute(out.bounds.w, out.bounds.h, self.dock_cfg, &entries[..n], &self.tray)
+        DockLayout::compute(out.bounds.w, out.bounds.h, self.dock_cfg, &entries[..n], &self.tray, self.char_w)
     }
 
     /// Composite all dirty rectangles for `output` into `canvas`.
     /// `fetch_surface` supplies the read-only client buffer bytes for each `window_id`.
     /// Returns the output-local `DamageSet` that was rendered (ready for `gpu::present`).
-    pub fn composite_output<'s, F>(&self, output: Output, canvas: &mut Canvas<'_>, mut fetch_surface: F) -> DamageSet
+    pub fn composite_output<'s, F>(&self, output: Output, canvas: &mut Canvas<'_>, text: &mut dyn TextRender, mut fetch_surface: F) -> DamageSet
     where
         F: FnMut(u32) -> Option<SurfaceView<'s>>,
     {
@@ -1165,7 +1352,8 @@ impl WmState {
         };
         let dock_layout = output
             .primary
-            .then(|| DockLayout::compute(output.bounds.w, output.bounds.h, self.dock_cfg, &dock_entries[..dock_n], &self.tray));
+            .then(|| DockLayout::compute(output.bounds.w, output.bounds.h, self.dock_cfg, &dock_entries[..dock_n], &self.tray, self.char_w));
+        let launcher = (output.primary && self.launcher.open).then(|| self.launcher.rects(output.bounds.w, output.bounds.h, self.line_h));
 
         let snap_preview_local = match self.drag {
             DragOp::Move { snap_preview: Some(s), .. } => {
@@ -1217,25 +1405,25 @@ impl WmState {
                     canvas.fill_circle(clip, title_rect.x + 12, dot_cy, 4, trust_col);
 
                     // Verified manifest identity (muted) + separator + app title.
-                    let text_y = title_rect.y + ((title_rect.h.saturating_sub(16)) / 2) as i32;
+                    let text_mid = title_rect.y + (title_rect.h / 2) as i32;
                     let btns_w = self.chrome.btn_w * 3 + 6;
                     let max_label_w = title_rect.w.saturating_sub(24 + btns_w);
                     let mut tx = title_rect.x + 22;
                     let mut rem = max_label_w;
                     let id_b = w.identity_bytes();
-                    if !id_b.is_empty() && rem >= GLYPH_W {
-                        let used = canvas.draw_text(clip, tx, text_y, id_b, self.theme.text_muted, rem);
+                    if !id_b.is_empty() && rem >= self.char_w {
+                        let used = text.draw(canvas, clip, tx, text_mid, id_b, TextRole::Title, self.theme.text_muted, rem);
                         tx += used as i32;
                         rem = rem.saturating_sub(used);
-                        if !w.title_bytes().is_empty() && rem >= GLYPH_W * 3 {
-                            let sep = canvas.draw_text(clip, tx, text_y, b" - ", self.theme.text_muted, rem);
+                        if !w.title_bytes().is_empty() && rem >= self.char_w * 3 {
+                            let sep = text.draw(canvas, clip, tx, text_mid, b" - ", TextRole::Title, self.theme.text_muted, rem);
                             tx += sep as i32;
                             rem = rem.saturating_sub(sep);
                         }
                     }
-                    if !w.title_bytes().is_empty() && rem >= GLYPH_W {
+                    if !w.title_bytes().is_empty() && rem >= self.char_w {
                         let title_col = if focused { self.theme.text_primary } else { self.theme.text_muted };
-                        canvas.draw_text(clip, tx, text_y, w.title_bytes(), title_col, rem);
+                        text.draw(canvas, clip, tx, text_mid, w.title_bytes(), TextRole::Title, title_col, rem);
                     }
 
                     // Minimal window buttons: minimize, maximize/restore, close.
@@ -1282,17 +1470,24 @@ impl WmState {
                 }
             }
 
-            // 3. Snap-zone preview overlay while edge-dragging.
+            // 3. Snap-zone preview overlay while edge-dragging (fading in).
             if let Some(sr) = snap_preview_local {
-                canvas.fill_rounded_rect(clip, sr, 6, self.theme.snap_preview_fill, self.theme.snap_preview_border);
+                let p = self.progress(self.snap_since);
+                let fade = |c: u32| (c & 0x00FF_FFFF) | (((c >> 24) * p / 255) << 24);
+                canvas.fill_rounded_rect(clip, sr, 6, fade(self.theme.snap_preview_fill), fade(self.theme.snap_preview_border));
             }
 
             // 4. Unified floating bottom dock (primary output).
             if let Some(ref dl) = dock_layout {
-                dl.render(canvas, clip, &self.theme, self.dock_cfg, &dock_entries[..dock_n], &self.tray);
+                dl.render(canvas, clip, &self.theme, self.dock_cfg, &dock_entries[..dock_n], &self.tray, text);
             }
 
-            // 5. Software pointer cursor fallback if adapter lacks hardware cursor.
+            // 5. The launcher over everything but the pointer.
+            if let Some(ref lr) = launcher {
+                self.launcher.render(canvas, clip, &self.theme, text, lr, self.settings, self.progress(self.launcher.opened_at));
+            }
+
+            // 6. Software pointer cursor fallback if adapter lacks hardware cursor.
             if !output.hw_cursor && output.bounds.contains_point(self.pointer) {
                 canvas.draw_sw_cursor(clip, self.pointer.x - output.bounds.x, self.pointer.y - output.bounds.y);
             }

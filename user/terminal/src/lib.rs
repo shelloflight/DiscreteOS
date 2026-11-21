@@ -5,8 +5,8 @@
 //! endpoint. It offers one endpoint, `session`, to the shell, and keeps no other authority: what
 //! the shell can do is the shell's manifest, not the terminal's.
 //!
-//! - Output: text from the session with colours (`libd::term`), wrapped at the screen's width,
-//!   kept in a scrollback of `MAX_LINES` lines (PgUp/PgDn, Shift too).
+//! - Output: text from the session with colours (`libd::term`), kept as lines in a scrollback of
+//!   `MAX_LINES` lines (PgUp/PgDn, Shift too) and wrapped when drawn, so it reflows at any width.
 //! - Input: a line editor for the session's `READ`: insert anywhere, Backspace/Delete, Left/Right,
 //!   Home/End (Ctrl+A/Ctrl+E), history (Up/Down), Tab (the session completes the last word),
 //!   Escape clears, Ctrl+C cancels the line (or interrupts the running command), Ctrl+L clears the
@@ -16,6 +16,10 @@
 //!   session can be followed on the serial line.
 //! - `display` endpoint (the compositor): `term::DISPLAY_RELEASE` stops drawing while a graphical
 //!   session owns the screen; `term::DISPLAY_RECLAIM`, or that channel closing, redraws it all.
+//! - `view` endpoint (the graphical terminal): while the screen is released, the session is laid
+//!   out for the viewer's grid and kept in a VMO it maps read-only (`term::VIEW_*`); the keys typed
+//!   in its window come back here. When it detaches or the screen comes back, the screen's grid is
+//!   used again; the shell is told each new width.
 
 #![no_std]
 
@@ -29,9 +33,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use libd::proto::{self, HEADER, Header, key};
-use libd::sys::{self, Handle};
-use libd::{Port, Startup, println, svc, term};
-use screen::{CROSS, Cell, Screen, cell};
+use libd::sys::{self, Handle, MsgHandle};
+use libd::{Mapping, Port, Startup, println, svc, term};
+use screen::{Cell, Screen, cell, char_of};
 
 libd::entry!(_start, main);
 
@@ -40,59 +44,73 @@ const KEY_INPUT: u64 = 2;
 const KEY_SESSION: u64 = 3;
 const KEY_INDICATOR: u64 = 4;
 const KEY_DISPLAY: u64 = 5;
+const KEY_VIEW: u64 = 6;
 
 /// Lines kept for scrolling back.
 const MAX_LINES: usize = 2000;
 const MAX_HISTORY: usize = 100;
 /// Longest line the editor takes.
 const MAX_EDIT: usize = 1024;
+/// Longest output line kept as one line (longer ones continue on the next).
+const MAX_LINE: usize = 4096;
 
-/// A character as a code page 437 glyph (what the font and VGA text can show).
-fn glyph(c: char) -> u8 {
+/// A shown character back as text (for the mirrored log lines).
+fn ascii(c: char) -> char {
     match c {
-        ' '..='~' => c as u8,
-        '▸' | '►' | '▶' => 0x10,
-        '◂' | '◄' => 0x11,
-        '✓' | '√' => 0xFB,
-        '✗' | '✘' => CROSS,
-        '·' => 0xFA,
-        '•' => 0x07,
-        '—' | '–' | '─' => 0xC4,
-        '│' => 0xB3,
-        '┌' => 0xDA,
-        '┐' => 0xBF,
-        '└' => 0xC0,
-        '┘' => 0xD9,
-        '…' => b'~',
-        '°' => 0xF8,
-        'µ' => 0xE6,
-        _ => b'?',
+        ' '..='~' => c,
+        '▸' | '►' | '▶' => '>',
+        '◂' | '◄' => '<',
+        '✓' | '√' => 'v',
+        '✗' | '✘' => 'x',
+        '·' | '•' => '.',
+        '—' | '–' | '─' => '-',
+        '│' => '|',
+        _ => '?',
     }
 }
 
-/// A shown glyph back as text (for the mirrored log lines).
-fn ascii(g: u8) -> char {
-    match g {
-        0x20..=0x7E => g as char,
-        0x10 => '>',
-        0x11 => '<',
-        0xFB => 'v',
-        CROSS => 'x',
-        0xFA | 0x07 => '.',
-        0xC4 => '-',
-        0xB3 => '|',
-        _ => '?',
+/// The session shown in a window (`terminal.view`).
+struct View {
+    ch: Handle,
+    map: Mapping,
+    vmo_ro: Handle,
+    cols: usize,
+    rows: usize,
+    /// What the grid holds (to write and report only changes).
+    shown: Vec<Cell>,
+    cursor: Option<(usize, usize)>,
+    attached: bool,
+}
+
+impl View {
+    fn header(&self) {
+        let m = &self.map;
+        m.w32(0, term::VIEW_MAGIC);
+        m.w32(4, self.cols as u32);
+        m.w32(8, self.rows as u32);
+        let (cx, cy) = self.cursor.map_or((u32::MAX, u32::MAX), |(x, y)| (x as u32, y as u32));
+        m.w32(12, cx);
+        m.w32(16, cy);
+        m.w32(20, u32::from(term::DEFAULT_ATTR));
+    }
+
+    fn resize(&mut self, cols: usize, rows: usize) {
+        self.cols = cols.clamp(20, term::VIEW_MAX_COLS as usize);
+        self.rows = rows.clamp(5, term::VIEW_MAX_ROWS as usize);
+        self.shown.clear();
+        self.shown.resize(self.cols * self.rows, u32::MAX);
+        self.header();
     }
 }
 
 struct Term {
     scr: Screen,
-    /// Finished output lines (each at most `cols` cells).
+    /// Finished output lines (logical: wrapped only when drawn).
     lines: VecDeque<Vec<Cell>>,
     /// The output line being written (no newline yet).
     cur: Vec<Cell>,
     attr: u8,
-    /// Lines scrolled back from the bottom (0: following the output).
+    /// Rows scrolled back from the bottom (0: following the output).
     scroll: usize,
     // the line editor
     reading: bool,
@@ -112,6 +130,9 @@ struct Term {
     /// The compositor's `display` channel, and whether it holds the screen now.
     display: Handle,
     released: bool,
+    view: Option<View>,
+    /// The grid the session was last told about (columns, rows).
+    told: (usize, usize),
     mirror: bool,
     /// Which keyboard the last key came from (for the log line).
     from: [u8; 24],
@@ -119,13 +140,34 @@ struct Term {
 }
 
 impl Term {
+    /// The grid drawn into now: the window's while a viewer shows the session, else the screen's.
+    fn showing_view(&self) -> bool {
+        self.released && self.view.as_ref().is_some_and(|v| v.attached)
+    }
+
+    fn grid(&self) -> (usize, usize) {
+        match &self.view {
+            Some(v) if self.showing_view() => (v.cols, v.rows),
+            _ => (self.scr.cols, self.scr.rows),
+        }
+    }
+
     fn cols(&self) -> usize {
-        self.scr.cols
+        self.grid().0.max(1)
+    }
+
+    /// Tell the shell when the width it formats for changes.
+    fn tell_size(&mut self) {
+        let g = self.grid();
+        if g != self.told {
+            self.told = g;
+            self.send(term::SIZE, g.0 as u64, g.1 as u64, &[]);
+        }
     }
 
     fn push_line(&mut self, l: Vec<Cell>) {
         if self.mirror {
-            let s: String = l.iter().map(|&c| ascii((c & 0xFF) as u8)).collect();
+            let s: String = l.iter().map(|&c| ascii(char_of(c))).collect();
             println!("terminal| {}", s.trim_end());
         }
         if self.lines.len() == MAX_LINES {
@@ -163,18 +205,18 @@ impl Term {
     }
 
     fn put_char(&mut self, c: char) {
-        if self.cur.len() >= self.cols() {
+        if self.cur.len() >= MAX_LINE {
             let l = core::mem::take(&mut self.cur);
             self.push_line(l);
         }
-        self.cur.push(cell(glyph(c), self.attr));
+        self.cur.push(cell(c, self.attr));
     }
 
-    /// The prompt and the line being edited, wrapped: (lines, cursor (x, line)).
+    /// The prompt and the line being edited, wrapped: (rows, cursor (x, row)).
     fn edit_lines(&self) -> (Vec<Vec<Cell>>, (usize, usize)) {
         let cols = self.cols();
         let mut all: Vec<Cell> = self.prompt.clone();
-        all.extend(self.edit.iter().map(|&c| cell(glyph(c), term::DEFAULT_ATTR)));
+        all.extend(self.edit.iter().map(|&c| cell(c, term::DEFAULT_ATTR)));
         let cur = self.prompt.len() + self.at;
         let n = all.len().max(cur + 1);
         let mut out = Vec::new();
@@ -195,56 +237,112 @@ impl Term {
         }
     }
 
-    /// Draw what is visible now (nothing while a graphical session holds the screen).
-    fn render(&mut self) {
-        if self.released {
-            return;
-        }
-        let mut extra: Vec<Vec<Cell>> = Vec::new();
+    /// The rows to show (`rows` of them, `scroll` rows up from the bottom), the cursor's place.
+    fn frame(&mut self, cols: usize, rows: usize) -> (Vec<Vec<Cell>>, Option<(usize, usize)>) {
+        // Rows of the live part below the scrollback: the current line, the prompt and edit.
+        let mut tail: Vec<Vec<Cell>> = Vec::new();
         if !self.cur.is_empty() {
-            extra.push(self.cur.clone());
+            for ch in self.cur.chunks(cols) {
+                tail.push(ch.to_vec());
+            }
         }
-        let mut cursor_line = None;
+        let mut cursor_row = None;
         if self.reading {
             let (ls, (cx, cy)) = self.edit_lines();
-            cursor_line = Some((cx, extra.len() + cy));
-            extra.extend(ls);
+            cursor_row = Some((cx, tail.len() + cy));
+            tail.extend(ls);
         }
-        let total = self.lines.len() + extra.len();
-        let rows = self.scr.rows;
-        self.scroll = self.scroll.min(total.saturating_sub(rows));
-        let first = total.saturating_sub(rows + self.scroll);
-        let cursor = match cursor_line {
-            Some((cx, cl)) if self.scroll == 0 => {
-                let line = self.lines.len() + cl;
-                (line >= first && line < first + rows).then(|| (cx, line - first))
+        // Enough wrapped rows from the end of the scrollback for the view and the scroll.
+        let want = rows + self.scroll;
+        let mut back: Vec<Vec<Cell>> = Vec::new();
+        for l in self.lines.iter().rev() {
+            if back.len() + tail.len() >= want {
+                break;
+            }
+            let n = l.len().div_ceil(cols).max(1);
+            for k in (0..n).rev() {
+                back.push(l[(k * cols).min(l.len())..((k + 1) * cols).min(l.len())].to_vec());
+            }
+        }
+        back.reverse();
+        let available = back.len() + tail.len();
+        self.scroll = self.scroll.min(available.saturating_sub(rows));
+        let mut all = back;
+        let first_tail = all.len();
+        all.extend(tail);
+        let end = all.len().saturating_sub(self.scroll);
+        let start = end.saturating_sub(rows);
+        let cursor = match cursor_row {
+            Some((cx, cr)) if self.scroll == 0 => {
+                let r = first_tail + cr;
+                (r >= start && r < end).then(|| (cx, r - start))
             }
             _ => None,
         };
+        (all[start..end].to_vec(), cursor)
+    }
+
+    /// Draw what is visible now: in the window's grid while a viewer shows the session, on the
+    /// screen otherwise (nothing while a graphical session holds the screen without a viewer).
+    fn render(&mut self) {
+        self.tell_size();
+        if self.showing_view() {
+            self.render_view();
+            return;
+        }
+        if self.released {
+            return;
+        }
+        let (cols, rows) = (self.scr.cols, self.scr.rows);
+        let (shown, cursor) = self.frame(cols, rows);
         self.scr.set_cursor(cursor);
-        let blank = cell(b' ', term::DEFAULT_ATTR);
+        let blank = cell(' ', term::DEFAULT_ATTR);
         for y in 0..rows {
-            let idx = first + y;
-            let line: &[Cell] = if idx < self.lines.len() {
-                &self.lines[idx]
-            } else if idx - self.lines.len() < extra.len() {
-                &extra[idx - self.lines.len()]
-            } else {
-                &[]
-            };
-            for x in 0..self.scr.cols {
-                let c = line.get(x).copied().unwrap_or(blank);
-                self.scr.put(x, y, c);
+            let line = shown.get(y).map_or(&[][..], |l| &l[..]);
+            for x in 0..cols {
+                self.scr.put(x, y, line.get(x).copied().unwrap_or(blank));
             }
         }
         // Visible active microphone indicator (top-right badge on row 0, unforgeable: only audio.dsvc holds `terminal.indicator`).
-        if self.mic_active && self.scr.rows > 0 && self.scr.cols >= 12 {
-            let badge = b" [MIC LIVE] ";
+        if self.mic_active && rows > 0 && cols >= 12 {
+            let badge = " [MIC LIVE] ";
             let attr = term::WHITE | (term::RED << 4);
-            let start = self.scr.cols - badge.len();
-            for (i, &ch) in badge.iter().enumerate() {
+            let start = cols - badge.len();
+            for (i, ch) in badge.chars().enumerate() {
                 self.scr.put(start + i, 0, cell(ch, attr));
             }
+        }
+    }
+
+    fn render_view(&mut self) {
+        let Some((cols, rows)) = self.view.as_ref().map(|v| (v.cols, v.rows)) else { return };
+        let (shown, cursor) = self.frame(cols, rows);
+        let Some(v) = self.view.as_mut() else { return };
+        let blank = cell(' ', term::DEFAULT_ATTR);
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for y in 0..rows {
+            let line = shown.get(y).map_or(&[][..], |l| &l[..]);
+            for x in 0..cols {
+                let c = line.get(x).copied().unwrap_or(blank);
+                let i = y * cols + x;
+                if v.shown[i] != c {
+                    v.shown[i] = c;
+                    v.map.w32((term::VIEW_HEADER + i * 4) as u64, c);
+                    lo = lo.min(y);
+                    hi = hi.max(y + 1);
+                }
+            }
+        }
+        if cursor != v.cursor {
+            for (_, y) in [v.cursor, cursor].into_iter().flatten() {
+                lo = lo.min(y);
+                hi = hi.max(y + 1);
+            }
+            v.cursor = cursor;
+            v.header();
+        }
+        if lo < hi {
+            proto::send(v.ch, term::VIEW_DAMAGE, lo as u64, hi as u64);
         }
     }
 
@@ -263,15 +361,12 @@ impl Term {
     /// the session.
     fn submit(&mut self, cancelled: bool) {
         let text: String = self.edit.iter().collect();
-        let (mut ls, _) = self.edit_lines();
-        if cancelled
-            && let Some(l) = ls.last_mut()
-        {
-            l.extend("^C".chars().map(|c| cell(glyph(c), term::DARK_GREY)));
+        let mut line: Vec<Cell> = self.prompt.clone();
+        line.extend(self.edit.iter().map(|&c| cell(c, term::DEFAULT_ATTR)));
+        if cancelled {
+            line.extend("^C".chars().map(|c| cell(c, term::DARK_GREY)));
         }
-        for l in ls {
-            self.push_line(l);
-        }
+        self.push_line(line);
         if !cancelled {
             let from = core::str::from_utf8(&self.from[..self.from_len]).unwrap_or("?");
             println!("terminal: line from {}: {}", from, text);
@@ -360,9 +455,12 @@ impl Term {
     }
 
     fn key(&mut self, k: u32) {
+        if k & key::RELEASE != 0 || k & key::MASK == key::META {
+            return; // Super on its own is the compositor's
+        }
         let base = k & key::MASK;
         if base == key::PAGE_UP || base == key::PAGE_DOWN {
-            let page = self.scr.rows.saturating_sub(1).max(1);
+            let page = self.grid().1.saturating_sub(1).max(1);
             self.scroll = if base == key::PAGE_UP { self.scroll + page } else { self.scroll.saturating_sub(page) };
             return;
         }
@@ -446,7 +544,7 @@ impl Term {
                         '\u{1}' => style = true,
                         '\u{2}' => attr = term::DEFAULT_ATTR,
                         c if (c as u32) < 0x20 => {}
-                        c => self.prompt.push(cell(glyph(c), attr)),
+                        c => self.prompt.push(cell(c, attr)),
                     }
                 }
                 self.reading = true;
@@ -472,7 +570,51 @@ impl Term {
         self.reading = false;
         self.waiting_completion = false;
         self.enter_ahead = false;
-        self.send(term::SIZE, self.scr.cols as u64, self.scr.rows as u64, &[]);
+        let g = self.grid();
+        self.told = g;
+        self.send(term::SIZE, g.0 as u64, g.1 as u64, &[]);
+    }
+
+    /// A request from the viewer (`terminal.view`). The reply, if it was a call.
+    fn view_msg(&mut self, h: Header) -> Option<(i64, u64, Option<Handle>)> {
+        let grid = |a: u64| ((a as u32) as usize, (a >> 32) as usize);
+        match h.op {
+            term::VIEW_ATTACH => {
+                let Some(v) = self.view.as_mut() else { return Some((sys::ERR_BAD_STATE, 0, None)) };
+                let (c, r) = grid(h.a);
+                v.resize(c, r);
+                v.attached = true;
+                v.cursor = None;
+                let (cols, rows) = (v.cols, v.rows);
+                let dup = sys::handle_duplicate(v.vmo_ro, sys::RIGHT_READ | sys::RIGHT_MAP | sys::RIGHT_TRANSFER).ok();
+                println!("terminal: view attached ({}x{} cells)", cols, rows);
+                Some((0, term::VIEW_BYTES as u64, dup))
+            }
+            term::VIEW_RESIZE => {
+                if let Some(v) = self.view.as_mut() {
+                    let (c, r) = grid(h.a);
+                    v.resize(c, r);
+                }
+                Some((0, 0, None))
+            }
+            term::VIEW_DETACH => {
+                if let Some(v) = self.view.as_mut()
+                    && v.attached
+                {
+                    v.attached = false;
+                    println!("terminal: view detached");
+                }
+                Some((0, 0, None))
+            }
+            term::VIEW_KEY => {
+                let from = b"console";
+                self.from[..from.len()].copy_from_slice(from);
+                self.from_len = from.len();
+                self.key(h.a as u32);
+                None
+            }
+            _ => Some((sys::ERR_NOT_SUPPORTED, 0, None)),
+        }
     }
 }
 
@@ -487,6 +629,7 @@ fn main(s: *const Startup) -> i32 {
     let scr = Screen::open(libd::startup_handle(sys::TAG_DEVICE));
     let mirror = libd::args().split(|&c| c == b' ' || c == 0).any(|a| a == b"mirror") || !scr.present();
     println!("terminal: ready: {} ({}x{}), keyboard input from devmgr.input{}", scr.what, scr.cols, scr.rows, if mirror { ", mirrored to the log" } else { "" });
+    let told = (scr.cols, scr.rows);
     let mut t = Term {
         scr,
         lines: VecDeque::new(),
@@ -507,6 +650,8 @@ fn main(s: *const Startup) -> i32 {
         mic_active: false,
         display: 0,
         released: false,
+        view: None,
+        told,
         mirror,
         from: [0; 24],
         from_len: 0,
@@ -634,6 +779,41 @@ fn main(s: *const Startup) -> i32 {
                     }
                 }
             },
+            KEY_VIEW => while let Some(ch) = t.view.as_ref().map(|v| v.ch) {
+                let mut hs = [0 as Handle; 1];
+                match sys::channel_read_h(ch, &mut buf, &mut hs, 0) {
+                    Ok((n, nh)) => {
+                        if nh > 0 {
+                            sys::handle_close(hs[0]);
+                        }
+                        let Some(h) = Header::get(&buf[..n]) else { continue };
+                        if let Some((status, a, handle)) = t.view_msg(h)
+                            && h.txid != 0
+                        {
+                            let mut rep = [0u8; HEADER];
+                            Header { txid: h.txid, op: h.op, status: status as i32, a, b: 0 }.put(&mut rep);
+                            match handle {
+                                Some(hd) => sys::channel_write_h(ch, &rep, &[MsgHandle { handle: hd, rights: sys::RIGHTS_SAME }]),
+                                None => sys::channel_write(ch, &rep),
+                            };
+                        }
+                    }
+                    Err(sys::ERR_SHOULD_WAIT) => {
+                        port.arm(ch, sys::READABLE | sys::PEER_CLOSED, KEY_VIEW);
+                        break;
+                    }
+                    Err(_) => {
+                        // The viewer is gone (the service manager links a new one if it restarts).
+                        if let Some(v) = t.view.take() {
+                            sys::handle_close(v.ch);
+                            sys::handle_close(v.vmo_ro);
+                            sys::vmar_unmap(libd::root_vmar(), v.map.addr, v.map.len);
+                            sys::handle_close(v.map.vmo);
+                        }
+                        break;
+                    }
+                }
+            },
             _ => loop {
                 // The service manager: a session (the shell), a new input channel, or stop.
                 let mut hs = [0 as Handle; 1];
@@ -659,6 +839,27 @@ fn main(s: *const Startup) -> i32 {
                                 t.display = handle;
                                 t.reclaim();
                                 port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_DISPLAY);
+                            }
+                            Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"view" && handle != 0 => {
+                                // One viewer: a new one replaces the old.
+                                if let Some(v) = t.view.take() {
+                                    sys::handle_close(v.ch);
+                                    sys::handle_close(v.vmo_ro);
+                                    sys::vmar_unmap(libd::root_vmar(), v.map.addr, v.map.len);
+                                    sys::handle_close(v.map.vmo);
+                                }
+                                match Mapping::new(term::VIEW_BYTES as u64).and_then(|m| sys::handle_duplicate(m.vmo, sys::RIGHT_READ | sys::RIGHT_MAP | sys::RIGHT_TRANSFER | sys::RIGHT_DUPLICATE).map(|ro| (m, ro))) {
+                                    Ok((map, vmo_ro)) => {
+                                        let mut v = View { ch: handle, map, vmo_ro, cols: 80, rows: 25, shown: Vec::new(), cursor: None, attached: false };
+                                        v.resize(80, 25);
+                                        t.view = Some(v);
+                                        port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_VIEW);
+                                    }
+                                    Err(e) => {
+                                        println!("terminal: no memory for a view grid ({})", sys::status(e));
+                                        sys::handle_close(handle);
+                                    }
+                                }
                             }
                             Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"indicator" && handle != 0 => {
                                 if t.indicator != 0 {

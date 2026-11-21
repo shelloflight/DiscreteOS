@@ -1,5 +1,6 @@
-# The built-in demo windows of a graphical session (the shell's `gui`): an About panel with the
-# shortcuts and a pointer canvas. An ordinary window client: it can draw its own windows, nothing else.
+# The built-in example apps of the desktop, written with the native toolkit: Widgets (every
+# control) and About D-OS (the shortcuts). Opened from the launcher (or `gui demo`). An ordinary
+# window client: it can draw its own windows, nothing else.
 name = "awmi-demo"
 image = "awmi-demo.dsvc"
 group = "system"
@@ -10,7 +11,7 @@ log = true
 awmi = ["window"]
 
 [quota]
-memory = "16M"
+memory = "48M"
 handles = 64
 threads = 1
 

@@ -86,8 +86,20 @@ impl Keys {
             RSHIFT => self.shift_r = down,
             CTRL | RCTRL => self.ctrl = down,
             ALT | RALT => self.alt = down,
-            LMETA => self.meta_l = down,
-            RMETA => self.meta_r = down,
+            // Super on its own is reported too, down and up (`key::META`): a tap opens the
+            // compositor's launcher. Other programs ignore it.
+            LMETA | RMETA => {
+                let was = self.meta_l || self.meta_r;
+                if code == LMETA {
+                    self.meta_l = down;
+                } else {
+                    self.meta_r = down;
+                }
+                let is = self.meta_l || self.meta_r;
+                if was != is {
+                    return Some(if is { key::META | self.mods() } else { key::META | key::RELEASE });
+                }
+            }
             CAPS if down => self.caps = !self.caps,
             _ if down => {
                 let shift = self.shift_l || self.shift_r;
@@ -102,6 +114,10 @@ impl Keys {
                 }
                 if meta || self.alt {
                     return Some(u32::from(c) | self.mods());
+                }
+                // Shift+Tab moves backwards through controls: keep its Shift.
+                if c == b'\t' && shift {
+                    return Some(u32::from(c) | key::SHIFT);
                 }
                 if self.caps && c.is_ascii_alphabetic() {
                     c ^= 0x20;

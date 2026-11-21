@@ -1,0 +1,45 @@
+# D-OS theme: Dark Slate (the default). Installed as sys:/themes/dark-slate.toml; docs/ui.md.
+# Deep neutral slate, 1px hairlines and Discrete Blue (#566087) as the accent fill. Its lighter
+# tints carry thin things on dark surfaces (focus rings, links, accent text) so they keep their
+# contrast. Green, amber and red are semantic only (microphone live, sandboxed, alert).
+name = "Dark Slate"
+
+[colors]
+desktop_bg = "#0E1016"
+desktop_subtle = "#141620"
+title_active = "#181A24"
+title_inactive = "#13151D"
+client_bg = "#11131A"
+surface_raised = "#1B1E2A"
+input_bg = "#0F1118"
+border_active = "#3B425C"
+border_inactive = "#232736"
+border_sandbox = "#B87E24"
+accent = "#566087"          # Discrete Blue
+accent_hover = "#616C98"
+accent_pressed = "#485070"
+accent_ring = "#838EB9"
+accent_strong = "#A7B0D2"
+snap_preview_fill = "#38566087"
+snap_preview_border = "#CC838EB9"
+dock_bg = "#DC151822"
+dock_border = "#E02B3043"
+dock_pill_active = "#E8252A3D"
+dock_pill_idle = "#901B1E2C"
+text_primary = "#E5E7F0"
+text_muted = "#888EA4"
+text_on_accent = "#FFFFFF"
+trust_system = "#838EB9"
+trust_native = "#A3A8B4"
+trust_sandbox = "#E5A93B"
+ind_mic_live = "#34D399"
+ind_alert_red = "#EF4444"
+btn_hover = "#CC282D40"
+btn_close_hover = "#D8C03939"
+status_ok = "#7CC69D"
+status_off = "#5C6176"
+overlay_dim = "#6606070B"
+
+[metrics]
+focus_ring = 1
+radius = 6

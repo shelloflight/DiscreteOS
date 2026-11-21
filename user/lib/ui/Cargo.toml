@@ -1,0 +1,26 @@
+# `dosui`: D-OS's native UI toolkit (docs/ui.md). Pure no_std, zero-unsafe, zero external crates:
+# declarative views (`view` builds a tree from the app's state, `update` handles its messages),
+# flex layout, keyboard-first focus and activation, text fields, scrolling, themes and text scale
+# from the compositor, subtle transitions (off with reduce motion), and damage-tracked repaint.
+# Also the vector text engine glue (`FontText`) the compositor and apps share.
+[package]
+name = "dosui"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[dependencies]
+dosawmi = { path = "../awmi" }
+dosfont = { path = "../font" }
+
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"

@@ -7,7 +7,9 @@
 //! Arguments:
 //!   (none)              the system: the embedded manifests of group `system` (storaged,
 //!                       devmgr), then signed ones from the boot volume (`esp:/DOS/SERVICES`);
-//!                       supervised for ever. Disks are read-only (docs/hardware.md)
+//!                       supervised for ever. Disks are read-only (docs/hardware.md). The
+//!                       compositor starts a desktop session as soon as there is a display,
+//!                       unless `esp:/DOS/BOOT.CFG` says `desktop = off` (then the text console)
 //!   shell test          the system with writable disks and the terminal mirrored to the log
 //!                       (the host types a session on the keyboard)
 //!   time test           writable storage and svc-time (the wall-clock time across a reboot),
@@ -139,6 +141,18 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) ->
     }
     // System volume: load signed services, tools, and programs from the immutable `sys` volume,
     // plus any embedded test manifests (which may connect to services loaded from `sys`, like `log`).
+    // A normal boot (the system group only) goes to the desktop: the text console stays
+    // underneath, and comes back when the desktop is left or cannot start, unless the boot
+    // volume asks for the text console.
+    let mut overrides: Vec<(&str, &str)> = overrides.to_vec();
+    if load_sys && groups == [Group::System] && overrides.is_empty() {
+        if desktop_at_boot(&m) {
+            overrides.push(("awmi", "autostart"));
+        } else {
+            println!("init: boot: text console (DOS/BOOT.CFG: desktop = off)");
+        }
+    }
+    let overrides = &overrides[..];
     if load_sys {
         let mut added = m.load_sys_volume(groups);
         if groups.contains(&Group::Test) {
@@ -155,6 +169,25 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) ->
         }
     }
     Some(m)
+}
+
+/// The desktop at boot: on, unless `esp:/DOS/BOOT.CFG` has a line `desktop = off` (or `no`,
+/// `false`, `0`). The file is optional and unsigned: it can only turn the desktop off.
+fn desktop_at_boot(m: &Mgr) -> bool {
+    let Some(root) = m.volumes.iter().find(|v| v.name == "esp").and_then(|v| v.root.clone_with(fp::R_READ).ok()) else { return true };
+    let Ok((f, _, size)) = root.open(b"DOS/BOOT.CFG", 0, fp::R_READ) else { return true };
+    let mut b = alloc::vec![0u8; (size as usize).min(4096)];
+    let n = f.read(0, &mut b).unwrap_or(0);
+    let text = String::from_utf8_lossy(&b[..n]);
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if let Some((k, v)) = line.split_once('=')
+            && k.trim().eq_ignore_ascii_case("desktop")
+        {
+            return !matches!(v.trim().trim_matches('"').to_ascii_lowercase().as_str(), "off" | "no" | "false" | "0");
+        }
+    }
+    true
 }
 
 fn power(action: u64) -> i32 {
@@ -282,6 +315,9 @@ fn main(s: *const Startup) -> i32 {
 
     list_programs();
     let Some(mut m) = start_system(&[], &[Group::System], true) else { return 1 };
+    if m.find("awmi").is_some_and(|i| m.svcs[i].args.is_some()) {
+        println!("init: boot: desktop");
+    }
     if m.load_from_volume("esp", &[Group::System]) > 0 {
         m.check_set();
     }

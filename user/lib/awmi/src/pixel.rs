@@ -31,6 +31,30 @@ pub const fn blend_over(dst: u32, src: u32) -> u32 {
     0xFF00_0000 | (r << 16) | (g << 8) | b
 }
 
+/// Sub-pixel unit of the shape rasterizer (1/256 px).
+const AA_ONE: i64 = 256;
+
+/// Coverage in `0..=AA_ONE` as `0..=255`.
+#[inline]
+const fn cov255(c: i64) -> u32 {
+    ((c * 255 + AA_ONE / 2) / AA_ONE) as u32
+}
+
+/// Integer square root (floor), Newton's method from a power-of-two guess above the root.
+pub(crate) const fn isqrt(n: u64) -> u64 {
+    if n < 2 {
+        return n;
+    }
+    let mut x = 1u64 << (64 - n.leading_zeros()).div_ceil(2);
+    loop {
+        let y = (x + n / x) / 2;
+        if y >= x {
+            return x;
+        }
+        x = y;
+    }
+}
+
 /// Scale a color's alpha channel by `cov` in `0..=255`.
 #[inline]
 const fn scale_alpha(color: u32, cov: u32) -> u32 {
@@ -140,115 +164,102 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Draw a clean flat rounded rectangle with optional 1px hairline border (zero gradients).
+    /// Draw a flat rounded rectangle with an optional 1px hairline border, anti-aliased: each
+    /// pixel's coverage is its centre's signed distance to the rounded edge (1/256 px fixed point,
+    /// integer only), so curves are smooth and straight edges stay crisp. The fill and the border
+    /// get separate coverage (the border is the 1px band inside the outer edge).
     pub fn fill_rounded_rect(&mut self, clip: Rect, rect: Rect, radius: u32, fill: u32, border: u32) {
         let vis = rect.intersect(clip).intersect(self.bounds());
         if vis.is_empty() {
             return;
         }
-        let rad = radius.min(rect.w / 2).min(rect.h / 2) as i32;
+        let rad = i64::from(radius.min(rect.w / 2).min(rect.h / 2));
+        let has_border = (border >> 24) != 0;
         if rad <= 0 {
             self.fill_rect(clip, rect, fill);
-            if (border >> 24) != 0 {
+            if has_border {
                 self.stroke_rect(clip, rect, border);
             }
             return;
         }
-        let has_border = (border >> 24) != 0;
-        let rx0 = rect.x;
-        let ry0 = rect.y;
-        let rx1 = rect.x + rect.w as i32 - 1;
-        let ry1 = rect.y + rect.h as i32 - 1;
-        let r_outer_sq = rad * rad;
-        let r_inner = (rad - 1).max(0);
-        let r_inner_sq = r_inner * r_inner;
+        let s = AA_ONE;
+        let r = rad * s;
+        // The box the corner circles' centres span; distance is measured outward from it.
+        let (cl, cr) = ((i64::from(rect.x) + rad) * s, (i64::from(rect.x) + i64::from(rect.w) - rad) * s);
+        let (ct, cb) = ((i64::from(rect.y) + rad) * s, (i64::from(rect.y) + i64::from(rect.h) - rad) * s);
+        // Columns whose centres lie inside [cl, cr]: no horizontal distance.
+        let (mid0, mid1) = (rect.x + rad as i32, rect.x + rect.w as i32 - rad as i32);
         let stride = self.stride_px as usize;
-
+        let opaque_fill = (fill >> 24) == 255;
         for y in vis.y..(vis.y + vis.h as i32) {
-            let in_top_band = y < ry0 + rad;
-            let in_bot_band = y > ry1 - rad;
-            let row_off = (y as usize) * stride;
-            if !in_top_band && !in_bot_band {
-                // Fast interior scanline: left border, middle fill, right border.
-                let mut x0 = vis.x;
-                let mut x1 = vis.x + vis.w as i32;
-                if has_border && x0 == rx0 {
-                    let p = &mut self.pixels[row_off + x0 as usize];
-                    *p = blend_over(*p, border);
-                    x0 += 1;
-                }
-                if has_border && x1 - 1 == rx1 && x1 > x0 {
-                    x1 -= 1;
-                    let p = &mut self.pixels[row_off + x1 as usize];
-                    *p = blend_over(*p, border);
-                }
-                if x1 > x0 {
-                    if (fill >> 24) == 255 {
-                        self.pixels[row_off + x0 as usize..row_off + x1 as usize].fill(fill | 0xFF00_0000);
+            let py = i64::from(y) * s + s / 2;
+            let ey = (ct - py).max(py - cb).max(0);
+            let row = (y as usize) * stride;
+            let mut x = vis.x;
+            let x_end = vis.x + vis.w as i32;
+            while x < x_end {
+                if ey == 0 && x >= mid0 && x < mid1 {
+                    // Interior span: plain fill.
+                    let end = mid1.min(x_end);
+                    let span = &mut self.pixels[row + x as usize..row + end as usize];
+                    if opaque_fill {
+                        span.fill(fill | 0xFF00_0000);
                     } else {
-                        for p in &mut self.pixels[row_off + x0 as usize..row_off + x1 as usize] {
+                        for p in span {
                             *p = blend_over(*p, fill);
                         }
                     }
-                }
-                continue;
-            }
-            for x in vis.x..(vis.x + vis.w as i32) {
-                let in_left = x < rx0 + rad;
-                let in_right = x > rx1 - rad;
-                if !in_left && !in_right {
-                    let on_edge = y == ry0 || y == ry1;
-                    let c = if has_border && on_edge { border } else { fill };
-                    let p = &mut self.pixels[row_off + x as usize];
-                    *p = blend_over(*p, c);
+                    x = end;
                     continue;
                 }
-                let cx = if in_left { rx0 + rad } else { rx1 - rad };
-                let cy = if in_top_band { ry0 + rad } else { ry1 - rad };
-                let dx = x - cx;
-                let dy = y - cy;
-                let d2 = dx * dx + dy * dy;
-                if d2 <= r_inner_sq {
-                    let p = &mut self.pixels[row_off + x as usize];
-                    *p = blend_over(*p, fill);
-                } else if d2 <= r_outer_sq {
-                    let c = if has_border { border } else { fill };
-                    let p = &mut self.pixels[row_off + x as usize];
-                    *p = blend_over(*p, c);
-                } else if d2 <= r_outer_sq + rad {
-                    // Subtle 1-step corner softening without blur.
-                    let c = if has_border { border } else { fill };
-                    let p = &mut self.pixels[row_off + x as usize];
-                    *p = blend_over(*p, scale_alpha(c, 96));
+                let px = i64::from(x) * s + s / 2;
+                let ex = (cl - px).max(px - cr).max(0);
+                let dist = if ex == 0 {
+                    ey
+                } else if ey == 0 {
+                    ex
+                } else {
+                    isqrt((ex * ex + ey * ey) as u64) as i64
+                };
+                let outer = (r - dist + s / 2).clamp(0, s);
+                let inner = if has_border { (r - s - dist + s / 2).clamp(0, s) } else { outer };
+                let p = &mut self.pixels[row + x as usize];
+                if inner > 0 {
+                    *p = blend_over(*p, scale_alpha(fill, cov255(inner)));
                 }
+                if has_border && outer > inner {
+                    *p = blend_over(*p, scale_alpha(border, cov255(outer - inner)));
+                }
+                x += 1;
             }
         }
     }
 
-    /// Draw a clean filled circle (for trust dots and live status indicators).
+    /// Draw an anti-aliased filled circle centred on pixel `(cx, cy)` (trust dots, status
+    /// indicators, slider knobs).
     pub fn fill_circle(&mut self, clip: Rect, cx: i32, cy: i32, radius: i32, color: u32) {
         if radius <= 0 {
             return;
         }
-        let bb = Rect::new(cx - radius, cy - radius, (radius * 2 + 1) as u32, (radius * 2 + 1) as u32);
+        let bb = Rect::new(cx - radius - 1, cy - radius - 1, (radius * 2 + 3) as u32, (radius * 2 + 3) as u32);
         let vis = bb.intersect(clip).intersect(self.bounds());
         if vis.is_empty() {
             return;
         }
-        let r2 = radius * radius;
+        let s = AA_ONE;
+        // The covered disc reaches half a pixel past `radius` (the centre pixel's own half).
+        let r = i64::from(radius) * s + s / 2;
         let stride = self.stride_px as usize;
         for y in vis.y..(vis.y + vis.h as i32) {
-            let dy = y - cy;
+            let dy = i64::from(y - cy) * s;
             let row = (y as usize) * stride;
             for x in vis.x..(vis.x + vis.w as i32) {
-                let dx = x - cx;
-                let d2 = dx * dx + dy * dy;
-                if d2 <= r2 {
+                let dx = i64::from(x - cx) * s;
+                let dist = isqrt((dx * dx + dy * dy) as u64) as i64;
+                let cov = (r - dist + s / 2).clamp(0, s);
+                if cov > 0 {
                     let p = &mut self.pixels[row + x as usize];
-                    *p = blend_over(*p, color);
-                } else if d2 <= r2 + radius {
-                    let p = &mut self.pixels[row + x as usize];
-                    *p = blend_over(*p, scale_alpha(color, 110));
+                    *p = blend_over(*p, scale_alpha(color, cov255(cov)));
                 }
             }
         }

@@ -66,6 +66,13 @@ backoff = 100               # ms before the first restart, doubled each time, at
 Anything else is refused: no `.dsig`, a signature that does not match, a `.dsig` of another kind or
 for another name. `dbuild img sign <seed> manifest <name>.dman <file> <out.dsig>` signs one.
 
+### Boot to the desktop
+
+On a normal boot the service manager starts the compositor with the argument `autostart`, so the
+machine comes up on the desktop ([awmi.md](awmi.md)). A line `desktop = off` (or `no`, `false`,
+`0`) in the optional `DOS/BOOT.CFG` on the boot volume keeps the text console instead. The file
+is not signed because it can only turn the desktop off: it grants nothing.
+
 ### Checks across manifests
 
 Two services with one name, an image that is not an embedded program, an `after` naming no service,
@@ -147,8 +154,9 @@ every volume provider, sends `SUSPEND` to `devmgr` to quiesce and stop drivers, 
 | `audio` | log, `devmgr.audio`, `terminal.indicator` | `audio.playback`, `audio.capture`, `audio.control` |
 | `net` | log, `devmgr.net`, `clock.time` | `net.client`, `net.icmp`, `net.control`, `net.status` |
 | `gpu` | log, the `display` device, `devmgr.gpu` | `gpu.query`, `gpu.display`, `gpu.render` |
-| `terminal` | log, the `display` device, `devmgr.input` | `terminal.session`, `terminal.indicator`, `terminal.display` |
-| `awmi` | log, `gpu.display`, `audio.control`, `net.status`, `devmgr.input`, `terminal.display`, `clock.time` | `awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator` (identified clients) |
+| `terminal` | log, the `display` device, `devmgr.input` | `terminal.session`, `terminal.indicator`, `terminal.display`, `terminal.view` |
+| `awmi` | log, `gpu.display`, `audio.control`, `net.status`, `devmgr.input`, `terminal.display`, `clock.time`, `sys:/` read-only (fonts, themes) | `awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator` (identified clients) |
+| `console` | log, `awmi.window`, `terminal.view` | |
 | `awmi-demo` | log, `awmi.window` | |
 | `shell` | log, `terminal.session`, `log.read`, `clock.time`, `audio.*`, `net.*`, `gpu.query`, `awmi.admin`, `awmi.query`, every volume, the manager (services, power), the tools | |
 

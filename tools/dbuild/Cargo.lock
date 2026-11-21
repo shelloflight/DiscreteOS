@@ -7,12 +7,17 @@ name = "dbuild"
 version = "0.1.0"
 dependencies = [
  "doscrypt",
+ "dosfont",
  "dosfs",
  "dosnet",
 ]
 
 [[package]]
 name = "doscrypt"
+version = "0.1.0"
+
+[[package]]
+name = "dosfont"
 version = "0.1.0"
 
 [[package]]

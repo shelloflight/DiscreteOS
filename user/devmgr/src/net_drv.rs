@@ -5,7 +5,7 @@ use libd::net;
 use libd::proto::{self, HEADER, Header};
 use libd::ring::{Cqe, IoRing};
 use libd::sys::{self, Handle};
-use libd::Port;
+use libd::{Port, println};
 
 pub const KEY_CTL: u64 = 1;
 pub const KEY_SVC: u64 = 2;
@@ -20,6 +20,8 @@ pub struct NetBridge {
     pub rx_ring: Option<IoRing>,
     pub tx_frames: u64,
     pub rx_frames: u64,
+    /// Frames received while the network service had no buffer posted (dropped).
+    pub rx_dropped: u64,
 }
 
 impl NetBridge {
@@ -30,6 +32,7 @@ impl NetBridge {
             rx_ring: None,
             tx_frames: 0,
             rx_frames: 0,
+            rx_dropped: 0,
         }
     }
 
@@ -195,7 +198,14 @@ impl NetBridge {
             return;
         }
         let Some(rx) = self.rx_ring.as_mut() else { return };
-        let Some(sqe) = rx.pop_sq() else { return };
+        let Some(sqe) = rx.pop_sq() else {
+            // The network service is behind: the frame is lost. Said once, then every 1000.
+            self.rx_dropped += 1;
+            if self.rx_dropped == 1 || self.rx_dropped.is_multiple_of(1000) {
+                println!("net driver: {} received frame(s) dropped (no receive buffer from the network service)", self.rx_dropped);
+            }
+            return;
+        };
         if sqe.op != net::DRV_RING_FRAME || (sqe.buf_len as usize) < frame.len() {
             rx.push_cq(Cqe { id: sqe.id, status: sys::ERR_INVALID_ARGS as i32, a: 0 });
             return;

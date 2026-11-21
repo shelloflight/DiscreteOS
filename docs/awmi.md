@@ -1,16 +1,23 @@
 # D-AWMI: compositor and window manager
 
-D-AWMI (`awmi.dsvc`) is D-OS's compositor and window manager. It is idle at boot: no screen, no
-input, a few pages of memory. The shell's `gui` starts a **session**: the compositor takes the
-display from the terminal and the keyboard and pointer from the device manager, draws the desktop,
-the windows with their server-side decorations and the dock, and gives everything back when the
-session ends.
+D-AWMI (`awmi.dsvc`) is D-OS's compositor and window manager. A **session** takes the display
+from the terminal and the keyboard and pointer from the device manager. The compositor then draws
+the desktop, the windows with their server-side decorations, the dock and the launcher, and gives
+everything back when the session ends.
+
+A normal boot goes straight to a **desktop** session: the service manager starts the compositor
+with `autostart`, and the session begins as soon as a display is there. If there is no display
+within 20 s, the text console stays. The terminal window (`console.dsvc`) shows the same shell
+session as the text console. A line `desktop = off` in `esp:/DOS/BOOT.CFG` boots to the text
+console instead; the shell's `gui` starts the desktop from there. Fonts, the toolkit, themes, the
+launcher and accessibility are described in [ui.md](ui.md).
 
 **Code:** `user/lib/awmi` (`dosawmi`: `no_std`, `#![forbid(unsafe_code)]` geometry and bounded damage
 tracking, alpha compositing, rounded/hairline drawing, built-in 8x16 font, theme, window manager,
-dock, wire codecs), `user/awmi` (`awmi.dsvc`, `awmi-demo.dsvc`), `user/lib/libd/src/awmi.rs`
-(client protocol), `user/init/services/awmi.dman`, `awmi-demo.dman`.
-**Tests:** `awmi-host`, `awmi-virtio`, `awmi-gop`.
+dock, launcher, themes, wire codecs), `user/awmi` (`awmi.dsvc`, `awmi-demo.dsvc`, `console.dsvc`),
+`user/lib/libd/src/awmi.rs` (client protocol), `user/init/services/awmi.dman`, `awmi-demo.dman`,
+`console.dman`.
+**Tests:** `awmi-host`, `awmi-virtio`, `awmi-gop`, `desktop-virtio`, `desktop-gop`.
 
 ## Session lifecycle
 
@@ -22,9 +29,9 @@ dock, wire codecs), `user/awmi` (`awmi.dsvc`, `awmi-demo.dsvc`), `user/lib/libd/
 2. **Screen and input:** `terminal.display` `DISPLAY_RELEASE` (the terminal keeps its scrollback but
    stops drawing) and `devmgr.input` `INPUT_GRAB` (keys and pointer events go to the compositor
    only: nothing typed reaches the shell).
-3. **Frames:** client commits, input and dock changes add damage; a refresh-paced timer composites
-   only the damaged rectangles (desktop, windows bottom to top, snap preview, dock, software cursor)
-   and presents just those. Bursts coalesce into one frame per refresh. A single output with
+3. **Frames:** client commits, input, dock changes and animations add damage. A refresh-paced
+   timer composites only the damaged rectangles (desktop, windows bottom to top, snap preview,
+   dock, launcher, software cursor) and presents just those. Bursts coalesce into one frame per refresh. A single output with
    `CAP_HW_CURSOR` uses the 64x64 hardware cursor; otherwise the cursor is drawn in software.
 4. **End:** `Super+Esc` (`Ctrl+Alt+Esc` inside a VM, where the host takes `Super`) or
    `OP_SESSION_STOP`: every window closes (`EVT_SESSION` 0), the grab is released, the terminal
@@ -38,9 +45,9 @@ A GPU driver restart makes a present fail; the outputs are attached again at the
 Floating by default, with snapping: drag a title bar to move (an edge or corner of an output shows a
 snap preview: halves, quarters, maximize), drag an edge or corner to resize, title bar buttons to
 minimize, maximize/restore and close. Click to focus. Four workspaces. The dock is a floating
-island at the bottom of the primary output: running windows (click: focus, or minimize the focused
-one), workspaces `1`-`4`, network, audio, `MIC LIVE` (green) and security alert (red) indicators,
-and the UTC clock.
+island at the bottom of the primary output: the windows of the current workspace (each workspace
+has its own; click: focus, or minimize the focused one), workspaces `1`-`4`, network, audio,
+`MIC LIVE` (green) and security alert (red) indicators, and the UTC clock.
 
 | Keys | Action |
 |---|---|
@@ -50,7 +57,11 @@ and the UTC clock.
 | `Super+1`..`4` / `Super+Shift+1`..`4` | switch workspace / move the focused window there |
 | `Alt+Tab` | next window |
 | `Super+Q` | ask the focused window to close (`EVT_CLOSE`) |
+| `Super` (tap), `Alt+F1` | open or close the launcher ([ui.md](ui.md#launcher)) |
 | `Super+Esc`, `Ctrl+Alt+Esc` | end the session |
+
+`Super` itself is never delivered to windows: a tap opens the launcher, and with another key it
+is a shortcut.
 
 Keyboards report `Super` (PS/2 `E0 5B`/`E0 5C`, USB HID GUI modifiers, Linux `KEY_LEFTMETA`/
 `KEY_RIGHTMETA`) and `F1`-`F12`; with `Alt` or `Super` held, characters carry their modifier bits.
@@ -77,12 +88,13 @@ hairline border.
 [grants]
 awmi = ["window"]      # create and draw its own windows; input for them while focused
 awmi = ["query"]       # the compositor's status (OP_STATUS)
-awmi = ["admin"]       # start and stop the session (the shell's `gui`), plus status
+awmi = ["admin"]       # start and stop the session (the shell's `gui`), settings, plus status
 awmi = ["indicator"]   # set the dock's security alert
 ```
 
 `awmi.dsvc` itself holds `gpu = ["display"]`, `audio = ["control"]` (microphone and mute state),
-`net = ["status"]` (read-only link state), `devmgr.input`, `terminal.display` and `clock.time`.
+`net = ["status"]` (read-only link state), `devmgr.input`, `terminal.display`, `clock.time`, and
+read-only `sys:/` (fonts and themes).
 
 ## Client protocol (`libd::awmi`)
 
@@ -91,28 +103,45 @@ Requests are calls on the client's channel; events arrive on the same channel (t
 | Op | Endpoint | Meaning |
 |---|---|---|
 | `OP_CREATE` (900) | window | `a` = client size; `b` = flags; payload = title. Reply: window id, configured size. Refused (`ERR_BAD_STATE`) outside a session; at most 16 windows per client |
-| `OP_ATTACH` (901) | window | one VMO handle: the window's pixels (XRGB8888/ARGB8888, `pitch >= width * 4`, at most 64 MiB) |
+| `OP_ATTACH` (901) | window | one VMO handle: the window's pixels (XRGB8888/ARGB8888, `pitch >= width * 4`, at most 64 MiB). A buffer attached to replace another (a resize) is shown from its first commit; until then the old one stays on screen and its pending frame is still answered |
 | `OP_COMMIT` (902) | window | show the buffer; payload = up to 16 damage rectangles (window-local); `EVT_FRAME_DONE` follows |
 | `OP_SET_TITLE` (903), `OP_DESTROY` (904) | window | the program's own windows only |
-| `OP_SESSION_START` (930), `OP_SESSION_STOP` (931) | admin | `a` bit 0: open the demo windows |
-| `OP_STATUS` (932) | query, admin | session, outputs, mode, windows, workspace, indicators, frames, input counters |
+| `OP_FONTS` (905) | window | one read-only VMO handle: the font pack; `a` = its size |
+| `OP_APP_REGISTER` (906) | window | a launcher entry: `a` = entry 0-3, payload = label (32 bytes) |
+| `OP_SESSION_START` (930), `OP_SESSION_STOP` (931) | admin | `a`: `SESSION_DEMO` (1) opens the demo windows, `SESSION_DESKTOP` (2) the terminal window |
+| `OP_STATUS` (932) | query, admin | session, outputs, mode, windows, workspace, indicators, frames, input counters, settings, launcher, fonts, entries |
 | `OP_INDICATOR` (933) | indicator | `IND_SECURITY_ALERT` |
-| `OP_TEST_*` (940-944) | admin, test mode only | inject keys and pointer events, read back a backbuffer pixel, list windows, add a virtual output |
+| `OP_SETTINGS` (934) | admin | `a` = settings (theme, text size << 8, reduce motion << 24), `b` = which (`SET_*`) |
+| `OP_TEST_*` (940-945) | admin, test mode only | inject keys and pointer events, read back a backbuffer pixel, list windows, add a virtual output, hash a frame |
 
 Events: `EVT_CONFIGURE` (size and state after a snap, resize, maximize, minimize, focus change),
-`EVT_KEY`, `EVT_POINTER`, `EVT_FOCUS`, `EVT_CLOSE`, `EVT_FRAME_DONE`, `EVT_SESSION`.
+`EVT_KEY`, `EVT_POINTER`, `EVT_FOCUS`, `EVT_CLOSE`, `EVT_FRAME_DONE`, `EVT_SESSION` (`a` bit 0
+active, bit 1 demo, bit 2 desktop), `EVT_LAUNCH` (`a` = the entry opened), `EVT_SETTINGS` (`a` =
+settings, payload = the theme's colours).
 `libd::awmi::Window` creates a window with its own buffer, `resize`s it on `EVT_CONFIGURE` and
 `commit`s damage.
 
-`awmi-demo.dsvc` is an ordinary `awmi.window` client: in a session started with the demo (`gui`) it
-opens an About window (shortcuts) and a Canvas (draw with the pointer, the last key, focus).
+Window programs that ship with the desktop, all ordinary `awmi.window` clients:
+
+- `console.dsvc`: the terminal window. It needs `terminal.view` as well: the terminal lays the
+  session out for the window's grid in a VMO the console maps read-only, says which rows changed,
+  and takes the keys typed in the window. It opens on a desktop session and from the launcher.
+- `awmi-demo.dsvc`: the toolkit's example apps, Widgets (a tour of the controls, all local to its
+  window, with a theme preview that re-themes only that window) and About D-OS (the
+  shortcuts), from the launcher or `gui demo`.
 
 ## Trade-offs
 
 - Compositing is on the CPU into RAM backbuffers (never reading write-combining memory back),
   damage-tracked so idle desktops cost nothing; GPU-shader compositing comes later.
-- The UI font is the built-in 8x16 bitmap font; anti-aliased vector text, the native toolkit,
-  theming and accessibility follow with the UI foundation.
+- The chrome is drawn with the shipped vector fonts; without them (a damaged system volume) the
+  built-in 8x16 bitmap font keeps the desktop usable.
+- The window chrome and the launcher are drawn by the compositor, never by clients, so a program
+  cannot draw a fake title bar or launcher entry for another program.
+- The firmware framebuffer (UEFI GOP) has no vertical-blank signal or page flipping, so a copy
+  to it can tear while something moves (dragging a window, the launcher opening). To keep that
+  rare, the launcher's dim is drawn once and only its panel animates. Tear-free output needs a
+  native display driver that flips buffers at vertical blank.
 - On a PCI GPU the terminal's firmware framebuffer is not the scanout, so the session prefers the
   firmware framebuffer when there is one; a GOP-less machine (BIOS boot) uses its PCI GPUs.
 
@@ -130,4 +159,11 @@ opens an About window (shortcuts) and a Canvas (draw with the pointer, the last 
   onto a second (virtual) output draws there; the alert indicator and (`awmi-virtio`) `MIC LIVE`
   during a real capture stream; `Super+Q` closes; keys and pointer events typed by the host reach
   the compositor during the grab (`leak` never reaches the shell); after the session the terminal
-  gets the keyboard back (`gui status`).
+  gets the keyboard back (`gui status`). They also check the shared font pack (read-only, refused
+  to non-window endpoints), launcher registration and the Super-tap launcher, and the settings
+  (admin only, sent to window programs, visible in the frame).
+- `desktop-virtio` (BIOS, `virtio-gpu-pci`) and `desktop-gop` (UEFI framebuffer) boot the release
+  image as shipped: the desktop starts by itself and the terminal window attaches. A command
+  typed into it reaches the shell, and `gui text 125` changes the settings. Super and `widgets`
+  open an app from the launcher. Ctrl+Alt+Esc returns to the text console, where `power off`
+  switches off. Every other release-image test boots a copy with `desktop = off`.

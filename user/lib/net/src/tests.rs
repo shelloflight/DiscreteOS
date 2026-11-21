@@ -577,3 +577,42 @@ fn packet_and_tls_fuzzers() {
     }
     let _ = (PROTO_TCP, PROTO_UDP);
 }
+
+#[test]
+fn dns_falls_back_to_the_next_server_and_public_resolvers() {
+    let mut st = NetStack::new([0x02, 0, 0, 0, 0, 0x50], 0x5150);
+    st.set_static([192, 168, 1, 50], [255, 255, 255, 0], [192, 168, 1, 1], [192, 168, 1, 1]);
+    st.dns_server2 = [192, 168, 1, 2];
+    // The configured servers first, then the public ones, round robin; no duplicates.
+    let order: Vec<[u8; 4]> = (0..6).map(|a| st.dns_server_for(a).unwrap().0).collect();
+    assert_eq!(order, vec![[192, 168, 1, 1], [192, 168, 1, 2], [1, 1, 1, 1], [9, 9, 9, 9], [8, 8, 8, 8], [192, 168, 1, 1]]);
+    st.dns_fallback = false;
+    assert_eq!(st.dns_server_for(2).unwrap().0, [192, 168, 1, 1]);
+    st.dns_fallback = true;
+    st.dns_server2 = [0; 4];
+
+    // A lookup the router never answers: the retries go to 1.1.1.1, then 9.9.9.9 (via the gateway).
+    let gw_mac = [0x02, 0, 0, 0, 0, 0x01];
+    let reply = ArpPacket { op: 2, sha: gw_mac, spa: [192, 168, 1, 1], tha: st.mac, tpa: st.ip };
+    st.on_rx_frame(&build_eth(st.mac, gw_mac, 0x0806, &reply.encode()), 0);
+    st.start_dns_resolve("example.com", 0).unwrap();
+    let dns_dst = |st: &mut NetStack| -> Vec<[u8; 4]> {
+        let mut out = Vec::new();
+        while let Some(f) = st.poll_tx() {
+            let eth = EthFrame::parse(&f).unwrap();
+            if eth.ethertype == ETH_TYPE_IPV4 {
+                let ip = Ipv4Packet::parse(eth.payload).unwrap();
+                if ip.proto == PROTO_UDP {
+                    assert_eq!(eth.dst, gw_mac, "off-subnet servers go through the gateway");
+                    out.push(ip.dst);
+                }
+            }
+        }
+        out
+    };
+    assert_eq!(dns_dst(&mut st), vec![[192, 168, 1, 1]]);
+    st.tick(1_000);
+    assert_eq!(dns_dst(&mut st), vec![[1, 1, 1, 1]]);
+    st.tick(2_000);
+    assert_eq!(dns_dst(&mut st), vec![[9, 9, 9, 9]]);
+}

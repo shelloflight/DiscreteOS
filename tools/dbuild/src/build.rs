@@ -62,6 +62,7 @@ const SYS_BIN_PROGS: &[&str] = &[
     "gpu.dsvc",
     "awmi.dsvc",
     "awmi-demo.dsvc",
+    "console.dsvc",
     "log.dx",
     "terminal.dx",
     "shell.dx",
@@ -139,6 +140,18 @@ fn build_sys_files(
         let sig_dst = format!("tools/{stem}.dsig");
         files.push((dst, m));
         files.push((sig_dst, sig));
+    }
+
+    // The shipped faces (`sys:/fonts`, with their licences) and themes (`sys:/themes`): the
+    // compositor reads them and shares the fonts with window programs (docs/ui.md).
+    for (sub, exts) in [("fonts", &["ttf", "txt"][..]), ("themes", &["toml"][..])] {
+        let dir = env.root.join("user").join("init").join(sub);
+        for ext in exts {
+            for f in collect_files(&dir, ext, false) {
+                let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                files.push((format!("{sub}/{name}"), f));
+            }
+        }
     }
 
     // Compile the curated in-tree public TLS root CA bundle into compact binary DER (`sys:/certs/roots.der`).

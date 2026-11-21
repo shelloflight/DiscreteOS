@@ -44,6 +44,7 @@ enum HostTest {
     Net,
     Gpu,
     Awmi,
+    Ui,
     Aml,
     Kaslr,
     Static,
@@ -76,6 +77,9 @@ struct TestCase {
     qemu_extra: Vec<String>,
     post: Option<PostCheck>,
     host: Option<HostTest>,
+    /// Boot the release image as shipped (to the desktop). Other release-image boots use a copy
+    /// whose boot volume says `desktop = off`, so they test the text console as before.
+    desktop: bool,
 }
 
 impl TestCase {
@@ -107,7 +111,13 @@ impl TestCase {
             qemu_extra: Vec::new(),
             post: None,
             host: None,
+            desktop: false,
         }
+    }
+
+    fn desktop(mut self) -> Self {
+        self.desktop = true;
+        self
     }
 
     fn host_case(name: &'static str, host: HostTest) -> Self {
@@ -1377,6 +1387,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::host_case("net-host", HostTest::Net),
         TestCase::host_case("gpu-host", HostTest::Gpu),
         TestCase::host_case("awmi-host", HostTest::Awmi),
+        TestCase::host_case("ui-host", HostTest::Ui),
         TestCase::host_case("aml-host", HostTest::Aml),
 
         TestCase::boot("audio-hda")
@@ -1550,7 +1561,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             .timeout(90)
             .must_exit()
             .keys_vec(
-                convert_to_qemu_keys(&["@~1500", "net", "ping 10.0.2.2 2", "power off"], 600),
+                convert_to_qemu_keys(&["@~1500", "net", "ping 10.0.2.2 2", "net check", "power off"], 600),
                 "net: dhcp bound 10.0.2.15",
             )
             .expect(&[
@@ -1559,6 +1570,9 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "terminal|  virtio-net",
                 "terminal| PING 10.0.2.2 (10.0.2.2): 2 request(s)",
                 "terminal| v ping 10.0.2.2: 2/2 received (0% loss)",
+                "10.0.2.2 answers ping",
+                "terminal| ",
+                "net check: ",
                 "Power: switching off",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
@@ -1674,12 +1688,15 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "awmi: output: adapter #",
                 "1024x768",
                 "hardware cursor",
+                "awmi: fonts: 4 face(s)",
                 "awmi: ready, idle until a session starts",
                 "svc-awmi-ungranted: PASSED (no compositor endpoint)",
                 "awmi: session started:",
                 "svc-awmi-a: window",
                 "svc-awmi-b: window",
                 "svc-awmi-full: session OK",
+                "svc-awmi-full: fonts OK (",
+                "svc-awmi-full: launcher & settings OK (",
                 "svc-awmi-full: surface isolation OK",
                 "svc-awmi-full: verified identity OK",
                 "svc-awmi-full: focus & input routing OK",
@@ -1704,6 +1721,27 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", ": leak", "PANIC"]),
 
+        // The release image as shipped: straight to the desktop with the terminal window (the
+        // shell session, typed into through the compositor); the launcher opens an app; leaving
+        // the desktop gives the text console back, where the session goes on.
+        TestCase::boot("desktop-virtio")
+            .desktop()
+            .qemu(&["-device", "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1280,yres=800"])
+            .timeout(150)
+            .must_exit()
+            .keys_vec(desktop_keys(), "terminal: view attached")
+            .expect(&DESKTOP_EXPECT)
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC", "refused ("]),
+
+        TestCase::boot("desktop-gop")
+            .desktop()
+            .uefi()
+            .timeout(150)
+            .must_exit()
+            .keys_vec(desktop_keys(), "terminal: view attached")
+            .expect(&DESKTOP_EXPECT)
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC", "refused ("]),
+
         // D-AWMI on the firmware framebuffer (UEFI GOP: write-combining blits, software cursor).
         TestCase::boot("awmi-gop")
             .def("AWMI")
@@ -1722,12 +1760,15 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "D-OS: GOP framebuffer",
                 "awmi: output: adapter #1 'GOP Framebuffer'",
                 "software cursor",
+                "awmi: fonts: 4 face(s)",
                 "awmi: ready, idle until a session starts",
                 "svc-awmi-ungranted: PASSED (no compositor endpoint)",
                 "awmi: session started:",
                 "svc-awmi-a: window",
                 "svc-awmi-b: window",
                 "svc-awmi-full: session OK",
+                "svc-awmi-full: fonts OK (",
+                "svc-awmi-full: launcher & settings OK (",
                 "svc-awmi-full: surface isolation OK",
                 "svc-awmi-full: verified identity OK",
                 "svc-awmi-full: focus & input routing OK",
@@ -2030,6 +2071,8 @@ pub fn run_test_suite(
 
         if tc.tamper {
             image = make_tampered_image(env, &image)?;
+        } else if tc.define.is_none() && !tc.desktop {
+            image = make_text_console_image(env, &image)?;
         }
 
         let disk_dir = env.build.join("disks").join(tc.name);
@@ -2762,6 +2805,28 @@ fn post_kaslr_reboots(env: &Env, image: &Path, first_log: &str) -> Result<bool, 
     Ok(ok)
 }
 
+/// A copy of the release image that boots to the text console (`esp:/DOS/BOOT.CFG`:
+/// `desktop = off`), made again whenever the release image changed.
+fn make_text_console_image(env: &Env, image: &Path) -> Result<PathBuf, String> {
+    let dir = env.build.join("textmode");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let copy = dir.join("discrete.img");
+    let newer = |a: &Path, b: &Path| -> bool {
+        match (fs::metadata(a).and_then(|m| m.modified()), fs::metadata(b).and_then(|m| m.modified())) {
+            (Ok(x), Ok(y)) => x > y,
+            _ => true,
+        }
+    };
+    if newer(image, &copy) || !dir.join("SHA256SUMS").is_file() {
+        fs::copy(image, &copy).map_err(|e| format!("copy text console image: {e}"))?;
+        img::add_file(&copy, 2, "DOS/BOOT.CFG", b"# D-OS boot settings\r\ndesktop = off\r\n")?;
+        // The checks that the boot image stayed unchanged compare against this copy's digest.
+        fs::write(dir.join("SHA256SUMS"), format!("{}  discrete.img\n", sha256_file(&copy)?))
+            .map_err(|e| format!("write SHA256SUMS: {e}"))?;
+    }
+    Ok(copy)
+}
+
 fn make_tampered_image(env: &Env, image: &Path) -> Result<PathBuf, String> {
     let dir = env.build.join("tampered");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -2787,6 +2852,35 @@ fn make_tampered_image(env: &Env, image: &Path) -> Result<PathBuf, String> {
 // Host tests
 // ---------------------------------------------------------------------------
 
+/// Typed in the boot-to-desktop tests: commands in the terminal window, Super and an app from
+/// the launcher, Ctrl+Alt+Esc out of the desktop, then a command in the text console.
+fn desktop_keys() -> Vec<String> {
+    let mut k = vec!["~1500".to_string()];
+    k.extend(convert_to_qemu_keys(&["gui status", "gui text 125"], 1500));
+    k.extend(["meta_l".to_string(), "~800".to_string()]);
+    k.extend(convert_to_qemu_keys(&["widgets"], 2500));
+    k.extend(["ctrl-alt-esc".to_string(), "~2000".to_string()]);
+    k.extend(convert_to_qemu_keys(&["power off"], 500));
+    k
+}
+
+const DESKTOP_EXPECT: [&str; 14] = [
+    "init: boot: desktop",
+    "awmi: fonts: 4 face(s)",
+    "awmi: desktop session started at boot",
+    "console: terminal window",
+    "terminal: view attached",
+    "terminal: line from console: gui status",
+    "awmi: settings: theme Dark Slate, text 125%, motion on",
+    "awmi: launcher: opening entry 0 of client",
+    "awmi-demo: widgets window open",
+    "awmi: session ended (the user left the session)",
+    "terminal: view detached",
+    "terminal: display reclaimed",
+    ": power off",
+    "Power: switching off",
+];
+
 fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
     match test {
         HostTest::Dosfs => host_cargo_test(env, "user/lib/fs", &[], &[]),
@@ -2795,6 +2889,8 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
         HostTest::Net => host_cargo_test(env, "user/lib/net", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Gpu => host_cargo_test(env, "user/lib/gpu", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Awmi => host_cargo_test(env, "user/lib/awmi", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
+        HostTest::Ui => Ok(host_cargo_test(env, "user/lib/font", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?
+            && host_cargo_test(env, "user/lib/ui", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?),
         HostTest::Aml => host_aml_test(env),
         HostTest::Crypto => host_crypto_test(env),
         HostTest::Kaslr => host_kaslr_test(env),
@@ -3300,13 +3396,15 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     let cargo = env.cargo()?;
     let clippy_dir = env.build.join("clippy");
     let cargo_env = env.cargo_env_pairs();
-    let standalone: [(&str, &[&str]); 10] = [
+    let standalone: [(&str, &[&str]); 12] = [
         ("kernel/rust", &[]),
         ("kernel/aml", &["--all-targets"]),
         ("user/lib/audio", &["--all-targets"]),
         ("user/lib/net", &["--all-targets"]),
         ("user/lib/gpu", &["--all-targets"]),
         ("user/lib/awmi", &["--all-targets"]),
+        ("user/lib/font", &["--all-targets"]),
+        ("user/lib/ui", &["--all-targets"]),
         ("user/lib/crypto", &["--all-targets"]),
         ("user/lib/fs", &["--all-targets"]),
         ("user/lib/dman", &["--all-targets"]),

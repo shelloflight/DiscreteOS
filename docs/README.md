@@ -18,7 +18,8 @@ that cover it.
 | [audio.md](audio.md) | Audio service (`audio.dsvc`), HDA/USB/VirtIO drivers, mixing, routing, microphone indicator |
 | [networking.md](networking.md) | NIC drivers (`virtio-net`, `e1000e`, `r8169`), `net.dsvc`, `dosnet`, strict TLS 1.3, socket API |
 | [graphics.md](graphics.md) | GPU drivers (`virtio-gpu`, `amdgpu`, `xe`, `nvgpu`), GOP baseline, `gpu.dsvc`, `dosgpu` |
-| [awmi.md](awmi.md) | D-AWMI compositor and window manager (`awmi.dsvc`, `dosawmi`): sessions, isolation, shortcuts, client protocol |
+| [awmi.md](awmi.md) | D-AWMI compositor and window manager (`awmi.dsvc`, `dosawmi`): boot to desktop, sessions, isolation, shortcuts, client protocol |
+| [ui.md](ui.md) | UI foundation: typefaces and text engine (`dosfont`), declarative toolkit (`dosui`), themes, launcher, accessibility |
 | [compat.md](compat.md) | D-CMPL: running Windows and Linux programs unchanged |
 | [signing.md](signing.md) | Verified boot, measured boot, code signing, `.dsig` format |
 | [attestation.md](attestation.md) | Remote attestation reports |

@@ -132,6 +132,14 @@ pub struct AwmiStatus {
     pub input_keys: u32,
     /// Pointer events from real mice/tablets received during sessions.
     pub input_pointer: u32,
+    /// `UiSettings::pack()`: theme, text scale, reduce motion.
+    pub settings: u32,
+    /// The launcher is open.
+    pub launcher_open: bool,
+    /// The vector fonts are loaded (otherwise the bitmap font draws).
+    pub fonts: bool,
+    /// Launcher entries registered by programs.
+    pub apps: u8,
 }
 
 impl AwmiStatus {
@@ -151,6 +159,10 @@ impl AwmiStatus {
         out[40..48].copy_from_slice(&self.damage_flushes.to_le_bytes());
         out[48..52].copy_from_slice(&self.input_keys.to_le_bytes());
         out[52..56].copy_from_slice(&self.input_pointer.to_le_bytes());
+        out[56..60].copy_from_slice(&self.settings.to_le_bytes());
+        out[60] = u8::from(self.launcher_open);
+        out[61] = u8::from(self.fonts);
+        out[62] = self.apps;
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
@@ -177,6 +189,10 @@ impl AwmiStatus {
             damage_flushes: u64_at(40),
             input_keys: u32_at(48),
             input_pointer: u32_at(52),
+            settings: u32_at(56),
+            launcher_open: b[60] != 0,
+            fonts: b[61] != 0,
+            apps: b[62],
         })
     }
 }

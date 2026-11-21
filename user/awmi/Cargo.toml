@@ -10,7 +10,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [package.metadata.dos]
-dsvc = ["awmi", "awmi-demo"]
+dsvc = ["awmi", "awmi-demo", "console"]
 
 [lib]
 crate-type = ["staticlib"]
@@ -21,6 +21,8 @@ bench = false
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
 dosawmi = { path = "../lib/awmi" }
+dosui = { path = "../lib/ui" }
+dosfont = { path = "../lib/font" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

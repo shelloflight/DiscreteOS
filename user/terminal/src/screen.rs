@@ -11,11 +11,44 @@ use libd::{Mapping, println};
 
 use crate::font;
 
-/// A cell: the glyph (code page 437) in the low byte, the attribute (`fg | bg << 4`) above.
-pub type Cell = u16;
+/// A cell: the character (Unicode, bits 0-20) and the attribute (`fg | bg << 4`, bits 24-31).
+/// The framebuffer and VGA text show it through code page 437 (`glyph`); the graphical terminal
+/// (`view`) shows the character itself.
+pub type Cell = u32;
 
-pub fn cell(glyph: u8, attr: u8) -> Cell {
-    u16::from(glyph) | u16::from(attr) << 8
+pub fn cell(c: char, attr: u8) -> Cell {
+    c as u32 | u32::from(attr) << 24
+}
+
+pub fn char_of(c: Cell) -> char {
+    char::from_u32(c & 0x1F_FFFF).unwrap_or('?')
+}
+
+pub fn attr_of(c: Cell) -> u8 {
+    (c >> 24) as u8
+}
+
+/// A character as a code page 437 glyph (what the font and VGA text can show).
+pub fn glyph(c: char) -> u8 {
+    match c {
+        ' '..='~' => c as u8,
+        '▸' | '►' | '▶' => 0x10,
+        '◂' | '◄' => 0x11,
+        '✓' | '√' => 0xFB,
+        '✗' | '✘' => CROSS,
+        '·' => 0xFA,
+        '•' => 0x07,
+        '—' | '–' | '─' => 0xC4,
+        '│' => 0xB3,
+        '┌' => 0xDA,
+        '┐' => 0xBF,
+        '└' => 0xC0,
+        '┘' => 0xD9,
+        '…' => b'~',
+        '°' => 0xF8,
+        'µ' => 0xE6,
+        _ => b'?',
+    }
 }
 
 /// The CGA palette (the kernel console's colours).
@@ -86,7 +119,7 @@ impl Screen {
             return none;
         }
         println!("terminal: display {}x{} {}, {}x{} cells", info.width, info.height, what, cols, rows);
-        let mut s = Screen { cols, rows, shown: vec![0xFFFF; cols * rows], cursor: None, backend, what };
+        let mut s = Screen { cols, rows, shown: vec![u32::MAX; cols * rows], cursor: None, backend, what };
         if let Backend::Fb { map, .. } = &s.backend {
             // Whole screen black once (the area right of / below the grid included).
             for off in (0..(info.pitch as u64 * u64::from(info.height))).step_by(4) {
@@ -109,7 +142,7 @@ impl Screen {
     /// Forget what is shown (another program drew on the screen): the next frame redraws every
     /// cell, and the framebuffer margin right of / below the grid is cleared.
     pub fn invalidate(&mut self) {
-        self.shown.fill(0xFFFF);
+        self.shown.fill(u32::MAX);
         if let Backend::Fb { map, .. } = &self.backend {
             for off in (0..map.len).step_by(4) {
                 map.w32(off, 0);
@@ -120,7 +153,7 @@ impl Screen {
     pub fn clear(&mut self) {
         for y in 0..self.rows {
             for x in 0..self.cols {
-                self.put(x, y, cell(b' ', libd::term::DEFAULT_ATTR));
+                self.put(x, y, cell(' ', libd::term::DEFAULT_ATTR));
             }
         }
     }
@@ -150,14 +183,14 @@ impl Screen {
         if let Some((x, y)) = old {
             // Redraw the old cell plain on the next put: forget what is shown there.
             if let Some(s) = self.shown.get_mut(y * self.cols + x) {
-                *s = 0xFFFF;
+                *s = u32::MAX;
             }
         }
         self.cursor = at;
         if let Some((x, y)) = at
             && let Some(s) = self.shown.get_mut(y * self.cols + x)
         {
-            *s = 0xFFFF;
+            *s = u32::MAX;
         }
         if let Backend::Vga { dev, .. } = &self.backend {
             let pos = at.map_or(self.cols * self.rows, |(x, y)| y * self.cols + x) as u64; // off-screen hides it
@@ -170,12 +203,14 @@ impl Screen {
     }
 
     fn draw(&mut self, x: usize, y: usize, c: Cell) {
+        let g = glyph(char_of(c));
+        let attr = attr_of(c);
         match &self.backend {
             Backend::Fb { map, pitch_px, scale, palette } => {
-                let (glyph, attr) = ((c & 0xFF) as usize, (c >> 8) as u8);
                 let fg = palette[usize::from(attr & 0xF)];
                 let bg = palette[usize::from(attr >> 4)];
-                let rows: &[u8] = if glyph == usize::from(CROSS) { &CROSS_ROWS } else { &font::FONT[glyph * font::H..glyph * font::H + font::H] };
+                let gi = usize::from(g);
+                let rows: &[u8] = if g == CROSS { &CROSS_ROWS } else { &font::FONT[gi * font::H..gi * font::H + font::H] };
                 let (sc, pitch) = (*scale, *pitch_px);
                 let (px, py) = (x * font::W * sc, y * font::H * sc);
                 for (r, &bits) in rows.iter().enumerate() {
@@ -191,8 +226,8 @@ impl Screen {
                 }
             }
             Backend::Vga { map, .. } => {
-                let c = if (c & 0xFF) as u8 == CROSS { (c & 0xFF00) | u16::from(b'x') } else { c };
-                map.w16(((y * self.cols + x) * 2) as u64, c);
+                let g = if g == CROSS { b'x' } else { g };
+                map.w16(((y * self.cols + x) * 2) as u64, u16::from(g) | u16::from(attr) << 8);
             }
             Backend::None => {}
         }
@@ -201,8 +236,8 @@ impl Screen {
 
 /// The cursor on a framebuffer: the cell with its colours swapped. (VGA text has a hardware
 /// cursor, but swapping there too keeps one look; the hardware cursor is also set.)
-fn invert(c: Cell) -> Cell {
-    let attr = (c >> 8) as u8;
+pub fn invert(c: Cell) -> Cell {
+    let attr = attr_of(c);
     let swapped = (attr >> 4) | (attr & 0x0F) << 4;
-    (c & 0xFF) | u16::from(swapped) << 8
+    (c & 0x00FF_FFFF) | u32::from(swapped) << 24
 }

@@ -1,0 +1,22 @@
+# `dosfont`: pure no_std, zero-unsafe, in-tree TrueType font engine for D-OS: a bounds-checked
+# parser (cmap, hmtx, glyf/loca with composites, GPOS/kern pair kerning), an integer anti-aliasing
+# rasterizer (no floating point, no hinting bytecode), a glyph cache, text layout with font
+# fallback, and the subsetter `dbuild font-subset` uses. Shared by `awmi.dsvc`, `dosui` clients
+# and host unit/fuzz tests (`ui-host`).
+[package]
+name = "dosfont"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"

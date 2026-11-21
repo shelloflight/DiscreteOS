@@ -26,6 +26,8 @@ exclude = [
     "lib/awmi",
     "lib/crypto",
     "lib/dman",
+    "lib/font",
+    "lib/ui",
     "lib/fs",
     "lib/gpu",
     "lib/net",

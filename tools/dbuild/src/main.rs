@@ -34,6 +34,7 @@ fn print_help() {
            bench        Build build/discrete-bench.img for bare-metal benchmarking\n\
            clean        Delete the build/ directory\n\
            img <cmd>    Disk image, signing, verification, and attestation utilities\n\
+           font-subset <in.ttf> <out.ttf>  Subset the monospace face to the shipped characters\n\
            commit       Interactive stage, message, DCO sign-off, commit, and push\n\
            help         Show this message\n\
          \n\
@@ -78,6 +79,14 @@ fn run() -> Result<(), String> {
 
     if cmd == "img" {
         return img::cli(rest);
+    }
+    if cmd == "font-subset" {
+        let [src, dst] = rest else { return Err("usage: dbuild font-subset <in.ttf> <out.ttf>".into()) };
+        let data = fs::read(src).map_err(|e| format!("read {src}: {e}"))?;
+        let (out, glyphs) = dosfont::subset::subset(&data, dosfont::mono_subset_keeps).map_err(|e| format!("{src}: {e:?}"))?;
+        fs::write(dst, &out).map_err(|e| format!("write {dst}: {e}"))?;
+        println!("{dst}: {glyphs} glyphs, {} KiB (from {} KiB)", out.len() / 1024, data.len() / 1024);
+        return Ok(());
     }
 
     let env = Env::discover()?;

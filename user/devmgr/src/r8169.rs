@@ -14,6 +14,11 @@ use crate::net_drv::{KEY_CTL, KEY_IRQ0, KEY_SVC, MAX_FRAME, NetBridge};
 
 // Realtek r8169 / r8168 / r8125 / r8126 MMIO register offsets
 const REG_IDR0: u64 = 0x00;
+const REG_IDR4: u64 = 0x04;
+const REG_ERIDR: u64 = 0x70;
+const REG_ERIAR: u64 = 0x74;
+/// RTL8125/8126/8127: the factory MAC address (the `IDR` registers may not hold it after reset).
+const REG_MAC0_BKP_8125: u64 = 0x19E0;
 const REG_MAR0: u64 = 0x08;
 const REG_MAR4: u64 = 0x0C;
 const REG_TNPDS_LO: u64 = 0x20;
@@ -79,6 +84,66 @@ fn arm_rx_desc(dma: &Dma, i: usize, buf_addr: u64) {
     dma.map.w32(o, DESC_OWN | eor | (BUF_BYTES as u32 & 0x3FFF));
 }
 
+fn valid_mac(m: &[u8; 6]) -> bool {
+    *m != [0; 6] && *m != [0xFF; 6] && m[0] & 1 == 0
+}
+
+/// ERI register read (RTL8168E-VL and later): `None` if the access does not complete.
+fn eri_read(mmio: &Mapping, addr: u32) -> Option<u32> {
+    // Read command, all four byte enables, ExGMAC space.
+    mmio.w32(REG_ERIAR, (0xF << 12) | (addr & 0xFFF));
+    for _ in 0..1000 {
+        if mmio.r32(REG_ERIAR) & (1 << 31) != 0 {
+            return Some(mmio.r32(REG_ERIDR));
+        }
+        core::hint::spin_loop();
+    }
+    None
+}
+
+/// The adapter's MAC address, read where Linux reads it: the backup register on RTL8125 and
+/// later, ERI `0xE0` on RTL8168E-VL and later, else `IDR0-5`. If none holds a valid unicast
+/// address (zero, broadcast or multicast), a random locally administered one is used.
+fn factory_mac(mmio: &Mapping, bar_size: u64, is_8125: bool, xid: u32) -> ([u8; 6], &'static str) {
+    let mut m = [0u8; 6];
+    if is_8125 && bar_size >= REG_MAC0_BKP_8125 + 8 {
+        for (i, b) in m.iter_mut().enumerate() {
+            *b = mmio.r8(REG_MAC0_BKP_8125 + i as u64);
+        }
+        if valid_mac(&m) {
+            return (m, "factory backup register");
+        }
+    } else if !is_8125
+        && xid >= 0x2C8
+        && let (Some(lo), Some(hi)) = (eri_read(mmio, 0xE0), eri_read(mmio, 0xE4))
+    {
+        m[..4].copy_from_slice(&lo.to_le_bytes());
+        m[4..].copy_from_slice(&hi.to_le_bytes()[..2]);
+        if valid_mac(&m) {
+            return (m, "ERI");
+        }
+    }
+    for (i, b) in m.iter_mut().enumerate() {
+        *b = mmio.r8(REG_IDR0 + i as u64);
+    }
+    if valid_mac(&m) {
+        return (m, "IDR");
+    }
+    let _ = sys::get_random(&mut m, 0);
+    m[0] = (m[0] & 0xFE) | 0x02;
+    (m, "random (no valid address in the adapter)")
+}
+
+/// Program the receive address filter (`IDR0-5`) with `mac` (config registers unlocked).
+fn set_mac(mmio: &Mapping, mac: [u8; 6]) {
+    mmio.w8(REG_CFG9346, 0xC0);
+    mmio.w32(REG_IDR4, u32::from(u16::from_le_bytes([mac[4], mac[5]])));
+    let _ = mmio.r32(REG_IDR4);
+    mmio.w32(REG_IDR0, u32::from_le_bytes([mac[0], mac[1], mac[2], mac[3]]));
+    let _ = mmio.r32(REG_IDR0);
+    mmio.w8(REG_CFG9346, 0x00);
+}
+
 pub fn main(s: *const Startup) -> i32 {
     // SAFETY: `s` is the startup block pointer passed by the kernel.
     if !unsafe { libd::init(s, "r8169") } {
@@ -128,10 +193,8 @@ pub fn main(s: *const Startup) -> i32 {
         libd::handle::sleep(MS);
     }
 
-    let mut mac = [0u8; 6];
-    for (i, b) in mac.iter_mut().enumerate() {
-        *b = mmio.r8(REG_IDR0 + i as u64);
-    }
+    let (mac, mac_from) = factory_mac(&mmio, info.bar_size[bar], is_8125, xid);
+    set_mac(&mmio, mac);
 
     let mut dma = match Dma::new(dev, DMA_BYTES, sys::DMA_DEVICE_READ | sys::DMA_DEVICE_WRITE) {
         Ok(d) => d,
@@ -217,7 +280,7 @@ pub fn main(s: *const Startup) -> i32 {
 
     let mut link_up = (mmio.r8(REG_PHYSTATUS) & 0x02) != 0;
     println!(
-        "r8169: ready on {} ({:04x}:{:04x} xid={:#x} {}) BAR{} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} link={} irq={} IOMMU={}",
+        "r8169: ready on {} ({:04x}:{:04x} xid={:#x} {}) BAR{} MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} (from {}) link={} irq={} IOMMU={}",
         info.name(),
         info.vendor,
         info.device,
@@ -230,6 +293,7 @@ pub fn main(s: *const Startup) -> i32 {
         mac[3],
         mac[4],
         mac[5],
+        mac_from,
         link_up,
         irq != 0,
         (info.flags & sys::DEV_FLAG_IOMMU) != 0

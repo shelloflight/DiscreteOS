@@ -13,8 +13,10 @@
 //! | `INTERRUPT` | terminal -> shell | Ctrl+C while no line is being read (stop the command) |
 //! | `COMPLETE` | terminal -> shell | Tab: the line up to the cursor (payload) |
 //! | `COMPLETIONS` | shell -> terminal | NUL-separated candidates for the last word |
-//! | `SIZE` | terminal -> shell | `a` = columns, `b` = rows (sent when the session starts) |
+//! | `SIZE` | terminal -> shell | `a` = columns, `b` = rows (when the session starts and when the grid changes) |
 //! | `CLEAR` | shell -> terminal | clear the screen |
+//!
+//! The `view` endpoint (`VIEW_*`, below) shows the session in a window of the graphical session.
 
 pub const WRITE: u32 = 500;
 pub const READ: u32 = 501;
@@ -37,6 +39,34 @@ pub const DISPLAY_RELEASE: u32 = 509;
 /// Compositor -> terminal (`terminal.display`, a call): the screen is the terminal's again; it
 /// redraws everything. Also implied when the compositor's channel closes (it exited or crashed).
 pub const DISPLAY_RECLAIM: u32 = 510;
+
+// ---- `terminal.view`: the session shown in a window (the graphical terminal, `console.dsvc`) ----
+//
+// While a graphical session holds the screen, a viewer can show the terminal's session: the
+// terminal lays the text out for the viewer's grid (the shell is told the new width) and keeps the
+// cells in a VMO the viewer maps read-only; the viewer sends the keys typed in its window.
+
+/// Viewer -> terminal (call): show the session in a grid of `a` = columns | rows << 32. Reply:
+/// one read-only VMO handle (the grid, `VIEW_*` layout), `a` = its size.
+pub const VIEW_ATTACH: u32 = 511;
+/// Viewer -> terminal (call): the grid is now `a` = columns | rows << 32.
+pub const VIEW_RESIZE: u32 = 512;
+/// Viewer -> terminal: a key typed in the window (`a` = key value).
+pub const VIEW_KEY: u32 = 513;
+/// Terminal -> viewer: rows `a`..`b` (end exclusive) or the cursor changed; read the grid again.
+pub const VIEW_DAMAGE: u32 = 514;
+/// Viewer -> terminal (call): stop (the window closed); the terminal returns to its own screen size.
+pub const VIEW_DETACH: u32 = 515;
+
+/// Grid VMO layout: a header of `VIEW_HEADER` bytes (u32 little-endian: magic `DTVW`, columns,
+/// rows, cursor column, cursor row (`u32::MAX`: hidden), the attribute of the default colours),
+/// then `columns * rows` cells (u32: character bits 0-20, attribute `fg | bg << 4` bits 24-31).
+pub const VIEW_HEADER: usize = 64;
+pub const VIEW_MAGIC: u32 = u32::from_le_bytes(*b"DTVW");
+pub const VIEW_MAX_COLS: u32 = 400;
+pub const VIEW_MAX_ROWS: u32 = 200;
+/// The grid VMO's size.
+pub const VIEW_BYTES: usize = VIEW_HEADER + (VIEW_MAX_COLS * VIEW_MAX_ROWS) as usize * 4;
 
 /// Style control bytes in text.
 pub const STYLE: u8 = 0x01;

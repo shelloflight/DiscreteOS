@@ -71,8 +71,8 @@ Main test groups (see `tools/dbuild/src/test.rs` for the full list):
 | Protections fire | `stackprot`, `cet`, `cet-cp`, `cet-user`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `spec-intel`, `kaslr`, ... |
 | Kernel | `selftest`, `sched`, `cpupm`, `cpupm-bochs`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench`, `profile` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
-| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `services`, `shell`, `audio-hda`, `audio-virtio`, `audio-usb`, `audio-sec`, `net-virtio`, `net-e1000e`, `net-shell`, `gpu-virtio`, `gpu-virtio-amd`, `gpu-gop`, `gpu-shell`, `awmi-virtio`, `awmi-gop`, `time`, `time-uefi`, `attest`, `attest-tpm`, `powerbutton`, `poweroff`, `poweroff-uefi`, `reboot`, `hwbench`, `kdb` |
-| Host | `storage-host`, `audio-host`, `net-host`, `gpu-host`, `awmi-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |
+| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `services`, `shell`, `audio-hda`, `audio-virtio`, `audio-usb`, `audio-sec`, `net-virtio`, `net-e1000e`, `net-shell`, `gpu-virtio`, `gpu-virtio-amd`, `gpu-gop`, `gpu-shell`, `awmi-virtio`, `awmi-gop`, `desktop-virtio`, `desktop-gop`, `time`, `time-uefi`, `attest`, `attest-tpm`, `powerbutton`, `poweroff`, `poweroff-uefi`, `reboot`, `hwbench`, `kdb` |
+| Host | `storage-host`, `audio-host`, `net-host`, `gpu-host`, `awmi-host`, `ui-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |
 
 ## Adding a test
 

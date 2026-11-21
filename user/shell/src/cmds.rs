@@ -33,11 +33,11 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "log", aliases: &[], usage: "log [source]", description: "the system log (every record, or one source's)" },
     Builtin { name: "time", aliases: &["date"], usage: "time", description: "the date and time (UTC) and the time since boot" },
     Builtin { name: "audio", aliases: &["sound"], usage: "audio [vol <0-100%> | mute [on|off] | unmute | out <id|auto> | tone [hz] [ms] | mic <on|off>]", description: "audio devices, volume, mute/unmute, output switching and test tone" },
-    Builtin { name: "net", aliases: &["ip"], usage: "net", description: "network interface, IP address, gateway, DNS and counters" },
+    Builtin { name: "net", aliases: &["ip"], usage: "net [check]", description: "network interface, IP address, gateway, DNS and counters; check: find what does not work" },
     Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
     Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
     Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id]]", description: "GPU adapters, modes, EDID, VRAM, and IOMMU status" },
-    Builtin { name: "gui", aliases: &["awmi"], usage: "gui [status]", description: "start the graphical session (D-AWMI), or show its status" },
+    Builtin { name: "gui", aliases: &["awmi"], usage: "gui [demo | status | theme dark|contrast | text 100-200 | motion on|off]", description: "start the desktop (D-AWMI), show its status, or change its theme, text size and motion" },
     Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
 ];
@@ -56,9 +56,9 @@ fn text(s: &str) -> Value {
 pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let b = find(name)?;
     let max_args = match b.name {
-        "help" | "go" | "objects" | "log" | "gui" => 1,
+        "help" | "go" | "objects" | "log" | "net" => 1,
         "end" | "restart" | "wait" | "power" => 1,
-        "ping" | "tls" | "gpu" => 2,
+        "ping" | "tls" | "gpu" | "gui" => 2,
         "audio" => 3,
         _ => 0,
     };
@@ -79,11 +79,15 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "log" => log(sh, arg),
         "time" => clock(sh),
         "audio" => audio_cmd(sh, args),
-        "net" => net_cmd(sh),
+        "net" => match arg {
+            None => net_cmd(sh),
+            Some("check") => net_check(sh),
+            Some(other) => Err(format!("net: unknown argument '{}'; usage: net [check]", other)),
+        },
         "ping" => ping_cmd(sh, args),
         "tls" => tls_cmd(sh, args),
         "gpu" => gpu_cmd(sh, args),
-        "gui" => gui_cmd(sh, arg),
+        "gui" => gui_cmd(sh, args),
         "power" => power(sh, arg),
         _ => {
             sh.clear();
@@ -640,6 +644,88 @@ fn net_cmd(sh: &Shell) -> Res {
     ])
 }
 
+/// `net check`: try each step to the internet in turn (lease, router, internet by ICMP and by
+/// TCP, name lookup) and say in one line what does not work.
+fn net_check(sh: &Shell) -> Res {
+    use libd::net;
+    let ch = [sh.net_ctl, sh.net_client, sh.net_icmp].into_iter().find(|&h| h != 0).ok_or_else(|| String::from("net: no network capability granted to this session"))?;
+    let st = net::status(ch).map_err(|e| format!("net: {}", sys::status(e)))?;
+    let mut rs = Vec::new();
+    let mut row = |step: &str, ok: Option<bool>, detail: String| {
+        let result = match ok {
+            Some(true) => "ok",
+            Some(false) => "FAILED",
+            None => "skipped",
+        };
+        rs.push(Record::new().with("step", text(step)).with("result", text(result)).with("detail", Value::Text(detail)));
+    };
+    let leased = st.name_len != 0 && st.dhcp_bound;
+    row(
+        "address",
+        Some(leased),
+        if st.name_len == 0 {
+            String::from("no network adapter")
+        } else if !st.link_up {
+            String::from("no link: check the cable")
+        } else if !leased {
+            String::from("link up, but no DHCP lease from the router yet")
+        } else {
+            format!("{} via {} (gateway {}, DNS {})", fmt_ip(st.ip), st.name_str(), fmt_ip(st.gateway), fmt_ip(st.dns))
+        },
+    );
+    if !leased {
+        drop(row);
+        sh.write(&show::err_line("net check: no address yet; nothing further can work"));
+        return Ok(rs);
+    }
+    let ping = |ip: [u8; 4]| -> Option<u32> {
+        (sh.net_icmp != 0).then_some(())?;
+        (1..=2u16).find_map(|seq| net::ping(sh.net_icmp, ip, seq, 1_500).ok()).map(|(rtt, _)| rtt)
+    };
+    let icmp = sh.net_icmp != 0;
+    let gw = ping(st.gateway);
+    row("router", icmp.then_some(gw.is_some()), match gw {
+        Some(ms) => format!("{} answers ping ({} ms)", fmt_ip(st.gateway), ms),
+        None if icmp => format!("{} does not answer ping", fmt_ip(st.gateway)),
+        None => String::from("no ICMP right in this session"),
+    });
+    const PROBE: [u8; 4] = [1, 1, 1, 1];
+    let inet_icmp = ping(PROBE);
+    row("internet (ping)", icmp.then_some(inet_icmp.is_some()), match inet_icmp {
+        Some(ms) => format!("1.1.1.1 answers ping ({} ms)", ms),
+        None => String::from("1.1.1.1 does not answer ping"),
+    });
+    let tcp_start = sys::clock_ns();
+    let inet_tcp = (sh.net_client != 0).then(|| net::TcpStream::connect(sh.net_client, PROBE, 443, 3_000).map(|s| s.close()).is_ok());
+    let tcp_ms = (sys::clock_ns() - tcp_start) / 1_000_000;
+    row("internet (tcp)", inet_tcp, match inet_tcp {
+        Some(true) => format!("connected to 1.1.1.1 port 443 ({} ms)", tcp_ms),
+        Some(false) => String::from("no connection to 1.1.1.1 port 443"),
+        None => String::from("no TCP right in this session"),
+    });
+    // Lookups are served on the ICMP and client endpoints (not on control).
+    let dns_ch = if sh.net_icmp != 0 { sh.net_icmp } else { sh.net_client };
+    let dns = if dns_ch != 0 { net::resolve(dns_ch, "example.com") } else { Err(sys::ERR_ACCESS_DENIED) };
+    row("name lookup", Some(dns.is_ok()), match dns {
+        Ok(ip) => format!("example.com is {}", fmt_ip(ip)),
+        Err(e) => format!("example.com: {} (DNS {} and the public resolvers)", sys::status(e), fmt_ip(st.dns)),
+    });
+    drop(row);
+    let internet = inet_icmp.is_some() || inet_tcp == Some(true);
+    let verdict = match (gw.is_some(), internet, inet_icmp.is_some(), dns.is_ok()) {
+        (_, true, true, true) => Ok("everything works"),
+        (_, true, false, true) => Ok("the internet works; ping replies are blocked on the way (by the router or the network), so ping cannot reach outside hosts"),
+        (_, true, _, false) => Err("the internet works but no DNS server answers: names cannot be looked up"),
+        (true, false, _, _) => Err("the router answers but nothing beyond it: the router has no internet connection, or does not forward for this machine"),
+        (false, false, _, _) => Err("neither the router nor the internet answers: check the router, or the gateway the DHCP lease named"),
+    };
+    match verdict {
+        Ok(v) => sh.write(&show::ok_line(&format!("net check: {}", v))),
+        Err(v) => sh.write(&show::err_line(&format!("net check: {}", v))),
+    }
+    Ok(rs)
+}
+
 fn ping_cmd(sh: &Shell, args: &[String]) -> Res {
     let Some(host) = args.first().map(String::as_str) else {
         return Err(String::from("ping: usage: ping <host> [count]"));
@@ -709,6 +795,21 @@ fn ping_cmd(sh: &Shell, args: &[String]) -> Res {
             "ping {}: 0/{} received (100% loss)",
             ip_s, count
         )));
+        // Many networks drop ping but carry everything else: say whether the host is reachable.
+        let start = sys::clock_ns();
+        let tcp = (sh.net_client != 0)
+            .then(|| [443u16, 80].into_iter().find(|&port| libd::net::TcpStream::connect(sh.net_client, ip, port, 2_000).map(|s| s.close()).is_ok()))
+            .flatten();
+        match tcp {
+            Some(port) => sh.write(&show::ok_line(&format!(
+                "{} is reachable over TCP port {} ({} ms): ping replies are blocked on the way",
+                ip_s,
+                port,
+                (sys::clock_ns() - start) / 1_000_000
+            ))),
+            None => sh.write("  `net check` shows which step to the internet does not work
+"),
+        }
     }
     Ok(rs)
 }
@@ -832,19 +933,41 @@ fn tls_cmd(sh: &Shell, args: &[String]) -> Res {
     ])
 }
 
-/// `gui`: start the graphical session with the demo windows (the keyboard and screen go to the
-/// compositor until Super+Esc, or Ctrl+Alt+Esc in a VM); `gui status`: the compositor's state.
-fn gui_cmd(sh: &Shell, arg: Option<&str>) -> Res {
+/// `gui`: start the desktop (the keyboard and screen go to the compositor, this session shows in
+/// the terminal window, until Super+Esc, or Ctrl+Alt+Esc in a VM); `gui demo` also opens the
+/// example apps; `gui status`: the compositor's state; `gui theme|text|motion`: its settings.
+fn gui_cmd(sh: &Shell, args: &[String]) -> Res {
     use libd::awmi;
+    let arg = args.first().map(String::as_str);
+    let admin = || if sh.awmi_admin == 0 { Err(String::from("gui: no awmi.admin grant in this session")) } else { Ok(sh.awmi_admin) };
+    let set = |packed: u64, which: u64| -> Res {
+        let now = awmi::set_settings(admin()?, packed, which).map_err(|e| format!("gui: the setting was refused ({})", sys::status(e)))?;
+        let theme = if now & 0xFF == 1 { "high contrast" } else { "dark slate" };
+        sh.write(&show::ok_line(&format!("theme {}, text {}%, motion {}", theme, (now >> 8) & 0xFFFF, if now >> 24 & 1 != 0 { "reduced" } else { "on" })));
+        Ok(Vec::new())
+    };
+    let value = || args.get(1).map(String::as_str);
     match arg {
-        None => {
-            if sh.awmi_admin == 0 {
-                return Err(String::from("gui: no awmi.admin grant in this session"));
-            }
-            let n = awmi::session_start(sh.awmi_admin, true).map_err(|e| format!("gui: the session did not start ({})", sys::status(e)))?;
-            sh.write(&show::ok_line(&format!("graphical session on {} output(s); Super+Esc (Ctrl+Alt+Esc in a VM) comes back here", n)));
+        None | Some("demo") => {
+            let flags = awmi::SESSION_DESKTOP | if arg == Some("demo") { awmi::SESSION_DEMO } else { 0 };
+            let n = awmi::session_start_with(admin()?, flags).map_err(|e| format!("gui: the session did not start ({})", sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("desktop on {} output(s); Super+Esc (Ctrl+Alt+Esc in a VM) comes back here", n)));
             Ok(Vec::new())
         }
+        Some("theme") => match value() {
+            Some("dark") => set(0, awmi::SET_THEME),
+            Some("contrast") => set(1, awmi::SET_THEME),
+            _ => Err(String::from("gui: usage: gui theme dark|contrast")),
+        },
+        Some("text") => match value().and_then(|v| v.trim_end_matches('%').parse::<u64>().ok()) {
+            Some(p) if [100, 125, 150, 175, 200].contains(&p) => set(p << 8, awmi::SET_TEXT_SCALE),
+            _ => Err(String::from("gui: usage: gui text 100|125|150|175|200")),
+        },
+        Some("motion") => match value() {
+            Some("on") => set(0, awmi::SET_MOTION),
+            Some("off") => set(1 << 24, awmi::SET_MOTION),
+            _ => Err(String::from("gui: usage: gui motion on|off")),
+        },
         Some("status") => {
             let ep = if sh.awmi_query != 0 { sh.awmi_query } else { sh.awmi_admin };
             if ep == 0 {
@@ -859,6 +982,7 @@ fn gui_cmd(sh: &Shell, arg: Option<&str>) -> Res {
                 ind.push("security alert");
             }
             let mode = if st.active { format!("{}x{} @ {} Hz", st.width, st.height, st.refresh_mhz / 1000) } else { String::from("-") };
+            let theme = if st.settings & 0xFF == 1 { "high contrast" } else { "dark slate" };
             Ok(alloc::vec![
                 Record::new()
                     .with("session", text(if st.active { "active" } else { "idle" }))
@@ -867,10 +991,15 @@ fn gui_cmd(sh: &Shell, arg: Option<&str>) -> Res {
                     .with("windows", Value::Int(i64::from(st.windows)))
                     .with("workspace", Value::Text(format!("{} of {}", st.active_workspace + 1, st.workspaces)))
                     .with("frames", Value::Int(st.frames as i64))
-                    .with("indicators", Value::Text(if ind.is_empty() { String::from("none") } else { ind.join(", ") })),
+                    .with("indicators", Value::Text(if ind.is_empty() { String::from("none") } else { ind.join(", ") }))
+                    .with("theme", text(theme))
+                    .with("text", Value::Text(format!("{}%", (st.settings >> 8) & 0xFFFF)))
+                    .with("motion", text(if st.settings >> 24 & 1 != 0 { "reduced" } else { "on" }))
+                    .with("fonts", text(if st.fonts { "vector" } else { "bitmap" }))
+                    .with("apps", Value::Int(i64::from(st.apps))),
             ])
         }
-        Some(other) => Err(format!("gui: unknown argument '{}'; usage: gui [status]", other)),
+        Some(other) => Err(format!("gui: unknown argument '{}'; usage: gui [demo | status | theme dark|contrast | text 100-200 | motion on|off]", other)),
     }
 }
 

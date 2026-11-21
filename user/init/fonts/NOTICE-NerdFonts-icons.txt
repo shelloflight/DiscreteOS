@@ -1,0 +1,39 @@
+iosevka-term-nf-mono.ttf
+========================
+
+A subset of "IosevkaTermNerdFontMono-Regular.ttf" from Nerd Fonts 3.5.1
+(https://github.com/ryanoasis/nerd-fonts), which is Iosevka Term 34.8.0
+(https://github.com/be5invis/Iosevka) patched with the Nerd Fonts icon sets.
+
+The subset keeps Latin, Greek, Cyrillic, punctuation, box drawing, block elements, arrows,
+mathematical symbols and the icon sets below; the Font Logos set (U+F300-U+F381) is removed.
+The font's names and licence information are unchanged.
+
+The typeface (Iosevka) is licensed under the SIL Open Font License 1.1 (OFL-Iosevka.txt).
+The Nerd Fonts patcher and the patched font are distributed under the same licence.
+
+The icon glyphs come from these projects, under their own licences:
+
+  Set                    Project                                          Licence
+  ---------------------  -----------------------------------------------  ---------------------------
+  Seti-UI + Custom       https://github.com/jesseweed/seti-ui             MIT
+  Devicons               https://github.com/vorillaz/devicons             MIT
+  Font Awesome           https://github.com/FortAwesome/Font-Awesome      SIL OFL 1.1 (font),
+                                                                          CC BY 4.0 (icons)
+  Font Awesome Extension https://github.com/AndreLZGava/font-awesome-extension  MIT
+  Material Design Icons  https://github.com/Templarian/MaterialDesign     Apache License 2.0
+  Weather Icons          https://github.com/erikflowers/weather-icons     SIL OFL 1.1
+  Octicons               https://github.com/primer/octicons               MIT
+  Powerline Symbols      https://github.com/powerline/powerline           MIT
+  Powerline Extra        https://github.com/ryanoasis/powerline-extra-symbols  MIT
+  IEC Power Symbols      https://unicodepowersymbol.com/                  MIT
+  Pomicons               https://github.com/gabrielelana/pomicons         SIL OFL 1.1
+  Codicons               https://github.com/microsoft/vscode-codicons     CC BY 4.0
+
+Attribution for the CC BY 4.0 icons: Font Awesome icons by Fonticons, Inc.
+(https://fontawesome.com); Codicons by Microsoft Corporation. Licence text:
+https://creativecommons.org/licenses/by/4.0/
+
+The full licence texts are in each project's repository and in the Nerd Fonts repository
+(https://github.com/ryanoasis/nerd-fonts/blob/master/LICENSE and the per-set licence files under
+src/glyphs/).

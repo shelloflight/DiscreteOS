@@ -383,8 +383,13 @@ fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> ([u32; 8], usize, Opti
     ];
     for (bit, code) in mods {
         let (was, is) = (old[0] >> bit & 1, new[0] >> bit & 1);
-        if was != is {
-            keys.key(code, is == 1);
+        if was != is
+            && let Some(c) = keys.key(code, is == 1)
+            && n < out.len()
+        {
+            // Super on its own (the compositor's launcher key).
+            out[n] = c;
+            n += 1;
         }
     }
     for &u in &old[2..] {

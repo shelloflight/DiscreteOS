@@ -8,6 +8,12 @@
 //!   plus status; with the compositor started in test mode, the test hooks (`OP_TEST_*`).
 //! - `awmi.indicator`: set system indicators on the dock (`OP_INDICATOR`: security alert).
 //!
+//! Window programs also get the shipped fonts as one read-only VMO (`OP_FONTS`), can name a
+//! launcher entry (`OP_APP_REGISTER`; the launcher shows it with the verified identity, and
+//! `EVT_LAUNCH` arrives when the user opens it), and are told the theme, text size and motion
+//! setting (`EVT_SETTINGS`, with the theme's colours as payload) when a session starts and whenever
+//! they change (`OP_SETTINGS` on `awmi.admin`: the shell's `gui theme|text|motion`).
+//!
 //! Every window's pixels live in a VMO its program created; the compositor gets a read-only
 //! duplicate (`RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER`) and never writes it. A program cannot
 //! name, read or change another program's window: window ids are checked against the channel
@@ -34,6 +40,12 @@ pub const OP_COMMIT: u32 = 902;
 pub const OP_SET_TITLE: u32 = 903;
 /// Destroy a window. `a` = window id.
 pub const OP_DESTROY: u32 = 904;
+/// The shipped fonts: reply with one read-only VMO handle (a font pack, `dosui::fonts`) and
+/// `a` = its size. `ERR_NOT_FOUND` when the compositor has no fonts.
+pub const OP_FONTS: u32 = 905;
+/// Name a launcher entry: `a` = entry number (0-3), payload = label. Shown with the program's
+/// verified identity and trust tier.
+pub const OP_APP_REGISTER: u32 = 906;
 
 // ---- compositor -> window client (events, txid 0) -----------------------------------------------
 
@@ -52,20 +64,36 @@ pub const EVT_CLOSE: u32 = 924;
 /// The committed frame is on screen. `a` = window id, `b` = its sequence number.
 pub const EVT_FRAME_DONE: u32 = 925;
 /// A graphical session started (`a` bit 0 = 1; bit 1 = the session asked for the built-in demo
-/// windows; `b` = primary output width | height << 32) or ended (`a` = 0: every window is gone).
+/// windows; bit 2 = a desktop session, which opens the terminal window; `b` = primary output
+/// width | height << 32) or ended (`a` = 0: every window is gone).
 pub const EVT_SESSION: u32 = 926;
+/// The user opened this program's launcher entry `a`.
+pub const EVT_LAUNCH: u32 = 927;
+/// Settings: `a` = theme | text scale (percent) << 8 | reduce motion << 24; payload = the
+/// theme (`dosawmi::THEME_BYTES`).
+pub const EVT_SETTINGS: u32 = 928;
 
 // ---- `awmi.admin`, `awmi.query`, `awmi.indicator` (calls) ---------------------------------------
 
-/// `awmi.admin`: take the screens and the input (the shell's `gui`); `a` bit 0 = open the
-/// built-in demo windows. Reply `a` = outputs.
+/// `awmi.admin`: take the screens and the input (the shell's `gui`); `a` = `SESSION_*` flags.
+/// Reply `a` = outputs.
 pub const OP_SESSION_START: u32 = 930;
+/// Open the built-in demo windows.
+pub const SESSION_DEMO: u64 = 1;
+/// A desktop session: the terminal window opens (a normal boot, the shell's `gui`).
+pub const SESSION_DESKTOP: u64 = 2;
 /// `awmi.admin`: give the screens and the input back.
 pub const OP_SESSION_STOP: u32 = 931;
 /// `awmi.query` or `awmi.admin`: payload of the reply = `Status` (`STATUS_BYTES`).
 pub const OP_STATUS: u32 = 932;
 /// `awmi.indicator`: `a` = indicator bits (`IND_SECURITY_ALERT`).
 pub const OP_INDICATOR: u32 = 933;
+/// `awmi.admin`: change settings. `a` as in `EVT_SETTINGS`, `b` = which to change (`SET_*`).
+/// Reply `a` = the settings now.
+pub const OP_SETTINGS: u32 = 934;
+pub const SET_THEME: u64 = 1;
+pub const SET_TEXT_SCALE: u64 = 2;
+pub const SET_MOTION: u64 = 4;
 
 // ---- `awmi.admin`, compositor in test mode only ---------------------------------------------------
 
@@ -79,6 +107,9 @@ pub const OP_TEST_PIXEL: u32 = 942;
 pub const OP_TEST_WINDOWS: u32 = 943;
 /// Add a virtual output (memory only) right of the others: `a` = width | height << 32.
 pub const OP_TEST_ADD_OUTPUT: u32 = 944;
+/// Composite, then reply with a hash of the primary output's backbuffer (`a`) and the number of
+/// pixels differing from the desktop background (`b`): what tests check about rendering.
+pub const OP_TEST_FRAME: u32 = 945;
 
 // ---- flags & bits -------------------------------------------------------------------------------
 
@@ -196,9 +227,54 @@ pub fn destroy(ep: Handle, id: u32) -> Result<(), i64> {
     simple(ep, OP_DESTROY, u64::from(id), 0, &[]).map(|_| ())
 }
 
+/// The shipped fonts: a read-only mapping of the font pack (programs keep it for their life).
+pub fn fonts(ep: Handle) -> Result<Mapping, i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER];
+    Header { txid: 0, op: OP_FONTS, status: 0, a: 0, b: 0 }.put(&mut req);
+    let mut rep = [0u8; HEADER];
+    let mut hs = [0 as Handle; 1];
+    let (n, nh) = sys::channel_call_h(ep, &req, &[], &mut rep, &mut hs, CALL_TIMEOUT_NS)?;
+    let h = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if h.status != 0 {
+        if nh > 0 {
+            sys::handle_close(hs[0]);
+        }
+        return Err(i64::from(h.status));
+    }
+    if nh == 0 {
+        return Err(sys::ERR_INVALID_ARGS);
+    }
+    Mapping::of_ro(hs[0], h.a).inspect_err(|_| {
+        sys::handle_close(hs[0]);
+    })
+}
+
+/// Register launcher entry `app` (0-3) with `label`.
+pub fn register_app(ep: Handle, app: u8, label: &[u8]) -> Result<(), i64> {
+    simple(ep, OP_APP_REGISTER, u64::from(app), 0, &label[..label.len().min(32)]).map(|_| ())
+}
+
+/// Change settings (`which`: `SET_*` bits); the settings now.
+pub fn set_settings(ep: Handle, packed: u64, which: u64) -> Result<u64, i64> {
+    simple(ep, OP_SETTINGS, packed, which, &[]).map(|h| h.a)
+}
+
+/// Test hook: (hash of the primary output's pixels, pixels that are not the desktop background).
+pub fn test_frame(ep: Handle) -> Result<(u64, u64), i64> {
+    simple(ep, OP_TEST_FRAME, 0, 0, &[]).map(|h| (h.a, h.b))
+}
+
 /// Start the session (`demo`: with the built-in demo windows); the number of outputs.
 pub fn session_start(ep: Handle, demo: bool) -> Result<u32, i64> {
-    simple(ep, OP_SESSION_START, u64::from(demo), 0, &[]).map(|h| h.a as u32)
+    session_start_with(ep, if demo { SESSION_DEMO } else { 0 })
+}
+
+/// Start the session with `SESSION_*` flags; the number of outputs.
+pub fn session_start_with(ep: Handle, flags: u64) -> Result<u32, i64> {
+    simple(ep, OP_SESSION_START, flags, 0, &[]).map(|h| h.a as u32)
 }
 
 pub fn session_stop(ep: Handle) -> Result<(), i64> {
@@ -230,6 +306,13 @@ pub struct Status {
     pub input_keys: u32,
     /// Pointer events from a mouse or tablet the compositor received during sessions.
     pub input_pointer: u32,
+    /// Theme | text scale << 8 | reduce motion << 24 (as `EVT_SETTINGS`).
+    pub settings: u32,
+    pub launcher_open: bool,
+    /// The vector fonts are loaded.
+    pub fonts: bool,
+    /// Launcher entries registered by programs.
+    pub apps: u8,
 }
 
 impl Status {
@@ -255,6 +338,10 @@ impl Status {
             damage_flushes: u64_at(40),
             input_keys: u32_at(48),
             input_pointer: u32_at(52),
+            settings: u32_at(56),
+            launcher_open: b[60] != 0,
+            fonts: b[61] != 0,
+            apps: b[62],
         })
     }
 }
@@ -361,8 +448,14 @@ pub enum Event {
     Focus { window: u32, focused: bool },
     Close { window: u32 },
     FrameDone { window: u32, seq: u64 },
-    Session { active: bool, demo: bool, width: u32, height: u32 },
+    Session { active: bool, demo: bool, desktop: bool, width: u32, height: u32 },
+    Launch { app: u8 },
+    /// `settings` as in `EVT_SETTINGS`; `theme` the encoded colours (`THEME_LEN` bytes used).
+    Settings { settings: u64, theme: [u8; THEME_MAX] },
 }
+
+/// Room for an encoded theme in `Event::Settings`.
+pub const THEME_MAX: usize = 192;
 
 impl Event {
     pub fn decode(msg: &[u8]) -> Option<Self> {
@@ -382,7 +475,15 @@ impl Event {
             EVT_FOCUS => Self::Focus { window, focused: h.b != 0 },
             EVT_CLOSE => Self::Close { window },
             EVT_FRAME_DONE => Self::FrameDone { window, seq: h.b },
-            EVT_SESSION => Self::Session { active: h.a & 1 != 0, demo: h.a & 2 != 0, width: h.b as u32, height: (h.b >> 32) as u32 },
+            EVT_SESSION => Self::Session { active: h.a & 1 != 0, demo: h.a & 2 != 0, desktop: h.a & 4 != 0, width: h.b as u32, height: (h.b >> 32) as u32 },
+            EVT_LAUNCH => Self::Launch { app: h.a as u8 },
+            EVT_SETTINGS => {
+                let mut theme = [0u8; THEME_MAX];
+                let body = &msg[HEADER.min(msg.len())..];
+                let n = body.len().min(THEME_MAX);
+                theme[..n].copy_from_slice(&body[..n]);
+                Self::Settings { settings: h.a, theme }
+            }
             _ => return None,
         })
     }
@@ -390,7 +491,7 @@ impl Event {
 
 /// The next event on a window channel, waiting up to `timeout` ns.
 pub fn next_event(ep: Handle, timeout: u64) -> Result<Option<Event>, i64> {
-    let mut buf = [0u8; HEADER + 64];
+    let mut buf = [0u8; HEADER + THEME_MAX];
     loop {
         let mut hs = [0 as Handle; 1];
         let (n, nh) = match sys::channel_read_h(ep, &mut buf, &mut hs, timeout) {

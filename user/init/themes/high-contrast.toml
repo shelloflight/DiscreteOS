@@ -1,0 +1,44 @@
+# D-OS theme: High Contrast. Installed as sys:/themes/high-contrast.toml; docs/ui.md.
+# Black surfaces, white text and borders, opaque panels, 2px focus rings in a light Discrete Blue
+# tint. Discrete Blue fills are the darker step so white text on them stays above 7:1.
+name = "High Contrast"
+
+[colors]
+desktop_bg = "#000000"
+desktop_subtle = "#0A0A0A"
+title_active = "#000000"
+title_inactive = "#000000"
+client_bg = "#000000"
+surface_raised = "#000000"
+input_bg = "#000000"
+border_active = "#FFFFFF"
+border_inactive = "#A0A0A0"
+border_sandbox = "#FFB000"
+accent = "#485070"
+accent_hover = "#566087"
+accent_pressed = "#3A4160"
+accent_ring = "#C9D0EA"
+accent_strong = "#DDE2F5"
+snap_preview_fill = "#40A7B0D2"
+snap_preview_border = "#FFFFFF"
+dock_bg = "#000000"
+dock_border = "#FFFFFF"
+dock_pill_active = "#1A1D28"
+dock_pill_idle = "#000000"
+text_primary = "#FFFFFF"
+text_muted = "#D0D4E0"
+text_on_accent = "#FFFFFF"
+trust_system = "#C9D0EA"
+trust_native = "#FFFFFF"
+trust_sandbox = "#FFB000"
+ind_mic_live = "#4ADE80"
+ind_alert_red = "#FF5555"
+btn_hover = "#2A2F40"
+btn_close_hover = "#D02020"
+status_ok = "#4ADE80"
+status_off = "#A0A0A0"
+overlay_dim = "#B0000000"
+
+[metrics]
+focus_ring = 2
+radius = 6

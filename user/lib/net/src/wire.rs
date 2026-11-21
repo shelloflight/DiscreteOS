@@ -440,6 +440,8 @@ pub struct DhcpOffer {
     pub subnet_mask: Ipv4Addr,
     pub router: Option<Ipv4Addr>,
     pub dns: Option<Ipv4Addr>,
+    /// A second DNS server from option 6, if the server sent more than one.
+    pub dns2: Option<Ipv4Addr>,
     pub lease_secs: u32,
     pub bootfile: String,
 }
@@ -505,6 +507,7 @@ pub fn parse_dhcp(raw: &[u8], expect_mac: MacAddr) -> Option<DhcpOffer> {
     let mut subnet_mask = [255, 255, 255, 0];
     let mut router = None;
     let mut dns = None;
+    let mut dns2 = None;
     let mut lease_secs = 3600u32;
 
     let opts = &raw[240..];
@@ -526,7 +529,12 @@ pub fn parse_dhcp(raw: &[u8], expect_mac: MacAddr) -> Option<DhcpOffer> {
                     53 if len == 1 => msg_type = val[0],
                     1 if len == 4 => subnet_mask.copy_from_slice(val),
                     3 if len >= 4 => router = Some([val[0], val[1], val[2], val[3]]),
-                    6 if len >= 4 => dns = Some([val[0], val[1], val[2], val[3]]),
+                    6 if len >= 4 => {
+                        dns = Some([val[0], val[1], val[2], val[3]]);
+                        if len >= 8 {
+                            dns2 = Some([val[4], val[5], val[6], val[7]]);
+                        }
+                    }
                     51 if len == 4 => lease_secs = be32(val, 0),
                     54 if len == 4 => server_ip.copy_from_slice(val),
                     _ => {}
@@ -538,7 +546,7 @@ pub fn parse_dhcp(raw: &[u8], expect_mac: MacAddr) -> Option<DhcpOffer> {
     if msg_type == 0 {
         return None;
     }
-    Some(DhcpOffer { xid, msg_type, your_ip, server_ip, subnet_mask, router, dns, lease_secs, bootfile })
+    Some(DhcpOffer { xid, msg_type, your_ip, server_ip, subnet_mask, router, dns, dns2, lease_secs, bootfile })
 }
 
 // ---- DNS (RFC 1035) -----------------------------------------------------------------------------

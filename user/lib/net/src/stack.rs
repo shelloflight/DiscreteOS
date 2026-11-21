@@ -60,12 +60,17 @@ pub struct DnsResult {
 struct PendingDns {
     id: u16,
     local_port: u16,
-    server_ip: Ipv4Addr,
-    server_port: u16,
     hostname: String,
     last_tx_ms: u64,
+    /// Queries sent so far; each retry asks the next server (`dns_server_for`).
     retries: u8,
 }
+
+/// Public resolvers asked when the network's own DNS servers do not answer (Cloudflare, Quad9,
+/// Google), so name lookup works on networks whose DHCP DNS is missing or broken.
+pub const PUBLIC_DNS: [Ipv4Addr; 3] = [[1, 1, 1, 1], [9, 9, 9, 9], [8, 8, 8, 8]];
+/// Queries per lookup (one a second): the configured servers first, then the public ones.
+const DNS_ATTEMPTS: u8 = 5;
 
 struct DnsCacheEntry {
     hostname: String,
@@ -86,6 +91,10 @@ pub struct NetStack {
     pub gateway: Ipv4Addr,
     pub dns_server: Ipv4Addr,
     pub dns_port: u16,
+    /// A second DNS server from DHCP (unspecified if none).
+    pub dns_server2: Ipv4Addr,
+    /// When the configured servers do not answer, ask public resolvers (`PUBLIC_DNS`).
+    pub dns_fallback: bool,
     pub bootfile: String,
     pub dhcp_state: DhcpState,
     dhcp_xid: u32,
@@ -121,6 +130,8 @@ impl NetStack {
             gateway: IP_UNSPECIFIED,
             dns_server: IP_UNSPECIFIED,
             dns_port: 53,
+            dns_server2: IP_UNSPECIFIED,
+            dns_fallback: true,
             bootfile: String::new(),
             dhcp_state: DhcpState::Idle,
             dhcp_xid: 0,
@@ -319,6 +330,9 @@ impl NetStack {
                 } else if self.gateway != IP_UNSPECIFIED {
                     self.dns_server = self.gateway;
                 }
+                if let Some(dns2) = msg.dns2 {
+                    self.dns_server2 = dns2;
+                }
                 if !msg.bootfile.is_empty() {
                     self.bootfile = msg.bootfile;
                 }
@@ -344,6 +358,13 @@ impl NetStack {
         let icmp = build_icmp_echo(false, id, seq, b"D-OS ping payload 0123456789abcd");
         self.send_ipv4(self.ip, dst, PROTO_ICMP, &icmp, now_ms);
         true
+    }
+
+    /// Where a packet to `dst` goes first (itself on this subnet, else the gateway) and that
+    /// hop's MAC address if ARP has resolved it (diagnostics for unanswered pings).
+    pub fn next_hop_mac(&self, dst: Ipv4Addr, now_ms: u64) -> (Ipv4Addr, Option<MacAddr>) {
+        let hop = self.next_hop(dst);
+        (hop, self.arp.lookup(hop, now_ms))
     }
 
     pub fn poll_ping_reply(&mut self) -> Option<PingReply> {
@@ -373,22 +394,19 @@ impl NetStack {
             });
             return Some(id);
         }
-        if self.ip == IP_UNSPECIFIED || self.dns_server == IP_UNSPECIFIED {
+        if self.ip == IP_UNSPECIFIED {
             return None;
         }
+        let (server_ip, server_port) = self.dns_server_for(0)?;
         let id = (self.next_rand() as u16).max(1);
         let q = build_dns_query(id, hostname)?;
         let port = self.alloc_port();
         if self.dns_pending.len() >= MAX_DNS_PENDING {
             self.dns_pending.remove(0);
         }
-        let server_ip = self.dns_server;
-        let server_port = self.dns_port;
         self.dns_pending.push(PendingDns {
             id,
             local_port: port,
-            server_ip,
-            server_port,
             hostname: String::from(hostname),
             last_tx_ms: now_ms,
             retries: 0,
@@ -397,6 +415,27 @@ impl NetStack {
             self.send_ipv4(self.ip, server_ip, PROTO_UDP, &udp, now_ms);
         }
         Some(id)
+    }
+
+    /// The server for query `attempt` of a lookup: the configured server, the second DHCP one,
+    /// then (with `dns_fallback`) the public resolvers, round robin. `None`: no server at all.
+    pub fn dns_server_for(&self, attempt: u8) -> Option<(Ipv4Addr, u16)> {
+        let mut list: [(Ipv4Addr, u16); 5] = [(IP_UNSPECIFIED, 0); 5];
+        let mut n = 0;
+        let mut add = |ip: Ipv4Addr, port: u16| {
+            if ip != IP_UNSPECIFIED && !list[..n].iter().any(|e| e.0 == ip) && n < list.len() {
+                list[n] = (ip, port);
+                n += 1;
+            }
+        };
+        add(self.dns_server, self.dns_port);
+        add(self.dns_server2, 53);
+        if self.dns_fallback {
+            for ip in PUBLIC_DNS {
+                add(ip, 53);
+            }
+        }
+        (n > 0).then(|| list[usize::from(attempt) % n])
     }
 
     pub fn poll_dns_result(&mut self) -> Option<DnsResult> {
@@ -718,22 +757,23 @@ impl NetStack {
             _ => {}
         }
 
-        // Retry pending DNS queries.
-        let mut resend_dns: Vec<(Ipv4Addr, u16, u16, Vec<u8>)> = Vec::new();
+        // Retry pending DNS queries, each time with the next server.
+        let mut resend_dns: Vec<(u8, u16, Vec<u8>)> = Vec::new();
         self.dns_pending.retain_mut(|d| {
             if now_ms.saturating_sub(d.last_tx_ms) >= 1_000 {
-                if d.retries >= 3 {
+                if d.retries + 1 >= DNS_ATTEMPTS {
                     return false;
                 }
                 d.retries += 1;
                 d.last_tx_ms = now_ms;
                 if let Some(q) = build_dns_query(d.id, &d.hostname) {
-                    resend_dns.push((d.server_ip, d.local_port, d.server_port, q));
+                    resend_dns.push((d.retries, d.local_port, q));
                 }
             }
             true
         });
-        for (sip, lport, sport, q) in resend_dns {
+        for (attempt, lport, q) in resend_dns {
+            let Some((sip, sport)) = self.dns_server_for(attempt) else { continue };
             if let Some(udp) = build_udp(self.ip, sip, lport, sport, &q) {
                 self.send_ipv4(self.ip, sip, PROTO_UDP, &udp, now_ms);
             }

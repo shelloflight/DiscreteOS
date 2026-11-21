@@ -1,7 +1,10 @@
 # D-AWMI: the compositor and window manager. Idle at boot (no screen, no input) until a session is
 # started on its admin endpoint (the shell's `gui`); then it takes the display from the terminal
 # and the keyboard and pointer from the device manager (exclusive grab) until the session ends.
-# Clients' title bars show the identity the service manager verified (`identify`).
+# Clients' title bars show the identity the service manager verified (`identify`). It reads the
+# shipped fonts and themes from the system volume (read-only) and shares the fonts with window
+# programs. On a normal boot the service manager starts it with `autostart` (a desktop session as
+# soon as there is a display) unless the boot volume's DOS/BOOT.CFG says `desktop = off`.
 name = "awmi"
 image = "awmi.dsvc"
 group = "system"
@@ -18,6 +21,7 @@ gpu = ["display"]
 audio = ["control"]   # the dock: microphone live, output muted
 net = ["status"]      # the dock: network up (read-only)
 connect = ["devmgr.input", "terminal.display", "clock.time"]
+namespace = ["/sys=sys:r"]   # fonts and themes
 
 [quota]
 memory = "192M"

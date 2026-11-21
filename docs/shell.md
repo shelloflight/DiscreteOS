@@ -23,7 +23,7 @@ data ▸ copy report.txt /backup
 
 | Process | Holds | Does not hold |
 |---|---|---|
-| `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge, and `terminal.display` to the compositor, which stops and restarts its drawing for a graphical session) |
+| `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge, `terminal.display` to the compositor, which stops and restarts its drawing for a graphical session, and `terminal.view` to the terminal window) |
 | `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, `awmi.admin`, `awmi.query`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting, any window's pixels |
 | a tool | an output channel, one node per path argument with the rights its manifest declares, the log | the namespace, endpoints, anything else of the shell |
 
@@ -53,6 +53,14 @@ line editor cannot reach a file, and the shell cannot draw outside the terminal'
 - Every typed line is logged (`terminal: line from ps2: ...`). With the argument `mirror`, or
   without a display, every line shown is logged too (`terminal| ...`): a session can be followed
   on serial.
+- **Text:** output is kept as lines of Unicode characters and wrapped when drawn, so it reflows
+  whenever the grid changes size (the shell is sent the new `SIZE`). The framebuffer and VGA text
+  show characters through code page 437; the terminal window shows them all.
+- **The terminal window:** while the desktop holds the screen, the terminal lays the session out
+  for the terminal window's grid instead (`terminal.view`: `VIEW_ATTACH` returns a read-only VMO
+  of cells, `VIEW_DAMAGE` says which rows changed, `VIEW_KEY` carries the keys typed in the
+  window, `VIEW_RESIZE`, `VIEW_DETACH`). It is the same session: history, scrollback and the
+  running command carry over in both directions ([awmi.md](awmi.md)).
 
 Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with style bytes
 (`STYLE attr`, `PLAIN`), `READ` (show a prompt, edit a line) answered by `LINE` (or cancelled),
@@ -79,13 +87,15 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
 - **Built-ins** (they use the session's own grants): `go`, `places`, `tasks` (services through the
   manager, and jobs), `objects [job | service]` (handles held, through `process_handles`),
   `end`/`restart` (services through the manager), `log [source]`, `time`, `audio` (devices,
-  volume, mute/unmute, routing, test tone, mic policy; [audio.md](audio.md)), `net` (`ip`, link
-  and IPv4 status), `ping <host> [count]` (DNS + ICMP echo), `tls <host> [port]` (TLS 1.3
+  volume, mute/unmute, routing, test tone, mic policy; [audio.md](audio.md)), `net [check]` (`ip`,
+  link and IPv4 status; `check`: which step to the internet fails), `ping <host> [count]` (DNS +
+  ICMP echo, with a TCP reachability check when no reply comes), `tls <host> [port]` (TLS 1.3
   handshake & certificate verification against `/sys/certs/roots.der`;
   [networking.md](networking.md)), `gpu [modes [id]]` (`display`, GPU adapters, modes, EDID, VRAM,
-  and IOMMU status; [graphics.md](graphics.md)), `gui [status]` (`awmi`: start the graphical
-  session with the demo windows, back with `Super+Esc` or `Ctrl+Alt+Esc`; `status`: the
-  compositor's state; [awmi.md](awmi.md)), `power off | restart | sleep` (the manager stops every service
+  and IOMMU status; [graphics.md](graphics.md)), `gui [demo | status | theme dark|contrast |
+  text 100-200 | motion on|off]` (`awmi`: start the desktop, with the example apps too for `demo`,
+  back with `Super+Esc` or `Ctrl+Alt+Esc`; `status`: the compositor's state; `theme`, `text`,
+  `motion`: the accessibility settings; [awmi.md](awmi.md), [ui.md](ui.md)), `power off | restart | sleep` (the manager stops every service
   cleanly first), `clear`, `run <tool> [arguments]`.
 - **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
   (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place

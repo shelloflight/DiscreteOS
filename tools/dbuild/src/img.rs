@@ -342,6 +342,19 @@ pub fn make_boot(
     Ok(())
 }
 
+/// Write (create or replace) file `path` on partition `part_idx` of an image.
+pub fn add_file(img: &Path, part_idx: usize, path: &str, data: &[u8]) -> Result<(), String> {
+    with_fs(img, part_idx, &mut |fs| {
+        if let Ok(f) = resolve(fs, path) {
+            ok(fs.truncate(f, 0), path)?;
+            ok(fs.write(f, 0, data), path)?;
+        } else {
+            put(fs, path, data)?;
+        }
+        ok(fs.sync(), "sync")
+    })
+}
+
 pub fn patch_file(img: &Path, part_idx: usize, path: &str, off: usize, xor_byte: u8) -> Result<(), String> {
     with_fs(img, part_idx, &mut |fs| {
         let f = resolve(fs, path)?;

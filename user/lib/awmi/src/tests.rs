@@ -7,7 +7,10 @@ use crate::geom::{DamageSet, Point, Rect};
 use crate::pixel::{Canvas, blend_over, write_hw_cursor_64x64};
 use crate::proto::{AwmiStatus, STATUS_BYTES, TrustTier, decode_damage_rects, encode_damage_rects, indicator_bits, sanitize_label, win_flags};
 use crate::theme::{ChromeMetrics, DockConfig, Theme, argb, rgb};
-use crate::wm::{SnapState, SurfaceView, WmAction, WmState};
+use crate::launcher::{LaunchTarget, Setting, UiSettings};
+use crate::text::BitmapText;
+use crate::theme::{COLOR_NAMES, THEME_BYTES, ThemeError, ThemeId};
+use crate::wm::{KEY_META, SnapState, SurfaceView, WmAction, WmState};
 
 struct Rng(u64);
 impl Rng {
@@ -142,7 +145,7 @@ fn dock_geometry_indicators_and_compositor_render() {
     let mut fb = vec![0u32; 1024 * 768];
     let mut canvas = Canvas::new(&mut fb, 1024, 768, 1024).unwrap();
     wm.damage_all();
-    let flushed = wm.composite_output(wm.layout.primary().unwrap(), &mut canvas, |wid| {
+    let flushed = wm.composite_output(wm.layout.primary().unwrap(), &mut canvas, &mut BitmapText, |wid| {
         if wid == w1 {
             Some(SurfaceView { bytes: &surf, width: surf_w, height: surf_h, pitch_bytes: surf_w * 4 })
         } else {
@@ -156,7 +159,7 @@ fn dock_geometry_indicators_and_compositor_render() {
     assert_eq!(sample, rgb(0x20, 0x60, 0xCC));
 
     // Verify dock sits inset 24px from left/right edges and detects workspace & mic indicator hits.
-    let dl = DockLayout::compute(1024, 768, DockConfig::DEFAULT, &[], &wm.tray);
+    let dl = DockLayout::compute(1024, 768, DockConfig::DEFAULT, &[], &wm.tray, 8);
     assert_eq!(dl.bar.x, 24);
     assert_eq!(dl.bar.w, 1024 - 48);
     assert_eq!(dl.hit_test(Point::new(dl.ws_rects[2].x + 4, dl.ws_rects[2].y + 4)), DockHit::Workspace(2));
@@ -164,6 +167,17 @@ fn dock_geometry_indicators_and_compositor_render() {
     // Verify green MIC LIVE dot pixel was rendered inside the dock.
     let mic_dot = canvas.get_pixel((dl.mic_rect.x + 9) as u32, (dl.mic_rect.y + dl.mic_rect.h as i32 / 2) as u32).unwrap();
     assert_eq!(mic_dot, Theme::DARK_SLATE.ind_mic_live);
+
+    // Each workspace has its own dock: a window moved to workspace 2 leaves this dock.
+    let w2 = wm.create_window(11, b"other", TrustTier::Native, 200, 150, win_flags::DEFAULT, b"Other").unwrap();
+    let out = wm.layout.primary().unwrap();
+    assert_eq!(wm.dock_layout_for(out).win_count, 2);
+    assert!(wm.move_window_to_workspace(w2, 1));
+    let dl = wm.dock_layout_for(out);
+    assert_eq!((dl.win_count, dl.win_rects[0].0), (1, w1));
+    wm.switch_workspace(1);
+    let dl = wm.dock_layout_for(out);
+    assert_eq!((dl.win_count, dl.win_rects[0].0), (1, w2));
 
     // Hardware cursor bitmap generation sanity check.
     let mut cur = vec![0u8; 64 * 64 * 4];
@@ -191,6 +205,10 @@ fn alpha_blend_and_status_codec() {
         damage_flushes: 512,
         input_keys: 9,
         input_pointer: 77,
+        settings: 0x0100_7D01,
+        launcher_open: true,
+        fonts: true,
+        apps: 3,
     };
     let mut buf = [0u8; STATUS_BYTES];
     st.encode(&mut buf);
@@ -271,7 +289,7 @@ fn fuzz_untrusted_protocol_geometry_and_wm_12000_rounds() {
         }
         if step % 200 == 0 && !wm.damage.is_empty() {
             let mut canvas = Canvas::new(&mut fb, 320, 240, 320).unwrap();
-            let _ = wm.composite_output(wm.layout.primary().unwrap(), &mut canvas, |_| {
+            let _ = wm.composite_output(wm.layout.primary().unwrap(), &mut canvas, &mut BitmapText, |_| {
                 Some(SurfaceView { bytes: &dummy_surf, width: 64, height: 64, pitch_bytes: 64 * 4 })
             });
             wm.damage.clear();
@@ -311,4 +329,224 @@ fn connect_identity_and_window_info_codec() {
     assert_eq!((wm.owner_window_count(4), wm.owner_window_count(5), wm.windows().count()), (3, 1, 4));
     wm.remove_client(4);
     assert_eq!((wm.owner_window_count(4), wm.window_count()), (0, 1));
+}
+
+#[test]
+fn themes_parse_encode_and_meet_contrast() {
+    // The shipped theme files are exactly the built-in themes.
+    for (file, id) in [
+        (include_str!("../../../init/themes/dark-slate.toml"), ThemeId::DarkSlate),
+        (include_str!("../../../init/themes/high-contrast.toml"), ThemeId::HighContrast),
+    ] {
+        assert_eq!(Theme::from_toml(file), Ok(id.builtin()), "{}", id.file());
+    }
+    // Discrete Blue is the accent fill.
+    assert_eq!(Theme::DARK_SLATE.accent, rgb(0x56, 0x60, 0x87));
+    // Wire round trip, and clamping of shape tokens from untrusted bytes.
+    let mut b = [0u8; THEME_BYTES];
+    Theme::HIGH_CONTRAST.encode(&mut b);
+    assert_eq!(Theme::decode(&b), Some(Theme::HIGH_CONTRAST));
+    assert_eq!(Theme::decode(&b[..10]), None);
+    let m = COLOR_NAMES.len() * 4;
+    b[m..m + 4].copy_from_slice(&99u32.to_le_bytes());
+    assert_eq!(Theme::decode(&b).unwrap().focus_ring, 4);
+    // Strictness: unknown keys, bad values and missing colours are refused.
+    assert_eq!(Theme::from_toml("[colors]\nnope = \"#000000\""), Err(ThemeError::Unknown(2)));
+    assert_eq!(Theme::from_toml("[colors]\ndesktop_bg = \"#00000\""), Err(ThemeError::Value(2)));
+    assert_eq!(Theme::from_toml("[colors]\ndesktop_bg = #000000"), Err(ThemeError::Value(2)));
+    assert!(matches!(Theme::from_toml("[colors]\ndesktop_bg = \"#000000\""), Err(ThemeError::Missing(_))));
+    assert_eq!(Theme::from_toml("[metrics]\nfocus_ring = 9"), Err(ThemeError::Value(2)));
+    assert_eq!(Theme::from_toml("garbage"), Err(ThemeError::Syntax(1)));
+    // WCAG contrast of the pairs that matter (text 4.5:1, rings and outlines 3:1).
+    fn lin(c: u32) -> f64 {
+        let v = f64::from(c & 0xFF) / 255.0;
+        if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+    }
+    fn lum(c: u32) -> f64 {
+        0.2126 * lin(c >> 16) + 0.7152 * lin(c >> 8) + 0.0722 * lin(c)
+    }
+    fn ratio(a: u32, b: u32) -> f64 {
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+    for t in [Theme::DARK_SLATE, Theme::HIGH_CONTRAST] {
+        assert!(ratio(t.text_primary, t.title_active) >= 7.0);
+        assert!(ratio(t.text_muted, t.title_active) >= 4.5, "muted text {:.2}", ratio(t.text_muted, t.title_active));
+        assert!(ratio(t.text_on_accent, t.accent) >= 4.5, "text on accent {:.2}", ratio(t.text_on_accent, t.accent));
+        assert!(ratio(t.accent_ring, t.title_active) >= 3.0, "ring {:.2}", ratio(t.accent_ring, t.title_active));
+        assert!(ratio(t.accent_ring, t.surface_raised) >= 3.0);
+        assert!(ratio(t.accent_ring, t.desktop_bg) >= 4.5, "accent text on desktop {:.2}", ratio(t.accent_ring, t.desktop_bg));
+    }
+    assert!(ratio(Theme::HIGH_CONTRAST.text_primary, Theme::HIGH_CONTRAST.client_bg) >= 15.0);
+}
+
+fn launcher_wm() -> WmState {
+    let mut wm = WmState::new();
+    wm.layout.add_output(1, 1280, 800, 60_000, false).unwrap();
+    wm.register_app(7, 0, b"Terminal", b"console", TrustTier::System);
+    wm.register_app(8, 0, b"Widgets", b"awmi-demo", TrustTier::System);
+    wm.register_app(9, 1, b"Notes", b"foreign-notes", TrustTier::Sandbox);
+    wm
+}
+
+#[test]
+fn launcher_opens_on_super_tap_and_searches() {
+    let mut wm = launcher_wm();
+    let w = wm.create_window(7, b"console", TrustTier::System, 400, 300, win_flags::DEFAULT, b"Terminal").unwrap();
+    // A Super tap opens; Super used as a modifier does not.
+    assert_eq!(wm.handle_key(KEY_META, true), WmAction::None);
+    let _ = wm.handle_key(0x103 | 1 << 19, true); // Super+Left
+    assert_eq!(wm.handle_key(KEY_META, false), WmAction::None);
+    assert!(!wm.launcher.open);
+    wm.handle_key(KEY_META, true);
+    wm.handle_key(KEY_META, false);
+    assert!(wm.launcher.open);
+    // While open, typing goes to the search, never to the focused window.
+    for &c in b"term" {
+        assert_eq!(wm.handle_key(u32::from(c), true), WmAction::None);
+    }
+    assert_eq!(wm.launcher.query(), b"term");
+    assert_eq!(wm.handle_key(0x0A, true), WmAction::Launch { owner: 7, app: 0 });
+    assert!(!wm.launcher.open);
+    // Keys reach the window again.
+    assert_eq!(wm.handle_key(u32::from(b'x'), true), WmAction::DeliverKey { owner: 7, window_id: w });
+    // Alt+F1 opens too; the identity matches ("foreign"), Escape closes.
+    wm.handle_key(0x110 | 1 << 18, true);
+    assert!(wm.launcher.open);
+    for &c in b"foreign" {
+        wm.handle_key(u32::from(c), true);
+    }
+    let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); 29];
+    assert_eq!(wm.launcher.results(&mut r), 1);
+    assert_eq!(r[0], LaunchTarget::App { owner: 9, app: 1 });
+    wm.handle_key(0x1B, true);
+    assert!(!wm.launcher.open);
+    // Settings: "text" finds the two text sizes and the text console; Down moves the selection.
+    wm.toggle_launcher();
+    for &c in b"text" {
+        wm.handle_key(u32::from(c), true);
+    }
+    assert_eq!(wm.launcher.results(&mut r), 3, "larger, smaller, leave (text console)");
+    wm.handle_key(0x102, true);
+    assert_eq!(wm.handle_key(0x0D, true), WmAction::Setting(Setting::TextSmaller));
+    // Super+Esc still leaves the session from the launcher.
+    wm.toggle_launcher();
+    assert_eq!(wm.handle_key(0x1B | 1 << 19, true), WmAction::ExitSession);
+    // A program that goes away loses its entries.
+    wm.remove_client(9);
+    wm.toggle_launcher();
+    assert_eq!(wm.launcher.results(&mut r), 2 + 5);
+}
+
+#[test]
+fn launcher_is_modal_for_the_pointer() {
+    let mut wm = launcher_wm();
+    let w = wm.create_window(7, b"console", TrustTier::System, 400, 300, win_flags::DEFAULT, b"Terminal").unwrap();
+    let c = wm.window(w).unwrap().client_rect(wm.chrome);
+    wm.toggle_launcher();
+    let rects = wm.launcher.rects(1280, 800, wm.line_h);
+    assert!(rects.n >= 3);
+    // Moving over the second row selects it; a click opens it.
+    let r1 = rects.rows[1];
+    assert_eq!(wm.handle_pointer(0, 0, Some(Point::new(r1.x + 20, r1.y + 5)), 0), WmAction::None);
+    assert_eq!(wm.launcher.sel, 1);
+    assert_eq!(wm.handle_pointer(0, 0, Some(Point::new(r1.x + 20, r1.y + 5)), 1), WmAction::Launch { owner: 8, app: 0 });
+    wm.handle_pointer(0, 0, Some(Point::new(r1.x + 20, r1.y + 5)), 0);
+    // A click outside closes it and is not delivered to the window under it.
+    wm.toggle_launcher();
+    assert_eq!(wm.handle_pointer(0, 0, Some(Point::new(c.x + 5, c.y + c.h as i32 - 5)), 1), WmAction::None);
+    assert!(!wm.launcher.open);
+    // Rendering the open launcher (with the bitmap font) draws the panel.
+    wm.handle_pointer(0, 0, Some(Point::new(0, 0)), 0);
+    wm.toggle_launcher();
+    wm.now_ns = 1_000_000_000;
+    let mut fb = vec![0u32; 1280 * 800];
+    let mut canvas = Canvas::new(&mut fb, 1280, 800, 1280).unwrap();
+    wm.composite_output(wm.layout.primary().unwrap(), &mut canvas, &mut BitmapText, |_| None);
+    let p = rects.panel;
+    assert_eq!(canvas.get_pixel((p.x + 30) as u32, (p.y + p.h as i32 - 4) as u32), Some(Theme::DARK_SLATE.surface_raised));
+}
+
+#[test]
+fn settings_resize_chrome_and_animations_respect_reduce_motion() {
+    let mut wm = launcher_wm();
+    let w = wm.create_window(7, b"console", TrustTier::System, 400, 300, win_flags::DEFAULT, b"").unwrap();
+    wm.snap_window(w, SnapState::Maximized);
+    let before = wm.window(w).unwrap().frame;
+    let s = UiSettings::DEFAULT.apply(Setting::TextLarger).apply(Setting::TextLarger);
+    assert_eq!(s.text_scale, 150);
+    assert_eq!(UiSettings::unpack(s.pack()), s);
+    assert_eq!(UiSettings::unpack(0xFFFF_FFFF).text_scale, 100, "unknown scales fall back");
+    wm.apply_settings(s, Theme::HIGH_CONTRAST, 24, 11);
+    assert_eq!(wm.chrome.title_h, 36);
+    assert!(wm.dock_cfg.height > 40);
+    let after = wm.window(w).unwrap().frame;
+    assert!(after.h < before.h, "maximized windows follow the taller dock");
+    assert_eq!(wm.theme, Theme::HIGH_CONTRAST);
+    // The open animation runs for OPEN_NS unless motion is reduced.
+    wm.now_ns = 5_000_000_000;
+    wm.toggle_launcher();
+    assert!(wm.animating());
+    wm.now_ns += 200_000_000;
+    assert!(!wm.animating());
+    wm.toggle_launcher();
+    wm.apply_settings(s.apply(Setting::MotionToggle), Theme::DARK_SLATE, 16, 8);
+    wm.toggle_launcher();
+    assert!(!wm.animating());
+    assert_eq!(UiSettings::DEFAULT.apply(Setting::ThemeToggle).theme, ThemeId::HighContrast);
+    assert_eq!(UiSettings::DEFAULT.smaller().text_scale, 100);
+}
+
+#[test]
+fn rounded_shapes_are_antialiased_with_crisp_edges() {
+    // Integer square root: exact floor for small values, squares and their neighbours.
+    for n in 0u64..5000 {
+        let r = crate::pixel::isqrt(n);
+        assert!(r * r <= n && (r + 1) * (r + 1) > n, "isqrt({n}) = {r}");
+    }
+    for k in [255u64, 4096, 65_535, 1 << 20, 3_000_000_000] {
+        assert_eq!(crate::pixel::isqrt(k * k), k);
+        assert_eq!(crate::pixel::isqrt(k * k - 1), k - 1);
+    }
+
+    const BG: u32 = 0xFF00_0000;
+    const FILL: u32 = 0xFFFF_FFFF;
+    const BORDER: u32 = 0xFFFF_0000;
+    let mut fb = vec![BG; 64 * 64];
+    let mut c = Canvas::new(&mut fb, 64, 64, 64).unwrap();
+    let all = c.bounds();
+    let r = Rect::new(10, 10, 40, 30);
+    c.fill_rounded_rect(all, r, 8, FILL, 0);
+    let px = |c: &Canvas<'_>, x: u32, y: u32| c.get_pixel(x, y).unwrap() & 0xFF; // blue channel
+    // The very corner is outside the curve, the interior and straight edges fully covered.
+    assert_eq!(px(&c, 10, 10), 0);
+    assert_eq!(px(&c, 30, 10), 255, "top edge");
+    assert_eq!(px(&c, 10, 25), 255, "left edge");
+    assert_eq!(px(&c, 30, 25), 255, "interior");
+    assert_eq!(px(&c, 9, 25), 0, "nothing outside the rectangle");
+    // Along the curve there are partial pixels (anti-aliasing), and coverage grows inward.
+    let partial = (10..18).flat_map(|y| (10..18).map(move |x| (x, y))).filter(|&(x, y)| (1..255).contains(&px(&c, x, y))).count();
+    assert!(partial >= 6, "only {partial} anti-aliased corner pixels");
+    assert!(px(&c, 11, 13) <= px(&c, 12, 13) && px(&c, 12, 13) <= px(&c, 13, 13));
+    // The corner is symmetric.
+    for d in 0..8 {
+        assert_eq!(px(&c, 10 + d, 12), px(&c, 49 - d, 12), "left/right mirror at {d}");
+        assert_eq!(px(&c, 10 + d, 12), px(&c, 10 + d, 37), "top/bottom mirror at {d}");
+    }
+
+    // With a border: the 1px band is the border colour on straight edges, fill inside.
+    let mut fb = vec![BG; 64 * 64];
+    let mut c = Canvas::new(&mut fb, 64, 64, 64).unwrap();
+    c.fill_rounded_rect(all, r, 8, FILL, BORDER);
+    assert_eq!(c.get_pixel(30, 10), Some(BORDER));
+    assert_eq!(c.get_pixel(49, 25), Some(BORDER));
+    assert_eq!(c.get_pixel(30, 11), Some(FILL));
+
+    // Circles: the centre covered, a smooth rim, nothing past it.
+    let mut fb = vec![BG; 64 * 64];
+    let mut c = Canvas::new(&mut fb, 64, 64, 64).unwrap();
+    c.fill_circle(all, 20, 20, 6, FILL);
+    assert_eq!(px(&c, 20, 20), 255);
+    assert_eq!(px(&c, 20, 13), 0);
+    assert!((1..255).contains(&px(&c, 24, 25)), "rim pixel {}", px(&c, 24, 25));
 }

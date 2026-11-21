@@ -18,17 +18,32 @@
 //! it created on its channel, and gets keys only while its window is focused and pointer events
 //! only over its window. The title bar's identity and trust dot come from the service manager
 //! (`provides.identify`), never from the client.
+//!
+//! The UI foundation (docs/ui.md): the shipped faces (`sys:/fonts`) are read once at start and
+//! drawn with `dosfont` (the chrome, the dock, the launcher) and shared read-only with window
+//! programs (`OP_FONTS`); the themes come from `sys:/themes` (built-in copies if missing); the
+//! launcher (tap Super, Alt+F1) opens programs' entries and the accessibility actions; settings
+//! (theme, text size, reduce motion) are sent to every window program. With the argument
+//! `autostart` (a normal boot) a desktop session starts as soon as there is a display.
 
 #![no_std]
 
 extern crate alloc;
 
+mod app;
+mod console;
 mod demo;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 
-use dosawmi::{AwmiStatus, Canvas, DamageSet, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, SurfaceView, TrustTier, WINDOW_INFO_BYTES, WmAction, WmState, encode_window_info, split_connect};
+use dosawmi::{
+    AwmiStatus, BitmapText, Canvas, DamageSet, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, TextRender, Theme, ThemeId, TrustTier, UiSettings,
+    WINDOW_INFO_BYTES, WmAction, WmState, encode_window_info, split_connect,
+};
+use dosui::{FontText, fonts};
+use libd::fs as fp;
 use libd::awmi as wire;
 use libd::gpu::{self, AdapterInfo, ModeEntry};
 use libd::proto::{self, HEADER, Header, key};
@@ -37,6 +52,7 @@ use libd::{Mapping, Port, Startup, println, svc, term, time};
 
 libd::entry!(dsvc_awmi, main);
 libd::entry!(dsvc_awmi_demo, demo::main);
+libd::entry!(dsvc_console, console::main);
 
 const KEY_CTL: u64 = 1;
 const KEY_INPUT: u64 = 2;
@@ -50,6 +66,10 @@ const MAX_WINDOWS_PER_CLIENT: usize = 16;
 /// Largest client buffer accepted (8192 x 8192 would be 256 MiB: refused).
 const MAX_SURFACE_BYTES: u64 = 64 << 20;
 const MAX_CLIENTS: usize = 64;
+/// How long a boot waits for a display before staying in the text console.
+const AUTOSTART_WAIT_NS: u64 = 20 * SEC;
+/// Largest font or theme file read from the system volume.
+const MAX_FONT_FILE: usize = 8 << 20;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -80,6 +100,9 @@ struct Surface {
     pending: Option<u64>,
     /// What the client was last told (`EVT_CONFIGURE`, `EVT_FOCUS`): client size and state bits.
     told: (u32, u32, u32),
+    /// A new buffer attached (a resize) but not committed yet: the current one stays on screen,
+    /// and its pending frame is still answered, until the client commits into the new one.
+    staged: Option<Box<Surface>>,
 }
 
 impl Drop for Surface {
@@ -147,6 +170,78 @@ struct Awmi {
     clock_base: Option<time::Base>,
     /// A present failed: the GPU restarted; outputs are attached again at the next frame.
     reattach: bool,
+    /// The vector text engine over the font pack (None: the bitmap font draws).
+    text: Option<FontText<'static>>,
+    /// The font pack VMO and its size (shared read-only with window programs).
+    pack_vmo: Handle,
+    pack_len: u64,
+    /// Dark Slate and High Contrast as read from the system volume.
+    themes: [Theme; 2],
+    settings: UiSettings,
+    /// The text size was chosen (`OP_SETTINGS`, the launcher): not sized for the display any more.
+    scale_set: bool,
+    /// Launcher entries programs registered: (client, entry, label); replayed into each session.
+    apps: Vec<(u32, u8, Vec<u8>)>,
+    /// What the session was started with (`SESSION_DEMO`, `SESSION_DESKTOP`).
+    session_flags: u64,
+    /// Boot: start a desktop session once a display is there (until this time).
+    autostart_until: u64,
+}
+
+/// Read a whole file from the system volume (`/sys` in this service's namespace).
+fn read_sys(path: &[u8], max: usize) -> Option<Vec<u8>> {
+    let ns = fp::Namespace::get();
+    let (dir, rest) = ns.resolve(path)?;
+    let d = fp::Node::from(dir);
+    let out = (|| {
+        let (f, _, size) = d.open(rest, 0, fp::R_READ).ok()?;
+        let size = usize::try_from(size).ok()?;
+        if size == 0 || size > max {
+            return None;
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let n = f.read(0, &mut buf).ok()?;
+        buf.truncate(n);
+        Some(buf)
+    })();
+    let _ = d.into_handle(); // the namespace keeps its directory
+    out
+}
+
+/// The shipped faces as one font pack in a VMO; `None` without fonts (the bitmap font is used).
+fn load_fonts() -> Option<(Mapping, u64)> {
+    let mut files: Vec<(dosfont::Face, Vec<u8>)> = Vec::new();
+    for (face, name) in fonts::FACE_FILES {
+        let mut path = Vec::from(&b"/sys/fonts/"[..]);
+        path.extend_from_slice(name.as_bytes());
+        match read_sys(&path, MAX_FONT_FILE) {
+            Some(d) if dosfont::Font::parse(&d).is_ok() => files.push((face, d)),
+            _ => println!("awmi: font {} missing or invalid", name),
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    let refs: Vec<(dosfont::Face, &[u8])> = files.iter().map(|(f, d)| (*f, d.as_slice())).collect();
+    let pack = fonts::build(&refs);
+    let mut map = Mapping::new(pack.len() as u64).ok()?;
+    map.bytes_mut()[..pack.len()].copy_from_slice(&pack);
+    println!("awmi: fonts: {} face(s), {} KiB (shared read-only with window programs)", files.len(), pack.len() / 1024);
+    Some((map, pack.len() as u64))
+}
+
+/// A theme from `sys:/themes`, or the built-in copy.
+fn load_theme(id: ThemeId) -> Theme {
+    let mut path = Vec::from(&b"/sys/themes/"[..]);
+    path.extend_from_slice(id.file().as_bytes());
+    match read_sys(&path, 64 * 1024).map(|d| Theme::from_toml(&String::from_utf8_lossy(&d))) {
+        Some(Ok(t)) => t,
+        Some(Err(e)) => {
+            println!("awmi: theme {} refused ({:?}): the built-in one is used", id.file(), e);
+            id.builtin()
+        }
+        None => id.builtin(),
+    }
 }
 
 impl Awmi {
@@ -245,6 +340,7 @@ impl Awmi {
                 self.clients.push(Client { id, ch: hnd, role, identity, identity_len: n, trust });
                 self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_CLIENT_BASE + u64::from(id));
                 if role == Role::Window && self.active {
+                    self.send_settings(hnd);
                     self.send_session(hnd, true);
                 }
             }
@@ -317,11 +413,11 @@ impl Awmi {
     }
 
     fn key(&mut self, k: u32) {
+        self.wm.now_ns = sys::clock_ns();
         let pressed = k & key::RELEASE == 0;
         let action = self.wm.handle_key(k & !key::RELEASE, pressed);
         match action {
             WmAction::DeliverKey { owner, window_id } => self.send_to(owner, wire::EVT_KEY, u64::from(window_id), u64::from(k)),
-            WmAction::ExitSession => self.session_stop("the user left the session"),
             other => self.act(other),
         }
         self.sync_windows();
@@ -370,9 +466,56 @@ impl Awmi {
     fn act(&mut self, action: WmAction) {
         match action {
             WmAction::RequestClose { owner, window_id } => self.send_to(owner, wire::EVT_CLOSE, u64::from(window_id), 0),
-            WmAction::ExitSession => self.session_stop("the user left the session"),
+            WmAction::ExitSession | WmAction::Setting(Setting::LeaveDesktop) => self.session_stop("the user left the session"),
+            WmAction::Launch { owner, app } => {
+                println!("awmi: launcher: opening entry {} of client {}", app, owner);
+                self.send_to(owner, wire::EVT_LAUNCH, u64::from(app), 0);
+            }
+            WmAction::Setting(s) => {
+                if matches!(s, Setting::TextLarger | Setting::TextSmaller) {
+                    self.scale_set = true;
+                }
+                self.settings = self.settings.apply(s);
+                self.apply_settings();
+            }
             _ => {}
         }
+    }
+
+    // ---- settings ---------------------------------------------------------------------------------
+
+    /// Apply the settings: text engine scale, the window manager's theme and chrome metrics, and
+    /// every window program is told.
+    fn apply_settings(&mut self) {
+        let theme = self.themes[self.settings.theme as usize];
+        let (line_h, char_w) = match self.text.as_mut() {
+            Some(t) => {
+                t.scale = self.settings.text_scale;
+                let sample = "The quick brown fox jumps 0123";
+                (t.line_height(dosui::TextStyle::Body), t.width(dosui::TextStyle::Body, sample) / sample.len() as u32)
+            }
+            None => (16, 8),
+        };
+        self.wm.apply_settings(self.settings, theme, line_h, char_w.max(4));
+        let chans: Vec<Handle> = self.clients.iter().filter(|c| c.role == Role::Window && c.ch != 0).map(|c| c.ch).collect();
+        for ch in chans {
+            self.send_settings(ch);
+        }
+        println!(
+            "awmi: settings: theme {}, text {}%, motion {}",
+            self.settings.theme.name(),
+            self.settings.text_scale,
+            if self.settings.reduce_motion { "reduced" } else { "on" }
+        );
+    }
+
+    fn send_settings(&self, ch: Handle) {
+        let mut m = [0u8; HEADER + THEME_BYTES];
+        Header { txid: 0, op: wire::EVT_SETTINGS, status: 0, a: self.settings.pack(), b: 0 }.put(&mut m);
+        let mut t = [0u8; THEME_BYTES];
+        self.themes[self.settings.theme as usize].encode(&mut t);
+        m[HEADER..].copy_from_slice(&t);
+        sys::channel_write(ch, &m);
     }
 
     /// Tell each window's owner about size, state and focus changes (snaps, resizes, workspace
@@ -409,7 +552,8 @@ impl Awmi {
 
     fn send_session(&self, ch: Handle, active: bool) {
         let p = self.wm.layout.primary().map_or(Rect::EMPTY, |o| o.bounds);
-        let a = u64::from(active) | u64::from(active && self.demo) << 1;
+        let desktop = active && self.session_flags & wire::SESSION_DESKTOP != 0;
+        let a = u64::from(active) | u64::from(active && self.demo) << 1 | u64::from(desktop) << 2;
         proto::send(ch, wire::EVT_SESSION, a, u64::from(p.w) | u64::from(p.h) << 32);
     }
 
@@ -501,7 +645,7 @@ impl Awmi {
         }
     }
 
-    fn session_start(&mut self, demo: bool) -> Result<u32, i64> {
+    fn session_start(&mut self, flags: u64) -> Result<u32, i64> {
         if self.active {
             return Ok(self.wm.layout.count as u32);
         }
@@ -511,7 +655,22 @@ impl Awmi {
             println!("awmi: no display output: the session cannot start");
             return Err(sys::ERR_NOT_SUPPORTED);
         }
-        self.demo = demo;
+        self.demo = flags & wire::SESSION_DEMO != 0;
+        self.session_flags = flags;
+        self.autostart_until = 0;
+        // Large displays start with larger text (until the user picks a size).
+        if !self.scale_set
+            && let Some(p) = self.wm.layout.primary()
+        {
+            self.settings.text_scale = if p.bounds.w >= 3840 { 150 } else if p.bounds.w >= 2560 { 125 } else { 100 };
+        }
+        self.wm.now_ns = sys::clock_ns();
+        self.apply_settings();
+        for (owner, app, label) in &self.apps {
+            if let Some(c) = self.clients.iter().find(|c| c.id == *owner && c.ch != 0) {
+                self.wm.register_app(*owner, *app, label, &c.identity[..c.identity_len], c.trust);
+            }
+        }
         self.term_call(term::DISPLAY_RELEASE);
         self.grab(true);
         self.upload_cursor();
@@ -606,7 +765,14 @@ impl Awmi {
             self.attach_outputs();
             self.upload_cursor();
         }
-        let Self { wm, outs, surfaces, gpu: gpu_ep, .. } = self;
+        self.wm.now_ns = sys::clock_ns();
+        self.wm.tick();
+        let Self { wm, outs, surfaces, gpu: gpu_ep, text, .. } = self;
+        let mut bitmap = BitmapText;
+        let text: &mut dyn TextRender = match text.as_mut() {
+            Some(t) => t,
+            None => &mut bitmap,
+        };
         let mut presented = 0u64;
         let mut failed = false;
         if !wm.damage.is_empty() {
@@ -615,7 +781,7 @@ impl Awmi {
                 let px = (ob.width as usize) * (ob.height as usize);
                 let (w, h) = (ob.width, ob.height);
                 let Some(mut canvas) = Canvas::new(pixels_of(&mut ob.map, px), w, h, w) else { continue };
-                let local: DamageSet = wm.composite_output(out, &mut canvas, |wid| {
+                let local: DamageSet = wm.composite_output(out, &mut canvas, text, |wid| {
                     surfaces.iter().find(|s| s.window == wid).map(|s| SurfaceView { bytes: s.map.bytes(), width: s.width, height: s.height, pitch_bytes: s.pitch })
                 });
                 if ob.adapter == 0 {
@@ -666,6 +832,27 @@ impl Awmi {
         }
     }
 
+    /// A frame is due: damage, owed frames, the cursor, an animation.
+    fn due(&self) -> bool {
+        !self.wm.damage.is_empty() || self.cursor_moved || self.reattach || self.wm.animating() || self.surfaces.iter().any(|s| s.pending.is_some())
+    }
+
+    /// The font pack for a window program: a read-only duplicate of the pack VMO.
+    fn fonts_reply(&self, ch: Handle, txid: u32) {
+        let mut rep = [0u8; HEADER];
+        let dup = if self.pack_vmo != 0 { sys::handle_duplicate(self.pack_vmo, sys::RIGHT_READ | sys::RIGHT_MAP | sys::RIGHT_TRANSFER).ok() } else { None };
+        match dup {
+            Some(h) => {
+                Header { txid, op: wire::OP_FONTS, status: 0, a: self.pack_len, b: 0 }.put(&mut rep);
+                sys::channel_write_h(ch, &rep, &[sys::MsgHandle { handle: h, rights: sys::RIGHTS_SAME }]);
+            }
+            None => {
+                Header { txid, op: wire::OP_FONTS, status: sys::ERR_NOT_SUPPORTED as i32, a: 0, b: 0 }.put(&mut rep);
+                sys::channel_write(ch, &rep);
+            }
+        }
+    }
+
     // ---- client requests --------------------------------------------------------------------------
 
     fn on_client(&mut self, id: u32) {
@@ -683,6 +870,14 @@ impl Awmi {
                         }
                         continue;
                     };
+                    let is_window = self.clients.iter().any(|c| c.id == id && c.role == Role::Window);
+                    if h.op == wire::OP_FONTS && is_window && h.txid != 0 {
+                        if hnd != 0 {
+                            sys::handle_close(hnd);
+                        }
+                        self.fonts_reply(ch, h.txid);
+                        continue;
+                    }
                     let (status, a, b, body) = self.request(id, h, &buf[HEADER..n], hnd);
                     if h.txid != 0 {
                         let mut rep = alloc::vec![0u8; HEADER + body.len()];
@@ -701,6 +896,7 @@ impl Awmi {
                     if let Some(c) = self.clients.iter_mut().find(|c| c.id == id) {
                         c.ch = 0;
                     }
+                    self.apps.retain(|a| a.0 != id);
                     self.surfaces.retain(|s| s.owner != id);
                     self.wm.remove_client(id);
                     self.sync_windows();
@@ -734,12 +930,47 @@ impl Awmi {
                 self.status().encode(&mut b);
                 (0, 0, 0, b.to_vec())
             }
-            wire::OP_SESSION_START if admin => match self.session_start(h.a & 1 != 0) {
+            wire::OP_SESSION_START if admin => match self.session_start(h.a & (wire::SESSION_DEMO | wire::SESSION_DESKTOP)) {
                 Ok(n) => ok(u64::from(n), 0),
                 Err(e) => err(e),
             },
             wire::OP_SESSION_STOP if admin => {
                 self.session_stop("asked to");
+                ok(0, 0)
+            }
+            wire::OP_SETTINGS if admin => {
+                let want = UiSettings::unpack(h.a);
+                let mut s = self.settings;
+                if h.b & wire::SET_THEME != 0 {
+                    s.theme = want.theme;
+                }
+                if h.b & wire::SET_TEXT_SCALE != 0 {
+                    s.text_scale = want.text_scale;
+                    self.scale_set = true;
+                }
+                if h.b & wire::SET_MOTION != 0 {
+                    s.reduce_motion = want.reduce_motion;
+                }
+                if s != self.settings {
+                    self.settings = s;
+                    self.apply_settings();
+                }
+                ok(self.settings.pack(), 0)
+            }
+            wire::OP_APP_REGISTER if role == Role::Window => {
+                let app = h.a as u8;
+                let label: Vec<u8> = payload[..payload.len().min(dosawmi::launcher::LAUNCH_LABEL_BYTES)].to_vec();
+                if usize::from(app) >= dosawmi::launcher::MAX_APPS_PER_CLIENT || label.is_empty() || h.a > 0xFF {
+                    return err(sys::ERR_INVALID_ARGS);
+                }
+                if self.apps.len() >= dosawmi::launcher::MAX_LAUNCH_APPS && !self.apps.iter().any(|a| a.0 == id && a.1 == app) {
+                    return err(sys::ERR_NO_RESOURCES);
+                }
+                self.apps.retain(|a| !(a.0 == id && a.1 == app));
+                self.apps.push((id, app, label.clone()));
+                if self.active {
+                    self.wm.register_app(id, app, &label, &identity[..identity_len], trust);
+                }
                 ok(0, 0)
             }
             wire::OP_INDICATOR if role == Role::Indicator => {
@@ -779,7 +1010,16 @@ impl Awmi {
                 };
                 s.pending = Some(h.b);
                 let mut rects = [Rect::EMPTY; wire::MAX_DAMAGE];
-                let n = dosawmi::proto::decode_damage_rects(payload, &mut rects);
+                let mut n = dosawmi::proto::decode_damage_rects(payload, &mut rects);
+                // The first commit into a newly attached buffer swaps it in (the old one is
+                // unmapped when `new`, now holding it, drops) and shows all of it.
+                if let Some(mut new) = s.staged.take() {
+                    core::mem::swap(&mut s.map, &mut new.map);
+                    s.width = new.width;
+                    s.height = new.height;
+                    s.pitch = new.pitch;
+                    n = 0;
+                }
                 self.wm.commit_damage(id, win, &rects[..n]);
                 ok(0, 0)
             }
@@ -832,6 +1072,21 @@ impl Awmi {
                 }
                 (0, 0, 0, body)
             }
+            wire::OP_TEST_FRAME if test && self.active => {
+                self.flush();
+                let bg = self.wm.theme.desktop_bg & 0x00FF_FFFF;
+                let Some(ob) = self.outs.first() else { return err(sys::ERR_BAD_STATE) };
+                let px = (ob.width as usize) * (ob.height as usize);
+                let bytes = ob.map.bytes();
+                let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                let mut other = 0u64;
+                for c in bytes[..px * 4].as_chunks::<4>().0 {
+                    let v = u32::from_le_bytes(*c) & 0x00FF_FFFF;
+                    hash = (hash ^ u64::from(v)).wrapping_mul(0x0100_0000_01b3);
+                    other += u64::from(v != bg);
+                }
+                ok(hash, other)
+            }
             wire::OP_TEST_ADD_OUTPUT if test && self.active => {
                 let (w, hh) = ((h.a as u32).clamp(320, 4096), ((h.a >> 32) as u32).clamp(200, 4096));
                 let Ok(map) = Mapping::new(u64::from(w) * u64::from(hh) * 4) else {
@@ -876,9 +1131,12 @@ impl Awmi {
         let Ok(map) = Mapping::of_ro(hnd, need) else {
             return fail(sys::ERR_ACCESS_DENIED); // not readable or mappable
         };
-        let told = self.surfaces.iter().find(|s| s.window == win).map_or((0, 0, 0), |s| s.told);
-        self.surfaces.retain(|s| s.window != win);
-        self.surfaces.push(Surface { window: win, owner: id, map, width: w, height: hh, pitch, pending: None, told });
+        let new = Surface { window: win, owner: id, map, width: w, height: hh, pitch, pending: None, told: (0, 0, 0), staged: None };
+        match self.surfaces.iter_mut().find(|s| s.window == win) {
+            // A resize: shown at the next commit (see `OP_COMMIT`); until then the old pixels.
+            Some(s) => s.staged = Some(Box::new(new)),
+            None => self.surfaces.push(new),
+        }
         self.sync_windows();
         (0, 0, 0, Vec::new())
     }
@@ -900,6 +1158,10 @@ impl Awmi {
             damage_flushes: self.flushes,
             input_keys: self.input_keys,
             input_pointer: self.input_pointer,
+            settings: self.settings.pack() as u32,
+            launcher_open: self.active && self.wm.launcher.open,
+            fonts: self.text.is_some(),
+            apps: self.apps.len() as u8,
         }
     }
 }
@@ -909,8 +1171,23 @@ fn main(s: *const Startup) -> i32 {
     if !unsafe { libd::init(s, "awmi") } {
         return 1;
     }
-    let test_mode = libd::args().split(|&c| c == b' ' || c == 0).any(|a| a == b"test");
+    let has_arg = |w: &[u8]| libd::args().split(|&c| c == b' ' || c == 0).any(|a| a == w);
+    let test_mode = has_arg(b"test");
+    let autostart = has_arg(b"autostart");
     let Ok(port) = Port::new(256) else { return 1 };
+    let (text, pack_vmo, pack_len) = match load_fonts() {
+        Some((map, len)) => {
+            let vmo = map.vmo;
+            // The pack lives as long as this service: the engine borrows it for ever.
+            let map: &'static Mapping = Box::leak(Box::new(map));
+            (Some(FontText::new(fonts::engine(&map.bytes()[..len as usize]), 100)), vmo, len)
+        }
+        None => {
+            println!("awmi: no fonts on the system volume: the built-in bitmap font draws");
+            (None, 0, 0)
+        }
+    };
+    let themes = [load_theme(ThemeId::DarkSlate), load_theme(ThemeId::HighContrast)];
     let mut a = Awmi {
         port,
         ctl: libd::startup_handle(proto::TAG_CONTROL),
@@ -940,6 +1217,15 @@ fn main(s: *const Startup) -> i32 {
         mic_live: false,
         clock_base: None,
         reattach: false,
+        text,
+        pack_vmo,
+        pack_len,
+        themes,
+        settings: UiSettings::DEFAULT,
+        scale_set: false,
+        apps: Vec::new(),
+        session_flags: 0,
+        autostart_until: if autostart { sys::clock_ns() + AUTOSTART_WAIT_NS } else { 0 },
     };
     if a.ctl != 0 {
         a.port.arm(a.ctl, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
@@ -951,15 +1237,28 @@ fn main(s: *const Startup) -> i32 {
         "awmi: ready, idle until a session starts (endpoints: window, admin, query, indicator{})",
         if test_mode { "; test hooks on" } else { "" }
     );
+    let mut next_try = 0u64;
     loop {
-        // Idle: wait for a request. In a session: until the next frame is due (damage pending or
-        // frames owed to clients), or the next dock refresh.
+        // Boot: a desktop session as soon as a display is there (the GPU drivers come up after
+        // this service); without one by the deadline, the text console stays.
         let now = sys::clock_ns();
+        if a.autostart_until != 0 && !a.active && now >= next_try {
+            if now >= a.autostart_until {
+                println!("awmi: no display for a desktop: staying in the text console");
+                a.autostart_until = 0;
+            } else if a.gpu != 0 && a.session_start(wire::SESSION_DESKTOP).is_ok() {
+                println!("awmi: desktop session started at boot");
+            } else {
+                next_try = now + 500 * MS;
+            }
+        }
+        // Idle: wait for a request. In a session: until the next frame is due (damage pending,
+        // frames owed to clients, an animation), or the next dock refresh.
         let timeout = if !a.active {
-            sys::WAIT_FOREVER
+            if a.autostart_until != 0 { next_try.saturating_sub(now).max(MS) } else { sys::WAIT_FOREVER }
         } else {
             let mut until = a.next_tray;
-            if !a.wm.damage.is_empty() || a.cursor_moved || a.reattach || a.surfaces.iter().any(|s| s.pending.is_some()) {
+            if a.due() {
                 until = until.min(a.next_frame);
             }
             until.saturating_sub(now)
@@ -978,9 +1277,9 @@ fn main(s: *const Startup) -> i32 {
         }
         if a.active {
             let now = sys::clock_ns();
+            a.wm.now_ns = now;
             a.poll_tray();
-            let due = !a.wm.damage.is_empty() || a.cursor_moved || a.reattach || a.surfaces.iter().any(|s| s.pending.is_some());
-            if due && now >= a.next_frame {
+            if a.due() && now >= a.next_frame {
                 a.frame();
                 // Refresh-paced: bursts of commits and pointer motion coalesce into one frame.
                 a.next_frame = now + a.frame_interval();

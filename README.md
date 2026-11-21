@@ -15,14 +15,14 @@ measured**. Where standards cost nothing, D-OS uses them: ELF, UEFI, ACPI, GPT, 
 |---|---|---|
 | **D-KRNL** | the kernel | working, hardened, extensively tested |
 | **D-CMPL** | compatibility layer for Windows and Linux programs | console programs run |
-| **D-AWMI** | window manager and graphics | planned |
+| **D-AWMI** | compositor, window manager and UI toolkit | desktop, terminal window, launcher |
 | **D-PACK** | signed packages and updates | planned |
 
 ## Where it stands
 
 **D-KRNL 1.0.** The kernel is complete (stable SMP, a versioned ABI, every protection proven by a
-test, fuzzers and sanitizers clean). It boots in QEMU and on real PCs (BIOS and UEFI) to a terminal and a shell. There
-is no GUI yet.
+test, fuzzers and sanitizers clean). It boots in QEMU and on real PCs (BIOS and UEFI) to a desktop with a terminal window, or to
+the text console when there is no display.
 
 - Own BIOS and UEFI loaders with verified boot (Ed25519) and KASLR; one GPT image for both
 - SMP kernel (x2APIC), W^X everywhere, SMEP/SMAP/UMIP, KPTI, retpolines and other speculation
@@ -39,6 +39,10 @@ is no GUI yet.
   and keyboard input
 - A terminal and a shell whose commands pass typed records (`list | where size > 1M | sort
   modified`); each tool gets only the paths typed, with the rights its manifest declares
+- A desktop (D-AWMI): damage-tracked compositing with zero-copy GPU scanout, floating and snapped
+  windows whose title bars show the verified program, a dock, a type-to-search launcher, anti-aliased
+  Inter and Iosevka text, a declarative toolkit, Dark Slate and High Contrast themes, text sizes up
+  to 200 %
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
 - Windows console programs built with MSVC's static C runtime (threads, TLS, SEH, C++
   exceptions, files) and static Linux programs (threads, `mmap`, files, signals, `futex`) run

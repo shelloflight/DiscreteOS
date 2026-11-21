@@ -24,7 +24,7 @@ public Root CAs compiled to `sys:/certs/roots.der`), `user/net` (`net.dsvc`),
 |---|---|
 | `virtio-net.ddrv` | VirtIO 1.0+ network adapter (PCI `1AF4:1041`): modern PCI transport, RX/TX virtqueues with 12-byte `virtio_net_hdr`, link status detection, MSI-X interrupts, IOMMU-confined DMA buffers. |
 | `e1000e.ddrv` | Intel Gigabit & 2.5GbE Ethernet (PCI `8086:*` class `02.00`): supports classic `e1000e`/`e1000` (82574L, I217/I218/I219) plus `igb` (I210/I211/I350) and `igc` (I225-V/I226-V 2.5GbE) extended queue registers (`0xC000`/`0xE000`, `SRRCTL`, `RXDCTL`/`TXDCTL` queue enable, `EIMS`/`IVAR`), dynamic link polling, and IOMMU-confined 24-entry TX/RX rings. |
-| `r8169.ddrv` | Realtek Gigabit / 2.5GbE / 5GbE Ethernet (PCI `10EC:*` class `02.00`): supports RTL8111/8168/8169 and RTL8125/8125B/8125D/8126/8127 (auto-detected via PCI device ID / `TxConfig` XID), with 8125-specific TX doorbell (`0x90`), 32-bit IMR/ISR (`0x38`/`0x3C`), `RX_FETCH_DFLT_8125`, `MISC.RXDV_GATED_EN` clearing, dynamic link polling, and IOMMU-confined 24-entry TX/RX rings. |
+| `r8169.ddrv` | Realtek Gigabit / 2.5GbE / 5GbE Ethernet (PCI `10EC:*` class `02.00`): supports RTL8111/8168/8169 and RTL8125/8125B/8125D/8126/8127 (auto-detected via PCI device ID / `TxConfig` XID), with 8125-specific TX doorbell (`0x90`), 32-bit IMR/ISR (`0x38`/`0x3C`), `RX_FETCH_DFLT_8125`, `MISC.RXDV_GATED_EN` clearing, dynamic link polling, and IOMMU-confined 24-entry TX/RX rings. The MAC address is read as Linux reads it (the factory backup register `0x19E0` on RTL8125 and later, ERI `0xE0` on RTL8168E-VL and later, else `IDR0-5`; a random locally administered one if none is valid) and written back into the receive filter. |
 | `net.dsvc` | Owns the `dosnet::NetStack` state machine, runs automatic DHCPv4 configuration when a NIC attaches, manages client TCP/UDP/DNS/ICMP requests over shared `IoRing` channels, and enforces capability boundaries across endpoints. |
 | `dosnet` | Pure-Rust `no_std` network stack (`#![forbid(unsafe_code)]`): strict bounds-checked Ethernet II, ARP, IPv4, ICMPv4, UDP, DHCPv4, DNS (with compression-pointer loop and depth protection), RFC 9293 TCP, and strict TLS 1.3. |
 
@@ -51,7 +51,10 @@ net = ["status"]                    # interface status only (read-only; the desk
 - `status(ctrl)` — query active link state, MAC address, IPv4 address, netmask, gateway, DNS
   server, and packet counters.
 - `set_dns(ctrl, ip)` — override the DNS resolver address (requires `net.control`).
-- `resolve(client, name)` — resolve a hostname via UDP DNS (`A` record).
+- `resolve(client, name)` — resolve a hostname via UDP DNS (`A` record). A lookup sends one
+  query a second, each to the next server: the configured one, a second server from DHCP, then
+  the public resolvers 1.1.1.1, 9.9.9.9 and 8.8.8.8, so names resolve even when the network's DNS
+  is missing or broken (trade-off: those lookups are seen by the public resolver).
 - `ping(icmp, ip, timeout_ms)` — send an ICMP Echo Request and return round-trip time (requires
   `net.icmp`).
 - `TcpStream::connect(client, ip, port)` — open a zero-copy `IoRing`-backed TCP connection
@@ -89,9 +92,16 @@ net = ["status"]                    # interface status only (read-only; the desk
 The shell holds `net = ["client", "icmp", "control"]` and provides:
 
 - `net` (`ip` alias) — display link state, MAC, IPv4 address, netmask, gateway, DNS server, and
-  TX/RX counters.
+  TX/RX counters. `net check` tries each step to the internet (DHCP address, the router, the
+  internet by ICMP and by TCP port 443, a name lookup) and says in one line what does not work,
+  for example that ping replies are blocked while the internet works.
 - `ping <host> [count]` — resolve a hostname or IPv4 address and send ICMP Echo Requests (default
-  4 pings), reporting per-reply RTT and packet loss summary.
+  4 pings), reporting per-reply RTT and packet loss summary. When no reply comes, it tries TCP
+  ports 443 and 80 on the host and says whether the host is reachable that way (many networks
+  drop ping but carry everything else). An unanswered ping is logged by
+  `net.dsvc` with where it failed (`log net`): no ARP reply from the first hop (the gateway, for
+  hosts off the subnet), or the echo sent with no reply, with the frame counters. Drivers log
+  frames dropped because the network service had no receive buffer posted.
 - `tls <host> [port]` — resolve a host, load `/sys/certs/roots.der`, perform a strict TLS 1.3
   handshake using the kernel CSPRNG and UTC clock, and report the negotiated cipher suite and key
   exchange group (e.g. `TLS_AES_256_GCM_SHA384 / X25519MLKEM768`).
@@ -110,4 +120,5 @@ The shell holds `net = ["client", "icmp", "control"]` and provides:
   bring-up, DHCP lease acquisition, ungranted-process refusal, role separation, DNS lookup, ICMP
   ping, TCP HTTP round-trip, post-quantum `X25519MLKEM768` + `TLS_AES_256_GCM_SHA384` handshake
   backed by the kernel CSPRNG, and bad-SAN TLS 1.3 rejection.
-- `net-shell`: QEMU shell test verifying DHCP, `net` status output, and `ping 10.0.2.2 2`.
+- `net-shell`: QEMU shell test verifying DHCP, `net` status output, `ping 10.0.2.2 2` and
+  `net check`.

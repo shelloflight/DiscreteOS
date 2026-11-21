@@ -1,5 +1,6 @@
 # `dbuild`: cross-platform (Windows & Linux) host build, test, image, and contributor CLI for D-OS.
-# Zero external crates: uses only std and the in-tree `dosfs` and `doscrypt` libraries.
+# Zero external crates: uses only std and the in-tree `dosfs`, `doscrypt`, `dosnet` and `dosfont`
+# libraries.
 [package]
 name = "dbuild"
 version = "0.1.0"
@@ -11,6 +12,7 @@ publish = false
 dosfs = { path = "../../user/lib/fs" }
 doscrypt = { path = "../../user/lib/crypto" }
 dosnet = { path = "../../user/lib/net", features = ["tls-server"] }
+dosfont = { path = "../../user/lib/font" }
 
 [profile.release]
 opt-level = 2
