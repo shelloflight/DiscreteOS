@@ -140,7 +140,7 @@ impl OutputLayout {
             .map(|o| o.refresh_mhz)
             .max()
             .unwrap_or(60_000)
-            .clamp(30_000, 240_000)
+            .clamp(30_000, 1_000_000)
     }
 }
 

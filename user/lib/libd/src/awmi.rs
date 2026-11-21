@@ -94,6 +94,9 @@ pub const OP_SETTINGS: u32 = 934;
 pub const SET_THEME: u64 = 1;
 pub const SET_TEXT_SCALE: u64 = 2;
 pub const SET_MOTION: u64 = 4;
+/// `awmi.admin`: run the 5-second native hardware page-flip test (`a` = adapter id, `b` = duration_ms),
+/// pausing the terminal safely and reverting automatically; reply payload = `gpu::FlipTestResult`.
+pub const OP_FLIP_TEST: u32 = 935;
 
 // ---- `awmi.admin`, compositor in test mode only ---------------------------------------------------
 
@@ -260,6 +263,31 @@ pub fn register_app(ep: Handle, app: u8, label: &[u8]) -> Result<(), i64> {
 /// Change settings (`which`: `SET_*` bits); the settings now.
 pub fn set_settings(ep: Handle, packed: u64, which: u64) -> Result<u64, i64> {
     simple(ep, OP_SETTINGS, packed, which, &[]).map(|h| h.a)
+}
+
+/// Run the native display flip test via `awmi.admin` (releases terminal, flips two patterns with
+/// frame counter for `duration_ms`, reverts to GOP, reclaims terminal).
+pub fn flip_test(ep: Handle, adapter_id: u32, duration_ms: u32) -> Result<crate::gpu::FlipTestResult, i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER];
+    Header {
+        txid: 0,
+        op: OP_FLIP_TEST,
+        status: 0,
+        a: u64::from(adapter_id),
+        b: u64::from(duration_ms),
+    }
+    .put(&mut req);
+    let mut rep = [0u8; HEADER + crate::gpu::FLIP_TEST_BYTES];
+    let timeout = u64::from(duration_ms.clamp(500, 15_000)) * 1_000_000 + 10_000_000_000;
+    let n = sys::channel_call(ep, &req, &mut rep, timeout)? as usize;
+    let h = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if h.status != 0 {
+        return Err(i64::from(h.status));
+    }
+    crate::gpu::FlipTestResult::decode(&rep[HEADER..n]).ok_or(sys::ERR_INVALID_ARGS)
 }
 
 /// Test hook: (hash of the primary output's pixels, pixels that are not the desktop background).

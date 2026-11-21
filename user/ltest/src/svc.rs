@@ -605,9 +605,17 @@ pub fn gpu_queryonly() -> i32 {
     }
     check!(count > 0, "no gpu adapters found");
     let id = adapters[0].id;
+    // Read-only display probe must succeed on query endpoint.
+    let probe = gpu::get_display_info(q, id);
+    check!(probe.is_ok(), "get_display_info failed on query: {:?}", probe);
     // Query-only endpoint must be refused on display, render, and crash-driver operations.
     check!(gpu::set_mode(q, id, 800, 600) == Err(sys::ERR_ACCESS_DENIED), "set_mode not refused on query");
     check!(gpu::present(q, id, 1, 0, 0, 64, 64) == Err(sys::ERR_ACCESS_DENIED), "present not refused on query");
+    check!(gpu::present_multi(q, id, 1, &[(0, 0, 64, 64)]) == Err(sys::ERR_ACCESS_DENIED), "present_multi not refused on query");
+    check!(gpu::release_display(q, id) == Err(sys::ERR_ACCESS_DENIED), "release_display not refused on query");
+    check!(gpu::set_vrr(q, id, true, 48, 240) == Err(sys::ERR_ACCESS_DENIED), "set_vrr not refused on query");
+    check!(gpu::set_hdr(q, id, true) == Err(sys::ERR_ACCESS_DENIED), "set_hdr not refused on query");
+    check!(gpu::flip_test(q, id, 500) == Err(sys::ERR_ACCESS_DENIED), "flip_test not refused on query");
     check!(gpu::ctx_create(q, id) == Err(sys::ERR_ACCESS_DENIED), "ctx_create not refused on query");
     check!(gpu::crash_driver(q, id) == Err(sys::ERR_ACCESS_DENIED), "crash_driver not refused on query");
     println!("svc-gpu-queryonly: PASSED (query ok, display/render refused)");
@@ -710,7 +718,9 @@ pub fn gpu_full() -> i32 {
     check!(f1 == Ok(1), "first present failed: {:?}", f1);
     let f2 = gpu::present(disp, id, fb_id, 32, 32, 128, 128);
     check!(f2 == Ok(2), "partial damage present failed: {:?}", f2);
-    println!("svc-gpu-full: scanout OK ({}x{}, 2 frames presented)", w, h);
+    let f3 = gpu::present_multi(disp, id, fb_id, &[(0, 0, 64, 64), (64, 64, 64, 64)]);
+    check!(matches!(f3, Ok((3, _))), "multi-rect present failed: {:?}", f3);
+    println!("svc-gpu-full: scanout OK ({}x{}, 3 frames presented)", w, h);
 
     // 5. PCI VirtIO-GPU specific checks: cursor, mode switch, CS validation, and crash-recovery.
     if ad.kind == gpu::KIND_VIRTIO_GPU {

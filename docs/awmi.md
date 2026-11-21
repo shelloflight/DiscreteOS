@@ -21,22 +21,30 @@ dock, launcher, themes, wire codecs), `user/awmi` (`awmi.dsvc`, `awmi-demo.dsvc`
 
 ## Session lifecycle
 
-1. **Outputs** from `gpu.display`: the firmware framebuffer when there is one (it is the screen the
-   terminal draws on, so ending the session hands it straight back), otherwise every online PCI GPU
-   (`virtio-gpu`, `amdgpu`, `xe`, `nvgpu`). Each output gets one offscreen backbuffer VMO, attached
-   once and kept across sessions: zero-copy IOMMU scanout on PCI GPUs, write-combining blits on the
-   firmware framebuffer. Several outputs form one desktop, left to right.
+1. **Outputs** from `gpu.display`: verified native PCI outputs (`CAP_NATIVE_GOP_MATCH`, e.g. AMD
+   DCN after passing its GOP-match and 3-frame flip self-check) are preferred over the firmware
+   framebuffer for tear-free high-refresh scanout; `display = firmware` in `esp:/DOS/BOOT.CFG`
+   (passing `firmware-display` to `awmi`) forces the firmware framebuffer instead. Without a
+   verified native PCI output, the firmware framebuffer is used when present, otherwise every online
+   PCI GPU (`virtio-gpu`, `amdgpu`, `xe`, `nvgpu`). Each output gets one offscreen backbuffer VMO,
+   attached once and kept across sessions: zero-copy IOMMU scanout on PCI GPUs, write-combining
+   blits on the firmware framebuffer or native VRAM scanout buffers. Several outputs form one
+   desktop, left to right.
 2. **Screen and input:** `terminal.display` `DISPLAY_RELEASE` (the terminal keeps its scrollback but
    stops drawing) and `devmgr.input` `INPUT_GRAB` (keys and pointer events go to the compositor
    only: nothing typed reaches the shell).
-3. **Frames:** client commits, input, dock changes and animations add damage. A refresh-paced
-   timer composites only the damaged rectangles (desktop, windows bottom to top, snap preview,
-   dock, launcher, software cursor) and presents just those. Bursts coalesce into one frame per refresh. A single output with
-   `CAP_HW_CURSOR` uses the 64x64 hardware cursor; otherwise the cursor is drawn in software.
+3. **Frames:** client commits, input, dock changes and animations add damage. Outputs supporting
+   `CAP_ASYNC_FLIP` use event-driven vsync pacing (`OP_PRESENT_MULTI` -> unsolicited
+   `EVT_FLIP_DONE` from the driver's vblank/flip interrupt, tying `EVT_FRAME_DONE` to real vertical
+   blank with zero idle CPU and stepping down cleanly on late frames); synchronous outputs use a
+   refresh-paced timer (supporting up to 540+ Hz). Bursts coalesce into one frame per refresh. A
+   single output with `CAP_HW_CURSOR` uses the hardware cursor and pushes pointer moves immediately
+   without recompositing; otherwise the cursor is drawn in software.
 4. **End:** `Super+Esc` (`Ctrl+Alt+Esc` inside a VM, where the host takes `Super`) or
-   `OP_SESSION_STOP`: every window closes (`EVT_SESSION` 0), the grab is released, the terminal
-   redraws. If the compositor exits or crashes, the device manager and the terminal see its channels
-   close and take input and screen back on their own.
+   `OP_SESSION_STOP`: every window closes (`EVT_SESSION` 0), native outputs call
+   `OP_RELEASE_DISPLAY` to restore the firmware GOP framebuffer, the grab is released, and the
+   terminal redraws. If the compositor exits or crashes, the device manager and the terminal see its
+   channels close and take input and screen back on their own.
 
 A GPU driver restart makes a present fail; the outputs are attached again at the next frame.
 
@@ -112,6 +120,7 @@ Requests are calls on the client's channel; events arrive on the same channel (t
 | `OP_STATUS` (932) | query, admin | session, outputs, mode, windows, workspace, indicators, frames, input counters, settings, launcher, fonts, entries |
 | `OP_INDICATOR` (933) | indicator | `IND_SECURITY_ALERT` |
 | `OP_SETTINGS` (934) | admin | `a` = settings (theme, text size << 8, reduce motion << 24), `b` = which (`SET_*`) |
+| `OP_FLIP_TEST` (935) | admin | `a` = adapter id (0 = first), `b` = duration ms; releases terminal, runs `gpu::flip_test`, restores terminal |
 | `OP_TEST_*` (940-945) | admin, test mode only | inject keys and pointer events, read back a backbuffer pixel, list windows, add a virtual output, hash a frame |
 
 Events: `EVT_CONFIGURE` (size and state after a snap, resize, maximize, minimize, focus change),
@@ -142,8 +151,10 @@ Window programs that ship with the desktop, all ordinary `awmi.window` clients:
   to it can tear while something moves (dragging a window, the launcher opening). To keep that
   rare, the launcher's dim is drawn once and only its panel animates. Tear-free output needs a
   native display driver that flips buffers at vertical blank.
-- On a PCI GPU the terminal's firmware framebuffer is not the scanout, so the session prefers the
-  firmware framebuffer when there is one; a GOP-less machine (BIOS boot) uses its PCI GPUs.
+- On a verified native AMD display (`CAP_NATIVE_GOP_MATCH`), the compositor flips dedicated VRAM
+  scanout buffers at vertical blank and restores the untouched GOP scanout on session end; on
+  unverified PCI GPUs or when `display = firmware` is configured in `BOOT.CFG`, the session falls
+  back to the firmware framebuffer when present (or PCI GPUs on GOP-less BIOS boots).
 
 ## Tests
 

@@ -1647,7 +1647,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             .timeout(90)
             .must_exit()
             .keys_vec(
-                convert_to_qemu_keys(&["gpu", "gpu modes", "power off"], 500),
+                convert_to_qemu_keys(&["gpu", "gpu modes", "gpu display", "power off"], 500),
                 "shell: ready",
             )
             .expect(&[
@@ -1655,6 +1655,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "terminal|   1  virtio-gpu",
                 "1af4:1050",
                 "1024x768",
+                "gop/virtio",
                 "Power: switching off",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),

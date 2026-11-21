@@ -35,7 +35,7 @@ pub const MAX_HANDLES: usize = 256;
 /// ABI version (docs/abi.md): 2 added IPC, ports and exceptions; 3 added devices for user-space
 /// drivers. A program built for version N runs on any kernel whose
 /// version is at least N.
-pub const ABI_VERSION: u32 = 14;
+pub const ABI_VERSION: u32 = 15;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44; // "DOSS"
 
 /// Startup handle tags (docs/abi.md).
