@@ -1,0 +1,20 @@
+# D-AWMI test window client B (window grant only; VMEX makes its trust tier "sandbox"): draws a green
+# window, sets a forged-looking title, must receive exactly the key typed while it is focused.
+name = "svc-awmi-b"
+image = "ltest.dx"
+args = "svc-awmi-b"
+group = "test"
+after = ["awmi"]
+
+[grants]
+log = true
+awmi = ["window"]
+vmex = true
+
+[quota]
+memory = "16M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"

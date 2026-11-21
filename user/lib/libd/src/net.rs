@@ -8,6 +8,7 @@
 //! - `net.client`: DNS resolution, TCP connections, UDP sockets, interface status.
 //! - `net.icmp`:   ICMP echo (`ping`), DNS resolution, interface status.
 //! - `net.control`: interface status and DNS configuration.
+//! - `net.status`:  interface status only (read-only; the desktop's network indicator).
 //!
 //! An application without `grants.net` receives no endpoints and cannot access the network.
 
@@ -99,6 +100,11 @@ pub fn icmp_endpoint() -> Handle {
 /// Look up the granted `net.control` endpoint handle (0 if not granted).
 pub fn control_endpoint() -> Handle {
     svc::endpoint(b"net.control")
+}
+
+/// Look up the granted read-only `net.status` endpoint handle (0 if not granted).
+pub fn status_endpoint() -> Handle {
+    svc::endpoint(b"net.status")
 }
 
 /// Fixed-size network interface status snapshot returned by `OP_STATUS` (128 bytes).
@@ -199,7 +205,7 @@ impl NetStatus {
     }
 }
 
-/// Query network interface status from `net.control`, `net.client`, or `net.icmp`.
+/// Query network interface status from `net.status`, `net.control`, `net.client`, or `net.icmp`.
 pub fn status(ch: Handle) -> Result<NetStatus, i64> {
     if ch == 0 {
         return Err(sys::ERR_ACCESS_DENIED);

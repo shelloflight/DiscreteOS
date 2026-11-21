@@ -1,0 +1,17 @@
+# D-AWMI test service with NO awmi grant: must receive zero compositor endpoints.
+name = "svc-awmi-ungranted"
+image = "ltest.dx"
+args = "svc-awmi-ungranted"
+group = "test"
+after = ["awmi"]
+
+[grants]
+log = true
+
+[quota]
+memory = "8M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"

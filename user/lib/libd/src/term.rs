@@ -31,6 +31,13 @@ pub const INDICATOR: u32 = 508;
 /// Indicator flag bits for `INDICATOR`.
 pub const IND_MIC_ACTIVE: u64 = 1 << 0;
 
+/// Compositor -> terminal (`terminal.display`, a call): stop drawing on the screen (a graphical
+/// session owns it). Output is still kept in the scrollback. Reply: the same op.
+pub const DISPLAY_RELEASE: u32 = 509;
+/// Compositor -> terminal (`terminal.display`, a call): the screen is the terminal's again; it
+/// redraws everything. Also implied when the compositor's channel closes (it exited or crashed).
+pub const DISPLAY_RECLAIM: u32 = 510;
+
 /// Style control bytes in text.
 pub const STYLE: u8 = 0x01;
 pub const PLAIN: u8 = 0x02;

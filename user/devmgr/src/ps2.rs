@@ -119,10 +119,17 @@ pub fn main(s: *const Startup) -> i32 {
                 continue;
             }
             let ext = core::mem::take(&mut extended);
-            let code = u16::from(sc & 0x7F);
-            if ext && (code == keymap::LSHIFT || code == keymap::RSHIFT) {
+            let raw = u16::from(sc & 0x7F);
+            if ext && (raw == keymap::LSHIFT || raw == keymap::RSHIFT) {
                 continue; // the fake shifts some keyboards send around the navigation block
             }
+            let code = if ext && raw == 0x5B {
+                keymap::LMETA
+            } else if ext && raw == 0x5C {
+                keymap::RMETA
+            } else {
+                raw
+            };
             if let Some(c) = keys.key(code, sc & 0x80 == 0) {
                 proto::send(ch, proto::KEY, u64::from(c), 0);
             }

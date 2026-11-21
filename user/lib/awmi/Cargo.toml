@@ -1,0 +1,19 @@
+# `dosawmi`: pure no_std, zero-unsafe, in-tree compositor & window manager core for D-OS (D-AWMI).
+# Shared between `awmi.dsvc`, `libd::awmi`, and host unit/fuzz tests (`awmi-host`).
+[package]
+name = "dosawmi"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+bench = false
+
+[profile.test]
+opt-level = 2
+overflow-checks = true
+
+[lints.rust]
+unsafe_code = "forbid"

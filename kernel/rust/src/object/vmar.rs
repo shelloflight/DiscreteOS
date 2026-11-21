@@ -30,6 +30,8 @@ pub const USER_BASE: u64 = ffi::USER_BASE;
 pub const USER_TOP: u64 = ffi::USER_TOP;
 const PAGE: u64 = 4096;
 const ASLR_TRIES: u32 = 16;
+/// Placements `allocate_at` makes when other threads keep taking the spot it found.
+const ALLOCATE_TRIES: u32 = 64;
 
 pub const PERM_MASK: Rights = Rights(Rights::READ.0 | Rights::WRITE.0 | Rights::EXECUTE.0);
 
@@ -336,21 +338,33 @@ impl Vmar {
 
     pub fn allocate_at(&self, at: Placement, len: u64) -> KResult<KRef<Vmar>> {
         // Find a place, then allocate the child without holding the lock (never drop it under it).
-        let g = self.inner.lock();
-        if g.dead {
-            return Err(Status::BadState);
-        }
-        let (start, _) = self.place(&g, at, len)?;
-        drop(g);
-        let child = Vmar::create(start, len, 0, false, self.aspace.clone())?;
-        let mut g = self.inner.lock();
-        // Re-check: the range may have been taken meanwhile.
-        let fits = !g.dead && Self::fits(&g, start, len).is_some();
-        if !fits || g.entries.try_reserve(1).is_err() {
-            let e = if !fits { Status::NoSpace } else { Status::NoMemory };
+        // Another thread of the process may take the range meanwhile (a heap mapping placed
+        // first-fit from the same hint): then place again. A fixed offset is not retried.
+        let mut tries = 0;
+        let (child, mut g) = loop {
+            let g = self.inner.lock();
+            if g.dead {
+                return Err(Status::BadState);
+            }
+            let (start, _) = self.place(&g, at, len)?;
+            drop(g);
+            let child = Vmar::create(start, len, 0, false, self.aspace.clone())?;
+            let g = self.inner.lock();
+            if !g.dead && Self::fits(&g, start, len).is_some() {
+                break (child, g);
+            }
             drop(g);
             drop(child);
-            return Err(e);
+            tries += 1;
+            if matches!(at, Placement::At(_)) || tries >= ALLOCATE_TRIES {
+                return Err(Status::NoSpace);
+            }
+        };
+        let start = child.base;
+        if g.entries.try_reserve(1).is_err() {
+            drop(g);
+            drop(child);
+            return Err(Status::NoMemory);
         }
         let pos = g.entries.partition_point(|e| e.start < start);
         g.entries.insert(

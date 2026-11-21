@@ -37,12 +37,13 @@ Services declare network permissions in their signed `.dman` manifest under `[gr
 net = ["client"]                    # DNS lookup, outbound TCP and UDP sockets
 net = ["client", "icmp"]            # plus ICMP echo (`ping`)
 net = ["client", "icmp", "control"] # plus interface status and configuration
+net = ["status"]                    # interface status only (read-only; the desktop's indicator)
 ```
 
 - **No ambient authority:** a process without `grants.net` receives no network endpoint handles
   from `init` and cannot access the network.
-- **Role separation:** `net.dsvc` exposes separate `net.client`, `net.icmp`, and `net.control`
-  endpoints. Calling `OP_PING` over a `net.client` handle or calling `OP_SET_DNS` over a
+- **Role separation:** `net.dsvc` exposes separate `net.client`, `net.icmp`, `net.control` and
+  read-only `net.status` endpoints. Calling `OP_PING` over a `net.client` handle or calling `OP_SET_DNS` over a
   non-control handle is refused with `ERR_ACCESS_DENIED`.
 
 ## Client API (`libd::net`)

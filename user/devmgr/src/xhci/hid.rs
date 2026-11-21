@@ -370,8 +370,17 @@ fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> ([u32; 8], usize, Opti
     let mut out = [0u32; 8];
     let mut n = 0;
     let mut held = None;
-    // Modifiers first: left/right control, shift and alt.
-    let mods = [(0, keymap::CTRL), (1, keymap::LSHIFT), (2, keymap::ALT), (4, keymap::CTRL), (5, keymap::RSHIFT), (6, keymap::ALT)];
+    // Modifiers first: left/right control, shift, alt, and Super/GUI.
+    let mods = [
+        (0, keymap::CTRL),
+        (1, keymap::LSHIFT),
+        (2, keymap::ALT),
+        (3, keymap::LMETA),
+        (4, keymap::CTRL),
+        (5, keymap::RSHIFT),
+        (6, keymap::ALT),
+        (7, keymap::RMETA),
+    ];
     for (bit, code) in mods {
         let (was, is) = (old[0] >> bit & 1, new[0] >> bit & 1);
         if was != is {

@@ -1,0 +1,30 @@
+# D-AWMI: the compositor and window manager. Idle at boot (no screen, no input) until a session is
+# started on its admin endpoint (the shell's `gui`); then it takes the display from the terminal
+# and the keyboard and pointer from the device manager (exclusive grab) until the session ends.
+# Clients' title bars show the identity the service manager verified (`identify`).
+name = "awmi"
+image = "awmi.dsvc"
+group = "system"
+after = ["devmgr", "gpu", "terminal", "clock", "audio", "net"]
+description = "D-AWMI compositor and window manager"
+
+[provides]
+endpoints = ["window", "admin", "query", "indicator"]
+identify = true
+
+[grants]
+log = true
+gpu = ["display"]
+audio = ["control"]   # the dock: microphone live, output muted
+net = ["status"]      # the dock: network up (read-only)
+connect = ["devmgr.input", "terminal.display", "clock.time"]
+
+[quota]
+memory = "192M"
+handles = 512
+threads = 4
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

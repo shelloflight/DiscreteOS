@@ -156,6 +156,9 @@ pub struct Manifest {
     // [provides]
     pub endpoints: Vec<String>,
     pub volumes: bool,
+    /// Clients' verified identity (service name, trust tier) is attached to each `svc::CONNECT`
+    /// the manager sends this provider (`provides.identify`).
+    pub identify: bool,
     // [grants]
     pub log: bool,
     pub devices: Vec<DeviceSel>,
@@ -178,14 +181,21 @@ pub struct Manifest {
     pub audio_playback: bool,
     pub audio_capture: bool,
     pub audio_control: bool,
-    /// Network capabilities (`grants.net`: `client`, `icmp`, `control`).
+    /// Network capabilities (`grants.net`: `client`, `icmp`, `control`, `status`).
     pub net_client: bool,
     pub net_icmp: bool,
     pub net_control: bool,
+    pub net_status: bool,
     /// GPU & display capabilities (`grants.gpu`: `query`, `display`, `render`).
     pub gpu_query: bool,
     pub gpu_display: bool,
     pub gpu_render: bool,
+    /// Compositor & window manager capabilities (`grants.awmi`: `window`, `admin`, `query`,
+    /// `indicator`).
+    pub awmi_window: bool,
+    pub awmi_admin: bool,
+    pub awmi_query: bool,
+    pub awmi_indicator: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
@@ -301,6 +311,7 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("", "log-level", Want::Str),
     ("provides", "endpoints", Want::Strings),
     ("provides", "volumes", Want::Bool),
+    ("provides", "identify", Want::Bool),
     ("grants", "log", Want::Bool),
     ("grants", "devices", Want::Strings),
     ("grants", "programs", Want::Strings),
@@ -315,6 +326,7 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "audio", Want::Strings),
     ("grants", "net", Want::Strings),
     ("grants", "gpu", Want::Strings),
+    ("grants", "awmi", Want::Strings),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -354,6 +366,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         log_level: LEVEL_INFO,
         endpoints: Vec::new(),
         volumes: false,
+        identify: false,
         log: false,
         devices: Vec::new(),
         programs: Vec::new(),
@@ -372,9 +385,14 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         net_client: false,
         net_icmp: false,
         net_control: false,
+        net_status: false,
         gpu_query: false,
         gpu_display: false,
         gpu_render: false,
+        awmi_window: false,
+        awmi_admin: false,
+        awmi_query: false,
+        awmi_indicator: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -426,6 +444,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
             (Want::Str, v) => return Err(bad(&format!("a string, not {}", v.type_name()))),
             (Want::Bool, Value::Bool(b)) => match fk.as_str() {
                 "provides.volumes" => m.volumes = *b,
+                "provides.identify" => m.identify = *b,
                 "grants.log" => m.log = *b,
                 "grants.vmex" => m.vmex = *b,
                 "grants.power" => m.power = *b,
@@ -567,7 +586,11 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                                     m.net_control = true;
                                     "control"
                                 }
-                                _ => return Err(invalid("unknown net right (client, icmp, control)", s)),
+                                "status" => {
+                                    m.net_status = true;
+                                    "status"
+                                }
+                                _ => return Err(invalid("unknown net right (client, icmp, control, status)", s)),
                             };
                             let c = Connect { service: "net".to_string(), endpoint: ep.to_string() };
                             if !m.connect.contains(&c) {
@@ -593,6 +616,33 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                                 _ => return Err(invalid("unknown gpu right (query, display, render)", s)),
                             };
                             let c = Connect { service: "gpu".to_string(), endpoint: ep.to_string() };
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
+                            }
+                        }
+                    }
+                    "grants.awmi" => {
+                        for s in &list {
+                            let ep = match s.as_str() {
+                                "window" => {
+                                    m.awmi_window = true;
+                                    "window"
+                                }
+                                "admin" => {
+                                    m.awmi_admin = true;
+                                    "admin"
+                                }
+                                "query" => {
+                                    m.awmi_query = true;
+                                    "query"
+                                }
+                                "indicator" => {
+                                    m.awmi_indicator = true;
+                                    "indicator"
+                                }
+                                _ => return Err(invalid("unknown awmi right (window, admin, query, indicator)", s)),
+                            };
+                            let c = Connect { service: "awmi".to_string(), endpoint: ep.to_string() };
                             if !m.connect.contains(&c) {
                                 m.connect.push(c);
                             }
@@ -680,7 +730,7 @@ pub fn summary(m: &Manifest) -> String {
         }
         add(&format!("audio ({})", parts.join(", ")));
     }
-    if m.net_client || m.net_icmp || m.net_control {
+    if m.net_client || m.net_icmp || m.net_control || m.net_status {
         let mut parts: Vec<&str> = Vec::new();
         if m.net_client {
             parts.push("client");
@@ -690,6 +740,9 @@ pub fn summary(m: &Manifest) -> String {
         }
         if m.net_control {
             parts.push("control");
+        }
+        if m.net_status {
+            parts.push("status");
         }
         add(&format!("net ({})", parts.join(", ")));
     }
@@ -705,6 +758,18 @@ pub fn summary(m: &Manifest) -> String {
             parts.push("render");
         }
         add(&format!("gpu ({})", parts.join(", ")));
+    }
+    if m.awmi_window || m.awmi_admin || m.awmi_query || m.awmi_indicator {
+        let mut parts: Vec<&str> = Vec::new();
+        for (on, name) in [(m.awmi_window, "window"), (m.awmi_admin, "admin"), (m.awmi_query, "query"), (m.awmi_indicator, "indicator")] {
+            if on {
+                parts.push(name);
+            }
+        }
+        add(&format!("awmi ({})", parts.join(", ")));
+    }
+    if m.identify {
+        add("verified client identity");
     }
     if s.is_empty() {
         s.push_str("nothing");

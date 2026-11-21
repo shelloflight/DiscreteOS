@@ -121,6 +121,8 @@ const char *ktest_init_args(void)
     return "net test";
 #elif defined(KTEST_GPU)
     return "gpu test";
+#elif defined(KTEST_AWMI)
+    return "awmi test";
 #elif defined(KTEST_FUZZ)
     return "run utest fuzz 200000";
 #elif defined(KTEST_ATTEST) || defined(KTEST_ATTESTTPM)
@@ -2399,7 +2401,7 @@ void ktest_run(void)
 }
 
 #elif defined(KTEST_USER) || defined(KTEST_SMAP) || defined(KTEST_SMEP) || defined(KTEST_COMPAT) || defined(KTEST_LIBD) || defined(KTEST_STORAGE) || defined(KTEST_READONLY) || defined(KTEST_ATTEST) || defined(KTEST_ATTESTTPM) || defined(KTEST_POWEROFF) || defined(KTEST_REBOOT) || defined(KTEST_SERVICES) || \
-    defined(KTEST_TIME) || defined(KTEST_SHELL) || defined(KTEST_AUDIO) || defined(KTEST_NET) || defined(KTEST_GPU) || defined(KTEST_CETUSER)
+    defined(KTEST_TIME) || defined(KTEST_SHELL) || defined(KTEST_AUDIO) || defined(KTEST_NET) || defined(KTEST_GPU) || defined(KTEST_AWMI) || defined(KTEST_CETUSER)
 
 /* Ring-3 tests: init runs utest (ktest_init_args); nothing to do in the kernel first. */
 void ktest_run(void) {}

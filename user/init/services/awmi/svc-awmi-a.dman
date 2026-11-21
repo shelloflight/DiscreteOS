@@ -1,0 +1,19 @@
+# D-AWMI test window client A (window grant only): draws a red window, must receive exactly the key
+# typed while it is focused, and is refused admin, status, indicator and other clients' windows.
+name = "svc-awmi-a"
+image = "ltest.dx"
+args = "svc-awmi-a"
+group = "test"
+after = ["awmi"]
+
+[grants]
+log = true
+awmi = ["window"]
+
+[quota]
+memory = "16M"
+handles = 64
+threads = 2
+
+[restart]
+policy = "never"

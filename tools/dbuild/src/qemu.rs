@@ -512,6 +512,8 @@ pub fn run_interactive(
             _ => {}
         }
     }
+    // A pointer for graphical sessions (`gui`): an absolute tablet, so the cursor follows the host's.
+    extra.extend(["-device".into(), "virtio-tablet-pci,disable-legacy=on,iommu_platform=on".into()]);
     match gpu {
         "virtio" => extra.extend([
             "-device".into(),

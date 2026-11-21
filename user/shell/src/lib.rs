@@ -100,6 +100,8 @@ pub struct Shell {
     pub net_icmp: Handle,
     pub net_ctl: Handle,
     pub gpu_query: Handle,
+    pub awmi_admin: Handle,
+    pub awmi_query: Handle,
     pub jobs: Vec<Job>,
     next_job: u32,
     /// The job whose output the terminal is waiting for.
@@ -790,8 +792,10 @@ impl Shell {
             for r in &b.records[..b.count] {
                 let src = String::from_utf8_lossy(r.source()).into_owned();
                 let text = String::from_utf8_lossy(r.text()).trim_end().to_string();
+                // The terminal's own mirrored lines (`mirror`) are what is shown: never shown again.
+                let echo = src == "terminal" && text.starts_with("terminal|");
                 let about_keys = matches!(src.as_str(), "xhci" | "ps2" | "virtio-input") || text.contains("keyboard");
-                if (about_keys || u32::from(r.level) <= sys::LOG_WARN) && self.notices_shown < NOTICES_MAX {
+                if !echo && (about_keys || u32::from(r.level) <= sys::LOG_WARN) && self.notices_shown < NOTICES_MAX {
                     out.push_str(&show::coloured(term::DARK_GREY, &format!("  · {}\n", text)));
                     self.notices_shown += 1;
                 }
@@ -880,6 +884,8 @@ fn main(s: *const Startup) -> i32 {
         net_icmp: svc::endpoint(b"net.icmp"),
         net_ctl: svc::endpoint(b"net.control"),
         gpu_query: svc::endpoint(b"gpu.query"),
+        awmi_admin: svc::endpoint(b"awmi.admin"),
+        awmi_query: svc::endpoint(b"awmi.query"),
         jobs: Vec::new(),
         next_job: 1,
         fg: None,
@@ -947,6 +953,8 @@ fn main(s: *const Startup) -> i32 {
                                     b"net.icmp" => &mut sh.net_icmp,
                                     b"net.control" => &mut sh.net_ctl,
                                     b"gpu.query" => &mut sh.gpu_query,
+                                    b"awmi.admin" => &mut sh.awmi_admin,
+                                    b"awmi.query" => &mut sh.awmi_query,
                                     _ => {
                                         sys::handle_close(handle);
                                         continue;

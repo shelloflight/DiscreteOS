@@ -43,6 +43,7 @@ enum HostTest {
     Audio,
     Net,
     Gpu,
+    Awmi,
     Aml,
     Kaslr,
     Static,
@@ -1375,6 +1376,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::host_case("audio-host", HostTest::Audio),
         TestCase::host_case("net-host", HostTest::Net),
         TestCase::host_case("gpu-host", HostTest::Gpu),
+        TestCase::host_case("awmi-host", HostTest::Awmi),
         TestCase::host_case("aml-host", HostTest::Aml),
 
         TestCase::boot("audio-hda")
@@ -1642,6 +1644,113 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "Power: switching off",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
+
+        // D-AWMI on a PCI GPU (virtio-gpu: zero-copy IOMMU scanout, hardware cursor), with a
+        // capture device for the microphone indicator and a tablet for real pointer input.
+        TestCase::boot("awmi-virtio")
+            .def("AWMI")
+            .audio_wav()
+            .qemu(&[
+                "-device",
+                "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1024,yres=768",
+                "-device",
+                "ich9-intel-hda",
+                "-device",
+                "hda-duplex,audiodev=snd0",
+                "-device",
+                "virtio-tablet-pci,disable-legacy=on,iommu_platform=on",
+            ])
+            .timeout(150)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(
+                    &["leak", "@!mouse_move 40 30", "@~200", "@!mouse_button 1", "@~200", "@!mouse_button 0", "@~2000", "gui status"],
+                    300,
+                ),
+                "svc-awmi-full: input grab active, type now",
+            )
+            .expect(&[
+                "virtio-gpu: ready on pci-",
+                "awmi: output: adapter #",
+                "1024x768",
+                "hardware cursor",
+                "awmi: ready, idle until a session starts",
+                "svc-awmi-ungranted: PASSED (no compositor endpoint)",
+                "awmi: session started:",
+                "svc-awmi-a: window",
+                "svc-awmi-b: window",
+                "svc-awmi-full: session OK",
+                "svc-awmi-full: surface isolation OK",
+                "svc-awmi-full: verified identity OK",
+                "svc-awmi-full: focus & input routing OK",
+                "svc-awmi-full: snapping OK",
+                "svc-awmi-full: workspaces OK",
+                "svc-awmi-full: multi-monitor OK",
+                "svc-awmi-full: indicators OK",
+                "svc-awmi-a: PASSED (only its own key 'a', closed on request)",
+                "svc-awmi-b: PASSED (only its own key 'b', closed on request)",
+                "svc-awmi-full: close requests OK",
+                "devmgr: input grabbed by input client",
+                "terminal: display released to the compositor",
+                "awmi: keys routed to the compositor (input grab held)",
+                "awmi: pointer input routed to the compositor (grab held)",
+                "svc-awmi-full: input grab OK",
+                "devmgr: input grab released",
+                "terminal: display reclaimed",
+                "svc-awmi-full: PASSED",
+                ": gui status",
+                "init: awmi test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", ": leak", "PANIC"]),
+
+        // D-AWMI on the firmware framebuffer (UEFI GOP: write-combining blits, software cursor).
+        TestCase::boot("awmi-gop")
+            .def("AWMI")
+            .uefi()
+            .qemu(&["-device", "virtio-tablet-pci,disable-legacy=on,iommu_platform=on"])
+            .timeout(150)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(
+                    &["leak", "@!mouse_move 40 30", "@~200", "@!mouse_button 1", "@~200", "@!mouse_button 0", "@~2000", "gui status"],
+                    300,
+                ),
+                "svc-awmi-full: input grab active, type now",
+            )
+            .expect(&[
+                "D-OS: GOP framebuffer",
+                "awmi: output: adapter #1 'GOP Framebuffer'",
+                "software cursor",
+                "awmi: ready, idle until a session starts",
+                "svc-awmi-ungranted: PASSED (no compositor endpoint)",
+                "awmi: session started:",
+                "svc-awmi-a: window",
+                "svc-awmi-b: window",
+                "svc-awmi-full: session OK",
+                "svc-awmi-full: surface isolation OK",
+                "svc-awmi-full: verified identity OK",
+                "svc-awmi-full: focus & input routing OK",
+                "svc-awmi-full: snapping OK",
+                "svc-awmi-full: workspaces OK",
+                "svc-awmi-full: multi-monitor OK",
+                "svc-awmi-full: indicators OK",
+                "svc-awmi-a: PASSED (only its own key 'a', closed on request)",
+                "svc-awmi-b: PASSED (only its own key 'b', closed on request)",
+                "svc-awmi-full: close requests OK",
+                "devmgr: input grabbed by input client",
+                "terminal: display released to the compositor",
+                "awmi: keys routed to the compositor (input grab held)",
+                "awmi: pointer input routed to the compositor (grab held)",
+                "svc-awmi-full: input grab OK",
+                "devmgr: input grab released",
+                "terminal: display reclaimed",
+                "svc-awmi-full: PASSED",
+                ": gui status",
+                "init: awmi test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", ": leak", "PANIC"]),
 
         TestCase::boot("uefi-badsig")
             .uefi()
@@ -2685,6 +2794,7 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
         HostTest::Audio => host_cargo_test(env, "user/lib/audio", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Net => host_cargo_test(env, "user/lib/net", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Gpu => host_cargo_test(env, "user/lib/gpu", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
+        HostTest::Awmi => host_cargo_test(env, "user/lib/awmi", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Aml => host_aml_test(env),
         HostTest::Crypto => host_crypto_test(env),
         HostTest::Kaslr => host_kaslr_test(env),
@@ -3190,12 +3300,13 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     let cargo = env.cargo()?;
     let clippy_dir = env.build.join("clippy");
     let cargo_env = env.cargo_env_pairs();
-    let standalone: [(&str, &[&str]); 9] = [
+    let standalone: [(&str, &[&str]); 10] = [
         ("kernel/rust", &[]),
         ("kernel/aml", &["--all-targets"]),
         ("user/lib/audio", &["--all-targets"]),
         ("user/lib/net", &["--all-targets"]),
         ("user/lib/gpu", &["--all-targets"]),
+        ("user/lib/awmi", &["--all-targets"]),
         ("user/lib/crypto", &["--all-targets"]),
         ("user/lib/fs", &["--all-targets"]),
         ("user/lib/dman", &["--all-targets"]),
@@ -3236,6 +3347,7 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
         ("audio", &[]),
         ("net", &[]),
         ("gpu", &[]),
+        ("awmi", &[]),
         ("init", &[]),
         ("log", &[]),
         ("clock", &[]),

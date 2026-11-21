@@ -10,10 +10,12 @@
 //! - Input: a line editor for the session's `READ`: insert anywhere, Backspace/Delete, Left/Right,
 //!   Home/End (Ctrl+A/Ctrl+E), history (Up/Down), Tab (the session completes the last word),
 //!   Escape clears, Ctrl+C cancels the line (or interrupts the running command), Ctrl+L clears the
-//!   screen.
+//!   screen. A line typed while a command runs is kept and submitted when the next prompt comes.
 //! - Every line typed is logged (`terminal: line from <keyboard>: <text>`). With the argument
 //!   `mirror` (or without a display) every line shown is logged too (`terminal| ...`), so a
 //!   session can be followed on the serial line.
+//! - `display` endpoint (the compositor): `term::DISPLAY_RELEASE` stops drawing while a graphical
+//!   session owns the screen; `term::DISPLAY_RECLAIM`, or that channel closing, redraws it all.
 
 #![no_std]
 
@@ -37,6 +39,7 @@ const KEY_CTL: u64 = 1;
 const KEY_INPUT: u64 = 2;
 const KEY_SESSION: u64 = 3;
 const KEY_INDICATOR: u64 = 4;
+const KEY_DISPLAY: u64 = 5;
 
 /// Lines kept for scrolling back.
 const MAX_LINES: usize = 2000;
@@ -100,9 +103,15 @@ struct Term {
     hist: Option<usize>,
     saved: String,
     waiting_completion: bool,
+    /// Enter was pressed while no line was being read (a command still running): the typed line
+    /// is submitted as soon as the session asks for the next one (type-ahead).
+    enter_ahead: bool,
     session: Handle,
     indicator: Handle,
     mic_active: bool,
+    /// The compositor's `display` channel, and whether it holds the screen now.
+    display: Handle,
+    released: bool,
     mirror: bool,
     /// Which keyboard the last key came from (for the log line).
     from: [u8; 24],
@@ -177,8 +186,20 @@ impl Term {
         (out, (cur % cols, cur / cols))
     }
 
-    /// Draw what is visible now.
+    /// The compositor gave the screen back (or went away): draw every cell again.
+    fn reclaim(&mut self) {
+        if self.released {
+            self.released = false;
+            self.scr.invalidate();
+            println!("terminal: display reclaimed");
+        }
+    }
+
+    /// Draw what is visible now (nothing while a graphical session holds the screen).
     fn render(&mut self) {
+        if self.released {
+            return;
+        }
         let mut extra: Vec<Vec<Cell>> = Vec::new();
         if !self.cur.is_empty() {
             extra.push(self.cur.clone());
@@ -348,6 +369,7 @@ impl Term {
         self.scroll = 0;
         match base {
             0x03 => {
+                self.enter_ahead = false;
                 if self.reading {
                     self.submit(true);
                 } else {
@@ -363,6 +385,8 @@ impl Term {
             0x0A | 0x0D => {
                 if self.reading {
                     self.submit(false);
+                } else {
+                    self.enter_ahead = true;
                 }
             }
             0x08 if self.at > 0 => {
@@ -379,6 +403,7 @@ impl Term {
             key::UP => self.history_step(true),
             key::DOWN => self.history_step(false),
             0x1B => {
+                self.enter_ahead = false;
                 self.edit.clear();
                 self.at = 0;
             }
@@ -426,6 +451,9 @@ impl Term {
                 }
                 self.reading = true;
                 self.scroll = 0;
+                if core::mem::take(&mut self.enter_ahead) {
+                    self.submit(false);
+                }
             }
             term::COMPLETIONS => self.complete(payload),
             term::CLEAR => {
@@ -443,6 +471,7 @@ impl Term {
         self.session = ch;
         self.reading = false;
         self.waiting_completion = false;
+        self.enter_ahead = false;
         self.send(term::SIZE, self.scr.cols as u64, self.scr.rows as u64, &[]);
     }
 }
@@ -472,9 +501,12 @@ fn main(s: *const Startup) -> i32 {
         hist: None,
         saved: String::new(),
         waiting_completion: false,
+        enter_ahead: false,
         session: 0,
         indicator: 0,
         mic_active: false,
+        display: 0,
+        released: false,
         mirror,
         from: [0; 24],
         from_len: 0,
@@ -560,6 +592,48 @@ fn main(s: *const Startup) -> i32 {
                     }
                 }
             },
+            KEY_DISPLAY => loop {
+                let mut hs = [0 as Handle; 1];
+                match sys::channel_read_h(t.display, &mut buf, &mut hs, 0) {
+                    Ok((n, nh)) => {
+                        if nh > 0 {
+                            sys::handle_close(hs[0]);
+                        }
+                        let Some(h) = Header::get(&buf[..n]) else { continue };
+                        let ok = match h.op {
+                            term::DISPLAY_RELEASE => {
+                                if !t.released {
+                                    t.released = true;
+                                    println!("terminal: display released to the compositor");
+                                }
+                                true
+                            }
+                            term::DISPLAY_RECLAIM => {
+                                t.reclaim();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if h.txid != 0 {
+                            let mut rep = [0u8; HEADER];
+                            let status = if ok { 0 } else { sys::ERR_NOT_SUPPORTED as i32 };
+                            Header { txid: h.txid, op: h.op, status, a: 0, b: 0 }.put(&mut rep);
+                            sys::channel_write(t.display, &rep);
+                        }
+                    }
+                    Err(sys::ERR_SHOULD_WAIT) => {
+                        port.arm(t.display, sys::READABLE | sys::PEER_CLOSED, KEY_DISPLAY);
+                        break;
+                    }
+                    Err(_) => {
+                        // The compositor is gone: the screen is ours again.
+                        sys::handle_close(t.display);
+                        t.display = 0;
+                        t.reclaim();
+                        break;
+                    }
+                }
+            },
             _ => loop {
                 // The service manager: a session (the shell), a new input channel, or stop.
                 let mut hs = [0 as Handle; 1];
@@ -577,6 +651,14 @@ fn main(s: *const Startup) -> i32 {
                             Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"session" && handle != 0 => {
                                 t.connect(handle);
                                 port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_SESSION);
+                            }
+                            Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"display" && handle != 0 => {
+                                if t.display != 0 {
+                                    sys::handle_close(t.display);
+                                }
+                                t.display = handle;
+                                t.reclaim();
+                                port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_DISPLAY);
                             }
                             Some(h) if h.op == svc::CONNECT && &buf[HEADER..n] == b"indicator" && handle != 0 => {
                                 if t.indicator != 0 {

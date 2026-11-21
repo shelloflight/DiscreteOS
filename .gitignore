@@ -30,6 +30,7 @@ AGENTS.md
 PLAN.md
 CHANGELOG.md
 GATE-1.0.md
+DAWMI.md
 tools/changelog.ps1
 tools/commit-hook.ps1
 tools/commit-hook.sh

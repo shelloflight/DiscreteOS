@@ -30,6 +30,7 @@ use libd::sync::{Mutex, Once};
 use libd::sys::{self, Handle, SpawnHandle};
 use libd::{Channel, Event, Owned, Startup, heap, println, thread};
 
+mod awmi;
 mod svc;
 
 libd::entry!(_start, main);
@@ -562,6 +563,14 @@ fn main(s: *const Startup) -> i32 {
         return svc::gpu_queryonly();
     } else if a.starts_with(b"svc-gpu-full") {
         return svc::gpu_full();
+    } else if a.starts_with(b"svc-awmi-ungranted") {
+        return awmi::ungranted();
+    } else if a.starts_with(b"svc-awmi-full") {
+        return awmi::full();
+    } else if a.starts_with(b"svc-awmi-a") {
+        return awmi::client("svc-awmi-a", 0x00D0_3030, b"Alpha", None, b'a');
+    } else if a.starts_with(b"svc-awmi-b") {
+        return awmi::client("svc-awmi-b", 0x0030_C050, b"Beta", Some(b"system: fake"), b'b');
     }
     let ok = test_abi()
         && test_handles()

@@ -6,7 +6,7 @@ group = "system"
 description = "the screen and the keyboard"
 
 [provides]
-endpoints = ["session", "indicator"]   # the shell, and the audio service's live mic indicator
+endpoints = ["session", "indicator", "display"]   # the shell, the audio service's live mic indicator, the compositor
 
 [grants]
 log = true

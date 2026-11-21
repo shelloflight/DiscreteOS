@@ -23,8 +23,8 @@ data ▸ copy report.txt /backup
 
 | Process | Holds | Does not hold |
 |---|---|---|
-| `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge) |
-| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting |
+| `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge, and `terminal.display` to the compositor, which stops and restarts its drawing for a graphical session) |
+| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, `awmi.admin`, `awmi.query`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting, any window's pixels |
 | a tool | an output channel, one node per path argument with the rights its manifest declares, the log | the namespace, endpoints, anything else of the shell |
 
 The terminal and the shell are separate so that neither gets the other's authority: a bug in the
@@ -37,13 +37,15 @@ line editor cannot reach a file, and the shell cannot draw outside the terminal'
   its cursor ports. Mapping it takes the screen from the kernel; kernel lines then go to serial
   and the log service only, and a panic takes the screen back. Only changed cells are drawn.
 - **Keys** (`proto::INPUT_KEY`, `proto::key`): characters plus named keys (arrows, Home/End,
-  PgUp/PgDn, Insert/Delete) with Shift/Ctrl/Alt, from PS/2, USB and virtio keyboards. A keyboard
+  PgUp/PgDn, Insert/Delete, F1-F12) with Shift/Ctrl/Alt/Super, from PS/2, USB and virtio keyboards
+  (characters typed with Alt or Super held also carry those modifier bits). A keyboard
   plugged in while another is in use types nothing until accepted with Ctrl+Alt+Insert on the
   keyboard in use ([hardware.md](hardware.md)).
 - **Editing**: insert anywhere, Backspace/Delete, Left/Right, Home/End (Ctrl+A/E), history
   (Up/Down, 100 lines), Tab (the shell completes commands and paths), Escape clears, Ctrl+C
   cancels the line or stops the running command, Ctrl+L clears. PgUp/PgDn scroll back through
-  2000 lines.
+  2000 lines. A line typed (and Enter pressed) while a command still runs is submitted when the
+  next prompt comes.
 - **Keyboard notices**: until the first key arrives, the shell shows (dimmed, at most 40 lines)
   what the log says about keyboards (the keyboard drivers, lines that mention a keyboard) and every
   warning or error. A keyboard that is found but never types can be diagnosed from a photo of the
@@ -81,7 +83,9 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   and IPv4 status), `ping <host> [count]` (DNS + ICMP echo), `tls <host> [port]` (TLS 1.3
   handshake & certificate verification against `/sys/certs/roots.der`;
   [networking.md](networking.md)), `gpu [modes [id]]` (`display`, GPU adapters, modes, EDID, VRAM,
-  and IOMMU status; [graphics.md](graphics.md)), `power off | restart | sleep` (the manager stops every service
+  and IOMMU status; [graphics.md](graphics.md)), `gui [status]` (`awmi`: start the graphical
+  session with the demo windows, back with `Super+Esc` or `Ctrl+Alt+Esc`; `status`: the
+  compositor's state; [awmi.md](awmi.md)), `power off | restart | sleep` (the manager stops every service
   cleanly first), `clear`, `run <tool> [arguments]`.
 - **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
   (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place

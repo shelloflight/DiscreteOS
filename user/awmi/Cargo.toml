@@ -1,0 +1,29 @@
+# D-AWMI (`awmi.dsvc`): D-OS's compositor and window manager, and its built-in demo windows
+# (`awmi-demo.dsvc`). The compositing, window management, decorations and dock are `dosawmi`
+# (user/lib/awmi, no unsafe code); this crate is the service around it: the GPU outputs, the
+# input grab, the clients' windows and the session's lifecycle.
+[package]
+name = "awmi"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata.dos]
+dsvc = ["awmi", "awmi-demo"]
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+dosawmi = { path = "../lib/awmi" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

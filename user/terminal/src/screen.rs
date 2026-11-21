@@ -106,6 +106,17 @@ impl Screen {
         !matches!(self.backend, Backend::None)
     }
 
+    /// Forget what is shown (another program drew on the screen): the next frame redraws every
+    /// cell, and the framebuffer margin right of / below the grid is cleared.
+    pub fn invalidate(&mut self) {
+        self.shown.fill(0xFFFF);
+        if let Backend::Fb { map, .. } = &self.backend {
+            for off in (0..map.len).step_by(4) {
+                map.w32(off, 0);
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         for y in 0..self.rows {
             for x in 0..self.cols {

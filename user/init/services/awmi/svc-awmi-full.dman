@@ -1,0 +1,21 @@
+# D-AWMI test driver (admin, query, indicator, window): starts the session and, through the test
+# hooks, checks isolation, focus, identity, snapping, workspaces, a second output, the indicators,
+# the microphone indicator (audio capture) and the exclusive input grab with real keys and pointer.
+name = "svc-awmi-full"
+image = "ltest.dx"
+args = "svc-awmi-full"
+group = "test"
+after = ["awmi", "svc-awmi-ungranted"]
+
+[grants]
+log = true
+awmi = ["admin", "query", "indicator", "window"]
+audio = ["capture"]
+
+[quota]
+memory = "32M"
+handles = 128
+threads = 4
+
+[restart]
+policy = "never"

@@ -1,0 +1,20 @@
+# The built-in demo windows of a graphical session (the shell's `gui`): an About panel with the
+# shortcuts and a pointer canvas. An ordinary window client: it can draw its own windows, nothing else.
+name = "awmi-demo"
+image = "awmi-demo.dsvc"
+group = "system"
+description = "D-AWMI demo windows"
+
+[grants]
+log = true
+awmi = ["window"]
+
+[quota]
+memory = "16M"
+handles = 64
+threads = 1
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 200

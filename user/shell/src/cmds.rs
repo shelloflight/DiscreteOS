@@ -37,6 +37,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
     Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
     Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id]]", description: "GPU adapters, modes, EDID, VRAM, and IOMMU status" },
+    Builtin { name: "gui", aliases: &["awmi"], usage: "gui [status]", description: "start the graphical session (D-AWMI), or show its status" },
     Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
 ];
@@ -55,7 +56,7 @@ fn text(s: &str) -> Value {
 pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let b = find(name)?;
     let max_args = match b.name {
-        "help" | "go" | "objects" | "log" => 1,
+        "help" | "go" | "objects" | "log" | "gui" => 1,
         "end" | "restart" | "wait" | "power" => 1,
         "ping" | "tls" | "gpu" => 2,
         "audio" => 3,
@@ -82,6 +83,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "ping" => ping_cmd(sh, args),
         "tls" => tls_cmd(sh, args),
         "gpu" => gpu_cmd(sh, args),
+        "gui" => gui_cmd(sh, arg),
         "power" => power(sh, arg),
         _ => {
             sh.clear();
@@ -828,6 +830,48 @@ fn tls_cmd(sh: &Shell, args: &[String]) -> Res {
             .with("group", text(group))
             .with("roots", Value::Int(root_count as i64)),
     ])
+}
+
+/// `gui`: start the graphical session with the demo windows (the keyboard and screen go to the
+/// compositor until Super+Esc, or Ctrl+Alt+Esc in a VM); `gui status`: the compositor's state.
+fn gui_cmd(sh: &Shell, arg: Option<&str>) -> Res {
+    use libd::awmi;
+    match arg {
+        None => {
+            if sh.awmi_admin == 0 {
+                return Err(String::from("gui: no awmi.admin grant in this session"));
+            }
+            let n = awmi::session_start(sh.awmi_admin, true).map_err(|e| format!("gui: the session did not start ({})", sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("graphical session on {} output(s); Super+Esc (Ctrl+Alt+Esc in a VM) comes back here", n)));
+            Ok(Vec::new())
+        }
+        Some("status") => {
+            let ep = if sh.awmi_query != 0 { sh.awmi_query } else { sh.awmi_admin };
+            if ep == 0 {
+                return Err(String::from("gui: no awmi.query grant in this session"));
+            }
+            let st = awmi::status(ep).map_err(|e| format!("gui: status failed ({})", sys::status(e)))?;
+            let mut ind = Vec::new();
+            if st.indicators & awmi::IND_MIC_LIVE != 0 {
+                ind.push("mic live");
+            }
+            if st.indicators & awmi::IND_SECURITY_ALERT != 0 {
+                ind.push("security alert");
+            }
+            let mode = if st.active { format!("{}x{} @ {} Hz", st.width, st.height, st.refresh_mhz / 1000) } else { String::from("-") };
+            Ok(alloc::vec![
+                Record::new()
+                    .with("session", text(if st.active { "active" } else { "idle" }))
+                    .with("outputs", Value::Int(i64::from(st.outputs)))
+                    .with("mode", Value::Text(mode))
+                    .with("windows", Value::Int(i64::from(st.windows)))
+                    .with("workspace", Value::Text(format!("{} of {}", st.active_workspace + 1, st.workspaces)))
+                    .with("frames", Value::Int(st.frames as i64))
+                    .with("indicators", Value::Text(if ind.is_empty() { String::from("none") } else { ind.join(", ") })),
+            ])
+        }
+        Some(other) => Err(format!("gui: unknown argument '{}'; usage: gui [status]", other)),
+    }
 }
 
 fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {

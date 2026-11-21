@@ -9,7 +9,18 @@ use libd::{Dma, Port, Startup, println};
 use crate::keymap::Keys;
 use crate::virtio::{DESC_WRITE, Virtio};
 
+const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
+const EV_REL: u16 = 2;
+const EV_ABS: u16 = 3;
+const REL_X: u16 = 0;
+const REL_Y: u16 = 1;
+const REL_WHEEL: u16 = 8;
+const ABS_X: u16 = 0;
+const ABS_Y: u16 = 1;
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
 const EVENT: u64 = 8; // struct virtio_input_event { u16 type, code; u32 value }
 
 const KEY_IRQ: u64 = 1;
@@ -48,9 +59,17 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
     let port = Port::new(16).map_err(|_| "no port")?;
     port.arm(q.irq, sys::SIGNALED, KEY_IRQ);
     port.arm(ch, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
-    println!("virtio-input: keyboard ready (US layout, {} event buffers, MSI-X)", q.size);
+    println!("virtio-input: device ready (US keyboard + pointer, {} event buffers, MSI-X)", q.size);
     proto::send(ch, proto::READY, 0, 0);
     let mut keys = Keys::default();
+    let mut buttons = 0u8;
+    let mut rel_dx = 0i32;
+    let mut rel_dy = 0i32;
+    let mut rel_wheel = 0i8;
+    let mut abs_x = 0u32;
+    let mut abs_y = 0u32;
+    let mut abs_dirty = false;
+    let mut ptr_dirty = false;
     let mut msg = [0u8; 256];
     loop {
         let Some((key, _)) = port.wait(sys::WAIT_FOREVER) else { continue };
@@ -86,10 +105,57 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
                 let m = &events.map;
                 let off = u64::from(id) * EVENT;
                 let (ty, code, value) = (m.r16(off), m.r16(off + 2), m.r32(off + 4));
-                if ty == EV_KEY
-                    && let Some(c) = keys.key(code, value != 0)
-                {
-                    proto::send(ch, proto::KEY, u64::from(c), 0);
+                match ty {
+                    EV_KEY => match code {
+                        BTN_LEFT => {
+                            if value != 0 { buttons |= 1; } else { buttons &= !1; }
+                            ptr_dirty = true;
+                        }
+                        BTN_RIGHT => {
+                            if value != 0 { buttons |= 2; } else { buttons &= !2; }
+                            ptr_dirty = true;
+                        }
+                        BTN_MIDDLE => {
+                            if value != 0 { buttons |= 4; } else { buttons &= !4; }
+                            ptr_dirty = true;
+                        }
+                        _ => {
+                            if let Some(c) = keys.key(code, value != 0) {
+                                proto::send(ch, proto::KEY, u64::from(c), 0);
+                            }
+                        }
+                    },
+                    EV_REL => {
+                        let v = value as i32;
+                        match code {
+                            REL_X => { rel_dx = rel_dx.saturating_add(v); ptr_dirty = true; }
+                            REL_Y => { rel_dy = rel_dy.saturating_add(v); ptr_dirty = true; }
+                            REL_WHEEL => { rel_wheel = rel_wheel.saturating_add(v.clamp(-127, 127) as i8); ptr_dirty = true; }
+                            _ => {}
+                        }
+                    }
+                    EV_ABS => {
+                        match code {
+                            ABS_X => { abs_x = value.min(32767); abs_dirty = true; ptr_dirty = true; }
+                            ABS_Y => { abs_y = value.min(32767); abs_dirty = true; ptr_dirty = true; }
+                            _ => {}
+                        }
+                    }
+                    EV_SYN if ptr_dirty => {
+                        let (a, flags) = if abs_dirty {
+                            (u64::from(abs_x) | (u64::from(abs_y) << 32), proto::POINTER_ABS)
+                        } else {
+                            (u64::from(rel_dx as u32) | (u64::from(rel_dy as u32) << 32), 0)
+                        };
+                        let b = u64::from(buttons) | (u64::from(rel_wheel as u8) << 8) | flags;
+                        proto::send(ch, proto::POINTER, a, b);
+                        rel_dx = 0;
+                        rel_dy = 0;
+                        rel_wheel = 0;
+                        abs_dirty = false;
+                        ptr_dirty = false;
+                    }
+                    _ => {}
                 }
             }
             post(&mut q, &events, id);

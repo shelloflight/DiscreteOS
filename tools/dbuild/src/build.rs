@@ -60,6 +60,8 @@ const SYS_BIN_PROGS: &[&str] = &[
     "audio.dsvc",
     "net.dsvc",
     "gpu.dsvc",
+    "awmi.dsvc",
+    "awmi-demo.dsvc",
     "log.dx",
     "terminal.dx",
     "shell.dx",
@@ -84,7 +86,7 @@ fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
             "utest.dx" | "dcmpl.dx" | "w1.exe" | "w1_32.exe" | "w1fault.exe" | "w1bad.exe" | "l1" | "w2.exe" | "l2"
         ),
         Some("LIBD") => matches!(name, "ltest.dx" | "ctest.dx"),
-        Some("SERVICES" | "TIME" | "AUDIO" | "NET" | "GPU") => name == "ltest.dx",
+        Some("SERVICES" | "TIME" | "AUDIO" | "NET" | "GPU" | "AWMI") => name == "ltest.dx",
         Some("STORAGE" | "READONLY") => name == "fstest.dx",
         Some("HWBENCH") => matches!(name, "utest.dx" | "fstest.dx"),
         _ => false,
@@ -477,6 +479,7 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         Some("AUDIO") => Some("audio"),
         Some("NET") => Some("net"),
         Some("GPU") => Some("gpu"),
+        Some("AWMI") => Some("awmi"),
         _ => None,
     } {
         manifests.extend(collect_files(&man_dir.join(sub), "dman", false));

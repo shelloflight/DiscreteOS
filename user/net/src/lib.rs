@@ -43,6 +43,8 @@ enum Role {
     Client,
     Icmp,
     Control,
+    /// Read-only interface status (`OP_STATUS` only): the desktop's network indicator.
+    Status,
 }
 
 struct NicPipe {
@@ -290,10 +292,11 @@ impl NetSvc {
                                 self.devmgr = hnd;
                                 self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_DEVMGR);
                             }
-                            b"client" | b"icmp" | b"control" => {
+                            b"client" | b"icmp" | b"control" | b"status" => {
                                 let role = match ep {
                                     b"client" => Role::Client,
                                     b"icmp" => Role::Icmp,
+                                    b"status" => Role::Status,
                                     _ => Role::Control,
                                 };
                                 let id = self.next_client_id;

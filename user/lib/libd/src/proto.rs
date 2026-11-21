@@ -40,14 +40,22 @@ pub const USB_AUDIO_ATTACH: u32 = 9;
 /// (`key`: a character, US layout, or a named key with modifiers), `b` = which input device (an
 /// index); payload: the driver's name (`ps2`, `xhci`, `virtio-input`).
 pub const INPUT_KEY: u32 = 410;
-/// Device manager -> each client of its `input` endpoint: pointer input. `a` as in `POINTER`;
-/// `b` = buttons and wheel as in `POINTER` (bits 0-15) | which input device (bits 32-47);
-/// payload: the driver's name.
+/// Device manager -> each client of its `input` endpoint: pointer input. `a` as in `POINTER`
+/// (or `(abs_x_0_32767 | abs_y_0_32767 << 32)` when `POINTER_ABS` bit 16 is set in `b`);
+/// `b` = buttons and wheel as in `POINTER` (bits 0-15) | `POINTER_ABS` (bit 16) | which input
+/// device (bits 32-47); payload: the driver's name.
 pub const INPUT_POINTER: u32 = 411;
+/// Client -> device manager on `devmgr.input`: grab (`a = 1`) or release (`a = 0`) exclusive
+/// input routing (used by the compositor during an active GUI session; automatically released on
+/// channel close).
+pub const INPUT_GRAB: u32 = 412;
+
+/// Flag bit in `POINTER` / `INPUT_POINTER` `Header::b`: `a` carries absolute `[0..=32767]` coords.
+pub const POINTER_ABS: u64 = 1 << 16;
 
 /// Key values (`KEY`, `INPUT_KEY`): below 0x100 a character (`\n` Enter, 0x08 Backspace, 0x1B
 /// Escape, `\t` Tab, Ctrl+letter its control character); from 0x100 a named key, with the
-/// modifier bits held when it was pressed.
+/// modifier bits held when it was pressed. Shortcuts holding Alt or Super also carry modifier bits.
 pub mod key {
     pub const UP: u32 = 0x101;
     pub const DOWN: u32 = 0x102;
@@ -59,9 +67,23 @@ pub mod key {
     pub const PAGE_DOWN: u32 = 0x108;
     pub const INSERT: u32 = 0x109;
     pub const DELETE: u32 = 0x10A;
+    pub const F1: u32 = 0x110;
+    pub const F2: u32 = 0x111;
+    pub const F3: u32 = 0x112;
+    pub const F4: u32 = 0x113;
+    pub const F5: u32 = 0x114;
+    pub const F6: u32 = 0x115;
+    pub const F7: u32 = 0x116;
+    pub const F8: u32 = 0x117;
+    pub const F9: u32 = 0x118;
+    pub const F10: u32 = 0x119;
+    pub const F11: u32 = 0x11A;
+    pub const F12: u32 = 0x11B;
     pub const SHIFT: u32 = 1 << 16;
     pub const CTRL: u32 = 1 << 17;
     pub const ALT: u32 = 1 << 18;
+    pub const SUPER: u32 = 1 << 19;
+    pub const RELEASE: u32 = 1 << 20;
     /// The key without its modifiers.
     pub const MASK: u32 = 0xFFFF;
 }

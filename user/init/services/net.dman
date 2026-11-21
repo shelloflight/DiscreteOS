@@ -1,5 +1,5 @@
 # Network service: in-tree Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS, and TCP stack.
-# Provides capability-separated endpoints (`client`, `icmp`, `control`).
+# Provides capability-separated endpoints (`client`, `icmp`, `control`, read-only `status`).
 name = "net"
 image = "net.dsvc"
 group = "system"
@@ -7,7 +7,7 @@ after = ["devmgr", "clock"]
 description = "in-tree TCP/IP, DHCP, and DNS networking service"
 
 [provides]
-endpoints = ["client", "icmp", "control"]
+endpoints = ["client", "icmp", "control", "status"]
 
 [grants]
 log = true

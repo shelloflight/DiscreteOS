@@ -2,7 +2,8 @@
 # (with the rights the storage service gives it: read-only on a normal boot), the log, the clock,
 # the service manager (services and power) and the tools. A tool it starts gets only the paths
 # typed, with the rights its own manifest declares. D-CMPL and the VMEX resource are for `run` of a
-# Windows or Linux program: it runs under D-CMPL with only the current place.
+# Windows or Linux program: it runs under D-CMPL with only the current place. The compositor's admin
+# endpoint is for `gui` (start a graphical session).
 name = "shell"
 image = "shell.dx"
 group = "system"
@@ -15,6 +16,7 @@ connect = ["terminal.session", "log.read", "clock.time"]
 audio = ["playback", "control"]
 net = ["client", "icmp", "control"]
 gpu = ["query"]
+awmi = ["admin", "query"]
 namespace = ["*"]
 manager = ["services", "power"]
 tools = true

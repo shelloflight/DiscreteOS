@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "awmi"
+version = "0.1.0"
+dependencies = [
+ "dosawmi",
+ "libd",
+]
+
+[[package]]
 name = "clock"
 version = "0.1.0"
 dependencies = [
@@ -39,6 +47,10 @@ version = "0.1.0"
 
 [[package]]
 name = "dosaudio"
+version = "0.1.0"
+
+[[package]]
+name = "dosawmi"
 version = "0.1.0"
 
 [[package]]

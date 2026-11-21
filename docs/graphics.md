@@ -12,6 +12,7 @@ PCI IDs / GMD_ID / Display Pipes / MI Blitter, NVIDIA Open-GSP PCI IDs / `PMC_BO
 framing, dirty-rect WC pixel blitter), `user/devmgr/src/{gpu_drv,virtio_gpu,amdgpu,xe,nvgpu}.rs`,
 `user/gpu` (`gpu.dsvc`), `user/lib/libd/src/gpu.rs`, `user/init/services/gpu.dman`.
 **Tests:** `gpu-host`, `gpu-virtio`, `gpu-virtio-amd`, `gpu-gop`, `gpu-shell`.
+The compositor and window manager built on `gpu.display` is D-AWMI ([awmi.md](awmi.md)).
 
 ## Architecture
 

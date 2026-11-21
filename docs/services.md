@@ -25,6 +25,7 @@ log-level = "info"          # error | warn | info (default) | debug: lower recor
 [provides]
 endpoints = ["disks"]       # others connect to "<name>.disks"
 volumes = false             # announces volumes (the storage service)
+identify = false            # clients' verified name and trust tier come with each CONNECT (the compositor)
 
 [grants]
 log = true
@@ -32,8 +33,9 @@ devices = ["pci", "platform:ps2"]   # "all", "pci", "pci:CC[SS[PP]]", "platform:
 programs = ["*.ddrv"]       # program images, by name or "*.dx" / "*.dsvc" / "*.ddrv"
 connect = ["storaged.disks"]
 audio = ["playback"]        # optional audio capabilities: "playback", "capture", "control"
-net = ["client"]            # optional network capabilities: "client", "icmp", "control"
+net = ["client"]            # optional network capabilities: "client", "icmp", "control", "status"
 gpu = ["query"]             # optional GPU capabilities: "query", "display", "render"
+awmi = ["window"]           # optional compositor capabilities: "window", "admin", "query", "indicator"
 namespace = ["/system=system:r"]   # /<path>=<volume>:r | rw | rwa; or ["*"] / ["*:r"]: every volume
 manager = ["services", "power"]     # a channel to the manager: list/stop/restart services; power
 tools = false               # the tool manifests and their programs (the shell; docs/shell.md)
@@ -84,8 +86,9 @@ was configured to grant ([attestation.md](attestation.md)).
 | `programs` | each embedded program the names match (tag `PROGRAM`) |
 | `connect` | one channel per endpoint (`TAG_ENDPOINT + i`, names in the `TAG_ENDPOINT_NAMES` VMO; `libd::svc::endpoint`) |
 | `audio` | audio endpoints (`audio.playback`, `audio.capture`, `audio.control`); microphone capture requires explicit `capture` ([audio.md](audio.md)) |
-| `net` | network endpoints (`net.client`, `net.icmp`, `net.control`); no grant means no network access ([networking.md](networking.md)) |
+| `net` | network endpoints (`net.client`, `net.icmp`, `net.control`, read-only `net.status`); no grant means no network access ([networking.md](networking.md)) |
 | `gpu` | GPU endpoints (`gpu.query`, `gpu.display`, `gpu.render`); separates read-only inspection, display scanout, and command submission ([graphics.md](graphics.md)) |
+| `awmi` | compositor endpoints (`awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator`) ([awmi.md](awmi.md)) |
 | `namespace` | each volume's root, narrowed to the rights granted, at its path ([storage.md](storage.md)); `*`: every volume at `/<volume>`, with at most the rights the volume has |
 | `manager` | a channel to the manager (`tool::TAG_MANAGER`): `MGR_LIST`, `MGR_STOP`, `MGR_RESTART`, `MGR_OBJECTS` with `services`; `MGR_POWER` with `power` (a clean shutdown, then the power) |
 | `tools` | every accepted tool manifest (`tool::TAG_TOOL_MANIFEST`, read-only) and each tool's program |
@@ -110,7 +113,7 @@ was configured to grant ([attestation.md](attestation.md)).
 
 | Op | Direction | Meaning |
 |---|---|---|
-| `CONNECT` (300) | manager -> service | carries a channel; payload: the endpoint (`disks` to a provider, `storaged.disks` to a client) |
+| `CONNECT` (300) | manager -> service | carries a channel; payload: the endpoint (`disks` to a provider, `storaged.disks` to a client). To a provider with `provides.identify`: `<endpoint>\0<client service name>`, `b` = the client's trust tier (1 system, 2 native, 3 sandbox: `vmex` or D-CMPL) |
 | `SHUTDOWN` (301) | manager -> service | make everything durable, exit 0 |
 | `SYNC` (302) | manager -> volume provider, call | make every volume durable; reply when done |
 | `LOG_LEVEL` (303) | manager -> kernel-log holder | a service's level: `a` = level, payload = its name |
@@ -140,11 +143,14 @@ every volume provider, sends `SUSPEND` to `devmgr` to quiesce and stop drivers, 
 | `log` | log, kernel log | `log.read` |
 | `clock` | log, the `rtc` device, boot time | `clock.time` |
 | `storaged` | log, `clock.time` (file times) | `storaged.disks`, volumes |
-| `devmgr` | log, every PCI device and `ps2`, the `*.ddrv` drivers, `storaged.disks` | `devmgr.input`, `devmgr.audio`, `devmgr.net` |
+| `devmgr` | log, every PCI device and `ps2`, the `*.ddrv` drivers, `storaged.disks` | `devmgr.input`, `devmgr.audio`, `devmgr.net`, `devmgr.gpu` |
 | `audio` | log, `devmgr.audio`, `terminal.indicator` | `audio.playback`, `audio.capture`, `audio.control` |
-| `net` | log, `devmgr.net`, `clock.time` | `net.client`, `net.icmp`, `net.control` |
-| `terminal` | log, the `display` device, `devmgr.input` | `terminal.session`, `terminal.indicator` |
-| `shell` | log, `terminal.session`, `log.read`, `clock.time`, `audio.*`, `net.*`, every volume, the manager (services, power), the tools | |
+| `net` | log, `devmgr.net`, `clock.time` | `net.client`, `net.icmp`, `net.control`, `net.status` |
+| `gpu` | log, the `display` device, `devmgr.gpu` | `gpu.query`, `gpu.display`, `gpu.render` |
+| `terminal` | log, the `display` device, `devmgr.input` | `terminal.session`, `terminal.indicator`, `terminal.display` |
+| `awmi` | log, `gpu.display`, `audio.control`, `net.status`, `devmgr.input`, `terminal.display`, `clock.time` | `awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator` (identified clients) |
+| `awmi-demo` | log, `awmi.window` | |
+| `shell` | log, `terminal.session`, `log.read`, `clock.time`, `audio.*`, `net.*`, `gpu.query`, `awmi.admin`, `awmi.query`, every volume, the manager (services, power), the tools | |
 
 ### The log service
 
@@ -172,8 +178,11 @@ The device manager sends every key from a keyboard in use to each client of `dev
 (`proto::INPUT_KEY`: a character or a named key with modifiers, and the driver's name). The
 terminal turns them into edited lines for the shell ([shell.md](shell.md)). A keyboard plugged in
 while another is in use is held until accepted with Ctrl+Alt+Insert on one in use
-(`user/devmgr/src/trust.rs`, [hardware.md](hardware.md)). Mice send `proto::INPUT_POINTER`
-(relative movement, wheel, buttons); no client uses them yet.
+(`user/devmgr/src/trust.rs`, [hardware.md](hardware.md)). Mice and tablets send
+`proto::INPUT_POINTER` (relative movement, or absolute `[0, 32767]` with `proto::POINTER_ABS`;
+wheel, buttons). One client at a time may take all input with `proto::INPUT_GRAB` (`a` = 1; the
+compositor during a graphical session, [awmi.md](awmi.md)): keys and pointer events then go to it
+only, until it sends `a` = 0 or its channel closes.
 
 ### Tool manifests
 

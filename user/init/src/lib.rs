@@ -24,6 +24,9 @@
 //!   storage readonly    the default setup with storaged checking that every driver refuses a
 //!                       raw write; then `fstest readonly`
 //!   power off|reboot    switch the machine off or reset it with the POWER resource
+//!   audio|net|gpu test  the subsystem's capability, isolation and recovery test services
+//!   awmi test           the compositor (test hooks on) and its window, focus, input-grab and
+//!                       identity test services; the terminal mirrored to the log
 //!   bench               the hardware benchmark image (docs/benchmarks.md): storage read-only,
 //!                       then `utest bench` and `fstest bench`; 0 only if both passed
 
@@ -273,6 +276,7 @@ fn main(s: *const Startup) -> i32 {
         "audio test" => return audio_test(),
         "net test" => return net_test(),
         "gpu test" => return gpu_test(),
+        "awmi test" => return awmi_test(),
         _ => {}
     }
 
@@ -464,6 +468,28 @@ fn net_test() -> i32 {
     }
     m.shutdown();
     println!("init: net test: PASSED");
+    let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
+    println!("init: power: system_power returned {}", r);
+    1
+}
+
+/// Compositor & window manager test: capability separation, surface and input isolation, verified
+/// identity, snapping and workspaces, multi-monitor layout, and the exclusive input grab.
+fn awmi_test() -> i32 {
+    let Some(mut m) = start_system(&[("awmi", "test"), ("terminal", "mirror")], &[Group::System, Group::Test], true) else {
+        return 1;
+    };
+    let state = |m: &Mgr, name: &str| m.find(name).map(|i| m.svcs[i].state);
+    let names = ["svc-awmi-ungranted", "svc-awmi-a", "svc-awmi-b", "svc-awmi-full"];
+    let ok = m.run_until(120 * SEC, |m| names.iter().all(|n| matches!(state(m, n), Some(State::Done(_)))));
+    check!(ok, "awmi test services did not finish in time");
+    for s in names {
+        check!(state(&m, s) == Some(State::Done(0)), "{} ended with {:?}", s, state(&m, s));
+    }
+    // A moment for the shell line the host types after the session ended (checked on the serial log).
+    m.run_until(10 * SEC, |_| false);
+    m.shutdown();
+    println!("init: awmi test: PASSED");
     let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
     println!("init: power: system_power returned {}", r);
     1

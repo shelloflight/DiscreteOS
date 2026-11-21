@@ -8,6 +8,9 @@
 //!
 //! Input drivers send characters; the device manager forwards each one to every client of its
 //! `input` endpoint (`proto::INPUT_KEY`; the console service is one). It echoes nothing itself.
+//! One client at a time may take the input for itself (`proto::INPUT_GRAB`, the compositor during
+//! a graphical session): then keys and pointer events go to that client only, until it releases
+//! the grab or its channel closes.
 //!
 //! Block drivers (virtio-blk, AHCI, NVMe) announce their disks. For each one the
 //! device manager makes a channel, attaches one end to the driver (BLK_ATTACH) and hands the
@@ -85,6 +88,8 @@ const MAX_GPU: usize = 8;
 const MAX_INPUT_CLIENTS: usize = 8;
 /// Port key of the control channel from the service manager.
 const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
+/// Port keys of the input endpoint's clients (`+ slot`): their requests (`proto::INPUT_GRAB`).
+const KEY_INPUT_BASE: u64 = (MAX_DRIVERS as u64) << 8 | 0x10;
 
 /// A disk a driver announced (kept to hand it over again to a restarted storage service).
 #[derive(Clone, Copy)]
@@ -196,6 +201,8 @@ struct Mgr {
     suspended: bool,
     /// Clients of the input endpoint (the console service).
     input: [Handle; MAX_INPUT_CLIENTS],
+    /// The input client holding the exclusive grab (`proto::INPUT_GRAB`), if any.
+    grab: Option<usize>,
     /// Block drivers may write (argument `rw` or `test`); otherwise they start read-only.
     writable: bool,
     /// Which keyboards may type (trust.rs).
@@ -291,6 +298,10 @@ impl Mgr {
         let Some((key, _)) = self.port.wait(timeout) else { return false };
         if key == KEY_MGR {
             self.manager();
+            return true;
+        }
+        if (KEY_INPUT_BASE..KEY_INPUT_BASE + MAX_INPUT_CLIENTS as u64).contains(&key) {
+            self.input_request((key - KEY_INPUT_BASE) as usize);
             return true;
         }
         let i = (key >> 8) as usize;
@@ -438,7 +449,12 @@ impl Mgr {
                                     if self.input[s] != 0 {
                                         sys::handle_close(self.input[s]);
                                     }
+                                    if self.grab == Some(s) {
+                                        self.grab = None;
+                                        println!("devmgr: input grab released (its holder is gone)");
+                                    }
                                     self.input[s] = handle;
+                                    self.port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_INPUT_BASE + s as u64);
                                 }
                                 None => {
                                     println!("devmgr: more than {} input clients: one refused", MAX_INPUT_CLIENTS);
@@ -852,11 +868,77 @@ impl Mgr {
             );
         }
         let mut msg = [0u8; HEADER + 24];
-        Header { txid: 0, op: proto::INPUT_POINTER, status: 0, a, b: (b & 0xFFFF) | (dev as u64) << 32 }.put(&mut msg);
+        let bits = b & (0xFFFF | proto::POINTER_ABS);
+        Header { txid: 0, op: proto::INPUT_POINTER, status: 0, a, b: bits | (dev as u64) << 32 }.put(&mut msg);
         let n = from.len().min(24);
         msg[HEADER..HEADER + n].copy_from_slice(&from.as_bytes()[..n]);
-        for ch in self.input.iter().copied().filter(|&c| c != 0) {
+        for ch in self.input_targets() {
             sys::channel_write(ch, &msg[..HEADER + n]);
+        }
+    }
+
+    /// Where input goes: the grab holder only, or every client of the input endpoint.
+    fn input_targets(&self) -> impl Iterator<Item = Handle> + '_ {
+        let grab = self.grab;
+        self.input.iter().enumerate().filter(move |&(i, &c)| c != 0 && grab.is_none_or(|g| g == i)).map(|(_, &c)| c)
+    }
+
+    /// Requests from client `slot` of the input endpoint: take or release the exclusive grab. A
+    /// closed channel drops the grab it held (the holder exited or crashed): input is shared again.
+    fn input_request(&mut self, slot: usize) {
+        let mut buf = [0u8; HEADER + 16];
+        loop {
+            let ch = self.input[slot];
+            if ch == 0 {
+                return;
+            }
+            let mut hs = [0 as Handle; 1];
+            match sys::channel_read_h(ch, &mut buf, &mut hs, 0) {
+                Ok((n, nh)) => {
+                    if nh > 0 {
+                        sys::handle_close(hs[0]);
+                    }
+                    let Some(h) = Header::get(&buf[..n]) else { continue };
+                    let status = match h.op {
+                        proto::INPUT_GRAB if h.a != 0 => match self.grab {
+                            Some(g) if g != slot => sys::ERR_BAD_STATE,
+                            _ => {
+                                if self.grab.is_none() {
+                                    println!("devmgr: input grabbed by input client {} (keys and pointer go to it only)", slot);
+                                }
+                                self.grab = Some(slot);
+                                0
+                            }
+                        },
+                        proto::INPUT_GRAB => {
+                            if self.grab == Some(slot) {
+                                self.grab = None;
+                                println!("devmgr: input grab released");
+                            }
+                            0
+                        }
+                        _ => sys::ERR_NOT_SUPPORTED,
+                    };
+                    if h.txid != 0 {
+                        let mut rep = [0u8; HEADER];
+                        Header { txid: h.txid, op: h.op, status: status as i32, a: 0, b: 0 }.put(&mut rep);
+                        sys::channel_write(ch, &rep);
+                    }
+                }
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.port.arm(ch, sys::READABLE | sys::PEER_CLOSED, KEY_INPUT_BASE + slot as u64);
+                    return;
+                }
+                Err(_) => {
+                    if self.grab == Some(slot) {
+                        self.grab = None;
+                        println!("devmgr: input grab released (its holder is gone)");
+                    }
+                    sys::handle_close(ch);
+                    self.input[slot] = 0;
+                    return;
+                }
+            }
         }
     }
 
@@ -867,7 +949,7 @@ impl Mgr {
         Header { txid: 0, op: proto::INPUT_KEY, status: 0, a: u64::from(k), b: dev as u64 }.put(&mut msg);
         let n = from.len().min(24);
         msg[HEADER..HEADER + n].copy_from_slice(&from.as_bytes()[..n]);
-        for ch in self.input.iter().copied().filter(|&c| c != 0) {
+        for ch in self.input_targets() {
             sys::channel_write(ch, &msg[..HEADER + n]); // a full or closed client loses the key, never us
         }
         let Ok(c) = u8::try_from(k) else { return }; // a named key: not part of a line
@@ -1069,6 +1151,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
         stop: false,
         suspended: false,
         input: [0; MAX_INPUT_CLIENTS],
+        grab: None,
         writable,
         trust: trust::Trust::new(),
         pointer_seen: 0,

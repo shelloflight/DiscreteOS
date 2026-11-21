@@ -10,6 +10,9 @@
 //!   devices by class, program images by name, VMEX, POWER, directories of volumes (narrowed to
 //!   the rights granted) and channels to other services' endpoints; plus its control channel to
 //!   the manager. Its quota is the manifest's.
+//! - **Identity**: a provider whose manifest says `provides.identify` gets, with each client's
+//!   channel, that client's service name (verified: it is its accepted manifest's) and trust tier
+//!   (`trust_tier`), so it can show who it serves in a way no client can forge.
 //! - **Supervision**: services start in dependency order (`after`, endpoints, volumes). When one
 //!   ends it is restarted per its policy, after a delay that doubles each time, up to its limit;
 //!   then the manager gives up and says so. A restarted provider is linked to its running clients
@@ -119,6 +122,19 @@ pub struct Mgr {
 
 fn startup(tag: u32) -> Handle {
     libd::startup_handle(tag)
+}
+
+/// The trust tier of a service, as a provider with `provides.identify` is told it: sandbox for
+/// anything that may run foreign code (VMEX or the D-CMPL program), system for the system's own
+/// services, native for the rest.
+fn trust_tier(m: &Manifest) -> u64 {
+    if m.vmex || m.programs.iter().any(|p| p == "dcmpl.dx") {
+        u64::from(libd::awmi::TRUST_SANDBOX)
+    } else if m.group == Group::System {
+        u64::from(libd::awmi::TRUST_SYSTEM)
+    } else {
+        u64::from(libd::awmi::TRUST_NATIVE)
+    }
 }
 
 fn dup(h: Handle) -> Option<Handle> {
@@ -378,10 +394,19 @@ impl Mgr {
     fn link(&self, ci: usize, pi: usize, endpoint: &str, send: bool) -> Option<Handle> {
         let (mine, theirs) = sys::channel_pair().ok()?;
         let p = &self.svcs[pi];
-        let mut msg = [0u8; HEADER + 64];
-        Header { txid: 0, op: svc::CONNECT, status: 0, a: 0, b: 0 }.put(&mut msg);
-        let n = endpoint.len().min(64);
+        let c = &self.svcs[ci].m;
+        let mut msg = [0u8; HEADER + 64 + 1 + 32];
+        let tier = if p.m.identify { trust_tier(c) } else { 0 };
+        Header { txid: 0, op: svc::CONNECT, status: 0, a: 0, b: tier }.put(&mut msg);
+        let mut n = endpoint.len().min(64);
         msg[HEADER..HEADER + n].copy_from_slice(&endpoint.as_bytes()[..n]);
+        if p.m.identify {
+            // `<endpoint>\0<client service name>`: who this channel serves, as accepted.
+            let name = &c.name.as_bytes()[..c.name.len().min(32)];
+            msg[HEADER + n] = 0;
+            msg[HEADER + n + 1..HEADER + n + 1 + name.len()].copy_from_slice(name);
+            n += 1 + name.len();
+        }
         if sys::channel_write_h(p.ctl.raw(), &msg[..HEADER + n], &[MsgHandle { handle: theirs, rights: sys::RIGHTS_SAME }]) < 0 {
             sys::handle_close(mine);
             return None;
@@ -389,6 +414,7 @@ impl Mgr {
         if !send {
             return Some(mine);
         }
+        Header { txid: 0, op: svc::CONNECT, status: 0, a: 0, b: 0 }.put(&mut msg);
         let full = format!("{}.{}", p.m.name, endpoint);
         let n = full.len().min(64);
         msg[HEADER..HEADER + n].copy_from_slice(&full.as_bytes()[..n]);

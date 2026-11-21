@@ -5,6 +5,7 @@
 resolver = "2"
 members = [
     "audio",
+    "awmi",
     "clock",
     "dcmpl",
     "devmgr",
@@ -22,6 +23,7 @@ members = [
 ]
 exclude = [
     "lib/audio",
+    "lib/awmi",
     "lib/crypto",
     "lib/dman",
     "lib/fs",
