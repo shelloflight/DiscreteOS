@@ -81,7 +81,7 @@ pub const TAG_BOOT_TIME: u32 = 12;
 pub const TAG_POWER_BUTTON: u32 = 13;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 14;
+pub const ABI_VERSION: u32 = 15;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -184,8 +184,9 @@ pub mod nr {
     pub const ATTEST_ACTIVATE: u64 = 71;
     pub const VMAR_DESTROY: u64 = 72;
     pub const GET_RANDOM: u64 = 73;
+    pub const DEVICE_BAR_ADDR: u64 = 74;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 74;
+    pub const COUNT: u64 = 75;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -504,6 +505,10 @@ pub fn config_write(dev: Handle, off: u64, size: u64, val: u64) -> R {
 }
 pub fn device_map_bar(dev: Handle, bar: u64) -> Result<Handle, i64> {
     hres(sc(nr::DEVICE_MAP_BAR, u64::from(dev), bar, 0, 0, 0, 0))
+}
+/// ABI v15, INSPECT on `dev`: physical base address of memory BAR `bar` (PCI MMIO or platform display).
+pub fn device_bar_addr(dev: Handle, bar: u64) -> R {
+    res(sc(nr::DEVICE_BAR_ADDR, u64::from(dev), bar, 0, 0, 0, 0))
 }
 pub fn io_read(dev: Handle, bar: u64, off: u64, size: u64) -> R {
     res(sc(nr::DEVICE_IO_READ, u64::from(dev), bar, off, size, 0, 0))

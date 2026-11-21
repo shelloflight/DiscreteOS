@@ -1,8 +1,21 @@
-//! Host unit tests and 13,000-round fuzzers for `dosgpu` (`gpu-host`).
+//! Host unit tests, simulated DCN hardware verification, and fuzzers for `dosgpu` (`gpu-host`).
 
 use super::*;
 use std::vec;
 use std::vec::Vec;
+
+use edid::DetailedTiming;
+use amd::dp_aux::{AuxError, dpcd_rate_label, probe_dp_aux_readonly, train_dp_link};
+use amd::dcn::{
+    ActivePipe, DcnAccess, DcnVersion, FbWindow, GopInfo, RegIo, allocate_scanout_buffers,
+    decode_surface_addr, encode_surface_addr, measure_refresh_mhz, probe_active_pipes,
+};
+use amd::flip::{
+    CursorSize, FlipEngine, FlipError, FlipPoll, HwCursor, IhController, IhEvent, ModeBandwidthPlan,
+    SelfCheckReason, SelfCheckState, encode_dsc_1_2_pps, plan_mode_bandwidth, program_mode_regs,
+    set_hdr, set_vrr,
+};
+use amd::sim::{DcnSim, build_discovery_image, build_high_refresh_edid, default_ip_blocks};
 
 struct Rng(u64);
 impl Rng {
@@ -58,7 +71,7 @@ fn make_valid_edid(w: u32, h: u32, name: &[u8]) -> [u8; 128] {
 }
 
 #[test]
-fn edid_parse_valid_and_invalid() {
+fn edid_parse_valid_and_high_refresh_extensions() {
     let raw = make_valid_edid(1920, 1080, b"D-OS Monitor");
     let info = edid::parse_edid(&raw).unwrap();
     assert_eq!(info.manufacturer_str(), "DOS");
@@ -68,6 +81,19 @@ fn edid_parse_valid_and_invalid() {
     assert!(info.mode_count >= 1);
     assert_eq!((info.modes()[0].width, info.modes()[0].height), (1920, 1080));
     assert!(info.modes()[0].preferred);
+
+    // Multi-block EDID with CTA-861 HDR10 + FreeSync + DisplayID 2.0 240 Hz & 540 Hz timings.
+    let hr = build_high_refresh_edid();
+    let hr_info = edid::parse_edid(&hr).unwrap();
+    assert_eq!(hr_info.name_str(), "RX9070-540Hz");
+    assert_eq!(hr_info.ext_blocks, 2);
+    assert!(hr_info.hdr_supported);
+    assert!(hr_info.hdr_max_nits >= 700);
+    assert_eq!((hr_info.vrr_min_hz, hr_info.vrr_max_hz), (48, 240));
+    assert!(hr_info.timings().iter().any(|t| t.h_active == 2560 && t.v_active == 1440 && (239_000..=241_000).contains(&t.refresh_mhz)));
+    assert!(hr_info.timings().iter().any(|t| t.h_active == 2560 && t.v_active == 1440 && (539_000..=541_000).contains(&t.refresh_mhz)));
+    let best = hr_info.highest_refresh_for(2560, 1440).unwrap();
+    assert!((539_000..=541_000).contains(&best.refresh_mhz));
 
     // Bad checksum refused
     let mut bad = raw;
@@ -82,14 +108,47 @@ fn edid_parse_valid_and_invalid() {
 }
 
 #[test]
-fn damage_rect_and_blit_wc() {
+fn damage_rect_buffer_age_and_blit_wc() {
     let r = DamageRect { x: 50, y: 40, w: 200, h: 100 }.clip(100, 80).unwrap();
     assert_eq!(r, DamageRect { x: 50, y: 40, w: 50, h: 40 });
     assert_eq!(DamageRect { x: 100, y: 0, w: 10, h: 10 }.clip(100, 80), None);
     let u = DamageRect { x: 10, y: 20, w: 30, h: 40 }.union(DamageRect { x: 25, y: 10, w: 50, h: 20 });
     assert_eq!(u, DamageRect { x: 10, y: 10, w: 65, h: 50 });
 
-    // 4x2 XRGB8888 source -> BGR shifts [0, 8, 16]
+    // Double-buffered buffer-age tracking: never copies full frame after warmup.
+    let mut age = BufferAgeTracker::new(2, 2560, 1440);
+    let mut out = [DamageRect::EMPTY; 16];
+    let d0 = [DamageRect { x: 10, y: 10, w: 40, h: 40 }];
+    // Buffer 0 starts dirty -> full copy once.
+    assert_eq!(age.collect_for_buffer(0, &d0, &mut out), 1);
+    assert_eq!(out[0], DamageRect::full(2560, 1440));
+    age.commit_buffer(0, &d0);
+
+    // Buffer 1 starts dirty -> full copy once.
+    let d1 = [DamageRect { x: 100, y: 100, w: 50, h: 50 }];
+    assert_eq!(age.collect_for_buffer(1, &d1, &mut out), 1);
+    assert_eq!(out[0], DamageRect::full(2560, 1440));
+    age.commit_buffer(1, &d1);
+
+    // Now buffer 0 is age 1: needs d1 (frame 1) + d2 (current), NOT full frame!
+    let d2 = [DamageRect { x: 500, y: 500, w: 20, h: 20 }];
+    let n = age.collect_for_buffer(0, &d2, &mut out);
+    assert_eq!(n, 2);
+    let total_px: u64 = out[..n].iter().map(|r| r.area()).sum();
+    assert_eq!(total_px, 50 * 50 + 20 * 20);
+    assert!(total_px < 2560 * 1440 / 100);
+    age.commit_buffer(0, &d2);
+
+    // Triple-buffered buffer-age tracking: buffer 0 at age 2 gets union of d1 + d2 + d3.
+    let mut age3 = BufferAgeTracker::new(3, 1920, 1080);
+    age3.commit_buffer(0, &[DamageRect { x: 0, y: 0, w: 10, h: 10 }]);
+    age3.commit_buffer(1, &[DamageRect { x: 50, y: 0, w: 10, h: 10 }]);
+    age3.commit_buffer(2, &[DamageRect { x: 100, y: 0, w: 10, h: 10 }]);
+    let d3 = [DamageRect { x: 150, y: 0, w: 10, h: 10 }];
+    let n3 = age3.collect_for_buffer(0, &d3, &mut out);
+    assert_eq!(n3, 3); // frames 1, 2, and current d3
+
+    // 4x2 XRGB8888 source -> BGR shifts [0, 8, 16] and HDR10 ARGB2101010 conversion.
     let mut src = [0u8; 4 * 2 * 4];
     src[0..4].copy_from_slice(&0x0011_2233u32.to_le_bytes()); // R=0x11, G=0x22, B=0x33
     let mut written = Vec::new();
@@ -106,6 +165,11 @@ fn damage_rect_and_blit_wc() {
     );
     assert_eq!(n, 1);
     assert_eq!(written, vec![(0, 0x0033_2211)]);
+
+    let hdr_px = convert_pixel_to_argb2101010(0x00FF_8000, PixelFormat::Xrgb8888);
+    assert_eq!((hdr_px >> 30) & 3, 3);
+    assert_eq!((hdr_px >> 20) & 0x3FF, 1023);
+    assert_eq!(hdr_px & 0x3FF, 0);
 }
 
 #[test]
@@ -139,64 +203,38 @@ fn virtio_gpu_2d_and_virgl_roundtrip() {
 }
 
 #[test]
-fn amd_rdna_rx9070_discovery_pm4_sdma() {
+fn amd_ip_discovery_v1_v2_v4_and_cs_validators() {
     let rx9070 = amd::identify_pci(0x7550);
     assert_eq!(rx9070.family, amd::AmdFamily::Rdna4);
     assert_eq!(rx9070.gfx_major, 12);
     assert_eq!(rx9070.dcn_major, 4);
+    assert_eq!(rx9070.dcn_hint(), DcnVersion::Dcn401);
     assert!(rx9070.name.contains("RX 9070"));
 
     let igpu = amd::identify_pci(0x13C0);
     assert_eq!(igpu.family, amd::AmdFamily::Rdna2);
     assert!(igpu.is_apu);
+    assert_eq!(igpu.dcn_hint(), DcnVersion::Dcn315);
 
-    // Construct a synthetic valid AMD IP Discovery binary image with GC + DCN + SDMA0.
-    let mut img = vec![0u8; 256];
-    // Die table at offset 128: die_id=0, num_ips=3
-    let die_off = 128usize;
-    img[die_off..die_off + 2].copy_from_slice(&0u16.to_le_bytes());
-    img[die_off + 2..die_off + 4].copy_from_slice(&3u16.to_le_bytes());
-    let mut cur = die_off + 4;
-    for (hwid, major, minor, base) in [
-        (amd::HWID_GC, 12u8, 0u8, 0x1260u32),
-        (amd::HWID_DCE, 4, 0, 0x0040),
-        (amd::HWID_SDMA0, 7, 0, 0x4980),
-    ] {
-        img[cur..cur + 2].copy_from_slice(&hwid.to_le_bytes());
-        img[cur + 2] = 0; // instance
-        img[cur + 3] = 1; // 1 base
-        img[cur + 4] = major;
-        img[cur + 5] = minor;
-        img[cur + 6] = 1;
-        img[cur + 8..cur + 12].copy_from_slice(&base.to_le_bytes());
-        cur += 12;
+    // Real IP Discovery v1 (32-bit bases) and v2 + 64-bit v4 bases + MEM_RESERVED_INFO.
+    let blocks = default_ip_blocks(DcnVersion::Dcn401);
+    for &(ver_maj, b64) in &[(1u16, false), (2u16, false), (2u16, true)] {
+        let img = build_discovery_image(ver_maj, b64, &blocks, &[(0x100_0000, 0x20_0000)]);
+        let disc = amd::parse_ip_discovery(&img).unwrap();
+        assert_eq!(disc.dcn_version(), Some(DcnVersion::Dcn401));
+        let dcn_blk = disc.find(amd::HWID_DCE, 0).unwrap();
+        assert_eq!((dcn_blk.major, dcn_blk.minor, dcn_blk.revision), (4, 0, 1));
+        assert_eq!(dcn_blk.base(1), Some(0x0000_00C0));
+        assert_eq!(dcn_blk.base(2), Some(0x0000_34C0));
+        assert_eq!(disc.find(amd::HWID_MMHUB, 0).unwrap().major, 4);
+        assert_eq!(disc.find(amd::HWID_OSSSYS, 0).unwrap().major, 7);
+        assert_eq!(disc.find(amd::HWID_NBIO, 0).unwrap().base(2), Some(0x0000_0D20));
+        assert_eq!(disc.reserved().len(), 1);
+        assert_eq!(disc.reserved()[0].offset, 0x100_0000);
+        assert_eq!(disc.reserved()[0].size, 0x20_0000);
     }
-    // IP discovery table at offset 64 (size 32)
-    let ip_off = 64usize;
-    let ip_size = 32usize;
-    img[ip_off..ip_off + 4].copy_from_slice(&amd::IP_DISCOVERY_TABLE_SIG.to_le_bytes());
-    img[ip_off + 10..ip_off + 12].copy_from_slice(&1u16.to_le_bytes()); // num_dies=1
-    img[ip_off + 12..ip_off + 14].copy_from_slice(&0u16.to_le_bytes()); // die 0
-    img[ip_off + 14..ip_off + 16].copy_from_slice(&(die_off as u16).to_le_bytes());
-    let ip_csum = amd::discovery_checksum(&img[ip_off..ip_off + ip_size]);
 
-    // Binary header at offset 0
-    let img_len = img.len() as u16;
-    img[0..4].copy_from_slice(&amd::IP_DISCOVERY_BINARY_SIG.to_le_bytes());
-    img[4..6].copy_from_slice(&2u16.to_le_bytes());
-    img[6..8].copy_from_slice(&img_len.to_le_bytes());
-    img[12..14].copy_from_slice(&(ip_off as u16).to_le_bytes());
-    img[14..16].copy_from_slice(&ip_csum.to_le_bytes());
-    img[16..18].copy_from_slice(&(ip_size as u16).to_le_bytes());
-    let bin_csum = amd::discovery_checksum(&img[12..]);
-    img[10..12].copy_from_slice(&bin_csum.to_le_bytes());
-
-    let disc = amd::parse_ip_discovery(&img).unwrap();
-    assert_eq!(disc.find(amd::HWID_GC, 0).unwrap().major, 12);
-    assert_eq!(disc.find(amd::HWID_DCE, 0).unwrap().base_dword, 0x0040);
-    assert_eq!(disc.find(amd::HWID_SDMA0, 0).unwrap().major, 7);
-
-    // PM4 & SDMA command validation
+    // PM4 & SDMA command validation including 2D sub-window GPU composition builder.
     let mut pm4 = [0u32; 12];
     let n1 = amd::pm4_nop(&mut pm4, 0x1234).unwrap();
     let n2 = amd::pm4_release_mem_fence(&mut pm4[n1..], 0x10000, 42).unwrap();
@@ -206,7 +244,7 @@ fn amd_rdna_rx9070_discovery_pm4_sdma() {
     }
     assert_eq!(amd::validate_pm4_cs(&pm4_bytes), Ok(2));
 
-    // Privileged PM4 WRITE_DATA must be refused
+    // Privileged PM4 WRITE_DATA must be refused.
     let bad_pm4 = [amd::pm4_hdr(amd::PM4_WRITE_DATA, 1), 0];
     let mut bad_bytes = Vec::new();
     for w in bad_pm4 {
@@ -214,14 +252,293 @@ fn amd_rdna_rx9070_discovery_pm4_sdma() {
     }
     assert_eq!(amd::validate_pm4_cs(&bad_bytes), Err(CsError::UnknownOpcode));
 
-    let mut sdma = [0u32; 16];
-    let s1 = amd::sdma_const_fill(&mut sdma, 0x20000, 0x00FF_0000, 4096).unwrap();
-    let s2 = amd::sdma_fence(&mut sdma[s1..], 0x10000, 7).unwrap();
+    let mut sdma = [0u32; 64];
+    let comp_dw = amd::build_sdma_composite_rects(
+        &mut sdma,
+        0x1000_0000,
+        2560,
+        0x2000_0000,
+        2560,
+        2560,
+        1440,
+        &[DamageRect { x: 16, y: 32, w: 200, h: 100 }, DamageRect { x: 400, y: 500, w: 64, h: 64 }],
+        0x3000_0000,
+        9,
+    )
+    .unwrap();
     let mut sdma_bytes = Vec::new();
-    for &w in &sdma[..s1 + s2] {
+    for &w in &sdma[..comp_dw] {
         sdma_bytes.extend_from_slice(&w.to_le_bytes());
     }
-    assert_eq!(amd::validate_sdma_cs(&sdma_bytes), Ok(2));
+    assert_eq!(amd::validate_sdma_cs(&sdma_bytes), Ok(3)); // 2 sub-window copies + 1 fence
+}
+
+#[test]
+fn dcn_all_generations_probe_mc_vram_and_gop_match() {
+    let fb_base = 0x0000_0080_0000_0000u64; // Typical 512 GiB MC aperture base on RDNA 4
+    let bar0_phys = 0x0000_00FC_0000_0000u64;
+    let vram_size = 16u64 << 30; // 16 GiB RX 9070
+    let gop_vram_off = 0x0040_0000u64; // 4 MiB into VRAM
+    let gop_mc = fb_base + gop_vram_off;
+
+    let timing = DetailedTiming {
+        pixel_clock_khz: 966_240,
+        h_active: 2560,
+        h_blank: 80,
+        h_front_porch: 16,
+        h_sync_width: 32,
+        v_active: 1440,
+        v_blank: 85,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_pos: true,
+        v_sync_pos: true,
+        refresh_mhz: 240_000,
+        preferred: true,
+    };
+
+    let gop = GopInfo {
+        phys_base: bar0_phys + gop_vram_off,
+        size: 2560 * 1440 * 4,
+        width: 2560,
+        height: 1440,
+        pitch: 2560 * 4,
+        red_shift: 16,
+        green_shift: 8,
+        blue_shift: 0,
+    };
+
+    for ver in [DcnVersion::Dcn401, DcnVersion::Dcn315, DcnVersion::Dcn32, DcnVersion::Dcn30] {
+        let mut sim = DcnSim::new(ver, fb_base, vram_size);
+        // Active pipe 0 (GOP monitor) + active pipe 2 (secondary monitor, multi-monitor 4f).
+        sim.setup_active_pipe(0, &timing, 2560, gop_mc);
+        sim.setup_active_pipe(2, &timing, 2560, fb_base + 0x0400_0000);
+
+        let fb_win = FbWindow::read(&sim, &sim.access, vram_size).unwrap();
+        assert_eq!(fb_win.fb_base, fb_base);
+        assert_eq!(fb_win.mc_to_vram(gop_mc), Some(gop_vram_off));
+        assert_eq!(fb_win.vram_to_mc(gop_vram_off), Some(gop_mc));
+        assert_eq!(fb_win.mc_to_vram(fb_base - 0x1000), None); // out of window
+
+        let mut pipes = [ActivePipe::default(); 6];
+        let n = probe_active_pipes(&sim, &sim.access, Some(fb_win), bar0_phys, Some(&gop), &mut pipes);
+        assert_eq!(n, 2, "version {:?}", ver);
+        assert_eq!(pipes[0].pipe, 0);
+        assert_eq!((pipes[0].width(), pipes[0].height()), (2560, 1440));
+        assert_eq!(pipes[0].pitch_bytes, 2560 * 4);
+        assert_eq!(pipes[0].vram_off, Some(gop_vram_off));
+        assert!(pipes[0].gop_matched);
+        assert_eq!(pipes[1].pipe, 2);
+        assert!(!pipes[1].gop_matched);
+
+        // Wrong GOP phys_base must NOT match.
+        let wrong_gop = GopInfo { phys_base: bar0_phys + 0x0800_0000, ..gop };
+        assert!(!pipes[0].check_gop_match(bar0_phys, &wrong_gop));
+    }
+
+    // Exact refresh-rate measurement from OTG frame counter.
+    assert_eq!(measure_refresh_mhz(24, 100_000_000), Some(240_000));
+    assert_eq!(measure_refresh_mhz(54, 100_000_000), Some(540_000));
+    assert_eq!(measure_refresh_mhz(6, 100_000_000), Some(60_000));
+    assert_eq!(measure_refresh_mhz(0, 100_000_000), None);
+}
+
+#[test]
+fn dcn_sim_flip_state_machine_self_check_revert_and_crash_recovery() {
+    let fb_base = 0x0000_0080_0000_0000u64;
+    let vram_size = 16u64 << 30;
+    let bar0_size = 16u64 << 30;
+    let gop_vram_off = 0x0040_0000u64;
+    let gop_mc = fb_base + gop_vram_off;
+
+    let timing = DetailedTiming {
+        pixel_clock_khz: 966_240,
+        h_active: 2560,
+        h_blank: 80,
+        h_front_porch: 16,
+        h_sync_width: 32,
+        v_active: 1440,
+        v_blank: 85,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_pos: true,
+        v_sync_pos: true,
+        refresh_mhz: 240_000,
+        preferred: true,
+    };
+
+    let mut sim = DcnSim::new(DcnVersion::Dcn401, fb_base, vram_size);
+    sim.setup_active_pipe(0, &timing, 2560, gop_mc);
+    let access = sim.access;
+    let fb_win = FbWindow::read(&sim, &access, vram_size).unwrap();
+
+    // Allocate 3 scanout buffers + cursor adjacent to GOP FB, avoiding reserved top VRAM.
+    let layout = allocate_scanout_buffers(
+        gop_vram_off,
+        2560 * 1440 * 4,
+        2560 * 4,
+        1440,
+        bar0_size,
+        vram_size,
+        &[amd::ReservedMemRegion { offset: 0x0200_0000, size: 0x10_0000 }],
+        true,
+    )
+    .unwrap();
+    assert_eq!(layout.buf_count, 3);
+    assert!(layout.buffers[0] >= gop_vram_off + 2560 * 1440 * 4);
+    assert!(layout.cursor_vram_off + layout.cursor_size_bytes < vram_size - amd::dcn::TOP_VRAM_RESERVE);
+
+    // 1. Self-check failure path: latch stalls -> after 3 frames, must restore GOP MC addr!
+    sim.stall_flip_latch = true;
+    let mut eng_fail = FlipEngine::new(0, fb_win, layout, gop_mc, 2560, 1440, 240_000);
+    assert!(matches!(eng_fail.self_check_start(&mut sim, &access), SelfCheckState::InProgress { .. }));
+    sim.advance_vblank(0);
+    assert!(matches!(eng_fail.self_check_poll(&mut sim, &access), SelfCheckState::InProgress { .. }));
+    sim.advance_vblank(0);
+    assert!(matches!(eng_fail.self_check_poll(&mut sim, &access), SelfCheckState::InProgress { .. }));
+    sim.advance_vblank(0);
+    assert_eq!(
+        eng_fail.self_check_poll(&mut sim, &access),
+        SelfCheckState::Failed(SelfCheckReason::NotLatchedWithin3Frames)
+    );
+    // Verify original GOP MC addr was written back to HUBP primary surface address.
+    let lo = access.r_dcn(&sim, access.regs.hubp_primary_addr(0)).unwrap();
+    let hi = access.r_dcn(&sim, access.regs.hubp_primary_addr_hi(0)).unwrap();
+    assert_eq!(decode_surface_addr(lo, hi), gop_mc);
+
+    // 2. Normal self-check pass + strict never-write-pending/on-screen invariant across 20 flips.
+    sim.stall_flip_latch = false;
+    sim.advance_vblank(0); // settle restored GOP
+    assert_eq!(sim.latched_mc(0), gop_mc);
+
+    let mut eng = FlipEngine::new(0, fb_win, layout, gop_mc, 2560, 1440, 240_000);
+    eng.self_check_start(&mut sim, &access);
+    sim.advance_vblank(0);
+    assert_eq!(eng.self_check_poll(&mut sim, &access), SelfCheckState::Verified);
+    assert_eq!(eng.on_screen_buf, Some(0));
+
+    let mut dmg_out = [DamageRect::EMPTY; 16];
+    for frame in 0..20u32 {
+        let now_ns = u64::from(frame + 1) * 4_166_666;
+        let b = eng.pick_draw_buffer(&sim, &access, now_ns).unwrap();
+        // Hard invariant: never draw into the buffer currently on screen.
+        assert_ne!(Some(b), eng.on_screen_buf);
+        assert_ne!(eng.buffer_mc(b).unwrap(), sim.latched_mc(0));
+
+        let cur_dmg = [DamageRect { x: (frame * 32) % 2400, y: 100, w: 64, h: 64 }];
+        let dn = eng.damage_for_buffer(b, &cur_dmg, &mut dmg_out);
+        assert!(dn >= 1);
+        if frame >= 3 {
+            // After initial buffer warmup, buffer-age damage must NEVER be full screen!
+            let px: u64 = dmg_out[..dn].iter().map(|r| r.area()).sum();
+            assert!(px < 2560 * 1440 / 50, "expected minimal buffer-age damage, got {} px", px);
+        }
+
+        eng.commit_vsync_flip(&mut sim, &access, b, &cur_dmg, now_ns).unwrap();
+        // While flip is pending, pick_draw_buffer MUST refuse to start another overlapping flip!
+        assert_eq!(eng.pick_draw_buffer(&sim, &access, now_ns), Err(FlipError::FlipInFlight));
+        assert_eq!(eng.poll_flip_complete(&sim, &access, now_ns), FlipPoll::Pending);
+
+        // Advance vblank -> flip completes cleanly and latches into EARLIEST_INUSE.
+        sim.advance_vblank(0);
+        assert_eq!(
+            eng.poll_flip_complete(&sim, &access, now_ns + 4_166_666),
+            FlipPoll::Completed { buf_idx: b, frames: u64::from(frame + 1), late: false }
+        );
+        assert_eq!(sim.latched_mc(0), eng.buffer_mc(b).unwrap());
+    }
+
+    // 3. Crash recovery: a newly spawned driver finds our own buffer on screen and restores GOP!
+    let mut crashed_restart = FlipEngine::new(0, fb_win, layout, gop_mc, 2560, 1440, 240_000);
+    assert!(crashed_restart.recover_if_crashed_own_buffer(&mut sim, &access));
+    sim.advance_vblank(0);
+    assert_eq!(sim.latched_mc(0), gop_mc);
+    assert!(!crashed_restart.recover_if_crashed_own_buffer(&mut sim, &access));
+}
+
+#[test]
+fn dcn_sim_dp_aux_edid_cursor_ih_modeset_vrr_hdr() {
+    let fb_base = 0x0000_0080_0000_0000u64;
+    let vram_size = 16u64 << 30;
+    let mut sim = DcnSim::new(DcnVersion::Dcn401, fb_base, vram_size);
+    let access = sim.access;
+    let edid_ref = edid::parse_edid(&build_high_refresh_edid()).unwrap();
+    let mode_240 = edid_ref.timings().iter().find(|t| (239_000..=241_000).contains(&t.refresh_mhz) && t.h_active == 2560).copied().unwrap();
+    let mode_540 = edid_ref.timings().iter().find(|t| (539_000..=541_000).contains(&t.refresh_mhz) && t.h_active == 2560).copied().unwrap();
+
+    sim.setup_active_pipe(0, &mode_240, 2560, fb_base + 0x40_0000);
+
+    // 1. Read-only DP AUX probe with injected DEFER retries.
+    sim.inject_defers = 3;
+    let probe = probe_dp_aux_readonly(&mut sim, &access, 0, |_| {}).unwrap();
+    assert_eq!(probe.link.active_lanes, 4);
+    assert_eq!(probe.link.active_link_rate_mbps, 8_100);
+    assert_eq!(dpcd_rate_label(probe.link.active_link_rate_mbps), "HBR3");
+    assert!(probe.link.dsc_supported);
+    assert!(probe.link.cr_done && probe.link.eq_done);
+    assert_eq!(probe.edid_blocks_read, 3);
+    let parsed_edid = probe.edid.unwrap();
+    assert_eq!(parsed_edid.name_str(), "RX9070-540Hz");
+    assert!(parsed_edid.hdr_supported);
+    // Disconnected AUX channel returns Disconnected.
+    assert_eq!(probe_dp_aux_readonly(&mut sim, &access, 1, |_| {}).unwrap_err(), AuxError::Disconnected);
+
+    // 2. Bandwidth planning for 1440p@240 vs 1440p@540 + DSC 1.2 PPS + DP link training.
+    assert_eq!(plan_mode_bandwidth(&probe.link, &mode_240, 8), ModeBandwidthPlan::FitsCurrentLink);
+    // 1440p@540 Hz @ 24 bpp (~52 Gbps) exceeds HBR3 (25.9 Gbps), fits via DSC on HBR3!
+    assert_eq!(
+        plan_mode_bandwidth(&probe.link, &mode_540, 8),
+        ModeBandwidthPlan::NeedsDscOnCurrentLink { target_bpp: 8 }
+    );
+    let pps = encode_dsc_1_2_pps(2560, 1440, 8, 8, 4);
+    assert_eq!(pps[0], 0x12);
+    let train = train_dp_link(&mut sim, &access, 0, 4, 0x02, true, |_| {}).unwrap(); // UHBR20
+    assert!(train.cr_done && train.eq_done && train.is_uhbr);
+    assert_eq!(train.link_rate_mbps, 20_000);
+
+    // 3. Guarded mode setting (OTG + DCCG DP DTO + MSA + DSC) and clean revert.
+    let saved = program_mode_regs(&mut sim, &access, 0, &mode_540, 100_000, true, 8, 8);
+    assert_eq!(access.r_dcn(&sim, access.regs.otg_h_total(0)), Some(mode_540.h_total() - 1));
+    assert_eq!(access.r_dcn(&sim, access.regs.dp_pixel_format(0)).unwrap() & 1, 1); // DSC enabled
+    saved.restore(&mut sim, &access);
+    assert_eq!(access.r_dcn(&sim, access.regs.dp_pixel_format(0)).unwrap() & 1, 0);
+
+    // 4. VRR (FreeSync) and HDR10.
+    let otg = amd::dcn::OtgTiming::read(&sim, &access, 0).unwrap();
+    assert!(set_vrr(&mut sim, &access, 0, &otg, 240_000, 48, 240, true));
+    assert_eq!(access.r_dcn(&sim, access.regs.otg_v_total_control(0)).unwrap() & 0x3, 0x3);
+    set_hdr(&mut sim, &access, 0, true);
+    assert_eq!(access.r_dcn(&sim, access.regs.hubp_surface_config(0)).unwrap() & 0x7F, amd::dcn::DCN_FMT_ARGB2101010);
+
+    // 5. Hardware cursor (HUBP + DPP, bit-15 X position shift, off-screen clipping).
+    let mut cur = HwCursor::new(0);
+    cur.configure(&mut sim, &access, fb_base + 0x0800_0000, CursorSize::Px64, 4, 4, true, 2560, 1440);
+    cur.move_pos(&mut sim, &access, 300, 150, 2560, 1440);
+    let pos_reg = access.r_dcn(&sim, access.regs.cursor_position(0)).unwrap();
+    assert_eq!((pos_reg >> 15) & 0x7FFF, 300);
+    assert_eq!(pos_reg & 0x7FFF, 150);
+    assert_eq!(access.r_dcn(&sim, access.regs.dpp_cursor_control(0)).unwrap() & 1, 1);
+    cur.move_pos(&mut sim, &access, 3000, 150, 2560, 1440); // off-screen disables DPP cursor
+    assert_eq!(access.r_dcn(&sim, access.regs.dpp_cursor_control(0)).unwrap() & 1, 0);
+
+    // 6. OSSSYS 7.0 IH ring setup + vblank & flip-done 32-byte IV decoding.
+    let mut ih = IhController::new(4096);
+    assert!(ih.enable(&mut sim, &access, 0x1000_0000, 0x1000_1000, 0x1000_2000));
+    ih.enable_pipe_irqs(&mut sim, &access, 0, otg.v_blank_start);
+    // Trigger a flip and advance vblank -> both FlipDone and Vblank IVs appear in IH ring!
+    let (lo, hi) = encode_surface_addr(fb_base + 0x0100_0000);
+    access.w_dcn(&mut sim, access.regs.hubp_primary_addr_hi(0), hi);
+    access.w_dcn(&mut sim, access.regs.hubp_primary_addr(0), lo);
+    sim.advance_vblank(0);
+    let ring_copy = sim.ih_ring.clone();
+    let wptr_wb = sim.ih_wptr_wb;
+    let mut events = Vec::new();
+    let drained = ih.drain(&mut sim, &access, &ring_copy, Some(wptr_wb), |ev| events.push(ev));
+    assert_eq!(drained, 2);
+    assert!(matches!(events[0], IhEvent::FlipDone { pipe: 0, .. }));
+    assert!(matches!(events[1], IhEvent::Vblank { pipe: 0, .. }));
+    ih.disable(&mut sim, &access);
+    assert!(!ih.active);
 }
 
 #[test]
@@ -251,14 +568,31 @@ fn intel_xe_and_nvidia_gsp_core() {
     assert_eq!(nvidia::validate_gsp_rpc(&rpc[..n]), Err(CsError::BadArgument));
 }
 
+/// Arbitrary-register-value fuzzing target implementing `RegIo` for DCN register parsers.
+struct FuzzRegs {
+    seed: u64,
+}
+impl RegIo for FuzzRegs {
+    fn r32(&self, byte_off: u64) -> Option<u32> {
+        let mut x = self.seed ^ byte_off.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 30;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 27;
+        Some(x as u32)
+    }
+    fn w32(&mut self, _byte_off: u64, val: u32) {
+        self.seed ^= u64::from(val);
+    }
+}
+
 #[test]
-fn fuzz_all_gpu_parsers_and_validators() {
+fn fuzz_all_gpu_parsers_validators_and_dcn_registers() {
     let mut rng = Rng(0xD056_0055_1234_5678);
     let mut buf = [0u8; 512];
 
-    // 3,000 rounds EDID fuzzer
+    // 3,000 rounds EDID (1-block & multi-block) fuzzer
     for _ in 0..3_000 {
-        let len = (rng.next() as usize) % 256;
+        let len = (rng.next() as usize) % buf.len();
         rng.fill(&mut buf[..len]);
         let _ = edid::parse_edid(&buf[..len]);
     }
@@ -271,13 +605,37 @@ fn fuzz_all_gpu_parsers_and_validators() {
         let _ = virtio::decode_capset_info(&buf[..len]);
         let _ = virtio::validate_virgl_cs(&buf[..len]);
     }
-    // 3,000 rounds AMD IP Discovery + PM4 + SDMA CS fuzzer
+    // 3,000 rounds AMD IP Discovery + PM4 + SDMA + IH IV fuzzer
     for _ in 0..3_000 {
         let len = (rng.next() as usize) % buf.len();
         rng.fill(&mut buf[..len]);
         let _ = amd::parse_ip_discovery(&buf[..len]);
         let _ = amd::validate_pm4_cs(&buf[..len]);
         let _ = amd::validate_sdma_cs(&buf[..len]);
+        let _ = amd::flip::decode_iv(&buf[..len]);
+    }
+    // 2,000 rounds arbitrary DCN/MMHUB/AUX register values fuzzer across all 4 DCN generations
+    let vers = [DcnVersion::Dcn401, DcnVersion::Dcn315, DcnVersion::Dcn32, DcnVersion::Dcn30];
+    let mut pipes = [ActivePipe::default(); 6];
+    for i in 0..2_000 {
+        let ver = vers[i % vers.len()];
+        let blocks = default_ip_blocks(ver);
+        let access = DcnAccess::new(ver, blocks[0], Some(blocks[1]), Some(blocks[2]), Some(blocks[3]));
+        let mut fio = FuzzRegs { seed: rng.next() };
+        let vram_sz = (rng.next() & 0x3_FFFF_FFFF).max(1 << 20);
+        let win = FbWindow::read(&fio, &access, vram_sz);
+        let _ = probe_active_pipes(&fio, &access, win, rng.next(), None, &mut pipes);
+        let _ = allocate_scanout_buffers(
+            rng.next() & 0x0FFF_FFFF,
+            (rng.next() & 0x03FF_FFFF).max(4096),
+            ((rng.next() as u32) & 0x7FFF).max(64),
+            ((rng.next() as u32) & 0x1FFF).max(64),
+            vram_sz,
+            vram_sz,
+            &[],
+            (i & 1) == 0,
+        );
+        let _ = probe_dp_aux_readonly(&mut fio, &access, (i as u8) % access.regs.max_aux(), |_| {});
     }
     // 2,000 rounds Intel MI CS fuzzer
     for _ in 0..2_000 {

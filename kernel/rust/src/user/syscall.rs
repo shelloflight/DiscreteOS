@@ -111,7 +111,9 @@ pub mod nr {
     pub const VMAR_DESTROY: u64 = 72;
     // ABI v14: kernel ChaCha20 CSPRNG
     pub const GET_RANDOM: u64 = 73;
-    pub const COUNT: u64 = 74;
+    // ABI v15: physical base address of a device memory BAR (PCI MMIO or platform display)
+    pub const DEVICE_BAR_ADDR: u64 = 74;
+    pub const COUNT: u64 = 75;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -389,6 +391,11 @@ fn device_map_bar(u: &UserThread, dh: u64, bar: u64) -> KResult<i64> {
     let v = d.bar_vmo(bar, u.proc.account())?;
     let rights = Rights::DUPLICATE | Rights::TRANSFER | Rights::READ | Rights::WRITE | Rights::MAP | Rights::INSPECT;
     u.proc.add(Object::Vmo(v), rights).map(|x| i64::from(x.0))
+}
+
+fn device_bar_addr(u: &UserThread, dh: u64, bar: u64) -> KResult<i64> {
+    let (d, _) = u.proc.get_device(h(dh), Rights::INSPECT)?;
+    ok(d.bar_addr(bar)?)
 }
 
 fn device_interrupt(u: &UserThread, dh: u64, index: u64, flags: u64) -> KResult<i64> {
@@ -1140,6 +1147,7 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
         nr::DISPLAY_INFO => display_info(u, a[0], a[1]),
         nr::PROCESS_HANDLES => process_handles(u, a[0], a[1], a[2]),
         nr::GET_RANDOM => get_random(a[0], a[1], a[2]),
+        nr::DEVICE_BAR_ADDR => device_bar_addr(u, a[0], a[1]),
         #[cfg(ktest)]
         nr::KTEST_SMAP => {
             // SAFETY: test builds only: makes the kernel fault on purpose (SMAP).

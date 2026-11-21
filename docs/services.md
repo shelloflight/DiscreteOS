@@ -69,9 +69,11 @@ for another name. `dbuild img sign <seed> manifest <name>.dman <file> <out.dsig>
 ### Boot to the desktop
 
 On a normal boot the service manager starts the compositor with the argument `autostart`, so the
-machine comes up on the desktop ([awmi.md](awmi.md)). A line `desktop = off` (or `no`, `false`,
-`0`) in the optional `DOS/BOOT.CFG` on the boot volume keeps the text console instead. The file
-is not signed because it can only turn the desktop off: it grants nothing.
+machine comes up on the desktop ([awmi.md](awmi.md)). In the optional `DOS/BOOT.CFG` on the boot
+volume, `desktop = off` (or `no`, `false`, `0`) keeps the text console instead, and
+`display = firmware` (or `gop`) passes `firmware-display` to the compositor so it stays on the
+UEFI GOP framebuffer instead of switching to a native PCI display driver. The file is not signed
+because it can only restrict the desktop or native display takeover: it grants nothing.
 
 ### Checks across manifests
 

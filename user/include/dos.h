@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 14
+#define DOS_ABI_VERSION 15
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -122,6 +122,8 @@ enum {
     DOS_SYS_VMAR_DESTROY,
     /* ABI v14: kernel ChaCha20 CSPRNG */
     DOS_SYS_GET_RANDOM,
+    /* ABI v15: physical base address of a device memory BAR */
+    DOS_SYS_DEVICE_BAR_ADDR,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -464,6 +466,8 @@ static inline int64_t dos_attest_activate(const uint8_t *challenge, uint8_t out[
 /* ABI v14: fill buf (up to 4096 bytes per call) from the kernel's ChaCha20 CSPRNG. */
 #define DOS_RANDOM_STRICT (1u << 0)
 static inline int64_t dos_get_random(void *buf, uint64_t len, uint64_t flags) { return DOS_SC(DOS_SYS_GET_RANDOM, buf, len, flags, 0, 0, 0); }
+/* ABI v15: physical base address of memory BAR `bar` (INSPECT on device). */
+static inline int64_t dos_device_bar_addr(dos_handle_t dev, uint32_t bar) { return DOS_SC(DOS_SYS_DEVICE_BAR_ADDR, dev, bar, 0, 0, 0, 0); }
 
 /* ---- storage (docs/storage.md; mirrors user/lib/libd/src/fs.rs) ---------------------------
  * Service messages start with a 32-byte header; VOLUME carries a channel to a volume's root. */

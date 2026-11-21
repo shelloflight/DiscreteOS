@@ -182,6 +182,15 @@ impl DeviceObj {
         Ok(b)
     }
 
+    /// Physical base address of memory BAR `i` (PCI MMIO BAR or platform display framebuffer).
+    pub fn bar_addr(&self, i: u64) -> KResult<u64> {
+        let b = self.bar(i)?;
+        if b.kind != BarKind::Memory || b.addr == 0 {
+            return Err(Status::WrongType);
+        }
+        Ok(b.addr)
+    }
+
     /// A device VMO over memory BAR `i`, charged to `acct`. The pages holding the MSI-X table or
     /// PBA are hidden (zero page): only the kernel programs interrupts.
     pub fn bar_vmo(&self, i: u64, acct: &KRef<Account>) -> KResult<KRef<Vmo>> {

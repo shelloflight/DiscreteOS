@@ -2,9 +2,10 @@
 //!
 //! Capability separation:
 //! - `gpu.query`: read-only adapter/mode/EDID/capability enumeration (`OP_LIST_ADAPTERS`,
-//!   `OP_GET_MODES`).
+//!   `OP_GET_MODES`, `OP_GET_DISPLAY_INFO`).
 //! - `gpu.display`: exclusive display/modesetting authority (`OP_ATTACH_FB`, `OP_SET_MODE`,
-//!   `OP_PRESENT`, `OP_SET_CURSOR`, `OP_MOVE_CURSOR`, plus query ops).
+//!   `OP_SET_MODE_EX`, `OP_PRESENT`, `OP_PRESENT_MULTI`, `OP_SET_CURSOR`, `OP_MOVE_CURSOR`,
+//!   `OP_RELEASE_DISPLAY`, `OP_SET_VRR`, `OP_SET_HDR`, `OP_FLIP_TEST`, plus query ops).
 //! - `gpu.render`: GPU command submission & context lifecycle (`OP_CTX_CREATE`,
 //!   `OP_CTX_DESTROY`, `OP_SUBMIT_CMD`, plus query ops; never touches display scanout).
 //!
@@ -33,6 +34,16 @@ pub const DRV_CTX_CREATE: u32 = 816;
 pub const DRV_CTX_DESTROY: u32 = 817;
 pub const DRV_SUBMIT_CMD: u32 = 818;
 pub const DRV_TEST_CRASH: u32 = 819;
+pub const DRV_SET_GOP_INFO: u32 = 831;
+pub const DRV_GET_DISPLAY_INFO: u32 = 832;
+pub const DRV_PRESENT_MULTI: u32 = 833;
+pub const DRV_RELEASE_DISPLAY: u32 = 834;
+pub const DRV_SET_MODE_EX: u32 = 835;
+pub const DRV_SET_VRR: u32 = 836;
+pub const DRV_SET_HDR: u32 = 837;
+pub const DRV_FLIP_TEST: u32 = 838;
+/// Unsolicited driver -> `gpu.dsvc` event (txid=0): `a` = frames | (late << 63), `b` = timestamp_ns.
+pub const DRV_FLIP_DONE: u32 = 839;
 
 // ---- Client <-> gpu.dsvc protocol (`gpu.query`, `gpu.display`, `gpu.render`) --------------------
 
@@ -47,6 +58,16 @@ pub const OP_CTX_CREATE: u32 = 827;
 pub const OP_CTX_DESTROY: u32 = 828;
 pub const OP_SUBMIT_CMD: u32 = 829;
 pub const OP_CRASH_DRIVER: u32 = 830;
+pub const OP_GET_DISPLAY_INFO: u32 = 840;
+pub const OP_PRESENT_MULTI: u32 = 841;
+pub const OP_RELEASE_DISPLAY: u32 = 842;
+pub const OP_SET_MODE_EX: u32 = 843;
+pub const OP_SET_VRR: u32 = 844;
+pub const OP_SET_HDR: u32 = 845;
+pub const OP_FLIP_TEST: u32 = 846;
+/// Unsolicited `gpu.dsvc` -> `gpu.display` event (txid=0):
+/// `a` = adapter_id | (late << 32), `b` = frames, payload = optional timestamp_ns (u64).
+pub const EVT_FLIP_DONE: u32 = 849;
 
 // Adapter kinds (mirroring `dosgpu::AdapterKind`).
 pub const KIND_GOP: u8 = 1;
@@ -66,11 +87,19 @@ pub const CAP_CMD_DMA: u32 = 1 << 6;
 pub const CAP_IOMMU: u32 = 1 << 7;
 pub const CAP_WC: u32 = 1 << 8;
 pub const CAP_GSP_RPC: u32 = 1 << 9;
+pub const CAP_ASYNC_FLIP: u32 = 1 << 10;
+pub const CAP_NATIVE_GOP_MATCH: u32 = 1 << 11;
+pub const CAP_VRR: u32 = 1 << 12;
+pub const CAP_HDR: u32 = 1 << 13;
+pub const CAP_DSC: u32 = 1 << 14;
 
 // Pixel formats (mirroring `dosgpu::PixelFormat`).
 pub const FMT_XRGB8888: u32 = 1;
 pub const FMT_ARGB8888: u32 = 2;
 pub const FMT_XBGR8888: u32 = 3;
+pub const FMT_ARGB2101010: u32 = 4;
+
+pub const MAX_PRESENT_RECTS: usize = 16;
 
 // Command submission engines (mirroring `dosgpu::EngineKind`).
 pub const ENGINE_VIRGL_3D: u32 = 1;
@@ -534,4 +563,449 @@ pub fn crash_driver(ep: Handle, adapter_id: u32) -> Result<(), i64> {
     let n = sys::channel_call(ep, &req, &mut rep, CALL_TIMEOUT_NS)? as usize;
     let hdr = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
     if hdr.status != 0 { Err(i64::from(hdr.status)) } else { Ok(()) }
+}
+
+// ---- Extended Native Display Probe, Multi-Damage Present, VRR/HDR & Flip Test -------------------
+
+pub const GOP_INFO_BYTES: usize = 32;
+
+/// Firmware GOP framebuffer layout passed from `gpu.dsvc` to PCI GPU drivers (`DRV_SET_GOP_INFO`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GopInfoWire {
+    pub phys_base: u64,
+    pub size: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pitch: u32,
+    pub shifts: [u8; 3],
+}
+
+impl GopInfoWire {
+    pub fn encode(&self, out: &mut [u8; GOP_INFO_BYTES]) {
+        out.fill(0);
+        out[0..8].copy_from_slice(&self.phys_base.to_le_bytes());
+        out[8..16].copy_from_slice(&self.size.to_le_bytes());
+        out[16..20].copy_from_slice(&self.width.to_le_bytes());
+        out[20..24].copy_from_slice(&self.height.to_le_bytes());
+        out[24..28].copy_from_slice(&self.pitch.to_le_bytes());
+        out[28..31].copy_from_slice(&self.shifts);
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < GOP_INFO_BYTES {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64_at = |o: usize| {
+            u64::from_le_bytes([
+                b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+            ])
+        };
+        Some(Self {
+            phys_base: u64_at(0),
+            size: u64_at(8),
+            width: u32_at(16),
+            height: u32_at(20),
+            pitch: u32_at(24),
+            shifts: [b[28], b[29], b[30]],
+        })
+    }
+}
+
+pub const DISPLAY_PROBE_BYTES: usize = 224;
+
+// `DisplayProbeInfo::flags` bits.
+pub const PROBE_GOP_MATCHED: u8 = 1 << 0;
+pub const PROBE_FLIP_VERIFIED: u8 = 1 << 1;
+pub const PROBE_IH_IRQ_ACTIVE: u8 = 1 << 2;
+pub const PROBE_VRR_SUPPORTED: u8 = 1 << 3;
+pub const PROBE_VRR_ENABLED: u8 = 1 << 4;
+pub const PROBE_HDR_SUPPORTED: u8 = 1 << 5;
+pub const PROBE_HDR_ENABLED: u8 = 1 << 6;
+pub const PROBE_DSC_SUPPORTED: u8 = 1 << 7;
+
+// `DisplayProbeInfo::flags2` bits.
+pub const PROBE2_DSC_ENABLED: u8 = 1 << 0;
+pub const PROBE2_IS_UHBR: u8 = 1 << 1;
+pub const PROBE2_CR_DONE: u8 = 1 << 2;
+pub const PROBE2_EQ_DONE: u8 = 1 << 3;
+pub const PROBE2_SELF_CHECK_FAILED: u8 = 1 << 4;
+
+/// Live display hardware probe report (`OP_GET_DISPLAY_INFO`, 224 bytes on the wire).
+#[derive(Clone, Copy, Debug)]
+pub struct DisplayProbeInfo {
+    pub adapter_id: u32,
+    pub pipe: u8,
+    pub active_pipes: u8,
+    pub dcn_major: u8,
+    pub dcn_minor: u8,
+    pub dcn_rev: u8,
+    pub flags: u8,
+    pub flags2: u8,
+    pub edid_blocks: u8,
+    pub width: u32,
+    pub height: u32,
+    pub h_total: u32,
+    pub v_total: u32,
+    pub pitch_bytes: u32,
+    pub measured_mhz: u32,
+    pub raw_format: u32,
+    pub vrr_min_hz: u16,
+    pub vrr_max_hz: u16,
+    pub mc_addr: u64,
+    pub vram_off: u64,
+    pub gop_phys_base: u64,
+    pub dp_lanes: u8,
+    pub dp_max_lanes: u8,
+    pub dp_rate_mbps: u32,
+    pub dp_max_rate_mbps: u32,
+    pub dpcd_000: [u8; 16],
+    pub dpcd_060: [u8; 4],
+    pub dpcd_100: [u8; 2],
+    pub dpcd_202: [u8; 4],
+    pub monitor_name: [u8; 24],
+    pub monitor_len: u8,
+    pub status_note: [u8; 48],
+    pub status_note_len: u8,
+}
+
+impl DisplayProbeInfo {
+    pub const fn empty() -> Self {
+        Self {
+            adapter_id: 0,
+            pipe: 0,
+            active_pipes: 0,
+            dcn_major: 0,
+            dcn_minor: 0,
+            dcn_rev: 0,
+            flags: 0,
+            flags2: 0,
+            edid_blocks: 0,
+            width: 0,
+            height: 0,
+            h_total: 0,
+            v_total: 0,
+            pitch_bytes: 0,
+            measured_mhz: 0,
+            raw_format: 0,
+            vrr_min_hz: 0,
+            vrr_max_hz: 0,
+            mc_addr: 0,
+            vram_off: 0,
+            gop_phys_base: 0,
+            dp_lanes: 0,
+            dp_max_lanes: 0,
+            dp_rate_mbps: 0,
+            dp_max_rate_mbps: 0,
+            dpcd_000: [0; 16],
+            dpcd_060: [0; 4],
+            dpcd_100: [0; 2],
+            dpcd_202: [0; 4],
+            monitor_name: [0; 24],
+            monitor_len: 0,
+            status_note: [0; 48],
+            status_note_len: 0,
+        }
+    }
+
+    pub fn monitor_str(&self) -> &str {
+        let n = usize::from(self.monitor_len).min(self.monitor_name.len());
+        core::str::from_utf8(&self.monitor_name[..n]).unwrap_or("")
+    }
+
+    pub fn note_str(&self) -> &str {
+        let n = usize::from(self.status_note_len).min(self.status_note.len());
+        core::str::from_utf8(&self.status_note[..n]).unwrap_or("")
+    }
+
+    pub fn set_note(&mut self, s: &[u8]) {
+        let n = s.len().min(self.status_note.len());
+        self.status_note.fill(0);
+        self.status_note[..n].copy_from_slice(&s[..n]);
+        self.status_note_len = n as u8;
+    }
+
+    pub fn encode(&self, out: &mut [u8; DISPLAY_PROBE_BYTES]) {
+        out.fill(0);
+        out[0..4].copy_from_slice(&self.adapter_id.to_le_bytes());
+        out[4] = self.pipe;
+        out[5] = self.active_pipes;
+        out[6] = self.dcn_major;
+        out[7] = self.dcn_minor;
+        out[8] = self.dcn_rev;
+        out[9] = self.flags;
+        out[10] = self.flags2;
+        out[11] = self.edid_blocks;
+        out[12..16].copy_from_slice(&self.width.to_le_bytes());
+        out[16..20].copy_from_slice(&self.height.to_le_bytes());
+        out[20..24].copy_from_slice(&self.h_total.to_le_bytes());
+        out[24..28].copy_from_slice(&self.v_total.to_le_bytes());
+        out[28..32].copy_from_slice(&self.pitch_bytes.to_le_bytes());
+        out[32..36].copy_from_slice(&self.measured_mhz.to_le_bytes());
+        out[36..40].copy_from_slice(&self.raw_format.to_le_bytes());
+        out[40..42].copy_from_slice(&self.vrr_min_hz.to_le_bytes());
+        out[42..44].copy_from_slice(&self.vrr_max_hz.to_le_bytes());
+        out[44] = self.dp_lanes;
+        out[45] = self.dp_max_lanes;
+        out[46] = self.monitor_len;
+        out[47] = self.status_note_len;
+        out[48..56].copy_from_slice(&self.mc_addr.to_le_bytes());
+        out[56..64].copy_from_slice(&self.vram_off.to_le_bytes());
+        out[64..72].copy_from_slice(&self.gop_phys_base.to_le_bytes());
+        out[72..76].copy_from_slice(&self.dp_rate_mbps.to_le_bytes());
+        out[76..80].copy_from_slice(&self.dp_max_rate_mbps.to_le_bytes());
+        out[80..96].copy_from_slice(&self.dpcd_000);
+        out[96..100].copy_from_slice(&self.dpcd_060);
+        out[100..102].copy_from_slice(&self.dpcd_100);
+        out[102..106].copy_from_slice(&self.dpcd_202);
+        out[108..132].copy_from_slice(&self.monitor_name);
+        out[132..180].copy_from_slice(&self.status_note);
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < DISPLAY_PROBE_BYTES {
+            return None;
+        }
+        let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64_at = |o: usize| {
+            u64::from_le_bytes([
+                b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+            ])
+        };
+        let mut p = Self::empty();
+        p.adapter_id = u32_at(0);
+        p.pipe = b[4];
+        p.active_pipes = b[5];
+        p.dcn_major = b[6];
+        p.dcn_minor = b[7];
+        p.dcn_rev = b[8];
+        p.flags = b[9];
+        p.flags2 = b[10];
+        p.edid_blocks = b[11];
+        p.width = u32_at(12);
+        p.height = u32_at(16);
+        p.h_total = u32_at(20);
+        p.v_total = u32_at(24);
+        p.pitch_bytes = u32_at(28);
+        p.measured_mhz = u32_at(32);
+        p.raw_format = u32_at(36);
+        p.vrr_min_hz = u16_at(40);
+        p.vrr_max_hz = u16_at(42);
+        p.dp_lanes = b[44];
+        p.dp_max_lanes = b[45];
+        p.monitor_len = b[46].min(24);
+        p.status_note_len = b[47].min(48);
+        p.mc_addr = u64_at(48);
+        p.vram_off = u64_at(56);
+        p.gop_phys_base = u64_at(64);
+        p.dp_rate_mbps = u32_at(72);
+        p.dp_max_rate_mbps = u32_at(76);
+        p.dpcd_000.copy_from_slice(&b[80..96]);
+        p.dpcd_060.copy_from_slice(&b[96..100]);
+        p.dpcd_100.copy_from_slice(&b[100..102]);
+        p.dpcd_202.copy_from_slice(&b[102..106]);
+        p.monitor_name.copy_from_slice(&b[108..132]);
+        p.status_note.copy_from_slice(&b[132..180]);
+        Some(p)
+    }
+}
+
+pub const FLIP_TEST_BYTES: usize = 40;
+
+/// Result returned by `OP_FLIP_TEST` / `awmi::OP_FLIP_TEST` (40 bytes on the wire).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlipTestResult {
+    pub frames: u64,
+    pub missed: u64,
+    pub late: u64,
+    pub measured_mhz: u32,
+    pub duration_ms: u32,
+    pub reverted: bool,
+    pub used_dcn: bool,
+    pub used_ih: bool,
+    pub pipe: u8,
+}
+
+impl FlipTestResult {
+    pub fn encode(&self, out: &mut [u8; FLIP_TEST_BYTES]) {
+        out.fill(0);
+        out[0..8].copy_from_slice(&self.frames.to_le_bytes());
+        out[8..16].copy_from_slice(&self.missed.to_le_bytes());
+        out[16..24].copy_from_slice(&self.late.to_le_bytes());
+        out[24..28].copy_from_slice(&self.measured_mhz.to_le_bytes());
+        out[28..32].copy_from_slice(&self.duration_ms.to_le_bytes());
+        out[32] = u8::from(self.reverted);
+        out[33] = u8::from(self.used_dcn);
+        out[34] = u8::from(self.used_ih);
+        out[35] = self.pipe;
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < FLIP_TEST_BYTES {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64_at = |o: usize| {
+            u64::from_le_bytes([
+                b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+            ])
+        };
+        Some(Self {
+            frames: u64_at(0),
+            missed: u64_at(8),
+            late: u64_at(16),
+            measured_mhz: u32_at(24),
+            duration_ms: u32_at(28),
+            reverted: b[32] != 0,
+            used_dcn: b[33] != 0,
+            used_ih: b[34] != 0,
+            pipe: b[35],
+        })
+    }
+}
+
+/// Query detailed display probe state for `adapter_id` (`gpu.query` or higher; strictly read-only).
+pub fn get_display_info(ep: Handle, adapter_id: u32) -> Result<DisplayProbeInfo, i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER];
+    Header { txid: 0, op: OP_GET_DISPLAY_INFO, status: 0, a: u64::from(adapter_id), b: 0 }.put(&mut req);
+    let mut rep = [0u8; HEADER + DISPLAY_PROBE_BYTES];
+    let n = sys::channel_call(ep, &req, &mut rep, CALL_TIMEOUT_NS)? as usize;
+    let h = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if h.status != 0 {
+        return Err(i64::from(h.status));
+    }
+    DisplayProbeInfo::decode(&rep[HEADER..n]).ok_or(sys::ERR_INVALID_ARGS)
+}
+
+/// Present up to 16 damage rectangles `(x, y, w, h)` in one IPC (`gpu.display` required).
+/// Returns `(frames, async_pending)`: if `async_pending` is true, `EVT_FLIP_DONE` follows at vblank.
+pub fn present_multi(
+    ep: Handle,
+    adapter_id: u32,
+    fb_id: u32,
+    rects: &[(u32, u32, u32, u32)],
+) -> Result<(u64, bool), i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let cnt = rects.len().min(MAX_PRESENT_RECTS);
+    let mut req = [0u8; HEADER + MAX_PRESENT_RECTS * 16];
+    Header {
+        txid: 0,
+        op: OP_PRESENT_MULTI,
+        status: 0,
+        a: u64::from(adapter_id) | (u64::from(fb_id) << 32),
+        b: cnt as u64,
+    }
+    .put(&mut req);
+    for (i, &(x, y, w, h)) in rects.iter().take(cnt).enumerate() {
+        let o = HEADER + i * 16;
+        req[o..o + 4].copy_from_slice(&x.to_le_bytes());
+        req[o + 4..o + 8].copy_from_slice(&y.to_le_bytes());
+        req[o + 8..o + 12].copy_from_slice(&w.to_le_bytes());
+        req[o + 12..o + 16].copy_from_slice(&h.to_le_bytes());
+    }
+    let mut rep = [0u8; HEADER];
+    let n = sys::channel_call(ep, &req[..HEADER + cnt * 16], &mut rep, CALL_TIMEOUT_NS)? as usize;
+    let hdr = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if hdr.status != 0 {
+        Err(i64::from(hdr.status))
+    } else {
+        Ok((hdr.a, hdr.b != 0))
+    }
+}
+
+/// Release native display scanout and restore the firmware GOP framebuffer (`gpu.display` required).
+pub fn release_display(ep: Handle, adapter_id: u32) -> Result<(), i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER];
+    Header { txid: 0, op: OP_RELEASE_DISPLAY, status: 0, a: u64::from(adapter_id), b: 0 }.put(&mut req);
+    let mut rep = [0u8; HEADER];
+    let n = sys::channel_call(ep, &req, &mut rep, CALL_TIMEOUT_NS)? as usize;
+    let hdr = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if hdr.status != 0 { Err(i64::from(hdr.status)) } else { Ok(()) }
+}
+
+/// Set mode with target refresh rate in mHz and optional flags (`bit 0=allow DSC`, `bit 1=allow retrain`).
+pub fn set_mode_ex(
+    ep: Handle,
+    adapter_id: u32,
+    width: u32,
+    height: u32,
+    refresh_mhz: u32,
+    flags: u32,
+) -> Result<(), i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER + 4];
+    Header {
+        txid: 0,
+        op: OP_SET_MODE_EX,
+        status: 0,
+        a: u64::from(adapter_id) | (u64::from(flags) << 32),
+        b: u64::from(width) | (u64::from(height) << 32),
+    }
+    .put(&mut req);
+    req[HEADER..HEADER + 4].copy_from_slice(&refresh_mhz.to_le_bytes());
+    let mut rep = [0u8; HEADER];
+    let n = sys::channel_call(ep, &req, &mut rep, CALL_TIMEOUT_NS)? as usize;
+    let hdr = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if hdr.status != 0 { Err(i64::from(hdr.status)) } else { Ok(()) }
+}
+
+/// Toggle FreeSync / Adaptive-Sync VRR (`gpu.display` required).
+pub fn set_vrr(ep: Handle, adapter_id: u32, enable: bool, min_hz: u16, max_hz: u16) -> Result<(), i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER];
+    Header {
+        txid: 0,
+        op: OP_SET_VRR,
+        status: 0,
+        a: u64::from(adapter_id),
+        b: u64::from(enable) | (u64::from(min_hz) << 16) | (u64::from(max_hz) << 32),
+    }
+    .put(&mut req);
+    let mut rep = [0u8; HEADER];
+    let n = sys::channel_call(ep, &req, &mut rep, CALL_TIMEOUT_NS)? as usize;
+    let hdr = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if hdr.status != 0 { Err(i64::from(hdr.status)) } else { Ok(()) }
+}
+
+/// Toggle 10-bit HDR10 scanout (`gpu.display` required).
+pub fn set_hdr(ep: Handle, adapter_id: u32, enable: bool) -> Result<(), i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER];
+    Header { txid: 0, op: OP_SET_HDR, status: 0, a: u64::from(adapter_id), b: u64::from(enable) }.put(&mut req);
+    let mut rep = [0u8; HEADER];
+    let n = sys::channel_call(ep, &req, &mut rep, CALL_TIMEOUT_NS)? as usize;
+    let hdr = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if hdr.status != 0 { Err(i64::from(hdr.status)) } else { Ok(()) }
+}
+
+/// Run the 5-second alternating-pattern hardware flip test and automatically revert (`gpu.display` required).
+pub fn flip_test(ep: Handle, adapter_id: u32, duration_ms: u32) -> Result<FlipTestResult, i64> {
+    if ep == 0 {
+        return Err(sys::ERR_BAD_HANDLE);
+    }
+    let mut req = [0u8; HEADER];
+    Header { txid: 0, op: OP_FLIP_TEST, status: 0, a: u64::from(adapter_id), b: u64::from(duration_ms) }.put(&mut req);
+    let mut rep = [0u8; HEADER + FLIP_TEST_BYTES];
+    let timeout = u64::from(duration_ms.clamp(500, 15_000)) * 1_000_000 + 10_000_000_000;
+    let n = sys::channel_call(ep, &req, &mut rep, timeout)? as usize;
+    let hdr = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if hdr.status != 0 {
+        return Err(i64::from(hdr.status));
+    }
+    FlipTestResult::decode(&rep[HEADER..n]).ok_or(sys::ERR_INVALID_ARGS)
 }

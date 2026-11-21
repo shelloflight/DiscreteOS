@@ -146,10 +146,18 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) ->
     // volume asks for the text console.
     let mut overrides: Vec<(&str, &str)> = overrides.to_vec();
     if load_sys && groups == [Group::System] && overrides.is_empty() {
-        if desktop_at_boot(&m) {
-            overrides.push(("awmi", "autostart"));
+        let cfg = boot_cfg(&m);
+        if cfg.firmware_display {
+            println!("init: boot: firmware display (DOS/BOOT.CFG: display = firmware)");
+        }
+        if cfg.desktop {
+            let awmi_args = if cfg.firmware_display { "autostart firmware-display" } else { "autostart" };
+            overrides.push(("awmi", awmi_args));
         } else {
             println!("init: boot: text console (DOS/BOOT.CFG: desktop = off)");
+            if cfg.firmware_display {
+                overrides.push(("awmi", "firmware-display"));
+            }
         }
     }
     let overrides = &overrides[..];
@@ -171,23 +179,38 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) ->
     Some(m)
 }
 
-/// The desktop at boot: on, unless `esp:/DOS/BOOT.CFG` has a line `desktop = off` (or `no`,
-/// `false`, `0`). The file is optional and unsigned: it can only turn the desktop off.
-fn desktop_at_boot(m: &Mgr) -> bool {
-    let Some(root) = m.volumes.iter().find(|v| v.name == "esp").and_then(|v| v.root.clone_with(fp::R_READ).ok()) else { return true };
-    let Ok((f, _, size)) = root.open(b"DOS/BOOT.CFG", 0, fp::R_READ) else { return true };
+struct BootCfg {
+    desktop: bool,
+    firmware_display: bool,
+}
+
+/// Parse optional unsigned `esp:/DOS/BOOT.CFG`:
+/// - `desktop = off|no|false|0` starts in the text console;
+/// - `display = firmware|gop` forces the UEFI GOP framebuffer path over verified native AMD display.
+fn boot_cfg(m: &Mgr) -> BootCfg {
+    let mut cfg = BootCfg { desktop: true, firmware_display: false };
+    let Some(root) = m.volumes.iter().find(|v| v.name == "esp").and_then(|v| v.root.clone_with(fp::R_READ).ok()) else {
+        return cfg;
+    };
+    let Ok((f, _, size)) = root.open(b"DOS/BOOT.CFG", 0, fp::R_READ) else {
+        return cfg;
+    };
     let mut b = alloc::vec![0u8; (size as usize).min(4096)];
     let n = f.read(0, &mut b).unwrap_or(0);
     let text = String::from_utf8_lossy(&b[..n]);
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
-        if let Some((k, v)) = line.split_once('=')
-            && k.trim().eq_ignore_ascii_case("desktop")
-        {
-            return !matches!(v.trim().trim_matches('"').to_ascii_lowercase().as_str(), "off" | "no" | "false" | "0");
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            let val = v.trim().trim_matches('"').to_ascii_lowercase();
+            if key.eq_ignore_ascii_case("desktop") {
+                cfg.desktop = !matches!(val.as_str(), "off" | "no" | "false" | "0");
+            } else if key.eq_ignore_ascii_case("display") {
+                cfg.firmware_display = matches!(val.as_str(), "firmware" | "gop");
+            }
         }
     }
-    true
+    cfg
 }
 
 fn power(action: u64) -> i32 {

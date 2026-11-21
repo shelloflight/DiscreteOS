@@ -126,10 +126,11 @@ struct NetDev {
     name_len: usize,
 }
 
-/// A GPU adapter a driver announced (kept to hand over again when `gpu.dsvc` connects/restarts).
+/// A GPU adapter output a driver announced (kept to hand over again when `gpu.dsvc` connects/restarts).
 #[derive(Clone, Copy)]
 struct GpuDev {
     drv: usize,
+    pipe: u8,
     a: u64,
     b: u64,
     name: [u8; 40],
@@ -272,7 +273,7 @@ impl Mgr {
             sys::SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: proto::TAG_CONTROL, reserved: 0 },
         ];
         let is_gpu = matches!(d.prog, "virtio-gpu" | "amdgpu" | "xe" | "nvgpu");
-        let limits = sys::Limits { memory: if is_gpu { 24 << 20 } else { 8 << 20 }, handles: 256, threads: 4 };
+        let limits = sys::Limits { memory: if is_gpu { 32 << 20 } else { 8 << 20 }, handles: 256, threads: 4 };
         let args: &[u8] = if self.writable { b"rw" } else { b"" };
         match sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), d.image, &name[..n + 5], args, &hs, &limits) {
             Ok(p) => {
@@ -754,15 +755,24 @@ impl Mgr {
     }
 
     fn gpu_dev(&mut self, i: usize, a: u64, b: u64, name: &[u8]) {
+        // Count existing outputs announced by driver `i` to assign a stable per-pipe slot.
+        let pipe = self
+            .known_gpu
+            .iter()
+            .flatten()
+            .filter(|x| x.drv == i)
+            .count()
+            .min(crate::gpu_drv::MAX_PIPES - 1) as u8;
         let mut rec = GpuDev {
             drv: i,
+            pipe,
             a,
             b,
             name: [0; 40],
             name_len: name.len().min(40),
         };
         rec.name[..rec.name_len].copy_from_slice(&name[..rec.name_len]);
-        let slot = self.known_gpu.iter().position(|x| x.is_some_and(|x| x.drv == i));
+        let slot = self.known_gpu.iter().position(|x| x.is_some_and(|x| x.drv == i && x.pipe == pipe));
         if let Some(s) = slot.or_else(|| self.known_gpu.iter().position(|x| x.is_none())) {
             self.known_gpu[s] = Some(rec);
         }
@@ -781,15 +791,16 @@ impl Mgr {
             return;
         };
         let mut m = [0u8; HEADER];
-        Header { txid: 0, op: proto::GPU_ATTACH, status: 0, a: 0, b: 0 }.put(&mut m);
+        Header { txid: 0, op: proto::GPU_ATTACH, status: 0, a: u64::from(rec.pipe), b: 0 }.put(&mut m);
         if sys::channel_write_h(d.ch, &m, &[sys::MsgHandle { handle: theirs, rights: sys::RIGHTS_SAME }]) < 0 {
             sys::handle_close(mine);
             return;
         }
-        // Payload: 4-byte stable driver key (`rec.drv`) followed by adapter name.
+        // Payload: 4-byte stable driver+pipe key followed by adapter name.
+        let drv_key: u32 = ((rec.drv as u32) << 4) | u32::from(rec.pipe & 0xF);
         let mut msg = [0u8; HEADER + 4 + 40];
         Header { txid: 0, op: gpu::BACKEND_ADD, status: 0, a: rec.a, b: rec.b }.put(&mut msg);
-        msg[HEADER..HEADER + 4].copy_from_slice(&(rec.drv as u32).to_le_bytes());
+        msg[HEADER..HEADER + 4].copy_from_slice(&drv_key.to_le_bytes());
         msg[HEADER + 4..HEADER + 4 + rec.name_len].copy_from_slice(&rec.name[..rec.name_len]);
         let _ = sys::channel_write_h(
             self.gpu_svc,
@@ -800,12 +811,15 @@ impl Mgr {
 
     fn gpu_gone(&mut self, i: usize) {
         for slot in &mut self.known_gpu {
-            if slot.is_some_and(|x| x.drv == i) {
+            if let Some(rec) = *slot
+                && rec.drv == i
+            {
                 *slot = None;
+                if self.gpu_svc != 0 {
+                    let drv_key: u32 = ((rec.drv as u32) << 4) | u32::from(rec.pipe & 0xF);
+                    proto::send(self.gpu_svc, gpu::BACKEND_GONE, u64::from(drv_key), 0);
+                }
             }
-        }
-        if self.gpu_svc != 0 {
-            proto::send(self.gpu_svc, gpu::BACKEND_GONE, i as u64, 0);
         }
     }
 
@@ -999,6 +1013,7 @@ impl Mgr {
             d.gave_up = false;
             self.trust.driver_gone(i);
             self.pointer_seen &= !(1u64 << i);
+            self.gpu_gone(i);
         }
         println!("devmgr: suspended: {} driver(s) stopped", n);
         n
@@ -1042,6 +1057,7 @@ impl Mgr {
         let is_dynamic = d.dynamic;
         self.trust.driver_gone(i);
         self.pointer_seen &= !(1u64 << i);
+        self.gpu_gone(i);
         if is_dynamic {
             // Dynamic USB class driver: free slot cleanly (unplug exited 0; crash is re-attached by xhci).
             if code == 0 {

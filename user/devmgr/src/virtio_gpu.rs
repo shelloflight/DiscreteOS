@@ -333,6 +333,66 @@ impl GpuDriver for VirtioGpu {
         Ok(self.frames)
     }
 
+    fn present_multi(&mut self, fb_id: u32, rects: &[DamageRect]) -> Result<(u64, bool), i64> {
+        if rects.len() <= 1 {
+            let r = rects.first().copied().unwrap_or(DamageRect::EMPTY);
+            return self.present(fb_id, r).map(|f| (f, false));
+        }
+        let Some((res_id, w, h, pitch)) = self
+            .fbs
+            .iter()
+            .flatten()
+            .find(|f| f.fb_id == fb_id)
+            .map(|f| (f.res_id, f.pin.width, f.pin.height, f.pin.pitch))
+        else {
+            return Err(sys::ERR_INVALID_ARGS);
+        };
+        if self.scanout_res != res_id {
+            self.bind_scanout(res_id, w, h)?;
+        }
+        let mut union = DamageRect::EMPTY;
+        for &r in rects {
+            let dmg = if r.w == 0 || r.h == 0 {
+                DamageRect::full(w, h)
+            } else {
+                match r.clip(w, h) {
+                    Some(c) => c,
+                    None => continue,
+                }
+            };
+            let byte_off = u64::from(dmg.y) * u64::from(pitch) + u64::from(dmg.x) * 4;
+            let n = vg::encode_transfer_to_host_2d(
+                &mut self.dma.map.bytes_mut()[CMD_BUF_OFF..],
+                dmg.x,
+                dmg.y,
+                dmg.w,
+                dmg.h,
+                byte_off,
+                res_id,
+            )
+            .ok_or(sys::ERR_INVALID_ARGS)?;
+            if self.exec_ctrl(n, vg::CTRL_HDR_SIZE)? != vg::RESP_OK_NODATA {
+                return Err(i64::from(proto::ERR_IO));
+            }
+            union = union.union(dmg);
+        }
+        let flush = if union.is_empty() { DamageRect::full(w, h) } else { union };
+        let n = vg::encode_resource_flush(
+            &mut self.dma.map.bytes_mut()[CMD_BUF_OFF..],
+            flush.x,
+            flush.y,
+            flush.w,
+            flush.h,
+            res_id,
+        )
+        .ok_or(sys::ERR_INVALID_ARGS)?;
+        if self.exec_ctrl(n, vg::CTRL_HDR_SIZE)? != vg::RESP_OK_NODATA {
+            return Err(i64::from(proto::ERR_IO));
+        }
+        self.frames += 1;
+        Ok((self.frames, false))
+    }
+
     fn set_cursor(&mut self, vmo: Handle, hot_x: u32, hot_y: u32) -> Result<(), i64> {
         let pin = FbPin::pin(self.dev, &mut self.scratch, vmo, 64, 64, 64 * 4, gpu::FMT_ARGB8888)?;
         if self.cursor_res != 0 {

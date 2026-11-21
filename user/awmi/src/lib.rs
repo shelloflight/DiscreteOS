@@ -56,6 +56,7 @@ libd::entry!(dsvc_console, console::main);
 
 const KEY_CTL: u64 = 1;
 const KEY_INPUT: u64 = 2;
+const KEY_GPU: u64 = 3;
 const KEY_CLIENT_BASE: u64 = 0x1000;
 
 const MS: u64 = 1_000_000;
@@ -127,6 +128,8 @@ struct OutBuf {
     height: u32,
     refresh_mhz: u32,
     hw_cursor: bool,
+    async_flip: bool,
+    native_match: bool,
 }
 
 /// The backbuffer's pixels as `u32`s.
@@ -148,6 +151,7 @@ struct Awmi {
     audio: Handle,
     net: Handle,
     test_mode: bool,
+    firmware_display: bool,
     clients: Vec<Client>,
     next_client: u32,
     wm: Box<WmState>,
@@ -161,7 +165,16 @@ struct Awmi {
     input_pointer: u32,
     next_frame: u64,
     next_tray: u64,
-    /// The pointer moved since the last frame (hardware cursor position to update).
+    /// True while an asynchronous vsync flip is in flight waiting for `gpu::EVT_FLIP_DONE`.
+    flip_pending: bool,
+    /// Safety timeout for an in-flight async flip (recovers if a driver restarts mid-flip).
+    flip_deadline: u64,
+    /// Timestamp of the last completed vsync flip.
+    last_flip_ns: u64,
+    /// When a frame missed its refresh deadline, hold the next composite until this time so we
+    /// drop cleanly to every other refresh rather than tearing.
+    pace_skip_until: u64,
+    /// The pointer moved since the last frame (hardware cursor position to update if software/deferred).
     cursor_moved: bool,
     cursor_vmo: Handle,
     /// Indicators set over `awmi.indicator`, and the microphone state polled from the audio service.
@@ -313,6 +326,9 @@ impl Awmi {
             }
             b"gpu.display" => {
                 Self::replace(&mut self.gpu, hnd);
+                self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_GPU);
+                self.flip_pending = false;
+                self.flip_deadline = 0;
                 self.reattach = true;
             }
             b"clock.time" => Self::replace(&mut self.clock, hnd),
@@ -444,7 +460,13 @@ impl Awmi {
         let before = (self.wm.pointer, self.wm.buttons);
         let action = self.wm.handle_pointer(dx, dy, abs, buttons);
         if self.wm.pointer != before.0 {
-            self.cursor_moved = true;
+            if let Some(o) = self.outs.iter().find(|o| o.hw_cursor) {
+                // Hardware cursor moves immediately without triggering a frame composite.
+                let p = self.wm.pointer;
+                let _ = gpu::move_cursor(self.gpu, o.adapter, p.x.max(0) as u32, p.y.max(0) as u32);
+            } else {
+                self.cursor_moved = true;
+            }
         }
         if let WmAction::DeliverPointer { owner, window_id, local_x, local_y } = action {
             let kind = if wheel != 0 {
@@ -559,16 +581,26 @@ impl Awmi {
 
     // ---- outputs & the session --------------------------------------------------------------------
 
-    /// The outputs to use: the firmware framebuffer when there is one (it is the screen the
-    /// terminal draws on, so leaving the session hands it straight back), otherwise every online
-    /// PCI GPU (BIOS boots, a second card).
+    /// The outputs to use:
+    /// - Unless `firmware_display` (`BOOT.CFG display = firmware`), prefer a verified native PCI
+    ///   output (`CAP_NATIVE_GOP_MATCH`, plus any additional online outputs of that GPU) over GOP;
+    /// - Otherwise prefer the firmware GOP framebuffer when present, else every online PCI GPU.
     fn choose_adapters(&self) -> Vec<(AdapterInfo, u32)> {
         let mut ads = [AdapterInfo::empty(); 8];
         let n = gpu::list_adapters(self.gpu, &mut ads).unwrap_or(0);
         let online: Vec<AdapterInfo> = ads[..n].iter().copied().filter(|a| a.online && a.width > 0 && a.height > 0).collect();
-        let pick: Vec<AdapterInfo> = match online.iter().find(|a| a.kind == gpu::KIND_GOP) {
-            Some(g) => alloc::vec![*g],
-            None => online,
+        let pick: Vec<AdapterInfo> = if !self.firmware_display
+            && let Some(nat) = online
+                .iter()
+                .find(|a| a.kind != gpu::KIND_GOP && (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0)
+        {
+            let kind = nat.kind;
+            online.into_iter().filter(|a| a.kind == kind).collect()
+        } else {
+            match online.iter().find(|a| a.kind == gpu::KIND_GOP) {
+                Some(g) => alloc::vec![*g],
+                None => online,
+            }
         };
         pick.into_iter()
             .map(|a| {
@@ -599,8 +631,32 @@ impl Awmi {
             match gpu::attach_fb(self.gpu, a.id, map.vmo, w, h, w * 4, gpu::FMT_XRGB8888) {
                 Ok(fb_id) => {
                     let hw = chosen.len() == 1 && a.caps & gpu::CAP_HW_CURSOR != 0;
-                    println!("awmi: output: adapter #{} '{}' {}x{} @ {}.{:02} Hz, {} cursor", a.id, a.name_str(), w, h, hz / 1000, hz % 1000 / 10, if hw { "hardware" } else { "software" });
-                    kept.push(OutBuf { adapter: a.id, restarts: a.restarts, fb_id, map, width: w, height: h, refresh_mhz: *hz, hw_cursor: hw });
+                    let async_flip = a.caps & gpu::CAP_ASYNC_FLIP != 0;
+                    let native_match = a.caps & gpu::CAP_NATIVE_GOP_MATCH != 0;
+                    println!(
+                        "awmi: output: adapter #{} '{}' {}x{} @ {}.{:02} Hz, {} cursor{}{}",
+                        a.id,
+                        a.name_str(),
+                        w,
+                        h,
+                        hz / 1000,
+                        hz % 1000 / 10,
+                        if hw { "hardware" } else { "software" },
+                        if native_match { ", native" } else { "" },
+                        if async_flip { ", async flip" } else { "" }
+                    );
+                    kept.push(OutBuf {
+                        adapter: a.id,
+                        restarts: a.restarts,
+                        fb_id,
+                        map,
+                        width: w,
+                        height: h,
+                        refresh_mhz: *hz,
+                        hw_cursor: hw,
+                        async_flip,
+                        native_match,
+                    });
                 }
                 Err(e) => {
                     println!("awmi: adapter #{} refused the backbuffer: {}", a.id, sys::status(e));
@@ -710,9 +766,64 @@ impl Awmi {
             sys::handle_close(o.map.vmo);
         }
         self.outs = real;
+        self.flip_pending = false;
+        self.flip_deadline = 0;
+        self.pace_skip_until = 0;
+        // Hand native scanout back to the firmware GOP framebuffer before the terminal reclaims the screen.
+        for o in &self.outs {
+            if o.adapter != 0 && o.native_match {
+                let _ = gpu::release_display(self.gpu, o.adapter);
+            }
+        }
         self.grab(false);
         self.term_call(term::DISPLAY_RECLAIM);
         println!("awmi: session ended ({}): display and input returned to the terminal", why);
+    }
+
+    fn deliver_frame_done(&mut self) {
+        let done: Vec<(u32, u32, u64)> = self.surfaces.iter_mut().filter_map(|s| s.pending.take().map(|q| (s.owner, s.window, q))).collect();
+        for (owner, window, seq) in done {
+            self.send_to(owner, wire::EVT_FRAME_DONE, u64::from(window), seq);
+        }
+    }
+
+    /// Receive unsolicited `gpu::EVT_FLIP_DONE` events from `gpu.dsvc` and pace the next frame.
+    fn on_gpu_event(&mut self) {
+        let mut buf = [0u8; HEADER + 32];
+        loop {
+            if self.gpu == 0 {
+                return;
+            }
+            match sys::channel_read(self.gpu, &mut buf, 0) {
+                Ok(n) => {
+                    let Some(h) = Header::get(&buf[..n as usize]) else { continue };
+                    if h.op == gpu::EVT_FLIP_DONE {
+                        let now = sys::clock_ns();
+                        let late_flag = (h.a >> 32) != 0;
+                        let interval = self.frame_interval();
+                        let missed_deadline = late_flag
+                            || (self.last_flip_ns > 0 && now.saturating_sub(self.last_flip_ns) > (interval * 3) / 2);
+                        self.flip_pending = false;
+                        self.flip_deadline = 0;
+                        self.last_flip_ns = now;
+                        if missed_deadline {
+                            // Drop cleanly to every other refresh rather than tearing when a frame is late.
+                            self.pace_skip_until = now + interval;
+                        }
+                        self.deliver_frame_done();
+                    }
+                }
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.port.arm(self.gpu, sys::READABLE | sys::PEER_CLOSED, KEY_GPU);
+                    return;
+                }
+                Err(_) => {
+                    self.flip_pending = false;
+                    self.flip_deadline = 0;
+                    return;
+                }
+            }
+        }
     }
 
     // ---- the dock's live state --------------------------------------------------------------------
@@ -775,6 +886,7 @@ impl Awmi {
         };
         let mut presented = 0u64;
         let mut failed = false;
+        let mut any_async = false;
         if !wm.damage.is_empty() {
             for (i, ob) in outs.iter_mut().enumerate() {
                 let Some(&out) = wm.layout.as_slice().get(i) else { continue };
@@ -787,16 +899,27 @@ impl Awmi {
                 if ob.adapter == 0 {
                     continue;
                 }
-                for r in local.as_slice() {
-                    match gpu::present(*gpu_ep, ob.adapter, ob.fb_id, r.x as u32, r.y as u32, r.w, r.h) {
-                        Ok(_) => presented += 1,
-                        Err(e) => {
-                            if !failed {
-                                println!("awmi: present on adapter #{} failed ({}): attaching again", ob.adapter, sys::status(e));
-                            }
-                            failed = true;
-                            break;
+                let slice = local.as_slice();
+                if slice.is_empty() {
+                    continue;
+                }
+                let mut rects = [(0u32, 0u32, 0u32, 0u32); gpu::MAX_PRESENT_RECTS];
+                let cnt = slice.len().min(gpu::MAX_PRESENT_RECTS);
+                for (slot, r) in rects.iter_mut().take(cnt).zip(slice.iter()) {
+                    *slot = (r.x as u32, r.y as u32, r.w, r.h);
+                }
+                match gpu::present_multi(*gpu_ep, ob.adapter, ob.fb_id, &rects[..cnt]) {
+                    Ok((_, is_async)) => {
+                        presented += cnt as u64;
+                        if is_async {
+                            any_async = true;
                         }
+                    }
+                    Err(e) => {
+                        if !failed {
+                            println!("awmi: present on adapter #{} failed ({}): attaching again", ob.adapter, sys::status(e));
+                        }
+                        failed = true;
                     }
                 }
             }
@@ -806,6 +929,8 @@ impl Awmi {
         }
         if failed {
             self.reattach = true;
+            self.flip_pending = false;
+            self.flip_deadline = 0;
             self.wm.damage_all();
         }
         if self.cursor_moved {
@@ -815,9 +940,12 @@ impl Awmi {
                 let _ = gpu::move_cursor(self.gpu, o.adapter, p.x.max(0) as u32, p.y.max(0) as u32);
             }
         }
-        let done: Vec<(u32, u32, u64)> = self.surfaces.iter_mut().filter_map(|s| s.pending.take().map(|q| (s.owner, s.window, q))).collect();
-        for (owner, window, seq) in done {
-            self.send_to(owner, wire::EVT_FRAME_DONE, u64::from(window), seq);
+        if any_async && !failed {
+            let now = sys::clock_ns();
+            self.flip_pending = true;
+            self.flip_deadline = now + (self.frame_interval() * 4).max(50 * MS);
+        } else {
+            self.deliver_frame_done();
         }
     }
 
@@ -830,6 +958,11 @@ impl Awmi {
         if !self.wm.damage.is_empty() || self.surfaces.iter().any(|s| s.pending.is_some()) {
             self.frame();
         }
+    }
+
+    /// True if any attached real output uses asynchronous `EVT_FLIP_DONE` pacing.
+    fn has_async_output(&self) -> bool {
+        self.outs.iter().any(|o| o.adapter != 0 && o.async_flip)
     }
 
     /// A frame is due: damage, owed frames, the cursor, an animation.
@@ -956,6 +1089,31 @@ impl Awmi {
                     self.apply_settings();
                 }
                 ok(self.settings.pack(), 0)
+            }
+            wire::OP_FLIP_TEST if admin => {
+                if self.gpu == 0 {
+                    return err(sys::ERR_BAD_STATE);
+                }
+                let id = h.a as u32;
+                let dur_ms = if h.b == 0 { 5000 } else { (h.b as u32).clamp(500, 15_000) };
+                let was_active = self.active;
+                if !was_active {
+                    self.term_call(term::DISPLAY_RELEASE);
+                }
+                let res = gpu::flip_test(self.gpu, id, dur_ms);
+                if !was_active {
+                    self.term_call(term::DISPLAY_RECLAIM);
+                } else {
+                    self.wm.damage_all();
+                }
+                match res {
+                    Ok(r) => {
+                        let mut enc = [0u8; gpu::FLIP_TEST_BYTES];
+                        r.encode(&mut enc);
+                        (0, 0, 0, enc.to_vec())
+                    }
+                    Err(e) => err(e),
+                }
             }
             wire::OP_APP_REGISTER if role == Role::Window => {
                 let app = h.a as u8;
@@ -1095,7 +1253,18 @@ impl Awmi {
                 for o in &mut self.outs {
                     o.hw_cursor = false; // one cursor for every output: drawn in software
                 }
-                self.outs.push(OutBuf { adapter: 0, restarts: 0, fb_id: 0, map, width: w, height: hh, refresh_mhz: 60_000, hw_cursor: false });
+                self.outs.push(OutBuf {
+                    adapter: 0,
+                    restarts: 0,
+                    fb_id: 0,
+                    map,
+                    width: w,
+                    height: hh,
+                    refresh_mhz: 60_000,
+                    hw_cursor: false,
+                    async_flip: false,
+                    native_match: false,
+                });
                 self.relayout();
                 println!("awmi: test: virtual output {}x{} added right of the others", w, hh);
                 ok(self.wm.layout.count as u64, 0)
@@ -1174,6 +1343,7 @@ fn main(s: *const Startup) -> i32 {
     let has_arg = |w: &[u8]| libd::args().split(|&c| c == b' ' || c == 0).any(|a| a == w);
     let test_mode = has_arg(b"test");
     let autostart = has_arg(b"autostart");
+    let firmware_display = has_arg(b"firmware-display");
     let Ok(port) = Port::new(256) else { return 1 };
     let (text, pack_vmo, pack_len) = match load_fonts() {
         Some((map, len)) => {
@@ -1198,6 +1368,7 @@ fn main(s: *const Startup) -> i32 {
         audio: libd::audio::control_endpoint(),
         net: libd::net::status_endpoint(),
         test_mode,
+        firmware_display,
         clients: Vec::new(),
         next_client: 1,
         wm: Box::new(WmState::new()),
@@ -1211,6 +1382,10 @@ fn main(s: *const Startup) -> i32 {
         input_pointer: 0,
         next_frame: 0,
         next_tray: 0,
+        flip_pending: false,
+        flip_deadline: 0,
+        last_flip_ns: 0,
+        pace_skip_until: 0,
         cursor_moved: false,
         cursor_vmo: 0,
         ext_indicators: 0,
@@ -1233,9 +1408,13 @@ fn main(s: *const Startup) -> i32 {
     if a.input != 0 {
         a.port.arm(a.input, sys::READABLE | sys::PEER_CLOSED, KEY_INPUT);
     }
+    if a.gpu != 0 {
+        a.port.arm(a.gpu, sys::READABLE | sys::PEER_CLOSED, KEY_GPU);
+    }
     println!(
-        "awmi: ready, idle until a session starts (endpoints: window, admin, query, indicator{})",
-        if test_mode { "; test hooks on" } else { "" }
+        "awmi: ready, idle until a session starts (endpoints: window, admin, query, indicator{}{})",
+        if test_mode { "; test hooks on" } else { "" },
+        if firmware_display { "; firmware display forced" } else { "" }
     );
     let mut next_try = 0u64;
     loop {
@@ -1252,14 +1431,25 @@ fn main(s: *const Startup) -> i32 {
                 next_try = now + 500 * MS;
             }
         }
-        // Idle: wait for a request. In a session: until the next frame is due (damage pending,
-        // frames owed to clients, an animation), or the next dock refresh.
+        // Idle: wait for a request. In a session:
+        // - If an async flip is pending, wait for `EVT_FLIP_DONE` (or safety deadline) & tray.
+        // - If async output is idle with no damage, sleep until next tray poll (zero CPU).
+        // - Otherwise wait until next refresh-paced frame or late-frame skip window.
         let timeout = if !a.active {
             if a.autostart_until != 0 { next_try.saturating_sub(now).max(MS) } else { sys::WAIT_FOREVER }
         } else {
             let mut until = a.next_tray;
-            if a.due() {
-                until = until.min(a.next_frame);
+            if a.flip_pending {
+                if a.flip_deadline != 0 {
+                    until = until.min(a.flip_deadline);
+                }
+            } else if a.due() {
+                let target = if a.has_async_output() {
+                    a.pace_skip_until
+                } else {
+                    a.next_frame.max(a.pace_skip_until)
+                };
+                until = until.min(target);
             }
             until.saturating_sub(now)
         };
@@ -1271,6 +1461,7 @@ fn main(s: *const Startup) -> i32 {
                     }
                 }
                 KEY_INPUT => a.on_input(),
+                KEY_GPU => a.on_gpu_event(),
                 k if k >= KEY_CLIENT_BASE => a.on_client((k - KEY_CLIENT_BASE) as u32),
                 _ => {}
             }
@@ -1279,9 +1470,20 @@ fn main(s: *const Startup) -> i32 {
             let now = sys::clock_ns();
             a.wm.now_ns = now;
             a.poll_tray();
-            if a.due() && now >= a.next_frame {
+            // Recover cleanly if a driver restarted mid-flip and missed `EVT_FLIP_DONE`.
+            if a.flip_pending && a.flip_deadline != 0 && now >= a.flip_deadline {
+                a.flip_pending = false;
+                a.flip_deadline = 0;
+                a.deliver_frame_done();
+            }
+            let ready_to_draw = if a.has_async_output() {
+                !a.flip_pending && now >= a.pace_skip_until
+            } else {
+                now >= a.next_frame && now >= a.pace_skip_until
+            };
+            if a.due() && ready_to_draw {
                 a.frame();
-                // Refresh-paced: bursts of commits and pointer motion coalesce into one frame.
+                // Refresh-paced for synchronous outputs; async outputs pace off real `EVT_FLIP_DONE`.
                 a.next_frame = now + a.frame_interval();
             }
         }

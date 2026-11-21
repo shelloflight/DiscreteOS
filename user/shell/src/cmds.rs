@@ -1009,36 +1009,194 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
         return Err(String::from("gpu: no gpu.query grant in this session"));
     }
     if let Some(sub) = args.first().map(String::as_str) {
-        if sub != "modes" {
-            return Err(String::from("gpu: usage: gpu [modes [id]]"));
-        }
-        let id = match args.get(1) {
-            Some(s) => s.parse::<u32>().map_err(|_| format!("gpu: invalid adapter id '{}'", s))?,
-            None => 0,
+        let parse_id = |arg: Option<&String>| -> Result<u32, String> {
+            match arg {
+                Some(s) => s.parse::<u32>().map_err(|_| format!("gpu: invalid adapter id '{}'", s)),
+                None => Ok(0),
+            }
         };
-        let mut modes = [ModeEntry::default(); 16];
-        let n = gpu::get_modes(sh.gpu_query, id, &mut modes)
-            .map_err(|e| format!("gpu: get_modes failed ({})", sys::status(e)))?;
-        let mut rs = Vec::new();
-        for m in &modes[..n] {
-            let mut flags = String::new();
-            if (m.flags & gpu::MODE_FLAG_CURRENT) != 0 {
-                flags.push_str("current");
-            }
-            if (m.flags & gpu::MODE_FLAG_PREFERRED) != 0 {
-                if !flags.is_empty() {
-                    flags.push(' ');
+        match sub {
+            "modes" => {
+                let id = parse_id(args.get(1))?;
+                let mut modes = [ModeEntry::default(); 16];
+                let n = gpu::get_modes(sh.gpu_query, id, &mut modes)
+                    .map_err(|e| format!("gpu: get_modes failed ({})", sys::status(e)))?;
+                let mut rs = Vec::new();
+                for m in &modes[..n] {
+                    let mut flags = String::new();
+                    if (m.flags & gpu::MODE_FLAG_CURRENT) != 0 {
+                        flags.push_str("current");
+                    }
+                    if (m.flags & gpu::MODE_FLAG_PREFERRED) != 0 {
+                        if !flags.is_empty() {
+                            flags.push(' ');
+                        }
+                        flags.push_str("preferred");
+                    }
+                    rs.push(
+                        Record::new()
+                            .with("mode", Value::Text(format!("{}x{}", m.width, m.height)))
+                            .with(
+                                "refresh",
+                                Value::Text(format!("{}.{:02} Hz", m.refresh_mhz / 1000, (m.refresh_mhz % 1000) / 10)),
+                            )
+                            .with("flags", Value::Text(flags)),
+                    );
                 }
-                flags.push_str("preferred");
+                return Ok(rs);
             }
-            rs.push(
-                Record::new()
-                    .with("mode", Value::Text(format!("{}x{}", m.width, m.height)))
-                    .with("refresh", Value::Text(format!("{}.{:02} Hz", m.refresh_mhz / 1000, (m.refresh_mhz % 1000) / 10)))
-                    .with("flags", Value::Text(flags)),
-            );
+            "display" => {
+                let id = parse_id(args.get(1))?;
+                let p = gpu::get_display_info(sh.gpu_query, id)
+                    .map_err(|e| format!("gpu: display probe failed ({})", sys::status(e)))?;
+                let rate_label = match p.dp_rate_mbps {
+                    1_620 => "RBR",
+                    2_700 => "HBR",
+                    5_400 => "HBR2",
+                    8_100 => "HBR3",
+                    10_000 => "UHBR10",
+                    13_500 => "UHBR13.5",
+                    20_000 => "UHBR20",
+                    _ => "none",
+                };
+                let link_str = if p.dp_lanes > 0 {
+                    format!(
+                        "{}x {} ({} Mbps{}{})",
+                        p.dp_lanes,
+                        rate_label,
+                        p.dp_rate_mbps,
+                        if (p.flags & gpu::PROBE_DSC_SUPPORTED) != 0 {
+                            if (p.flags2 & gpu::PROBE2_DSC_ENABLED) != 0 { ", DSC on" } else { ", DSC cap" }
+                        } else {
+                            ""
+                        },
+                        if (p.flags2 & gpu::PROBE2_IS_UHBR) != 0 { ", UHBR" } else { "" }
+                    )
+                } else {
+                    String::from("none")
+                };
+                let dcn_str = if p.dcn_major > 0 {
+                    format!("DCN {}.{}.{}", p.dcn_major, p.dcn_minor, p.dcn_rev)
+                } else {
+                    String::from("gop/virtio")
+                };
+                let mode_str = format!(
+                    "{}x{} (total {}x{}, pitch {})",
+                    p.width, p.height, p.h_total, p.v_total, p.pitch_bytes
+                );
+                let hz_str = if p.measured_mhz > 0 {
+                    format!("{}.{:02} Hz", p.measured_mhz / 1000, (p.measured_mhz % 1000) / 10)
+                } else {
+                    String::from("unmeasured")
+                };
+                let scanout_str = format!(
+                    "mc={:#x} vram={:#x} gop={:#x} ({})",
+                    p.mc_addr,
+                    p.vram_off,
+                    p.gop_phys_base,
+                    if (p.flags & gpu::PROBE_GOP_MATCHED) != 0 { "GOP matched" } else { "unmatched" }
+                );
+                let mut state_parts = Vec::new();
+                if (p.flags & gpu::PROBE_FLIP_VERIFIED) != 0 {
+                    state_parts.push("flip-verified");
+                } else if (p.flags2 & gpu::PROBE2_SELF_CHECK_FAILED) != 0 {
+                    state_parts.push("self-check-failed");
+                } else {
+                    state_parts.push("probe-only");
+                }
+                if (p.flags & gpu::PROBE_IH_IRQ_ACTIVE) != 0 {
+                    state_parts.push("ih-irq");
+                }
+                if (p.flags & gpu::PROBE_VRR_SUPPORTED) != 0 {
+                    state_parts.push(if (p.flags & gpu::PROBE_VRR_ENABLED) != 0 { "vrr-on" } else { "vrr-cap" });
+                }
+                if (p.flags & gpu::PROBE_HDR_SUPPORTED) != 0 {
+                    state_parts.push(if (p.flags & gpu::PROBE_HDR_ENABLED) != 0 { "hdr-on" } else { "hdr-cap" });
+                }
+
+                // Append concise EDID modes list & DPCD summary line to terminal output.
+                let mut modes = [ModeEntry::default(); 16];
+                let mn = gpu::get_modes(sh.gpu_query, p.adapter_id, &mut modes).unwrap_or(0);
+                let mut edid_modes = String::new();
+                for (idx, m) in modes[..mn].iter().enumerate() {
+                    if idx > 0 {
+                        edid_modes.push_str(", ");
+                    }
+                    edid_modes.push_str(&format!("{}x{}@{}", m.width, m.height, m.refresh_mhz / 1000));
+                }
+                if p.dp_lanes > 0 {
+                    sh.write(&format!(
+                        "  dpcd: 000={:02x}{:02x}{:02x}{:02x} 060={:02x}{:02x} 100={:02x}{:02x} 202={:02x}{:02x}{:02x} (edid {} blk)\n",
+                        p.dpcd_000[0],
+                        p.dpcd_000[1],
+                        p.dpcd_000[2],
+                        p.dpcd_000[3],
+                        p.dpcd_060[0],
+                        p.dpcd_060[1],
+                        p.dpcd_100[0],
+                        p.dpcd_100[1],
+                        p.dpcd_202[0],
+                        p.dpcd_202[1],
+                        p.dpcd_202[2],
+                        p.edid_blocks,
+                    ));
+                }
+                if !p.note_str().is_empty() {
+                    sh.write(&format!("  note: {}\n", p.note_str()));
+                }
+                return Ok(alloc::vec![
+                    Record::new()
+                        .with("adapter", Value::Int(i64::from(p.adapter_id)))
+                        .with("engine", Value::Text(dcn_str))
+                        .with("pipe", Value::Text(format!("{} ({} active)", p.pipe, p.active_pipes)))
+                        .with("monitor", Value::Text(String::from(p.monitor_str())))
+                        .with("mode", Value::Text(mode_str))
+                        .with("measured", Value::Text(hz_str))
+                        .with("link", Value::Text(link_str))
+                        .with("scanout", Value::Text(scanout_str))
+                        .with("state", Value::Text(state_parts.join(",")))
+                        .with("edid_modes", Value::Text(edid_modes)),
+                ]);
+            }
+            "flip-test" => {
+                if sh.awmi_admin == 0 {
+                    return Err(String::from("gpu: flip-test requires awmi.admin grant"));
+                }
+                let id = parse_id(args.get(1))?;
+                let dur_ms = match args.get(2) {
+                    Some(s) => s.parse::<u32>().map_err(|_| format!("gpu: invalid duration '{}'", s))?,
+                    None => 5000,
+                };
+                sh.write(&format!("running native page-flip test for {} ms...\n", dur_ms));
+                let res = libd::awmi::flip_test(sh.awmi_admin, id, dur_ms)
+                    .map_err(|e| format!("gpu: flip-test failed ({})", sys::status(e)))?;
+                sh.write(&show::ok_line(&format!(
+                    "flip-test done: {} frames, {} missed, {} late, {}.{:02} Hz (pipe {}, ih={}, reverted={})",
+                    res.frames,
+                    res.missed,
+                    res.late,
+                    res.measured_mhz / 1000,
+                    (res.measured_mhz % 1000) / 10,
+                    res.pipe,
+                    res.used_ih,
+                    res.reverted,
+                )));
+                return Ok(alloc::vec![
+                    Record::new()
+                        .with("frames", Value::Int(res.frames as i64))
+                        .with("missed", Value::Int(res.missed as i64))
+                        .with("late", Value::Int(res.late as i64))
+                        .with(
+                            "measured",
+                            Value::Text(format!("{}.{:02} Hz", res.measured_mhz / 1000, (res.measured_mhz % 1000) / 10)),
+                        )
+                        .with("dcn", text(if res.used_dcn { "yes" } else { "no" }))
+                        .with("irq", text(if res.used_ih { "ih" } else { "timer" }))
+                        .with("reverted", text(if res.reverted { "yes" } else { "no" })),
+                ]);
+            }
+            _ => return Err(String::from("gpu: usage: gpu [modes [id] | display [id] | flip-test [id] [ms]]")),
         }
-        return Ok(rs);
     }
     let mut adapters = [AdapterInfo::empty(); 8];
     let n = gpu::list_adapters(sh.gpu_query, &mut adapters)
@@ -1069,6 +1227,21 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
         }
         if (a.caps & gpu::CAP_PAGE_FLIP) != 0 {
             features.push("flip");
+        }
+        if (a.caps & gpu::CAP_ASYNC_FLIP) != 0 {
+            features.push("async");
+        }
+        if (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0 {
+            features.push("native");
+        }
+        if (a.caps & gpu::CAP_VRR) != 0 {
+            features.push("vrr");
+        }
+        if (a.caps & gpu::CAP_HDR) != 0 {
+            features.push("hdr");
+        }
+        if (a.caps & gpu::CAP_DSC) != 0 {
+            features.push("dsc");
         }
         if (a.caps & gpu::CAP_VIRGL_3D) != 0 {
             features.push("virgl3d");
