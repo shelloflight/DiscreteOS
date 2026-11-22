@@ -91,9 +91,10 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   link and IPv4 status; `check`: which step to the internet fails), `ping <host> [count]` (DNS +
   ICMP echo, with a TCP reachability check when no reply comes), `tls <host> [port]` (TLS 1.3
   handshake & certificate verification against `/sys/certs/roots.der`;
-  [networking.md](networking.md)), `gpu [modes [id] | display [id] | flip-test [id] [ms]]`
-  (`display`, GPU adapters, modes, live DCN/DPCD/EDID display probe, hardware page-flip test, VRAM,
-  and IOMMU status; [graphics.md](graphics.md)), `gui [demo | status | theme dark|contrast |
+  [networking.md](networking.md)), `gpu [modes [id] | display [id] | flip-test [id] [ms] | mode <w> <h> <hz> [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]`
+  (`display`, GPU adapters, modes, live DCN/DPCD/EDID display probe, hardware page-flip test,
+  guarded refresh/mode switching, VRR, HDR10, per-output scale, VRAM, and IOMMU status;
+  [graphics.md](graphics.md)), `gui [demo | status | theme dark|contrast |
   text 100-200 | motion on|off]` (`awmi`: start the desktop, with the example apps too for `demo`,
   back with `Super+Esc` or `Ctrl+Alt+Esc`; `status`: the compositor's state; `theme`, `text`,
   `motion`: the accessibility settings; [awmi.md](awmi.md), [ui.md](ui.md)), `power off | restart | sleep` (the manager stops every service

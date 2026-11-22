@@ -36,7 +36,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "net", aliases: &["ip"], usage: "net [check]", description: "network interface, IP address, gateway, DNS and counters; check: find what does not work" },
     Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
     Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
-    Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id]]", description: "GPU adapters, modes, EDID, VRAM, and IOMMU status" },
+    Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id] | display [id] | flip-test [id] [ms] | mode <w> <h> <hz> [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]", description: "GPU adapters, live display probe, refresh/mode, VRR, HDR, scale, and page-flip test" },
     Builtin { name: "gui", aliases: &["awmi"], usage: "gui [demo | status | theme dark|contrast | text 100-200 | motion on|off]", description: "start the desktop (D-AWMI), show its status, or change its theme, text size and motion" },
     Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
@@ -58,8 +58,9 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let max_args = match b.name {
         "help" | "go" | "objects" | "log" | "net" => 1,
         "end" | "restart" | "wait" | "power" => 1,
-        "ping" | "tls" | "gpu" | "gui" => 2,
+        "ping" | "tls" | "gui" => 2,
         "audio" => 3,
+        "gpu" => 5,
         _ => 0,
     };
     if args.len() > max_args {
@@ -1195,7 +1196,79 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
                         .with("reverted", text(if res.reverted { "yes" } else { "no" })),
                 ]);
             }
-            _ => return Err(String::from("gpu: usage: gpu [modes [id] | display [id] | flip-test [id] [ms]]")),
+            "mode" => {
+                if sh.awmi_admin == 0 {
+                    return Err(String::from("gpu: mode switching requires awmi.admin grant"));
+                }
+                let (Some(ws), Some(hs), Some(hzs)) = (args.get(1), args.get(2), args.get(3)) else {
+                    return Err(String::from("gpu: usage: gpu mode <width> <height> <hz> [adapter_id]"));
+                };
+                let w = ws.parse::<u32>().map_err(|_| format!("gpu: invalid width '{}'", ws))?;
+                let h = hs.parse::<u32>().map_err(|_| format!("gpu: invalid height '{}'", hs))?;
+                let raw_hz = hzs.parse::<u32>().map_err(|_| format!("gpu: invalid refresh '{}'", hzs))?;
+                let refresh_mhz = if raw_hz >= 10_000 { raw_hz } else { raw_hz.saturating_mul(1000) };
+                let id = parse_id(args.get(4))?;
+                // Allow DSC and DP link retrain (bits 0 and 1); driver verifies OTG progression and reverts on stall.
+                libd::awmi::set_display_mode(sh.awmi_admin, id, w, h, refresh_mhz, 3)
+                    .map_err(|e| format!("gpu: mode {}x{} @ {} Hz failed ({})", w, h, refresh_mhz / 1000, sys::status(e)))?;
+                sh.write(&show::ok_line(&format!("display mode set to {}x{} @ {}.{:02} Hz", w, h, refresh_mhz / 1000, (refresh_mhz % 1000) / 10)));
+                return Ok(Vec::new());
+            }
+            "vrr" => {
+                if sh.awmi_admin == 0 {
+                    return Err(String::from("gpu: VRR control requires awmi.admin grant"));
+                }
+                let enable = match args.get(1).map(String::as_str) {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(String::from("gpu: usage: gpu vrr on|off [adapter_id]")),
+                };
+                let id = parse_id(args.get(2))?;
+                libd::awmi::set_display_vrr(sh.awmi_admin, id, enable, 0, 0)
+                    .map_err(|e| format!("gpu: VRR {} failed ({})", if enable { "on" } else { "off" }, sys::status(e)))?;
+                sh.write(&show::ok_line(&format!("VRR (Adaptive-Sync) {}", if enable { "enabled" } else { "disabled" })));
+                return Ok(Vec::new());
+            }
+            "hdr" => {
+                if sh.awmi_admin == 0 {
+                    return Err(String::from("gpu: HDR control requires awmi.admin grant"));
+                }
+                let enable = match args.get(1).map(String::as_str) {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => return Err(String::from("gpu: usage: gpu hdr on|off [adapter_id]")),
+                };
+                let id = parse_id(args.get(2))?;
+                libd::awmi::set_display_hdr(sh.awmi_admin, id, enable)
+                    .map_err(|e| format!("gpu: HDR {} failed ({})", if enable { "on" } else { "off" }, sys::status(e)))?;
+                sh.write(&show::ok_line(&format!("HDR10 (10-bit scanout) {}", if enable { "enabled" } else { "disabled" })));
+                return Ok(Vec::new());
+            }
+            "scale" => {
+                if sh.awmi_admin == 0 {
+                    return Err(String::from("gpu: output scale requires awmi.admin grant"));
+                }
+                let scale: u16 = match args.get(1).map(String::as_str) {
+                    Some("auto") => 0,
+                    Some(v) => v
+                        .trim_end_matches('%')
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|p| [100, 125, 150, 175, 200].contains(p))
+                        .ok_or_else(|| String::from("gpu: usage: gpu scale 100|125|150|175|200|auto [adapter_id]"))?,
+                    None => return Err(String::from("gpu: usage: gpu scale 100|125|150|175|200|auto [adapter_id]")),
+                };
+                let id = parse_id(args.get(2))?;
+                libd::awmi::set_output_scale(sh.awmi_admin, id, scale)
+                    .map_err(|e| format!("gpu: scale failed ({})", sys::status(e)))?;
+                if scale == 0 {
+                    sh.write(&show::ok_line("output scale reset to automatic"));
+                } else {
+                    sh.write(&show::ok_line(&format!("output scale set to {}%", scale)));
+                }
+                return Ok(Vec::new());
+            }
+            _ => return Err(String::from("gpu: usage: gpu [modes [id] | display [id] | flip-test [id] [ms] | mode <w> <h> <hz> [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]")),
         }
     }
     let mut adapters = [AdapterInfo::empty(); 8];

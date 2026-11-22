@@ -131,6 +131,10 @@ struct AmdGpu {
     flip: Option<FlipEngine>,
     cursor: HwCursor,
     ih: IhController,
+    /// True only once a real FlipDone/Vblank IV has been observed in the IH ring; until then
+    /// flips wake on predicted vblank so an unrouted IRQ never cuts refresh rate in half.
+    ih_verified: bool,
+    ih_missed_streak: u8,
     vrr_enabled: bool,
     hdr_enabled: bool,
     dsc_enabled: bool,
@@ -175,25 +179,87 @@ impl AmdGpu {
         self.rreg32(amd::MM_DATA).unwrap_or(0xFFFF_FFFF)
     }
 
-    fn probe_ip_discovery(&self, vram_bytes: u64) -> Option<DiscoverySummary> {
+    fn ih_ready(&self) -> bool {
+        self.ih.active && self.ih_verified
+    }
+
+    fn probe_ip_discovery(&mut self, vram_bytes: u64) -> Option<DiscoverySummary> {
         if vram_bytes < amd::IP_DISCOVERY_OFFSET_FROM_TOP * 2 {
             return None;
         }
         let base = vram_bytes - amd::IP_DISCOVERY_OFFSET_FROM_TOP;
-        let sig = self.read_vram_indirect(base);
-        if sig != amd::IP_DISCOVERY_BINARY_SIG {
-            return None;
+        let max_len = amd::IP_DISCOVERY_MAX_SIZE;
+        let mut dir_sig = 0u32;
+
+        // 1. Direct BAR 0 path first when top of VRAM sits inside the visible BAR 0 aperture
+        // (Resizable BAR on modern GPUs — matches Linux `amdgpu_device_vram_access` fast path).
+        if vram_bytes <= self.bar0_size && self.bar0_size >= (1 << 20) {
+            if self.bar0_vmo == 0
+                && let Ok(vmo) = sys::device_map_bar(self.dev, 0)
+            {
+                self.bar0_vmo = vmo;
+            }
+            if self.bar0_vmo != 0
+                && let Ok(tmp) = Mapping::of_range(self.bar0_vmo, base, amd::IP_DISCOVERY_OFFSET_FROM_TOP)
+            {
+                dir_sig = tmp.r32(0);
+                let parsed = if dir_sig == amd::IP_DISCOVERY_BINARY_SIG {
+                    let bin_size = ((tmp.r32(8) >> 16) as usize).clamp(48, max_len);
+                    let read_len = bin_size.next_multiple_of(4).min(tmp.len as usize);
+                    if let Ok(mut buf) = Mapping::new(max_len as u64) {
+                        buf.bytes_mut()[..read_len].copy_from_slice(&tmp.bytes()[..read_len]);
+                        let res = amd::parse_ip_discovery(&buf.bytes()[..read_len]);
+                        let _ = sys::vmar_unmap(libd::root_vmar(), buf.addr, buf.len);
+                        sys::handle_close(buf.vmo);
+                        if let Err(e) = res {
+                            println!("amdgpu: ip-discovery direct parse err {:?} at {} MiB (size={})", e, vram_bytes >> 20, bin_size);
+                        }
+                        res.ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let _ = sys::vmar_unmap(libd::root_vmar(), tmp.addr, tmp.len);
+                if parsed.is_some() {
+                    return parsed;
+                }
+            }
         }
-        // Read binary header size at offset 10 (inside dword at offset 8: upper 16 bits).
-        let dw2 = self.read_vram_indirect(base + 8);
-        let bin_size = ((dw2 >> 16) as usize).clamp(48, 16384);
-        let read_len = bin_size.next_multiple_of(4);
-        let mut raw = [0u8; 16384];
-        for i in (0..read_len).step_by(4) {
-            let w = self.read_vram_indirect(base + i as u64);
-            raw[i..i + 4].copy_from_slice(&w.to_le_bytes());
+
+        // 2. Fallback: indirect VRAM access via `MM_INDEX` / `MM_INDEX_HI` / `MM_DATA` (small BAR).
+        let ind_sig = self.read_vram_indirect(base);
+        if ind_sig == amd::IP_DISCOVERY_BINARY_SIG {
+            let dw2 = self.read_vram_indirect(base + 8);
+            let bin_size = ((dw2 >> 16) as usize).clamp(48, max_len);
+            let read_len = bin_size.next_multiple_of(4).min(max_len);
+            if let Ok(mut buf) = Mapping::new(max_len as u64) {
+                let dst = buf.bytes_mut();
+                for i in (0..read_len).step_by(4) {
+                    let w = self.read_vram_indirect(base + i as u64);
+                    dst[i..i + 4].copy_from_slice(&w.to_le_bytes());
+                }
+                let res = amd::parse_ip_discovery(&buf.bytes()[..read_len]);
+                let _ = sys::vmar_unmap(libd::root_vmar(), buf.addr, buf.len);
+                sys::handle_close(buf.vmo);
+                if let Ok(disc) = res {
+                    return Some(disc);
+                }
+                if let Err(e) = res {
+                    println!("amdgpu: ip-discovery indirect parse err {:?} at {} MiB (size={})", e, vram_bytes >> 20, bin_size);
+                }
+            }
         }
-        amd::parse_ip_discovery(&raw[..read_len]).ok()
+
+        println!(
+            "amdgpu: ip-discovery miss at {} MiB (bar0={} MiB, dir_sig={:#x}, ind_sig={:#x})",
+            vram_bytes >> 20,
+            self.bar0_size >> 20,
+            dir_sig,
+            ind_sig
+        );
+        None
     }
 
     fn active_pipe(&self) -> Option<ActivePipe> {
@@ -365,6 +431,11 @@ impl AmdGpu {
                             self.pipes[0].gop_matched = true;
                             0
                         } else {
+                            println!(
+                                "amdgpu: GOP mismatch: gop={:#x} {}x{} p={} vs bar0={:#x} ({} MiB) pipe0={}x{} p={} vram={:?}",
+                                gop.phys_base, gop.width, gop.height, gop.pitch, self.bar0_phys, self.bar0_size >> 20,
+                                p0.width(), p0.height(), p0.pitch_bytes, p0.vram_off
+                            );
                             self.set_note(b"active DCN pipe does not match GOP FB");
                             return;
                         }
@@ -373,6 +444,13 @@ impl AmdGpu {
                         return;
                     }
                 } else {
+                    if let Some(p0) = self.pipes.first().filter(|_| self.pipe_count > 0) {
+                        println!(
+                            "amdgpu: GOP mismatch: gop={:#x} {}x{} p={} vs bar0={:#x} ({} MiB) pipe0={}x{} p={} vram={:?}",
+                            gop.phys_base, gop.width, gop.height, gop.pitch, self.bar0_phys, self.bar0_size >> 20,
+                            p0.width(), p0.height(), p0.pitch_bytes, p0.vram_off
+                        );
+                    }
                     self.set_note(b"active DCN pipe does not match GOP FB");
                     return;
                 }
@@ -409,20 +487,17 @@ impl AmdGpu {
             return;
         }
 
-        // Self-check before use: copy live GOP framebuffer verbatim into scanout buffer 0 so the
-        // test flip produces zero visible glitch, then confirm `EARLIEST_INUSE` latches within 3 frames.
-        let copy_len = u64::from(ap.pitch_bytes) * u64::from(ap.height());
-        if let (Some(vram), Some(src_rel), Some(dst_rel)) = (
-            self.vram_map.as_ref(),
-            layout.to_map_off(gop_off),
-            layout.to_map_off(layout.buffers[0]),
-        ) && src_rel + copy_len <= vram.len
-            && dst_rel + copy_len <= vram.len
+        // Self-check before use: write-only clear of scanout buffer 0 (never read back WC VRAM
+        // over PCIe, which takes seconds on 1440p/4K), flip for a single vblank to confirm
+        // `EARLIEST_INUSE` latches within 3 frames, then immediately hand back to untouched GOP.
+        let clear_len = u64::from(ap.pitch_bytes) * u64::from(ap.height());
+        if let (Some(vram), Some(dst_rel)) = (self.vram_map.as_ref(), layout.to_map_off(layout.buffers[0]))
+            && dst_rel + clear_len <= vram.len
         {
+            const DARK_SLATE_PAIR: u64 = 0x000E_1016_000E_1016;
             let mut off = 0u64;
-            while off + 8 <= copy_len {
-                let q = vram.r64(src_rel + off);
-                vram.w64(dst_rel + off, q);
+            while off + 8 <= clear_len {
+                vram.w64(dst_rel + off, DARK_SLATE_PAIR);
                 off += 8;
             }
             fence(Ordering::Release);
@@ -453,8 +528,11 @@ impl AmdGpu {
                 // Hand back to GOP immediately so the text console stays untouched until a GUI session presents!
                 let mut io = MmioRef(&self.mmio);
                 eng.restore_original(&mut io, &dcn);
+                eng.age.mark_all_dirty();
 
                 // Initialize OSSSYS IH ring DMA for zero-polling vblank/flip completion when MSI/MSI-X is bound.
+                self.ih_verified = false;
+                self.ih_missed_streak = 0;
                 if self.irq != 0 {
                     let ring_iova = self.ring_dma.dev_addr(IH_RING_OFF as u64);
                     let wptr_iova = self.ring_dma.dev_addr(IH_WPTR_OFF);
@@ -471,12 +549,12 @@ impl AmdGpu {
                 self.layout = Some(layout);
                 self.flip = Some(eng);
                 self.set_note(if self.ih.active {
-                    b"native DCN verified (IH IRQ active)"
+                    b"native DCN verified (IH IRQ armed)"
                 } else {
                     b"native DCN verified (timer pacing)"
                 });
                 println!(
-                    "amdgpu: native DCN {} pipe {} verified: {}x{} @ {}.{:02} Hz ({} bufs @ {:#x}, WC {} MiB, ih={})",
+                    "amdgpu: native DCN {} pipe {} verified: {}x{} @ {}.{:02} Hz ({} bufs @ {:#x}, WC {} MiB, ih_armed={})",
                     dcn.version.name(),
                     ap.pipe,
                     self.width,
@@ -516,12 +594,18 @@ impl AmdGpu {
             _ => {}
         });
         if saw_flip {
+            if !self.ih_verified {
+                self.ih_verified = true;
+                self.set_note(b"native DCN verified (IH IRQ active)");
+            }
+            self.ih_missed_streak = 0;
             self.check_pending_flip();
         }
     }
 
     fn check_pending_flip(&mut self) {
         let Some(dcn) = self.dcn else { return };
+        let ih_ready = self.ih_ready();
         let Some(flip) = self.flip.as_mut() else { return };
         if flip.pending_buf.is_none() {
             self.flip_deadline_ns = None;
@@ -534,11 +618,18 @@ impl AmdGpu {
                 self.frames = frames;
                 self.flip_deadline_ns = None;
                 self.pending_async_notify = Some((frames, now, late));
+                if self.ih_verified && late {
+                    self.ih_missed_streak = self.ih_missed_streak.saturating_add(1);
+                    if self.ih_missed_streak >= 2 {
+                        self.ih_verified = false;
+                        self.set_note(b"native DCN verified (timer fallback)");
+                    }
+                }
             }
             FlipPoll::Pending => {
-                // Schedule next short poll (200 us) if timer-paced, or safety timeout (2 frames) if IH active.
-                let delta = if self.ih.active {
-                    flip.frame_interval_ns() * 2
+                // Schedule next short poll (200 us) if timer-paced, or safety timeout (1 frame) if IH verified.
+                let delta = if ih_ready {
+                    flip.frame_interval_ns()
                 } else {
                     200_000
                 };
@@ -560,7 +651,7 @@ impl AmdGpu {
             self.check_pending_flip();
             if self.flip.as_ref().is_some_and(|f| f.pending_buf.is_some()) {
                 let sleep_ns = match (self.flip.as_ref(), self.active_pipe()) {
-                    (Some(f), Some(ap)) if !self.ih.active => f.ns_until_vblank(&MmioRef(&self.mmio), &dcn, &ap.timing).min(500_000),
+                    (Some(f), Some(ap)) if !self.ih_ready() => f.ns_until_vblank(&MmioRef(&self.mmio), &dcn, &ap.timing).min(500_000),
                     _ => 200_000,
                 };
                 libd::handle::sleep(sleep_ns);
@@ -715,7 +806,7 @@ impl GpuDriver for AmdGpu {
                 out.flags2 |= gpu::PROBE2_SELF_CHECK_FAILED;
             }
         }
-        if self.ih.active {
+        if self.ih_ready() {
             out.flags |= gpu::PROBE_IH_IRQ_ACTIVE;
         }
         if let Some(ed) = self.edid() {
@@ -805,6 +896,16 @@ impl GpuDriver for AmdGpu {
         let Some(ap) = self.active_pipe() else {
             return Err(sys::ERR_BAD_STATE);
         };
+        if width != ap.width() || height != ap.height() {
+            println!(
+                "amdgpu: mode {}x{} rejected (active pipe is {}x{}; same-resolution refresh switching supported)",
+                width,
+                height,
+                ap.width(),
+                ap.height()
+            );
+            return Err(sys::ERR_NOT_SUPPORTED);
+        }
         // Find matching detailed timing in EDID.
         let timing = self
             .edid()
@@ -854,10 +955,19 @@ impl GpuDriver for AmdGpu {
             }
         }
 
-        // Program new OTG/DCCG/MSA/DSC timing guarded by verify-and-revert!
+        // Derive live DCCG DTO source clock (e.g. DTBCLK on DCN 4.0.1) from active firmware
+        // registers before programming new OTG/DCCG/MSA/DSC timing guarded by verify-and-revert!
+        let src_clk_khz = flip::derive_dto_source_clk_khz(
+            &MmioRef(&self.mmio),
+            &dcn,
+            ap.pipe,
+            &ap.timing,
+            self.measured_mhz.max(60_000),
+            100_000,
+        );
         let saved = {
             let mut io = MmioRef(&self.mmio);
-            program_mode_regs(&mut io, &dcn, ap.pipe, &timing, 100_000, use_dsc, dsc_bpp, bpc)
+            program_mode_regs(&mut io, &dcn, ap.pipe, &timing, src_clk_khz, use_dsc, dsc_bpp, bpc)
         };
         // Verify OTG frame counter keeps advancing after mode switch.
         let new_hz = self.measure_pipe_refresh(&dcn, ap.pipe);
@@ -867,17 +977,20 @@ impl GpuDriver for AmdGpu {
             println!("amdgpu: mode {}x{}@{} Hz stalled OTG: reverted automatically", width, height, timing.refresh_mhz / 1000);
             return Err(i64::from(proto::ERR_IO));
         }
+        self.pipes[self.primary_slot].timing = dcn::OtgTiming::from_detailed(&timing);
         self.measured_mhz = new_hz.unwrap_or(timing.refresh_mhz);
         self.dsc_enabled = use_dsc;
         if let Some(f) = self.flip.as_mut() {
             f.refresh_mhz = self.measured_mhz;
+            f.age.mark_all_dirty();
         }
         println!(
-            "amdgpu: mode set {}x{} @ {}.{:02} Hz (dsc={})",
+            "amdgpu: mode set {}x{} @ {}.{:02} Hz (src_clk={} kHz, dsc={})",
             width,
             height,
             self.measured_mhz / 1000,
             (self.measured_mhz % 1000) / 10,
+            src_clk_khz,
             use_dsc
         );
         Ok(())
@@ -957,6 +1070,7 @@ impl GpuDriver for AmdGpu {
 
             // Commit vsync flip (`HIGH` then `LOW`, `SURFACE_FLIP_TYPE = 0`).
             let active_timing = self.active_pipe().map(|ap| ap.timing);
+            let ih_ready = self.ih_ready();
             let next_dl = {
                 let Some(flip) = self.flip.as_mut() else {
                     return Err(sys::ERR_BAD_STATE);
@@ -964,11 +1078,12 @@ impl GpuDriver for AmdGpu {
                 let mut io = MmioRef(&self.mmio);
                 flip.commit_vsync_flip(&mut io, &dcn, draw_buf, rects, now)
                     .map_err(|_| sys::ERR_BAD_STATE)?;
-                if self.ih.active {
-                    // Safety fallback deadline in case an IRQ is missed (2 frame intervals).
-                    now + flip.frame_interval_ns() * 2
+                if ih_ready {
+                    // Tight safety fallback deadline in case a verified IRQ is ever missed.
+                    let fi = flip.frame_interval_ns();
+                    now + fi + (fi / 2).max(2_000_000)
                 } else if let Some(timing) = active_timing {
-                    // High-resolution sleep straight to predicted vblank start.
+                    // High-resolution sleep straight to predicted vblank start (IH still wakes early if it fires).
                     now + flip.ns_until_vblank(&io, &dcn, &timing)
                 } else {
                     now + flip.frame_interval_ns()
@@ -1172,9 +1287,8 @@ impl GpuDriver for AmdGpu {
             while sys::clock_ns() < flip_dl {
                 if self.ih.active {
                     self.drain_ih_ring();
-                } else {
-                    self.check_pending_flip();
                 }
+                self.check_pending_flip();
                 if self.flip.as_ref().is_none_or(|f| f.pending_buf.is_none()) {
                     break;
                 }
@@ -1224,7 +1338,7 @@ impl GpuDriver for AmdGpu {
             duration_ms: (elapsed_ns / 1_000_000) as u32,
             reverted,
             used_dcn: true,
-            used_ih: self.ih.active,
+            used_ih: self.ih_ready(),
             pipe: ap.pipe,
         })
     }
@@ -1329,7 +1443,7 @@ pub fn main(s: *const Startup) -> i32 {
         println!("amdgpu: {}: cannot map MMIO BAR {}", info.name(), mmio_bar);
         return 1;
     };
-    let mmio_len = info.bar_size[mmio_bar as usize].min(4 << 20);
+    let mmio_len = info.bar_size[mmio_bar as usize].min(16 << 20);
     let Ok(mmio) = Mapping::of_range(mmio_vmo, 0, mmio_len) else {
         println!("amdgpu: {}: cannot map MMIO window", info.name());
         return 1;
@@ -1382,6 +1496,8 @@ pub fn main(s: *const Startup) -> i32 {
         flip: None,
         cursor: HwCursor::new(0),
         ih: IhController::new(IH_RING_BYTES),
+        ih_verified: false,
+        ih_missed_streak: 0,
         vrr_enabled: false,
         hdr_enabled: false,
         dsc_enabled: false,
@@ -1402,26 +1518,42 @@ pub fn main(s: *const Startup) -> i32 {
     };
 
     // ---- Read-only hardware probe (zero display writes) ----
-    let mem_reg = drv
-        .rreg32(amd::REG_RCC_CONFIG_MEMSIZE)
-        .filter(|&v| v > 0 && v != 0xFFFF_FFFF && v <= 65536)
-        .or_else(|| {
-            drv.rreg32(amd::REG_RCC_CONFIG_MEMSIZE_ALT)
-                .filter(|&v| v > 0 && v != 0xFFFF_FFFF && v <= 65536)
-        });
-    if let Some(mib) = mem_reg {
-        drv.vram_mib = mib;
+    // Probe IP Discovery across candidate VRAM sizes (NBIF memsize registers + BAR 0 ReBAR size)
+    // so an APU/NBIF register offset mismatch never hides the checksum-verified IP Discovery table.
+    let valid_mib = |v: u32| v > 0 && v != 0xFFFF_FFFF && v <= 65536;
+    let mut cand_mib = [0u32; 3];
+    let mut cand_n = 0usize;
+    let mut push_cand = |m: u32| {
+        if valid_mib(m) && !cand_mib[..cand_n].contains(&m) && cand_n < cand_mib.len() {
+            cand_mib[cand_n] = m;
+            cand_n += 1;
+        }
+    };
+    if let Some(m) = drv.rreg32(amd::REG_RCC_CONFIG_MEMSIZE) {
+        push_cand(m);
     }
-
-    let vram_bytes = u64::from(drv.vram_mib) << 20;
-    drv.discovery = drv.probe_ip_discovery(vram_bytes);
+    if let Some(m) = drv.rreg32(amd::REG_RCC_CONFIG_MEMSIZE_ALT) {
+        push_cand(m);
+    }
+    push_cand((bar0_size >> 20) as u32);
+    if cand_n > 0 {
+        drv.vram_mib = cand_mib[0];
+    }
+    for &mib in &cand_mib[..cand_n] {
+        if let Some(disc) = drv.probe_ip_discovery(u64::from(mib) << 20) {
+            drv.vram_mib = mib;
+            drv.discovery = Some(disc);
+            break;
+        }
+    }
     if let Some(disc) = drv.discovery {
         drv.dcn = DcnAccess::from_discovery(&disc, gpu_info.dcn_hint());
         if let Some(dcn) = drv.dcn {
-            // Refine VRAM size via NBIF 6.3.1 RCC_CONFIG_MEMSIZE if available.
-            if let Some(nbif_mem) = dcn
-                .r_nbif(&MmioRef(&drv.mmio), dcn::RegAddr::new(2, amd::NBIF631_RCC_CONFIG_MEMSIZE_OFF))
-                .filter(|&v| v > 0 && v != 0xFFFF_FFFF && v <= 65536)
+            // Refine VRAM size via NBIF 6.3.x RCC_CONFIG_MEMSIZE when present.
+            if dcn.nbif.is_some_and(|n| n.major == 6 && n.minor == 3)
+                && let Some(nbif_mem) = dcn
+                    .r_nbif(&MmioRef(&drv.mmio), dcn::RegAddr::new(2, amd::NBIF631_RCC_CONFIG_MEMSIZE_OFF))
+                    .filter(|&v| v > 0 && v != 0xFFFF_FFFF && v <= 65536)
             {
                 drv.vram_mib = nbif_mem;
             }
@@ -1437,6 +1569,14 @@ pub fn main(s: *const Startup) -> i32 {
                     drv.measured_mhz = hz;
                 }
                 drv.vrr_enabled = ap.vrr_enabled;
+                drv.set_note(b"read-only probe ok (awaiting GOP verify)");
+            } else {
+                // Unconnected GPU (e.g. integrated GPU when monitor is plugged into dGPU):
+                // report 0x0 so the compositor never attaches a phantom second display.
+                drv.width = 0;
+                drv.height = 0;
+                drv.pitch = 0;
+                drv.set_note(b"no active display pipe (unconnected)");
             }
             // Read-only DP AUX probe (DPCD + multi-block EDID).
             drv.aux_probe = {
@@ -1475,7 +1615,6 @@ pub fn main(s: *const Startup) -> i32 {
                     aux_p.edid.as_ref().map_or("-", EdidInfo::name_str),
                 );
             }
-            drv.set_note(b"read-only probe ok (awaiting GOP verify)");
         }
     } else {
         drv.set_note(b"IP Discovery not present");

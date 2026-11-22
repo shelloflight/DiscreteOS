@@ -896,6 +896,49 @@ impl SavedModeRegs {
     }
 }
 
+/// Derive the active DCCG DP DTO source clock (in kHz, e.g. DTBCLK ~600-1200 MHz on DCN 4.0.1)
+/// from the firmware's live OTG timing, measured refresh rate, and current DCCG DTO registers.
+///
+/// Falls back to `fallback_khz` if DTO is disabled or register values are outside plausible bounds.
+pub fn derive_dto_source_clk_khz<I: RegIo>(
+    io: &I,
+    dcn: &DcnAccess,
+    pipe: u8,
+    cur_timing: &OtgTiming,
+    cur_refresh_mhz: u32,
+    fallback_khz: u32,
+) -> u32 {
+    let fallback = fallback_khz.max(100_000);
+    let r = dcn.regs;
+    let cntl = dcn.r_dcn(io, r.dccg_otg_pixel_rate_cntl(pipe)).unwrap_or(0);
+    if (cntl & (1 << 4)) == 0 {
+        return fallback;
+    }
+    let modulo = dcn.r_dcn(io, r.dccg_dp_dto_modulo(pipe)).unwrap_or(0);
+    let phase = dcn.r_dcn(io, r.dccg_dp_dto_phase(pipe)).unwrap_or(0);
+    if modulo == 0 {
+        return fallback;
+    }
+    let old_int = r
+        .dccg_otg_pixel_rate_div()
+        .and_then(|reg| dcn.r_dcn(io, reg))
+        .map_or(0, |d| (d >> (1 + u32::from(pipe.min(3)) * 5)) & 1);
+    let cur_pclk_khz = (u128::from(cur_timing.h_total)
+        * u128::from(cur_timing.v_total)
+        * u128::from(cur_refresh_mhz))
+        / 1_000_000;
+    let den = u128::from(old_int) * u128::from(modulo) + u128::from(phase);
+    if cur_pclk_khz == 0 || den == 0 {
+        return fallback;
+    }
+    let derived = (cur_pclk_khz * u128::from(modulo)) / den;
+    if (50_000..=3_000_000).contains(&derived) {
+        derived as u32
+    } else {
+        fallback
+    }
+}
+
 /// Program new OTG timing, DCCG DP pixel-rate DTO, DP MSA, and optional DSC 1.2 PPS registers
 /// under `OTG_MASTER_UPDATE_LOCK`. Returns the saved prior register snapshot so callers can verify
 /// that OTG keeps scanning and automatically revert if anything stalls.
@@ -929,8 +972,11 @@ pub fn program_mode_regs<I: RegIo>(
 
     // 2. DCCG DP pixel-rate DTO (`dcn401_dccg.c`).
     let refclk = refclk_khz.max(100_000);
-    let dto_int = (timing.pixel_clock_khz / refclk).min(1);
-    let dto_phase = timing.pixel_clock_khz % refclk;
+    let (dto_int, dto_phase) = if timing.pixel_clock_khz >= refclk.saturating_mul(2) {
+        (1u32, refclk.saturating_sub(1))
+    } else {
+        (timing.pixel_clock_khz / refclk, timing.pixel_clock_khz % refclk)
+    };
     dcn.w_dcn(io, r.dccg_dp_dto_phase(pipe), dto_phase);
     dcn.w_dcn(io, r.dccg_dp_dto_modulo(pipe), refclk);
     if let Some(div_reg) = r.dccg_otg_pixel_rate_div() {

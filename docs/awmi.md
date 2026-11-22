@@ -22,14 +22,16 @@ dock, launcher, themes, wire codecs), `user/awmi` (`awmi.dsvc`, `awmi-demo.dsvc`
 ## Session lifecycle
 
 1. **Outputs** from `gpu.display`: verified native PCI outputs (`CAP_NATIVE_GOP_MATCH`, e.g. AMD
-   DCN after passing its GOP-match and 3-frame flip self-check) are preferred over the firmware
-   framebuffer for tear-free high-refresh scanout; `display = firmware` in `esp:/DOS/BOOT.CFG`
-   (passing `firmware-display` to `awmi`) forces the firmware framebuffer instead. Without a
-   verified native PCI output, the firmware framebuffer is used when present, otherwise every online
-   PCI GPU (`virtio-gpu`, `amdgpu`, `xe`, `nvgpu`). Each output gets one offscreen backbuffer VMO,
-   attached once and kept across sessions: zero-copy IOMMU scanout on PCI GPUs, write-combining
-   blits on the firmware framebuffer or native VRAM scanout buffers. Several outputs form one
-   desktop, left to right.
+   DCN after passing its GOP-match and 3-frame flip self-check, plus any additional page-flipping
+   outputs on that same GPU) are preferred over the firmware framebuffer for tear-free high-refresh
+   scanout; `display = firmware` in `esp:/DOS/BOOT.CFG` (passing `firmware-display` to `awmi`)
+   forces the firmware framebuffer instead. If a verified native PCI GPU finishes probing after a
+   session already started on GOP, `gpu.dsvc` emits `EVT_ADAPTERS_CHANGED` and the compositor
+   seamlessly upgrades outputs on the next frame. Without a verified native PCI output, the firmware
+   framebuffer is used when present, otherwise every online PCI GPU (`virtio-gpu`, `amdgpu`, `xe`,
+   `nvgpu`). Each output gets one offscreen backbuffer VMO, attached once and kept across sessions,
+   and an automatic per-output scale (100% / 125% / 150% by width, overridable via `OP_SET_DISPLAY`).
+   Several outputs form one desktop, left to right.
 2. **Screen and input:** `terminal.display` `DISPLAY_RELEASE` (the terminal keeps its scrollback but
    stops drawing) and `devmgr.input` `INPUT_GRAB` (keys and pointer events go to the compositor
    only: nothing typed reaches the shell).
@@ -52,10 +54,11 @@ A GPU driver restart makes a present fail; the outputs are attached again at the
 
 Floating by default, with snapping: drag a title bar to move (an edge or corner of an output shows a
 snap preview: halves, quarters, maximize), drag an edge or corner to resize, title bar buttons to
-minimize, maximize/restore and close. Click to focus. Four workspaces. The dock is a floating
-island at the bottom of the primary output: the windows of the current workspace (each workspace
-has its own; click: focus, or minimize the focused one), workspaces `1`-`4`, network, audio,
-`MIC LIVE` (green) and security alert (red) indicators, and the UTC clock.
+minimize, maximize/restore and close. Click to focus. Four workspaces. The dock is a floating island at the bottom of the primary output: pinned quick-launch apps on the
+left (with a running dot; clicking focuses/restores an open window or sends `EVT_LAUNCH` when
+closed), followed by the windows of the current workspace (each workspace has its own; click: focus,
+or minimize the focused one), workspaces `1`-`4`, network, audio, `MIC LIVE` (green) and security
+alert (red) indicators, and the UTC clock.
 
 | Keys | Action |
 |---|---|
@@ -115,12 +118,13 @@ Requests are calls on the client's channel; events arrive on the same channel (t
 | `OP_COMMIT` (902) | window | show the buffer; payload = up to 16 damage rectangles (window-local); `EVT_FRAME_DONE` follows |
 | `OP_SET_TITLE` (903), `OP_DESTROY` (904) | window | the program's own windows only |
 | `OP_FONTS` (905) | window | one read-only VMO handle: the font pack; `a` = its size |
-| `OP_APP_REGISTER` (906) | window | a launcher entry: `a` = entry 0-3, payload = label (32 bytes) |
+| `OP_APP_REGISTER` (906) | window | a launcher entry: `a` = entry 0-3, `b` = `APP_FLAG_PINNED` (1) to pin in dock, payload = label (32 bytes) |
 | `OP_SESSION_START` (930), `OP_SESSION_STOP` (931) | admin | `a`: `SESSION_DEMO` (1) opens the demo windows, `SESSION_DESKTOP` (2) the terminal window |
 | `OP_STATUS` (932) | query, admin | session, outputs, mode, windows, workspace, indicators, frames, input counters, settings, launcher, fonts, entries |
 | `OP_INDICATOR` (933) | indicator | `IND_SECURITY_ALERT` |
 | `OP_SETTINGS` (934) | admin | `a` = settings (theme, text size << 8, reduce motion << 24), `b` = which (`SET_*`) |
 | `OP_FLIP_TEST` (935) | admin | `a` = adapter id (0 = first), `b` = duration ms; releases terminal, runs `gpu::flip_test`, restores terminal |
+| `OP_SET_DISPLAY` (936) | admin | `a` = adapter id \| subop (`DISPLAY_SET_MODE`/`VRR`/`HDR`/`SCALE`) << 32; safe display mode/refresh, VRR, HDR10, and per-output scale control |
 | `OP_TEST_*` (940-945) | admin, test mode only | inject keys and pointer events, read back a backbuffer pixel, list windows, add a virtual output, hash a frame |
 
 Events: `EVT_CONFIGURE` (size and state after a snap, resize, maximize, minimize, focus change),

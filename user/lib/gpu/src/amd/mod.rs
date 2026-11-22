@@ -224,7 +224,7 @@ pub const HWID_DCE: u16 = 271; // DMU_HWID (DCN display engine)
 pub const HWID_DIO: u16 = 272;
 
 pub const MAX_IP_BASES: usize = 8;
-pub const MAX_IP_BLOCKS: usize = 32;
+pub const MAX_IP_BLOCKS: usize = 64;
 pub const MAX_RESERVED_REGIONS: usize = 8;
 
 /// One parsed IP block from AMD IP Discovery with all its MMIO register segment bases.
@@ -272,7 +272,7 @@ pub struct ReservedMemRegion {
 }
 
 /// Summary of discovered AMD IP blocks and reserved VRAM regions.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DiscoverySummary {
     pub version_major: u16,
     pub version_minor: u16,
@@ -280,6 +280,19 @@ pub struct DiscoverySummary {
     pub count: usize,
     pub reserved: [ReservedMemRegion; MAX_RESERVED_REGIONS],
     pub reserved_count: usize,
+}
+
+impl Default for DiscoverySummary {
+    fn default() -> Self {
+        Self {
+            version_major: 0,
+            version_minor: 0,
+            blocks: [IpBlock::default(); MAX_IP_BLOCKS],
+            count: 0,
+            reserved: [ReservedMemRegion::default(); MAX_RESERVED_REGIONS],
+            reserved_count: 0,
+        }
+    }
 }
 
 impl DiscoverySummary {
@@ -387,9 +400,11 @@ pub fn parse_ip_discovery(raw: &[u8]) -> Result<DiscoverySummary, DiscoveryError
     if tbl_sig != IP_DISCOVERY_TABLE_SIG {
         return Err(DiscoveryError::BadSignature);
     }
+    let ip_ver = rd_u16(ip_tbl, 4).unwrap_or(0);
     let num_dies = usize::from(rd_u16(ip_tbl, 12).ok_or(DiscoveryError::TooShort)?);
-    // `flags` field sits at byte offset 78 inside `ip_discovery_header` (after 16 x 4-byte `die_info`).
-    let base_addr_64_bit = ip_tbl.get(78).is_some_and(|&f| (f & 1) != 0);
+    // `flags` field (`base_addr_64_bit`, bit 0) sits at byte offset 78 inside
+    // `ip_discovery_header` starting with header version 4 (earlier versions keep padding there).
+    let base_addr_64_bit = ip_ver >= 4 && ip_tbl.get(78).is_some_and(|&f| (f & 1) != 0);
 
     let mut summary = DiscoverySummary {
         version_major,

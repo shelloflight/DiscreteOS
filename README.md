@@ -15,7 +15,7 @@ measured**. Where standards cost nothing, D-OS uses them: ELF, UEFI, ACPI, GPT, 
 |---|---|---|
 | **D-KRNL** | the kernel | working, hardened, extensively tested |
 | **D-CMPL** | compatibility layer for Windows and Linux programs | console programs run |
-| **D-AWMI** | compositor, window manager and UI toolkit | desktop, terminal window, launcher |
+| **D-AWMI** | compositor, window manager and UI toolkit | desktop, terminal window, launcher, dock, native AMD display |
 | **D-PACK** | signed packages and updates | planned |
 
 ## Where it stands
@@ -39,16 +39,18 @@ the text console when there is no display.
   and keyboard input
 - A terminal and a shell whose commands pass typed records (`list | where size > 1M | sort
   modified`); each tool gets only the paths typed, with the rights its manifest declares
-- A desktop (D-AWMI): damage-tracked compositing with zero-copy GPU scanout, floating and snapped
-  windows whose title bars show the verified program, a dock, a type-to-search launcher, anti-aliased
-  Inter and Iosevka text, a declarative toolkit, Dark Slate and High Contrast themes, text sizes up
-  to 200 %
+- A desktop (D-AWMI) and modern GPU stack: IOMMU-confined GPU drivers (`virtio-gpu`, native AMD
+  RDNA / DCN 4.0.1 & 3.x tear-free vsync flipping with hardware cursor, VRR/HDR10 and high-refresh
+  mode switching, Intel Xe, NVIDIA Open-GSP), damage-tracked compositing, floating and snapped
+  windows whose title bars show the verified program, a floating dock with pinned apps and
+  unforgeable indicators, a type-to-search launcher, anti-aliased Inter and Iosevka text, a
+  declarative toolkit, Dark Slate and High Contrast themes, per-output scaling up to 200 %
 - Measured boot with TPM 2.0, code signing for programs, remote attestation
 - Windows console programs built with MSVC's static C runtime (threads, TLS, SEH, C++
   exceptions, files) and static Linux programs (threads, `mmap`, files, signals, `futex`) run
   unchanged, started from the shell with `run` and given only the current directory
-- 81 automated test cases: protections firing, fuzzers, sanitizers, static analysis, multi-core
-  stress, reproducible builds
+- Over 110 automated test cases: protections firing, fuzzers, sanitizers, static analysis,
+  multi-core stress, reproducible builds
 
 ## Quick start
 

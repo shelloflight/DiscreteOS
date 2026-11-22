@@ -332,6 +332,27 @@ fn read_caps(bdf: Bdf) -> Vec<Cap> {
     caps
 }
 
+/// Decode a PCI memory BAR's `(addr, size)` from its saved register values and all-1s probe masks.
+/// Handles 64-bit Resizable BARs >= 4 GiB where `mask_lo & 0xFFFF_FFF0 == 0` and `mask_hi != 0`.
+pub const fn decode_mem_bar(orig_lo: u32, orig_hi: u32, mask_lo: u32, mask_hi: u32, is64: bool) -> Option<(u64, u64)> {
+    let lo = mask_lo & 0xFFFF_FFF0;
+    let mut mask = lo as u64;
+    let mut addr = (orig_lo & 0xFFFF_FFF0) as u64;
+    if is64 {
+        mask |= (mask_hi as u64) << 32;
+        addr |= (orig_hi as u64) << 32;
+    } else {
+        mask |= 0xFFFF_FFFF_0000_0000;
+    }
+    let present = if is64 { mask != 0 } else { lo != 0 };
+    let size = (!mask).wrapping_add(1);
+    if present && size != 0 && size.is_power_of_two() {
+        Some((addr, size))
+    } else {
+        None
+    }
+}
+
 /// Size the BARs of a type-0 header (decode is off while sizing, then restored).
 fn read_bars(bdf: Bdf, count: usize) -> [Bar; 6] {
     let mut bars = [Bar::default(); 6];
@@ -354,21 +375,18 @@ fn read_bars(bdf: Bdf, count: usize) -> [Bar; 6] {
         }
         let is64 = (orig >> 1) & 3 == 2 && i + 1 < count;
         write(bdf, off, 4, 0xFFFF_FFFF);
-        let lo = read(bdf, off, 4) & 0xFFFF_FFF0;
+        let mask_lo = read(bdf, off, 4);
         write(bdf, off, 4, orig);
-        let (mut mask, mut addr) = (u64::from(lo), u64::from(orig & 0xFFFF_FFF0));
-        if is64 {
+        let (orig_hi, mask_hi) = if is64 {
             let orig_hi = read(bdf, off + 4, 4);
             write(bdf, off + 4, 4, 0xFFFF_FFFF);
             let hi = read(bdf, off + 4, 4);
             write(bdf, off + 4, 4, orig_hi);
-            mask |= u64::from(hi) << 32;
-            addr |= u64::from(orig_hi) << 32;
+            (orig_hi, hi)
         } else {
-            mask |= 0xFFFF_FFFF_0000_0000;
-        }
-        let size = (!mask).wrapping_add(1);
-        if lo != 0 && size != 0 && size.is_power_of_two() {
+            (0, 0)
+        };
+        if let Some((addr, size)) = decode_mem_bar(orig, orig_hi, mask_lo, mask_hi, is64) {
             bars[i] = Bar { kind: BarKind::Memory, addr, size, is64, prefetch: orig & 8 != 0 };
         }
         i += if is64 { 2 } else { 1 };

@@ -43,9 +43,10 @@ pub const OP_DESTROY: u32 = 904;
 /// The shipped fonts: reply with one read-only VMO handle (a font pack, `dosui::fonts`) and
 /// `a` = its size. `ERR_NOT_FOUND` when the compositor has no fonts.
 pub const OP_FONTS: u32 = 905;
-/// Name a launcher entry: `a` = entry number (0-3), payload = label. Shown with the program's
-/// verified identity and trust tier.
+/// Name a launcher entry: `a` = entry number (0-3), `b` = flags (`APP_FLAG_PINNED`),
+/// payload = label. Shown with the program's verified identity and trust tier.
 pub const OP_APP_REGISTER: u32 = 906;
+pub const APP_FLAG_PINNED: u64 = 1;
 
 // ---- compositor -> window client (events, txid 0) -----------------------------------------------
 
@@ -97,6 +98,13 @@ pub const SET_MOTION: u64 = 4;
 /// `awmi.admin`: run the 5-second native hardware page-flip test (`a` = adapter id, `b` = duration_ms),
 /// pausing the terminal safely and reverting automatically; reply payload = `gpu::FlipTestResult`.
 pub const OP_FLIP_TEST: u32 = 935;
+/// `awmi.admin`: configure display mode, VRR, HDR, or per-output scale on an output:
+/// `a` = adapter_id | (subop `DISPLAY_SET_*` << 32).
+pub const OP_SET_DISPLAY: u32 = 936;
+pub const DISPLAY_SET_MODE: u8 = 0;
+pub const DISPLAY_SET_VRR: u8 = 1;
+pub const DISPLAY_SET_HDR: u8 = 2;
+pub const DISPLAY_SET_SCALE: u8 = 3;
 
 // ---- `awmi.admin`, compositor in test mode only ---------------------------------------------------
 
@@ -257,12 +265,56 @@ pub fn fonts(ep: Handle) -> Result<Mapping, i64> {
 
 /// Register launcher entry `app` (0-3) with `label`.
 pub fn register_app(ep: Handle, app: u8, label: &[u8]) -> Result<(), i64> {
-    simple(ep, OP_APP_REGISTER, u64::from(app), 0, &label[..label.len().min(32)]).map(|_| ())
+    register_app_pinned(ep, app, label, false)
+}
+
+/// Register launcher entry `app` (0-3) with `label`, optionally pinned in the floating dock.
+pub fn register_app_pinned(ep: Handle, app: u8, label: &[u8], pinned: bool) -> Result<(), i64> {
+    let flags = if pinned { APP_FLAG_PINNED } else { 0 };
+    simple(ep, OP_APP_REGISTER, u64::from(app), flags, &label[..label.len().min(32)]).map(|_| ())
 }
 
 /// Change settings (`which`: `SET_*` bits); the settings now.
 pub fn set_settings(ep: Handle, packed: u64, which: u64) -> Result<u64, i64> {
     simple(ep, OP_SETTINGS, packed, which, &[]).map(|h| h.a)
+}
+
+/// Switch display mode/refresh rate on `adapter_id` (0 = active primary PCI output) via `awmi.admin`.
+/// `flags`: bit 0 = allow DSC, bit 1 = allow DP link retrain. Guarded by verify-and-revert in the driver.
+pub fn set_display_mode(
+    ep: Handle,
+    adapter_id: u32,
+    width: u32,
+    height: u32,
+    refresh_mhz: u32,
+    flags: u32,
+) -> Result<(), i64> {
+    let mut p = [0u8; 16];
+    p[0..4].copy_from_slice(&width.to_le_bytes());
+    p[4..8].copy_from_slice(&height.to_le_bytes());
+    p[8..12].copy_from_slice(&refresh_mhz.to_le_bytes());
+    p[12..16].copy_from_slice(&flags.to_le_bytes());
+    let a = u64::from(adapter_id) | (u64::from(DISPLAY_SET_MODE) << 32);
+    simple(ep, OP_SET_DISPLAY, a, 0, &p).map(|_| ())
+}
+
+/// Enable or disable Variable Refresh Rate (FreeSync / Adaptive-Sync) via `awmi.admin`.
+pub fn set_display_vrr(ep: Handle, adapter_id: u32, enable: bool, min_hz: u16, max_hz: u16) -> Result<(), i64> {
+    let a = u64::from(adapter_id) | (u64::from(DISPLAY_SET_VRR) << 32);
+    let b = u64::from(enable) | (u64::from(min_hz) << 16) | (u64::from(max_hz) << 32);
+    simple(ep, OP_SET_DISPLAY, a, b, &[]).map(|_| ())
+}
+
+/// Enable or disable 10-bit HDR10 scanout via `awmi.admin`.
+pub fn set_display_hdr(ep: Handle, adapter_id: u32, enable: bool) -> Result<(), i64> {
+    let a = u64::from(adapter_id) | (u64::from(DISPLAY_SET_HDR) << 32);
+    simple(ep, OP_SET_DISPLAY, a, u64::from(enable), &[]).map(|_| ())
+}
+
+/// Set per-output UI/text scale percentage (`100..=200` in 25% steps, or `0` for auto) via `awmi.admin`.
+pub fn set_output_scale(ep: Handle, adapter_id: u32, scale_pct: u16) -> Result<(), i64> {
+    let a = u64::from(adapter_id) | (u64::from(DISPLAY_SET_SCALE) << 32);
+    simple(ep, OP_SET_DISPLAY, a, u64::from(scale_pct), &[]).map(|_| ())
 }
 
 /// Run the native display flip test via `awmi.admin` (releases terminal, flips two patterns with

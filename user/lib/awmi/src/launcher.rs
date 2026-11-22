@@ -105,9 +105,19 @@ struct App {
     identity: [u8; MAX_IDENTITY_BYTES],
     id_len: u8,
     trust: TrustTier,
+    pinned: bool,
 }
 
-const EMPTY_APP: App = App { owner: 0, app: 0, label: [0; LAUNCH_LABEL_BYTES], label_len: 0, identity: [0; MAX_IDENTITY_BYTES], id_len: 0, trust: TrustTier::Native };
+const EMPTY_APP: App = App {
+    owner: 0,
+    app: 0,
+    label: [0; LAUNCH_LABEL_BYTES],
+    label_len: 0,
+    identity: [0; MAX_IDENTITY_BYTES],
+    id_len: 0,
+    trust: TrustTier::Native,
+    pinned: false,
+};
 
 impl App {
     fn label(&self) -> &[u8] {
@@ -226,10 +236,15 @@ impl Launcher {
 
     /// Add or replace program `owner`'s entry `app` (at most `MAX_APPS_PER_CLIENT` per program).
     pub fn register(&mut self, owner: u32, app: u8, label: &[u8], identity: &[u8], trust: TrustTier) -> bool {
+        self.register_ex(owner, app, label, identity, trust, false)
+    }
+
+    /// Add or replace program `owner`'s entry `app`, optionally pinned as a dock quick-launch pill.
+    pub fn register_ex(&mut self, owner: u32, app: u8, label: &[u8], identity: &[u8], trust: TrustTier, pinned: bool) -> bool {
         if usize::from(app) >= MAX_APPS_PER_CLIENT {
             return false;
         }
-        let mut e = App { owner, app, trust, ..EMPTY_APP };
+        let mut e = App { owner, app, trust, pinned, ..EMPTY_APP };
         e.label_len = sanitize_label(label, &mut e.label) as u8;
         e.id_len = sanitize_label(identity, &mut e.identity) as u8;
         if e.label_len == 0 {
@@ -247,17 +262,47 @@ impl Launcher {
         true
     }
 
-    /// Drop every entry of a program that went away.
-    pub fn remove_owner(&mut self, owner: u32) {
+    /// Collect up to `MAX_DOCK_PINNED` pinned entries for the floating dock.
+    pub fn pinned_entries(&self, out: &mut [crate::dock::DockPinnedEntry; crate::dock::MAX_DOCK_PINNED]) -> usize {
+        let mut n = 0usize;
+        for a in &self.apps[..self.napps] {
+            if !a.pinned {
+                continue;
+            }
+            if n >= out.len() {
+                break;
+            }
+            let mut e = crate::dock::DockPinnedEntry {
+                owner: a.owner,
+                app: a.app,
+                running: false,
+                label: [0; 16],
+                label_len: 0,
+            };
+            let len = a.label().len().min(e.label.len());
+            e.label[..len].copy_from_slice(&a.label()[..len]);
+            e.label_len = len as u8;
+            out[n] = e;
+            n += 1;
+        }
+        n
+    }
+
+    /// Drop every entry of a program that went away; returns true if a pinned entry was removed.
+    pub fn remove_owner(&mut self, owner: u32) -> bool {
+        let mut removed_pinned = false;
         let mut k = 0;
         for i in 0..self.napps {
             if self.apps[i].owner != owner {
                 self.apps[k] = self.apps[i];
                 k += 1;
+            } else if self.apps[i].pinned {
+                removed_pinned = true;
             }
         }
         self.napps = k;
         self.sel = 0;
+        removed_pinned
     }
 
     pub fn show(&mut self, now: u64) {

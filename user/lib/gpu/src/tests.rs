@@ -650,3 +650,78 @@ fn fuzz_all_gpu_parsers_validators_and_dcn_registers() {
         let _ = nvidia::validate_gsp_rpc(&buf[..len]);
     }
 }
+
+#[test]
+fn amd_dccg_dto_source_clock_derivation_and_ip_discovery_v4() {
+    use crate::amd::dcn::{DcnAccess, DcnVersion, OtgTiming};
+    use crate::amd::flip::{derive_dto_source_clk_khz, program_mode_regs};
+    use crate::amd::sim::{DcnSim, build_discovery_image, default_ip_blocks};
+    use crate::edid::DetailedTiming;
+
+    // 1. Verify DCCG DTO source clock derivation (e.g. DTBCLK = 1000 MHz driving 2560x1440@60 Hz
+    // at 241.5 MHz, then reprogramming to 2560x1440@240 Hz at 966 MHz without assuming 100 MHz refclk).
+    let blocks = default_ip_blocks(DcnVersion::Dcn401);
+    let dcn = DcnAccess::new(DcnVersion::Dcn401, blocks[0], Some(blocks[1]), Some(blocks[2]), Some(blocks[3]));
+    let mut sim = DcnSim::new(DcnVersion::Dcn401, 0x0080_0000_0000, 16 << 30);
+    let r = dcn.regs;
+    // Simulate firmware programming 241.5 MHz from 1000 MHz DTBCLK (dto_int=0, phase=241_500, mod=1_000_000).
+    dcn.w_dcn(&mut sim, r.dccg_dp_dto_phase(0), 241_500);
+    dcn.w_dcn(&mut sim, r.dccg_dp_dto_modulo(0), 1_000_000);
+    dcn.w_dcn(&mut sim, r.dccg_otg_pixel_rate_cntl(0), 1 << 4);
+    let cur = OtgTiming {
+        h_active: 2560,
+        h_total: 2720,
+        h_blank_start: 2560,
+        h_blank_end: 80,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        h_sync_pos: true,
+        v_active: 1440,
+        v_total: 1481,
+        v_blank_start: 1440,
+        v_blank_end: 38,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        v_sync_pos: false,
+    };
+    let derived = derive_dto_source_clk_khz(&sim, &dcn, 0, &cur, 59_951, 100_000);
+    assert!((995_000..=1_005_000).contains(&derived), "derived DTBCLK={}", derived);
+
+    let mode_240 = DetailedTiming {
+        pixel_clock_khz: 966_000,
+        h_active: 2560,
+        h_blank: 160,
+        h_front_porch: 48,
+        h_sync_width: 32,
+        v_active: 1440,
+        v_blank: 41,
+        v_front_porch: 3,
+        v_sync_width: 5,
+        h_sync_pos: true,
+        v_sync_pos: false,
+        refresh_mhz: 239_803,
+        preferred: false,
+    };
+    let saved = program_mode_regs(&mut sim, &dcn, 0, &mode_240, derived, false, 8, 8);
+    assert_eq!(dcn.r_dcn(&sim, r.dccg_dp_dto_modulo(0)), Some(derived));
+    assert_eq!(dcn.r_dcn(&sim, r.dccg_dp_dto_phase(0)), Some(966_000));
+    saved.restore(&mut sim, &dcn);
+    assert_eq!(dcn.r_dcn(&sim, r.dccg_dp_dto_phase(0)), Some(241_500));
+
+    // 2. Verify IP Discovery v4 enables 64-bit base addresses while v2 ignores padding byte 78.
+    let img_v4 = build_discovery_image(2, true, &blocks, &[]);
+    let parsed_v4 = amd::parse_ip_discovery(&img_v4).expect("v4 64-bit discovery must parse");
+    assert!(parsed_v4.find(amd::HWID_DCE, 0).is_some());
+
+    let mut img_v2_pad = build_discovery_image(2, false, &blocks, &[]);
+    // Set padding byte 78 inside v2 ip_discovery_header and recompute checksums: must stay 32-bit!
+    let ip_off = 128usize;
+    let ip_size = 96usize;
+    img_v2_pad[ip_off + 78] = 1;
+    let ip_csum = amd::discovery_checksum(&img_v2_pad[ip_off..ip_off + ip_size]);
+    img_v2_pad[16 + 2..16 + 4].copy_from_slice(&ip_csum.to_le_bytes());
+    let bin_csum = amd::discovery_checksum(&img_v2_pad[10..]);
+    img_v2_pad[8..10].copy_from_slice(&bin_csum.to_le_bytes());
+    let parsed_v2 = amd::parse_ip_discovery(&img_v2_pad).expect("v2 with non-zero pad byte must parse as 32-bit");
+    assert_eq!(parsed_v2.find(amd::HWID_DCE, 0).map(|b| b.bases[0]), Some(blocks[0].bases[0]));
+}

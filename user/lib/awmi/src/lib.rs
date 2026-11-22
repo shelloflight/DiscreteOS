@@ -20,7 +20,7 @@ extern crate std;
 #[cfg(test)]
 mod tests;
 
-pub use dock::{DockHit, DockLayout, DockTrayState, DockWindowEntry};
+pub use dock::{DockHit, DockLayout, DockPinnedEntry, DockTrayState, DockWindowEntry, MAX_DOCK_PINNED};
 pub use geom::{DamageSet, MAX_DAMAGE_RECTS, Point, Rect, Size};
 pub use pixel::{CURSOR_H, CURSOR_W, Canvas, WinIcon, blend_over, write_hw_cursor_64x64};
 pub use proto::{AwmiStatus, MAX_IDENTITY_BYTES, MAX_TITLE_BYTES, STATUS_BYTES, TrustTier, WINDOW_INFO_BYTES, encode_window_info, indicator_bits, ptr_kind, split_connect, win_flags, win_state};

@@ -68,6 +68,9 @@ pub const OP_FLIP_TEST: u32 = 846;
 /// Unsolicited `gpu.dsvc` -> `gpu.display` event (txid=0):
 /// `a` = adapter_id | (late << 32), `b` = frames, payload = optional timestamp_ns (u64).
 pub const EVT_FLIP_DONE: u32 = 849;
+/// Unsolicited `gpu.dsvc` -> `gpu.display` event (txid=0):
+/// `a` = adapter_id whose online state, capabilities, or active mode changed.
+pub const EVT_ADAPTERS_CHANGED: u32 = 850;
 
 // Adapter kinds (mirroring `dosgpu::AdapterKind`).
 pub const KIND_GOP: u8 = 1;

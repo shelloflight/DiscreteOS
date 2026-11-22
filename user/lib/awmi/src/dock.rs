@@ -11,6 +11,24 @@ use crate::text::{TextRender, TextRole};
 use crate::theme::{DockConfig, Theme};
 
 pub const MAX_DOCK_WINDOWS: usize = 12;
+pub const MAX_DOCK_PINNED: usize = 4;
+
+/// A pinned quick-launch application shown on the left side of the floating dock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DockPinnedEntry {
+    pub owner: u32,
+    pub app: u8,
+    pub running: bool,
+    pub label: [u8; 16],
+    pub label_len: u8,
+}
+
+impl DockPinnedEntry {
+    pub fn label_bytes(&self) -> &[u8] {
+        let n = (self.label_len as usize).min(self.label.len());
+        &self.label[..n]
+    }
+}
 
 /// Summary of a window entry shown in the dock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -49,6 +67,7 @@ pub struct DockTrayState {
 pub enum DockHit {
     None,
     Background,
+    Pinned(u32, u8),
     Window(u32),
     Workspace(u8),
     NetStatus,
@@ -61,6 +80,9 @@ pub enum DockHit {
 #[derive(Clone, Debug)]
 pub struct DockLayout {
     pub bar: Rect,
+    pub pinned_rects: [(u32, u8, Rect); MAX_DOCK_PINNED],
+    pub pinned_count: usize,
+    pub pinned_sep_x: i32,
     pub win_rects: [(u32, Rect); MAX_DOCK_WINDOWS],
     pub win_count: usize,
     pub ws_rects: [Rect; 4],
@@ -78,6 +100,19 @@ impl DockLayout {
         out_w: u32,
         out_h: u32,
         cfg: DockConfig,
+        windows: &[DockWindowEntry],
+        tray: &DockTrayState,
+        char_w: u32,
+    ) -> Self {
+        Self::compute_with_pinned(out_w, out_h, cfg, &[], windows, tray, char_w)
+    }
+
+    /// Compute the floating dock layout including pinned quick-launch apps on the left.
+    pub fn compute_with_pinned(
+        out_w: u32,
+        out_h: u32,
+        cfg: DockConfig,
+        pinned: &[DockPinnedEntry],
         windows: &[DockWindowEntry],
         tray: &DockTrayState,
         char_w: u32,
@@ -148,10 +183,30 @@ impl DockLayout {
         }
         let right_boundary = rx - 10;
 
+        // Left: pinned quick-launch pills, then a subtle separator, then running windows.
+        let mut pinned_rects = [(0u32, 0u8, Rect::EMPTY); MAX_DOCK_PINNED];
+        let mut pinned_count = 0usize;
+        let mut pinned_sep_x = 0i32;
+        let mut lx = bar.x + 12;
+        for p in pinned.iter().take(MAX_DOCK_PINNED) {
+            let avail = right_boundary - lx;
+            if avail < 52 {
+                break;
+            }
+            let text_w = (p.label_bytes().len() as u32) * (cw + cw.div_ceil(3));
+            let pw = (text_w + 24).clamp(52, 112).min(avail as u32);
+            pinned_rects[pinned_count] = (p.owner, p.app, Rect::new(lx, pill_y, pw, pill_h));
+            pinned_count += 1;
+            lx += pw as i32 + 6;
+        }
+        if pinned_count > 0 {
+            pinned_sep_x = lx + 1;
+            lx += 9;
+        }
+
         // Left/center: running windows.
         let mut win_rects = [(0u32, Rect::EMPTY); MAX_DOCK_WINDOWS];
         let mut win_count = 0usize;
-        let mut lx = bar.x + 12;
         let max_pill_w = 136u32;
         for w in windows.iter().take(MAX_DOCK_WINDOWS) {
             let avail = right_boundary - lx;
@@ -168,6 +223,9 @@ impl DockLayout {
 
         Self {
             bar,
+            pinned_rects,
+            pinned_count,
+            pinned_sep_x,
             win_rects,
             win_count,
             ws_rects,
@@ -183,6 +241,11 @@ impl DockLayout {
     pub fn hit_test(&self, p: Point) -> DockHit {
         if !self.bar.contains_point(p) {
             return DockHit::None;
+        }
+        for &(owner, app, r) in self.pinned_rects.iter().take(self.pinned_count) {
+            if r.contains_point(p) {
+                return DockHit::Pinned(owner, app);
+            }
         }
         for &(wid, r) in self.win_rects.iter().take(self.win_count) {
             if r.contains_point(p) {
@@ -221,17 +284,54 @@ impl DockLayout {
         tray: &DockTrayState,
         text: &mut dyn TextRender,
     ) {
+        self.render_with_pinned(canvas, clip, theme, cfg, &[], windows, tray, text);
+    }
+
+    /// Render the floating bottom dock including pinned quick-launch pills clipped to `clip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_with_pinned(
+        &self,
+        canvas: &mut Canvas<'_>,
+        clip: Rect,
+        theme: &Theme,
+        cfg: DockConfig,
+        pinned: &[DockPinnedEntry],
+        windows: &[DockWindowEntry],
+        tray: &DockTrayState,
+        text: &mut dyn TextRender,
+    ) {
         if self.bar.intersect(clip).is_empty() {
             return;
         }
         // Dock floating surface + crisp 1px hairline border.
         canvas.fill_rounded_rect(clip, self.bar, cfg.corner_r, theme.dock_bg, theme.dock_border);
 
-        // Left/center: running window pills (or subtle brand mark when desktop is empty).
+        // Left: pinned quick-launch pills + running window pills (or subtle brand mark when empty).
         let mid = |r: Rect| r.y + (r.h / 2) as i32;
-        if self.win_count == 0 {
+        if self.pinned_count == 0 && self.win_count == 0 {
             text.draw(canvas, clip, self.bar.x + 16, mid(self.bar), b"D-OS", TextRole::Title, theme.text_muted, 80);
         } else {
+            for &(owner, app, rect) in self.pinned_rects.iter().take(self.pinned_count) {
+                let Some(entry) = pinned.iter().find(|e| e.owner == owner && e.app == app) else {
+                    continue;
+                };
+                canvas.fill_rounded_rect(clip, rect, 6, theme.dock_pill_idle, theme.dock_border);
+                let avail = rect.w.saturating_sub(14);
+                let tw = text.measure(entry.label_bytes(), TextRole::Body).min(avail);
+                let tx = rect.x + (rect.w.saturating_sub(tw) / 2) as i32;
+                let col = if entry.running { theme.text_primary } else { theme.text_muted };
+                text.draw(canvas, clip, tx, mid(rect), entry.label_bytes(), TextRole::Body, col, avail);
+                if entry.running {
+                    canvas.fill_circle(clip, rect.x + (rect.w / 2) as i32, rect.y + rect.h as i32 - 3, 2, theme.accent_ring);
+                }
+            }
+            if self.pinned_count > 0 && self.win_count > 0 {
+                canvas.fill_rect(
+                    clip,
+                    Rect::new(self.pinned_sep_x, self.bar.y + 10, 1, self.bar.h.saturating_sub(20)),
+                    theme.dock_border,
+                );
+            }
             for &(wid, rect) in self.win_rects.iter().take(self.win_count) {
                 let Some(entry) = windows.iter().find(|e| e.window_id == wid) else {
                     continue;

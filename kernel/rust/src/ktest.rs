@@ -311,6 +311,33 @@ mod selftest {
         crate::kprintln!("  attestation: TPM quote for the nonce, EK certificate chain, credential challenge (foreign ones refused)");
     }
 
+    fn pci_bars(t: &mut T) {
+        use crate::dev::pci::decode_mem_bar;
+        // 32-bit unimplemented BAR (lo=0) must be rejected; 1 MiB 32-bit BAR decoded cleanly.
+        check!(t, decode_mem_bar(0, 0, 0, 0, false).is_none());
+        check!(t, decode_mem_bar(0xFE00_0000, 0, 0xFFF0_0000, 0, false) == Some((0xFE00_0000, 1 << 20)));
+        // 64-bit unimplemented BAR (lo=0, hi=0) rejected; 512 MiB BAR decoded cleanly.
+        check!(t, decode_mem_bar(0x0C, 0, 0x0C, 0, true).is_none());
+        check!(
+            t,
+            decode_mem_bar(0xE000_000C, 0x78, 0xE000_000C, 0xFFFF_FFFF, true)
+                == Some((0x78_E000_0000, 512 << 20))
+        );
+        // 64-bit Resizable BARs >= 4 GiB have `mask_lo & !0xF == 0` and `mask_hi != 0` (16 GiB & 64 GiB).
+        check!(
+            t,
+            decode_mem_bar(0x0000_000C, 0x78, 0x0000_000C, 0xFFFF_FFFC, true)
+                == Some((0x78_0000_0000, 16 << 30))
+        );
+        check!(
+            t,
+            decode_mem_bar(0x0000_000C, 0x40, 0x0000_000C, 0xFFFF_FFF0, true)
+                == Some((0x40_0000_0000, 64 << 30))
+        );
+        // Corrupt non-power-of-two BAR mask rejected.
+        check!(t, decode_mem_bar(0x0C, 0x78, 0x0000_101C, 0xFFFF_FFFF, true).is_none());
+    }
+
     #[unsafe(no_mangle)]
     pub extern "C" fn rust_selftest() -> u32 {
         let mut t = T { failures: 0 };
@@ -320,6 +347,7 @@ mod selftest {
         spinlock(&mut t);
         klog_ring(&mut t);
         overflow_checks(&mut t);
+        pci_bars(&mut t);
         threads(&mut t);
         check!(t, crate::nospec::selftest());
         if t.failures == 0 {

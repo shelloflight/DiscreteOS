@@ -121,7 +121,7 @@ Space and arrows, and shows a visible focus ring. The window manager is fully ke
 | Setting | Values | From |
 |---|---|---|
 | Theme | Dark Slate, High Contrast | launcher, `gui theme dark|contrast`, `OP_SETTINGS` |
-| Text size | 100, 125, 150, 175, 200 % | launcher, `gui text <percent>`; at session start 125 % from 2560 px wide, 150 % from 3840 px, until chosen |
+| Text size | 100, 125, 150, 175, 200 % | launcher, `gui text <percent>`, `gpu scale <percent|auto> [id]`; per-output defaults: 125 % from 2560 px wide, 150 % from 3840 px, overridable per output |
 | Reduce motion | on, off | launcher, `gui motion on|off` |
 
 The text size scales the chrome as well (title bar, buttons and dock follow the line height), and

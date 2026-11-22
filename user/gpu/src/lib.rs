@@ -273,6 +273,8 @@ impl GpuSvc {
                                     ad.info.restarts,
                                     caps
                                 );
+                                let changed_id = ad.info.id;
+                                self.broadcast_adapters_changed(changed_id);
                             } else {
                                 let id = self.next_adapter_id;
                                 self.next_adapter_id += 1;
@@ -310,6 +312,7 @@ impl GpuSvc {
                                     backend: Backend::Pci { drv_key, ch: hnd },
                                 });
                                 self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_BACKEND_BASE + idx as u64);
+                                self.broadcast_adapters_changed(id);
                             }
                         }
                         gpu::BACKEND_GONE => {
@@ -317,6 +320,7 @@ impl GpuSvc {
                                 sys::handle_close(hnd);
                             }
                             let drv_key = h.a as u32;
+                            let mut gone_id = 0u32;
                             for ad in &mut self.adapters {
                                 if let Backend::Pci { drv_key: k, ch } = &mut ad.backend
                                     && *k == drv_key
@@ -326,7 +330,11 @@ impl GpuSvc {
                                         *ch = 0;
                                     }
                                     ad.info.online = false;
+                                    gone_id = ad.info.id;
                                 }
+                            }
+                            if gone_id != 0 {
+                                self.broadcast_adapters_changed(gone_id);
                             }
                         }
                         _ => {
@@ -402,7 +410,25 @@ impl GpuSvc {
         }
     }
 
+    fn broadcast_adapters_changed(&self, adapter_id: u32) {
+        let mut msg = [0u8; HEADER];
+        Header {
+            txid: 0,
+            op: gpu::EVT_ADAPTERS_CHANGED,
+            status: 0,
+            a: u64::from(adapter_id),
+            b: 0,
+        }
+        .put(&mut msg);
+        for c in &self.clients {
+            if c.role == Role::Display && c.ch != 0 {
+                let _ = sys::channel_write(c.ch, &msg);
+            }
+        }
+    }
+
     fn on_backend_closed(&mut self, idx: usize) {
+        let mut closed_id = 0u32;
         if let Some(ad) = self.adapters.get_mut(idx)
             && let Backend::Pci { ch, .. } = &mut ad.backend
         {
@@ -411,7 +437,11 @@ impl GpuSvc {
                 *ch = 0;
             }
             ad.info.online = false;
+            closed_id = ad.info.id;
             println!("gpu: adapter #{} '{}' offline (driver exited)", ad.info.id, ad.info.name_str());
+        }
+        if closed_id != 0 {
+            self.broadcast_adapters_changed(closed_id);
         }
     }
 
@@ -481,11 +511,21 @@ impl GpuSvc {
 
     fn find_adapter_mut(&mut self, id: u32) -> Option<&mut Adapter> {
         if id == 0 {
-            let pci = self
+            let idx = self
                 .adapters
                 .iter()
-                .position(|a| a.info.online && a.info.kind != gpu::KIND_GOP);
-            let idx = pci.or_else(|| self.adapters.iter().position(|a| a.info.online))?;
+                .position(|a| {
+                    a.info.online
+                        && a.info.kind != gpu::KIND_GOP
+                        && (a.info.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0
+                })
+                .or_else(|| {
+                    self.adapters
+                        .iter()
+                        .position(|a| a.info.online && a.info.kind != gpu::KIND_GOP && a.info.width > 0 && a.info.height > 0)
+                })
+                .or_else(|| self.adapters.iter().position(|a| a.info.online && a.info.kind != gpu::KIND_GOP))
+                .or_else(|| self.adapters.iter().position(|a| a.info.online))?;
             return self.adapters.get_mut(idx);
         }
         self.adapters.iter_mut().find(|a| a.info.id == id)
@@ -787,11 +827,17 @@ impl GpuSvc {
                         match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
                             Ok(rn) => {
                                 let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                if dh.status == 0 {
+                                let changed_id = if dh.status == 0 {
                                     ad.info.width = width;
                                     ad.info.height = height;
-                                }
+                                    Some(ad.info.id)
+                                } else {
+                                    None
+                                };
                                 Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
+                                if let Some(cid) = changed_id {
+                                    self.broadcast_adapters_changed(cid);
+                                }
                             }
                             Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
                         }
@@ -829,15 +875,21 @@ impl GpuSvc {
                         match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
                             Ok(rn) => {
                                 let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                if dh.status == 0 {
+                                let changed_id = if dh.status == 0 {
                                     ad.info.width = width;
                                     ad.info.height = height;
                                     let (modes, mon, mon_len) = Self::query_pci_modes(*dch);
                                     ad.modes = modes;
                                     ad.info.monitor = mon;
                                     ad.info.monitor_len = mon_len;
-                                }
+                                    Some(ad.info.id)
+                                } else {
+                                    None
+                                };
                                 Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
+                                if let Some(cid) = changed_id {
+                                    self.broadcast_adapters_changed(cid);
+                                }
                             }
                             Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
                         }

@@ -39,7 +39,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use dosawmi::{
-    AwmiStatus, BitmapText, Canvas, DamageSet, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, TextRender, Theme, ThemeId, TrustTier, UiSettings,
+    AwmiStatus, BitmapText, Canvas, DamageSet, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, Theme, ThemeId, TrustTier, UiSettings,
     WINDOW_INFO_BYTES, WmAction, WmState, encode_window_info, split_connect,
 };
 use dosui::{FontText, fonts};
@@ -193,8 +193,10 @@ struct Awmi {
     settings: UiSettings,
     /// The text size was chosen (`OP_SETTINGS`, the launcher): not sized for the display any more.
     scale_set: bool,
-    /// Launcher entries programs registered: (client, entry, label); replayed into each session.
-    apps: Vec<(u32, u8, Vec<u8>)>,
+    /// Per-output explicit scale overrides (`(adapter_id, scale_pct)`).
+    output_scales: Vec<(u32, u16)>,
+    /// Launcher entries programs registered: (client, entry, label, pinned); replayed into each session.
+    apps: Vec<(u32, u8, Vec<u8>, bool)>,
     /// What the session was started with (`SESSION_DEMO`, `SESSION_DESKTOP`).
     session_flags: u64,
     /// Boot: start a desktop session once a display is there (until this time).
@@ -583,7 +585,8 @@ impl Awmi {
 
     /// The outputs to use:
     /// - Unless `firmware_display` (`BOOT.CFG display = firmware`), prefer a verified native PCI
-    ///   output (`CAP_NATIVE_GOP_MATCH`, plus any additional online outputs of that GPU) over GOP;
+    ///   output (`CAP_NATIVE_GOP_MATCH`, plus any additional active page-flipping outputs on the
+    ///   same PCI GPU) over GOP;
     /// - Otherwise prefer the firmware GOP framebuffer when present, else every online PCI GPU.
     fn choose_adapters(&self) -> Vec<(AdapterInfo, u32)> {
         let mut ads = [AdapterInfo::empty(); 8];
@@ -594,8 +597,15 @@ impl Awmi {
                 .iter()
                 .find(|a| a.kind != gpu::KIND_GOP && (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0)
         {
-            let kind = nat.kind;
-            online.into_iter().filter(|a| a.kind == kind).collect()
+            let (vendor, device) = (nat.vendor, nat.device);
+            online
+                .into_iter()
+                .filter(|a| {
+                    a.vendor == vendor
+                        && a.device == device
+                        && (a.caps & (gpu::CAP_NATIVE_GOP_MATCH | gpu::CAP_PAGE_FLIP)) != 0
+                })
+                .collect()
         } else {
             match online.iter().find(|a| a.kind == gpu::KIND_GOP) {
                 Some(g) => alloc::vec![*g],
@@ -619,7 +629,19 @@ impl Awmi {
         let mut kept: Vec<OutBuf> = Vec::new();
         for (a, hz) in &chosen {
             let (w, h) = (a.width, a.height);
-            if let Some(i) = old.iter().position(|o| o.adapter == a.id && o.width == w && o.height == h && o.restarts == a.restarts && !self.reattach) {
+            let hw = chosen.len() == 1 && a.caps & gpu::CAP_HW_CURSOR != 0;
+            let async_flip = a.caps & gpu::CAP_ASYNC_FLIP != 0;
+            let native_match = a.caps & gpu::CAP_NATIVE_GOP_MATCH != 0;
+            if let Some(i) = old.iter().position(|o| {
+                o.adapter == a.id
+                    && o.width == w
+                    && o.height == h
+                    && o.refresh_mhz == *hz
+                    && o.restarts == a.restarts
+                    && o.native_match == native_match
+                    && o.hw_cursor == hw
+                    && !self.reattach
+            }) {
                 kept.push(old.remove(i));
                 continue;
             }
@@ -630,9 +652,6 @@ impl Awmi {
             };
             match gpu::attach_fb(self.gpu, a.id, map.vmo, w, h, w * 4, gpu::FMT_XRGB8888) {
                 Ok(fb_id) => {
-                    let hw = chosen.len() == 1 && a.caps & gpu::CAP_HW_CURSOR != 0;
-                    let async_flip = a.caps & gpu::CAP_ASYNC_FLIP != 0;
-                    let native_match = a.caps & gpu::CAP_NATIVE_GOP_MATCH != 0;
                     println!(
                         "awmi: output: adapter #{} '{}' {}x{} @ {}.{:02} Hz, {} cursor{}{}",
                         a.id,
@@ -679,7 +698,12 @@ impl Awmi {
     fn relayout(&mut self) {
         self.wm.layout.clear();
         for o in &self.outs {
-            self.wm.layout.add_output(o.adapter, o.width, o.height, o.refresh_mhz, o.hw_cursor);
+            let scale = self
+                .output_scales
+                .iter()
+                .find(|&&(id, _)| id == o.adapter)
+                .map_or_else(|| dosawmi::Output::recommended_scale(o.width), |&(_, sc)| sc);
+            self.wm.layout.add_output_scaled(o.adapter, o.width, o.height, o.refresh_mhz, o.hw_cursor, scale);
         }
         self.wm.damage_all();
     }
@@ -718,13 +742,13 @@ impl Awmi {
         if !self.scale_set
             && let Some(p) = self.wm.layout.primary()
         {
-            self.settings.text_scale = if p.bounds.w >= 3840 { 150 } else if p.bounds.w >= 2560 { 125 } else { 100 };
+            self.settings.text_scale = p.scale;
         }
         self.wm.now_ns = sys::clock_ns();
         self.apply_settings();
-        for (owner, app, label) in &self.apps {
+        for (owner, app, label, pinned) in &self.apps {
             if let Some(c) = self.clients.iter().find(|c| c.id == *owner && c.ch != 0) {
-                self.wm.register_app(*owner, *app, label, &c.identity[..c.identity_len], c.trust);
+                self.wm.register_app_ex(*owner, *app, label, &c.identity[..c.identity_len], c.trust, *pinned);
             }
         }
         self.term_call(term::DISPLAY_RELEASE);
@@ -787,9 +811,10 @@ impl Awmi {
         }
     }
 
-    /// Receive unsolicited `gpu::EVT_FLIP_DONE` events from `gpu.dsvc` and pace the next frame.
+    /// Receive unsolicited `gpu::EVT_FLIP_DONE` and `gpu::EVT_ADAPTERS_CHANGED` events from `gpu.dsvc`.
     fn on_gpu_event(&mut self) {
         let mut buf = [0u8; HEADER + 32];
+        let mut check_adapters = false;
         loop {
             if self.gpu == 0 {
                 return;
@@ -797,25 +822,31 @@ impl Awmi {
             match sys::channel_read(self.gpu, &mut buf, 0) {
                 Ok(n) => {
                     let Some(h) = Header::get(&buf[..n as usize]) else { continue };
-                    if h.op == gpu::EVT_FLIP_DONE {
-                        let now = sys::clock_ns();
-                        let late_flag = (h.a >> 32) != 0;
-                        let interval = self.frame_interval();
-                        let missed_deadline = late_flag
-                            || (self.last_flip_ns > 0 && now.saturating_sub(self.last_flip_ns) > (interval * 3) / 2);
-                        self.flip_pending = false;
-                        self.flip_deadline = 0;
-                        self.last_flip_ns = now;
-                        if missed_deadline {
-                            // Drop cleanly to every other refresh rather than tearing when a frame is late.
-                            self.pace_skip_until = now + interval;
+                    match h.op {
+                        gpu::EVT_FLIP_DONE => {
+                            let now = sys::clock_ns();
+                            let late_flag = (h.a >> 32) != 0;
+                            let interval = self.frame_interval();
+                            let missed_deadline = late_flag
+                                || (self.last_flip_ns > 0 && now.saturating_sub(self.last_flip_ns) > (interval * 3) / 2);
+                            self.flip_pending = false;
+                            self.flip_deadline = 0;
+                            self.last_flip_ns = now;
+                            if missed_deadline {
+                                // Drop cleanly to every other refresh rather than tearing when a frame is late.
+                                self.pace_skip_until = now + interval;
+                            }
+                            self.deliver_frame_done();
                         }
-                        self.deliver_frame_done();
+                        gpu::EVT_ADAPTERS_CHANGED => {
+                            check_adapters = true;
+                        }
+                        _ => {}
                     }
                 }
                 Err(sys::ERR_SHOULD_WAIT) => {
                     self.port.arm(self.gpu, sys::READABLE | sys::PEER_CLOSED, KEY_GPU);
-                    return;
+                    break;
                 }
                 Err(_) => {
                     self.flip_pending = false;
@@ -823,6 +854,34 @@ impl Awmi {
                     return;
                 }
             }
+        }
+        if check_adapters && self.active {
+            self.check_output_upgrade();
+        }
+    }
+
+    /// Re-evaluate available GPU outputs when `gpu.dsvc` reports an adapter change (e.g. a native
+    /// PCI GPU driver finishing its probe/self-check after boot, or a mode change).
+    fn check_output_upgrade(&mut self) {
+        let next = self.choose_adapters();
+        let cur: Vec<&OutBuf> = self.outs.iter().filter(|o| o.adapter != 0).collect();
+        let changed = next.len() != cur.len()
+            || next.iter().zip(cur.iter()).any(|((a, hz), o)| {
+                let nat = (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0;
+                o.adapter != a.id
+                    || o.width != a.width
+                    || o.height != a.height
+                    || o.refresh_mhz != *hz
+                    || o.native_match != nat
+                    || o.restarts != a.restarts
+            });
+        if changed && !next.is_empty() {
+            println!("awmi: display outputs changed: switching cleanly to updated GPU output(s)");
+            self.reattach = true;
+            self.flip_pending = false;
+            self.flip_deadline = 0;
+            self.pace_skip_until = 0;
+            self.wm.damage_all();
         }
     }
 
@@ -878,12 +937,8 @@ impl Awmi {
         }
         self.wm.now_ns = sys::clock_ns();
         self.wm.tick();
-        let Self { wm, outs, surfaces, gpu: gpu_ep, text, .. } = self;
+        let Self { wm, outs, surfaces, gpu: gpu_ep, text, output_scales, scale_set, settings, .. } = self;
         let mut bitmap = BitmapText;
-        let text: &mut dyn TextRender = match text.as_mut() {
-            Some(t) => t,
-            None => &mut bitmap,
-        };
         let mut presented = 0u64;
         let mut failed = false;
         let mut any_async = false;
@@ -893,9 +948,27 @@ impl Awmi {
                 let px = (ob.width as usize) * (ob.height as usize);
                 let (w, h) = (ob.width, ob.height);
                 let Some(mut canvas) = Canvas::new(pixels_of(&mut ob.map, px), w, h, w) else { continue };
-                let local: DamageSet = wm.composite_output(out, &mut canvas, text, |wid| {
-                    surfaces.iter().find(|s| s.window == wid).map(|s| SurfaceView { bytes: s.map.bytes(), width: s.width, height: s.height, pitch_bytes: s.pitch })
-                });
+                let eff_scale = if output_scales.iter().any(|&(id, _)| id == out.adapter_id) {
+                    out.scale
+                } else if *scale_set {
+                    settings.text_scale
+                } else {
+                    out.scale
+                };
+                let local: DamageSet = match text.as_mut() {
+                    Some(t) => {
+                        let prev = t.scale;
+                        t.scale = eff_scale;
+                        let d = wm.composite_output(out, &mut canvas, t, |wid| {
+                            surfaces.iter().find(|s| s.window == wid).map(|s| SurfaceView { bytes: s.map.bytes(), width: s.width, height: s.height, pitch_bytes: s.pitch })
+                        });
+                        t.scale = prev;
+                        d
+                    }
+                    None => wm.composite_output(out, &mut canvas, &mut bitmap, |wid| {
+                        surfaces.iter().find(|s| s.window == wid).map(|s| SurfaceView { bytes: s.map.bytes(), width: s.width, height: s.height, pitch_bytes: s.pitch })
+                    }),
+                };
                 if ob.adapter == 0 {
                     continue;
                 }
@@ -1115,8 +1188,86 @@ impl Awmi {
                     Err(e) => err(e),
                 }
             }
+            wire::OP_SET_DISPLAY if admin => {
+                if self.gpu == 0 {
+                    return err(sys::ERR_BAD_STATE);
+                }
+                let adapter_id = h.a as u32;
+                let subop = (h.a >> 32) as u8;
+                match subop {
+                    wire::DISPLAY_SET_MODE => {
+                        if payload.len() < 16 {
+                            return err(sys::ERR_INVALID_ARGS);
+                        }
+                        let w = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        let hh = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                        let refresh_mhz = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+                        let flags = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+                        match gpu::set_mode_ex(self.gpu, adapter_id, w, hh, refresh_mhz, flags) {
+                            Ok(()) => {
+                                self.reattach = true;
+                                self.flip_pending = false;
+                                self.flip_deadline = 0;
+                                self.pace_skip_until = 0;
+                                self.wm.damage_all();
+                                ok(0, 0)
+                            }
+                            Err(e) => err(e),
+                        }
+                    }
+                    wire::DISPLAY_SET_VRR => {
+                        let enable = (h.b & 1) != 0;
+                        let min_hz = ((h.b >> 16) & 0xFFFF) as u16;
+                        let max_hz = ((h.b >> 32) & 0xFFFF) as u16;
+                        match gpu::set_vrr(self.gpu, adapter_id, enable, min_hz, max_hz) {
+                            Ok(()) => ok(0, 0),
+                            Err(e) => err(e),
+                        }
+                    }
+                    wire::DISPLAY_SET_HDR => {
+                        let enable = (h.b & 1) != 0;
+                        match gpu::set_hdr(self.gpu, adapter_id, enable) {
+                            Ok(()) => {
+                                self.wm.damage_all();
+                                ok(0, 0)
+                            }
+                            Err(e) => err(e),
+                        }
+                    }
+                    wire::DISPLAY_SET_SCALE => {
+                        let scale = h.b as u16;
+                        if scale != 0 && !UiSettings::SCALES.contains(&scale) {
+                            return err(sys::ERR_INVALID_ARGS);
+                        }
+                        let resolved = if adapter_id == 0 {
+                            self.wm.layout.primary().map_or(0, |o| o.adapter_id)
+                        } else {
+                            adapter_id
+                        };
+                        if !self.wm.layout.set_output_scale(adapter_id, scale) {
+                            return err(sys::ERR_OUT_OF_RANGE);
+                        }
+                        self.output_scales.retain(|&(id, _)| id != resolved);
+                        if scale != 0 {
+                            self.output_scales.push((resolved, scale));
+                        }
+                        let is_primary = self.wm.layout.primary().is_some_and(|o| o.adapter_id == resolved);
+                        if is_primary && !self.scale_set {
+                            if let Some(p) = self.wm.layout.primary() {
+                                self.settings.text_scale = p.scale;
+                            }
+                            self.apply_settings();
+                        } else {
+                            self.wm.damage_all();
+                        }
+                        ok(0, 0)
+                    }
+                    _ => err(sys::ERR_INVALID_ARGS),
+                }
+            }
             wire::OP_APP_REGISTER if role == Role::Window => {
                 let app = h.a as u8;
+                let pinned = (h.b & wire::APP_FLAG_PINNED) != 0;
                 let label: Vec<u8> = payload[..payload.len().min(dosawmi::launcher::LAUNCH_LABEL_BYTES)].to_vec();
                 if usize::from(app) >= dosawmi::launcher::MAX_APPS_PER_CLIENT || label.is_empty() || h.a > 0xFF {
                     return err(sys::ERR_INVALID_ARGS);
@@ -1125,9 +1276,9 @@ impl Awmi {
                     return err(sys::ERR_NO_RESOURCES);
                 }
                 self.apps.retain(|a| !(a.0 == id && a.1 == app));
-                self.apps.push((id, app, label.clone()));
+                self.apps.push((id, app, label.clone(), pinned));
                 if self.active {
-                    self.wm.register_app(id, app, &label, &identity[..identity_len], trust);
+                    self.wm.register_app_ex(id, app, &label, &identity[..identity_len], trust, pinned);
                 }
                 ok(0, 0)
             }
@@ -1398,6 +1549,7 @@ fn main(s: *const Startup) -> i32 {
         themes,
         settings: UiSettings::DEFAULT,
         scale_set: false,
+        output_scales: Vec::new(),
         apps: Vec::new(),
         session_flags: 0,
         autostart_until: if autostart { sys::clock_ns() + AUTOSTART_WAIT_NS } else { 0 },

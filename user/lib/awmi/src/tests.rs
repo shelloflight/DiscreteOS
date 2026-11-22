@@ -550,3 +550,54 @@ fn rounded_shapes_are_antialiased_with_crisp_edges() {
     assert_eq!(px(&c, 20, 13), 0);
     assert!((1..255).contains(&px(&c, 24, 25)), "rim pixel {}", px(&c, 24, 25));
 }
+
+#[test]
+fn dock_pinned_apps_and_per_output_scale() {
+    let mut wm = WmState::new();
+    // Mixed-DPI multi-monitor layout: 2560x1440 (auto 125%) + 3840x2160 (auto 150%) + 1920x1080 (auto 100%).
+    wm.layout.add_output(1, 2560, 1440, 240_000, true).unwrap();
+    wm.layout.add_output(2, 3840, 2160, 60_000, false).unwrap();
+    wm.layout.add_output(3, 1920, 1080, 144_000, false).unwrap();
+    assert_eq!(wm.layout.as_slice()[0].scale, 125);
+    assert_eq!(wm.layout.as_slice()[1].scale, 150);
+    assert_eq!(wm.layout.as_slice()[2].scale, 100);
+    assert!(wm.layout.set_output_scale(2, 175));
+    assert_eq!(wm.layout.as_slice()[1].scale, 175);
+    assert!(!wm.layout.set_output_scale(2, 133)); // invalid scale rejected
+    assert!(wm.layout.set_output_scale(2, 0)); // 0 resets to recommended auto
+    assert_eq!(wm.layout.as_slice()[1].scale, 150);
+
+    // Pin Terminal (owner 7, app 0) to the floating dock.
+    assert!(wm.register_app_ex(7, 0, b"Terminal", b"console", TrustTier::System, true));
+    let prim = wm.layout.primary().unwrap();
+    let dl = wm.dock_layout_for(prim);
+    assert_eq!(dl.pinned_count, 1);
+    let (_, _, pr) = dl.pinned_rects[0];
+    let click_pt = Point::new(pr.x + 12, pr.y + (pr.h as i32) / 2);
+    assert_eq!(dl.hit_test(click_pt), DockHit::Pinned(7, 0));
+
+    // Clicking pinned pill while closed emits WmAction::Launch.
+    let act = wm.handle_pointer(0, 0, Some(click_pt), 1);
+    assert_eq!(act, WmAction::Launch { owner: 7, app: 0 });
+    wm.handle_pointer(0, 0, Some(click_pt), 0);
+
+    // Once owner 7 opens a window (and even if minimized), clicking the pinned pill focuses/restores it.
+    let wid = wm.create_window(7, b"console", TrustTier::System, 640, 400, win_flags::DEFAULT, b"Terminal").unwrap();
+    wm.minimize_window(wid);
+    assert!(wm.window(wid).unwrap().minimized);
+    let act2 = wm.handle_pointer(0, 0, Some(click_pt), 1);
+    assert_eq!(act2, WmAction::Configure { owner: 7, window_id: wid });
+    assert!(!wm.window(wid).unwrap().minimized);
+    assert_eq!(wm.focused, Some(wid));
+
+    // Render pinned pill + running dot cleanly without panic.
+    let mut fb = vec![0u32; 2560 * 1440];
+    let mut canvas = Canvas::new(&mut fb, 2560, 1440, 2560).unwrap();
+    wm.damage_all();
+    let flushed = wm.composite_output(prim, &mut canvas, &mut BitmapText, |_| None);
+    assert!(!flushed.is_empty());
+
+    // Disconnecting owner 7 removes the pinned pill from the dock.
+    wm.remove_client(7);
+    assert_eq!(wm.dock_layout_for(prim).pinned_count, 0);
+}

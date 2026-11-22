@@ -1,7 +1,7 @@
 //! Multi-monitor output layout, hybrid floating/snapping window manager, SSD hit-testing,
 //! strict surface/input isolation, and damage-tracked compositing.
 
-use crate::dock::{DockHit, DockLayout, DockTrayState, DockWindowEntry, MAX_DOCK_WINDOWS};
+use crate::dock::{DockHit, DockLayout, DockPinnedEntry, DockTrayState, DockWindowEntry, MAX_DOCK_PINNED, MAX_DOCK_WINDOWS};
 use crate::geom::{DamageSet, Point, Rect};
 use crate::launcher::{LaunchTarget, Launcher, OPEN_NS, Outcome, Setting, UiSettings};
 use crate::pixel::{CURSOR_H, CURSOR_W, Canvas, WinIcon};
@@ -23,9 +23,23 @@ pub struct Output {
     pub adapter_id: u32,
     pub bounds: Rect,
     pub refresh_mhz: u32,
+    pub scale: u16,
     pub hw_cursor: bool,
     pub primary: bool,
     pub online: bool,
+}
+
+impl Output {
+    /// Recommended text/UI scale percentage for an output of pixel width `width`.
+    pub const fn recommended_scale(width: u32) -> u16 {
+        if width >= 3840 {
+            150
+        } else if width >= 2560 {
+            125
+        } else {
+            100
+        }
+    }
 }
 
 /// Multi-monitor virtual desktop layout.
@@ -43,15 +57,29 @@ impl Default for OutputLayout {
 
 impl OutputLayout {
     pub const fn new() -> Self {
-        Self { outputs: [Output { adapter_id: 0, bounds: Rect::EMPTY, refresh_mhz: 60_000, hw_cursor: false, primary: false, online: false }; MAX_OUTPUTS], count: 0 }
+        Self { outputs: [Output { adapter_id: 0, bounds: Rect::EMPTY, refresh_mhz: 60_000, scale: 100, hw_cursor: false, primary: false, online: false }; MAX_OUTPUTS], count: 0 }
     }
 
     pub fn clear(&mut self) {
         self.count = 0;
     }
 
-    /// Add an output arranged cleanly left-to-right in virtual desktop coordinates.
+    /// Add an output arranged cleanly left-to-right in virtual desktop coordinates, using the
+    /// recommended per-output scale derived from its width.
     pub fn add_output(&mut self, adapter_id: u32, width: u32, height: u32, refresh_mhz: u32, hw_cursor: bool) -> Option<usize> {
+        self.add_output_scaled(adapter_id, width, height, refresh_mhz, hw_cursor, Output::recommended_scale(width))
+    }
+
+    /// Add an output with an explicit UI/text scale percentage (`UiSettings::SCALES`; 0 = auto).
+    pub fn add_output_scaled(
+        &mut self,
+        adapter_id: u32,
+        width: u32,
+        height: u32,
+        refresh_mhz: u32,
+        hw_cursor: bool,
+        scale: u16,
+    ) -> Option<usize> {
         if self.count >= MAX_OUTPUTS || width == 0 || height == 0 {
             return None;
         }
@@ -61,17 +89,41 @@ impl OutputLayout {
             let prev = self.outputs[self.count - 1].bounds;
             prev.x.saturating_add(prev.w as i32)
         };
+        let eff_scale = if UiSettings::SCALES.contains(&scale) {
+            scale
+        } else {
+            Output::recommended_scale(width)
+        };
         let idx = self.count;
         self.outputs[idx] = Output {
             adapter_id,
             bounds: Rect::new(x, 0, width, height),
             refresh_mhz: if refresh_mhz == 0 { 60_000 } else { refresh_mhz },
+            scale: eff_scale,
             hw_cursor,
             primary: idx == 0,
             online: true,
         };
         self.count += 1;
         Some(idx)
+    }
+
+    /// Update the scale percentage (`UiSettings::SCALES`, or 0 for recommended auto) on `adapter_id`
+    /// (0 targets the primary output). Returns true if a matching output was updated.
+    pub fn set_output_scale(&mut self, adapter_id: u32, scale: u16) -> bool {
+        if scale != 0 && !UiSettings::SCALES.contains(&scale) {
+            return false;
+        }
+        let target = if adapter_id == 0 {
+            self.outputs[..self.count].iter_mut().find(|o| o.primary && o.online)
+        } else {
+            self.outputs[..self.count].iter_mut().find(|o| o.adapter_id == adapter_id && o.online)
+        };
+        let Some(out) = target else {
+            return false;
+        };
+        out.scale = if scale == 0 { Output::recommended_scale(out.bounds.w) } else { scale };
+        true
     }
 
     pub fn as_slice(&self) -> &[Output] {
@@ -537,9 +589,27 @@ impl WmState {
 
     /// Register program `owner`'s launcher entry.
     pub fn register_app(&mut self, owner: u32, app: u8, label: &[u8], identity: &[u8], trust: TrustTier) -> bool {
-        let ok = self.launcher.register(owner, app, label, identity, trust);
-        if ok && self.launcher.open {
-            self.damage_launcher_output();
+        self.register_app_ex(owner, app, label, identity, trust, false)
+    }
+
+    /// Register program `owner`'s launcher entry, optionally pinned to the floating dock.
+    pub fn register_app_ex(
+        &mut self,
+        owner: u32,
+        app: u8,
+        label: &[u8],
+        identity: &[u8],
+        trust: TrustTier,
+        pinned: bool,
+    ) -> bool {
+        let ok = self.launcher.register_ex(owner, app, label, identity, trust, pinned);
+        if ok {
+            if self.launcher.open {
+                self.damage_launcher_output();
+            }
+            if pinned {
+                self.damage_dock();
+            }
         }
         ok
     }
@@ -605,6 +675,7 @@ impl WmState {
             adapter_id: 0,
             bounds: Rect::new(0, 0, 1024, 768),
             refresh_mhz: 60_000,
+            scale: 100,
             hw_cursor: false,
             primary: true,
             online: true,
@@ -715,7 +786,7 @@ impl WmState {
 
     /// Destroy all windows belonging to a disconnected client.
     pub fn remove_client(&mut self, owner: u32) {
-        self.launcher.remove_owner(owner);
+        let removed_pinned = self.launcher.remove_owner(owner);
         let mut removed = false;
         for slot in &mut self.windows {
             if slot.as_ref().is_some_and(|w| w.owner == owner)
@@ -738,6 +809,8 @@ impl WmState {
             if self.focused.is_none() {
                 self.focused = self.top_visible_window();
             }
+            self.damage_dock();
+        } else if removed_pinned {
             self.damage_dock();
         }
     }
@@ -1163,6 +1236,30 @@ impl WmState {
                 self.hovered = None;
                 if left_pressed {
                     match dhit {
+                        DockHit::Pinned(owner, app) => {
+                            // Focus/restore an existing window of this pinned app if open; otherwise launch it.
+                            let existing = self
+                                .windows
+                                .iter()
+                                .flatten()
+                                .filter(|w| w.owner == owner && w.workspace == self.active_workspace)
+                                .max_by_key(|w| w.z_order)
+                                .or_else(|| {
+                                    self.windows
+                                        .iter()
+                                        .flatten()
+                                        .filter(|w| w.owner == owner)
+                                        .max_by_key(|w| w.z_order)
+                                })
+                                .map(|w| w.id);
+                            if let Some(wid) = existing {
+                                if let Some((ow, id)) = self.focus_window(wid) {
+                                    return WmAction::Configure { owner: ow, window_id: id };
+                                }
+                            } else {
+                                return WmAction::Launch { owner, app };
+                            }
+                        }
                         DockHit::Window(wid) => {
                             let is_focused_vis = self.focused == Some(wid)
                                 && self.window(wid).is_some_and(|w| !w.minimized && w.workspace == self.active_workspace);
@@ -1304,9 +1401,19 @@ impl WmState {
         (entries, n)
     }
 
+    fn dock_pinned(&self) -> ([DockPinnedEntry; MAX_DOCK_PINNED], usize) {
+        let mut entries = [DockPinnedEntry::default(); MAX_DOCK_PINNED];
+        let n = self.launcher.pinned_entries(&mut entries);
+        for e in entries.iter_mut().take(n) {
+            e.running = self.windows.iter().flatten().any(|w| w.owner == e.owner);
+        }
+        (entries, n)
+    }
+
     pub(crate) fn dock_layout_for(&self, out: Output) -> DockLayout {
+        let (pinned, pn) = self.dock_pinned();
         let (entries, n) = self.dock_windows();
-        DockLayout::compute(out.bounds.w, out.bounds.h, self.dock_cfg, &entries[..n], &self.tray, self.char_w)
+        DockLayout::compute_with_pinned(out.bounds.w, out.bounds.h, self.dock_cfg, &pinned[..pn], &entries[..n], &self.tray, self.char_w)
     }
 
     /// Composite all dirty rectangles for `output` into `canvas`.
@@ -1345,14 +1452,27 @@ impl WmState {
             }
         }
 
+        let (dock_pinned, dock_pn) = if output.primary {
+            self.dock_pinned()
+        } else {
+            ([DockPinnedEntry::default(); MAX_DOCK_PINNED], 0)
+        };
         let (dock_entries, dock_n) = if output.primary {
             self.dock_windows()
         } else {
             ([DockWindowEntry::default(); MAX_DOCK_WINDOWS], 0)
         };
-        let dock_layout = output
-            .primary
-            .then(|| DockLayout::compute(output.bounds.w, output.bounds.h, self.dock_cfg, &dock_entries[..dock_n], &self.tray, self.char_w));
+        let dock_layout = output.primary.then(|| {
+            DockLayout::compute_with_pinned(
+                output.bounds.w,
+                output.bounds.h,
+                self.dock_cfg,
+                &dock_pinned[..dock_pn],
+                &dock_entries[..dock_n],
+                &self.tray,
+                self.char_w,
+            )
+        });
         let launcher = (output.primary && self.launcher.open).then(|| self.launcher.rects(output.bounds.w, output.bounds.h, self.line_h));
 
         let snap_preview_local = match self.drag {
@@ -1479,7 +1599,7 @@ impl WmState {
 
             // 4. Unified floating bottom dock (primary output).
             if let Some(ref dl) = dock_layout {
-                dl.render(canvas, clip, &self.theme, self.dock_cfg, &dock_entries[..dock_n], &self.tray, text);
+                dl.render_with_pinned(canvas, clip, &self.theme, self.dock_cfg, &dock_pinned[..dock_pn], &dock_entries[..dock_n], &self.tray, text);
             }
 
             // 5. The launcher over everything but the pointer.

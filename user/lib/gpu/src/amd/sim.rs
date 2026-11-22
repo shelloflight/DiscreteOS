@@ -62,8 +62,9 @@ pub fn build_discovery_image(
 
     // `ip_discovery_header` at `ip_off` (96 bytes).
     let ip_size = 96usize;
+    let ip_ver: u16 = if base_64 { 4 } else { 2 };
     img[ip_off..ip_off + 4].copy_from_slice(&IP_DISCOVERY_TABLE_SIG.to_le_bytes());
-    img[ip_off + 4..ip_off + 6].copy_from_slice(&2u16.to_le_bytes());
+    img[ip_off + 4..ip_off + 6].copy_from_slice(&ip_ver.to_le_bytes());
     img[ip_off + 6..ip_off + 8].copy_from_slice(&(ip_size as u16).to_le_bytes());
     img[ip_off + 12..ip_off + 14].copy_from_slice(&1u16.to_le_bytes()); // num_dies = 1
     img[ip_off + 14..ip_off + 16].copy_from_slice(&0u16.to_le_bytes()); // die 0

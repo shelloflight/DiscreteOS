@@ -193,7 +193,7 @@ fn on_ctl(ctl: Handle, ep: &mut Handle, view: &mut Handle, port: &Port) -> bool 
                         sys::handle_close(*ep);
                         *ep = hnd;
                         port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_WIN);
-                        let _ = wire::register_app(hnd, 0, b"Terminal");
+                        let _ = wire::register_app_pinned(hnd, 0, b"Terminal", true);
                     }
                     Some(h) if h.op == svc::CONNECT && hnd != 0 && &buf[HEADER..n] == b"terminal.view" => {
                         sys::handle_close(*view);
@@ -235,7 +235,7 @@ pub fn main(s: *const Startup) -> i32 {
     }
     port.arm(ep, sys::READABLE | sys::PEER_CLOSED, KEY_WIN);
     port.arm(view, sys::READABLE | sys::PEER_CLOSED, KEY_VIEW);
-    let _ = wire::register_app(ep, 0, b"Terminal");
+    let _ = wire::register_app_pinned(ep, 0, b"Terminal", true);
     let mut text = text_engine(ep, "console");
     let mut theme = Theme::DARK_SLATE;
     let mut settings = UiSettings::DEFAULT;

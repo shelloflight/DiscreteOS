@@ -239,6 +239,10 @@ pub fn full() -> i32 {
     check!(awmi::status(admin).is_ok_and(|s| !s.launcher_open), "Escape did not close the launcher");
     check!(awmi::set_settings(query, 1, awmi::SET_THEME).is_err(), "settings over awmi.query not refused");
     check!(awmi::set_settings(win, 1, awmi::SET_THEME).is_err(), "settings over awmi.window not refused");
+    check!(awmi::set_output_scale(query, 0, 125) == DENIED, "display config over awmi.query not refused");
+    check!(awmi::set_output_scale(win, 0, 125) == DENIED, "display config over awmi.window not refused");
+    check!(awmi::set_output_scale(admin, 0, 125).is_ok(), "per-output scale on admin failed");
+    check!(awmi::set_output_scale(admin, 0, 0).is_ok(), "per-output scale reset on admin failed");
     let now = awmi::set_settings(admin, 1 | 150 << 8 | 1 << 24, awmi::SET_THEME | awmi::SET_TEXT_SCALE | awmi::SET_MOTION);
     check!(now == Ok(1 | 150 << 8 | 1 << 24), "settings not applied: {:?}", now);
     let mut told = false;
