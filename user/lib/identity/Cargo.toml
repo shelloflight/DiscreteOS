@@ -1,0 +1,13 @@
+[package]
+name = "dosid"
+version = "1.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+doscrypt = { path = "../crypto" }
+dman = { path = "../dman" }

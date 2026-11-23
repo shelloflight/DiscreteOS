@@ -3,6 +3,29 @@
 version = 4
 
 [[package]]
+name = "appmgr"
+version = "0.1.0"
+dependencies = [
+ "dosapp",
+ "doscrypt",
+ "dosid",
+ "libd",
+]
+
+[[package]]
+name = "apps"
+version = "0.1.0"
+dependencies = [
+ "dosapp",
+ "dosaudio",
+ "dosawmi",
+ "dosfont",
+ "dosid",
+ "dosui",
+ "libd",
+]
+
+[[package]]
 name = "audio"
 version = "0.1.0"
 dependencies = [
@@ -48,6 +71,15 @@ name = "dman"
 version = "0.1.0"
 
 [[package]]
+name = "dosapp"
+version = "1.0.0"
+dependencies = [
+ "dman",
+ "doscrypt",
+ "dosid",
+]
+
+[[package]]
 name = "dosaudio"
 version = "0.1.0"
 
@@ -70,6 +102,14 @@ version = "0.1.0"
 [[package]]
 name = "dosgpu"
 version = "0.1.0"
+
+[[package]]
+name = "dosid"
+version = "1.0.0"
+dependencies = [
+ "dman",
+ "doscrypt",
+]
 
 [[package]]
 name = "dosnet"
@@ -102,6 +142,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "identity"
+version = "0.1.0"
+dependencies = [
+ "doscrypt",
+ "dosid",
+ "libd",
+]
+
+[[package]]
 name = "init"
 version = "0.2.0"
 dependencies = [
@@ -125,9 +174,11 @@ dependencies = [
 name = "ltest"
 version = "0.1.0"
 dependencies = [
+ "dosapp",
  "dosaudio",
  "doscrypt",
  "dosgpu",
+ "dosid",
  "dosnet",
  "libd",
 ]
@@ -145,6 +196,7 @@ name = "shell"
 version = "0.1.0"
 dependencies = [
  "dman",
+ "dosapp",
  "dosaudio",
  "dosnet",
  "libd",

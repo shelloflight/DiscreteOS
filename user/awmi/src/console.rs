@@ -18,7 +18,6 @@ use libd::{Mapping, Port, Startup, println, svc, term};
 
 use crate::app::{canvas_of, settings_of, text_engine};
 
-const KEY_CTL: u64 = 1;
 const KEY_WIN: u64 = 2;
 const KEY_VIEW: u64 = 3;
 const CALL_NS: u64 = 5_000_000_000;
@@ -181,79 +180,40 @@ impl Term {
     }
 }
 
-fn on_ctl(ctl: Handle, ep: &mut Handle, view: &mut Handle, port: &Port) -> bool {
-    let mut buf = [0u8; HEADER + 64];
-    loop {
-        let mut hs = [0 as Handle; 1];
-        match sys::channel_read_h(ctl, &mut buf, &mut hs, 0) {
-            Ok((n, nh)) => {
-                let hnd = if nh > 0 { hs[0] } else { 0 };
-                match Header::get(&buf[..n]) {
-                    Some(h) if h.op == svc::CONNECT && hnd != 0 && &buf[HEADER..n] == b"awmi.window" => {
-                        sys::handle_close(*ep);
-                        *ep = hnd;
-                        port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_WIN);
-                        let _ = wire::register_app_pinned(hnd, 0, b"Terminal", true);
-                    }
-                    Some(h) if h.op == svc::CONNECT && hnd != 0 && &buf[HEADER..n] == b"terminal.view" => {
-                        sys::handle_close(*view);
-                        *view = hnd;
-                        port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_VIEW);
-                    }
-                    Some(h) if h.op == svc::SHUTDOWN => return false,
-                    _ => {
-                        if hnd != 0 {
-                            sys::handle_close(hnd);
-                        }
-                    }
-                }
-            }
-            Err(sys::ERR_SHOULD_WAIT) => {
-                port.arm(ctl, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
-                return true;
-            }
-            Err(_) => return true,
-        }
-    }
-}
-
 pub fn main(s: *const Startup) -> i32 {
     // SAFETY: `s` is the startup block pointer the kernel passed to the entry point.
-    if !unsafe { libd::init(s, "console") } {
+    if !unsafe { libd::init(s, "terminal") } {
         return 1;
     }
-    let mut ep = wire::window_endpoint();
-    let mut view = svc::endpoint(b"terminal.view");
+    let ep = wire::window_endpoint();
+    let view = svc::endpoint(b"terminal.view");
     if ep == 0 || view == 0 {
         println!("console: needs awmi.window and terminal.view");
         return 1;
     }
-    let ctl = libd::startup_handle(proto::TAG_CONTROL);
     let Ok(port) = Port::new(8) else { return 1 };
-    if ctl != 0 {
-        port.arm(ctl, sys::READABLE | sys::PEER_CLOSED, KEY_CTL);
-    }
     port.arm(ep, sys::READABLE | sys::PEER_CLOSED, KEY_WIN);
     port.arm(view, sys::READABLE | sys::PEER_CLOSED, KEY_VIEW);
-    let _ = wire::register_app_pinned(ep, 0, b"Terminal", true);
     let mut text = text_engine(ep, "console");
     let mut theme = Theme::DARK_SLATE;
     let mut settings = UiSettings::DEFAULT;
-    let mut t: Option<Term> = None;
-    let close = |t: &mut Option<Term>, view: Handle| {
-        if t.take().is_some() {
-            let _ = view_call(view, term::VIEW_DETACH, 0);
+    // Drain any initial EVT_SETTINGS sent on connect before creating the window.
+    while let Ok(Some(ev)) = wire::next_event(ep, 0) {
+        if let Event::Settings { settings: s, theme: th } = ev {
+            (theme, settings) = settings_of(s, &th);
+            text.scale = settings.text_scale;
         }
+    }
+    let Some(mut tm) = Term::open(ep, view, &text) else {
+        return 1;
+    };
+    tm.draw(&mut text, &theme, settings.theme == dosawmi::ThemeId::HighContrast);
+    let detach = |view: Handle| {
+        let _ = view_call(view, term::VIEW_DETACH, 0);
     };
     loop {
         let Some((k, _)) = port.wait(sys::WAIT_FOREVER) else { continue };
         match k {
-            KEY_CTL => {
-                if !on_ctl(ctl, &mut ep, &mut view, &port) {
-                    close(&mut t, view);
-                    return 0;
-                }
-            }
             KEY_VIEW => {
                 let mut buf = [0u8; HEADER + 16];
                 loop {
@@ -261,7 +221,6 @@ pub fn main(s: *const Startup) -> i32 {
                         Ok(n) => {
                             if let Some(h) = Header::get(&buf[..n as usize])
                                 && h.op == term::VIEW_DAMAGE
-                                && let Some(tm) = t.as_mut()
                             {
                                 tm.mark(h.a as u32, h.b as u32);
                             }
@@ -270,12 +229,13 @@ pub fn main(s: *const Startup) -> i32 {
                             port.arm(view, sys::READABLE | sys::PEER_CLOSED, KEY_VIEW);
                             break;
                         }
-                        Err(_) => break, // the terminal restarts: the service manager links us again
+                        Err(_) => {
+                            detach(view);
+                            return 0;
+                        }
                     }
                 }
-                if let Some(tm) = t.as_mut() {
-                    tm.draw(&mut text, &theme, settings.theme == dosawmi::ThemeId::HighContrast);
-                }
+                tm.draw(&mut text, &theme, settings.theme == dosawmi::ThemeId::HighContrast);
             }
             _ => loop {
                 let ev = match wire::next_event(ep, 0) {
@@ -285,35 +245,28 @@ pub fn main(s: *const Startup) -> i32 {
                         break;
                     }
                     Err(_) => {
-                        t = None; // the compositor is gone; it comes back with a new channel
-                        break;
+                        detach(view);
+                        return 0;
                     }
                 };
                 match ev {
                     Event::Settings { settings: s, theme: th } => {
                         (theme, settings) = settings_of(s, &th);
                         text.scale = settings.text_scale;
-                        if let Some(tm) = t.as_mut() {
-                            (tm.cell_w, tm.cell_h, tm.ascent) = Term::metrics(&text);
-                            tm.fit();
-                            let _ = view_call(view, term::VIEW_RESIZE, u64::from(tm.cols) | u64::from(tm.rows) << 32);
-                            tm.full = true;
-                        }
+                        (tm.cell_w, tm.cell_h, tm.ascent) = Term::metrics(&text);
+                        tm.fit();
+                        let _ = view_call(view, term::VIEW_RESIZE, u64::from(tm.cols) | u64::from(tm.rows) << 32);
+                        tm.full = true;
                     }
-                    Event::Session { active: true, desktop, .. } => {
-                        if desktop && t.is_none() {
-                            t = Term::open(ep, view, &text);
-                        }
+                    Event::Session { active: false, .. } => {
+                        detach(view);
+                        return 0;
                     }
-                    Event::Session { active: false, .. } => close(&mut t, view),
-                    Event::Launch { .. } => {
-                        if t.is_none() {
-                            t = Term::open(ep, view, &text);
-                        }
+                    Event::Close { window } if tm.win.id == window => {
+                        detach(view);
+                        return 0;
                     }
-                    Event::Close { window } if t.as_ref().is_some_and(|tm| tm.win.id == window) => close(&mut t, view),
-                    Event::Configure { window, width, height, state } if t.as_ref().is_some_and(|tm| tm.win.id == window) => {
-                        let Some(tm) = t.as_mut() else { continue };
+                    Event::Configure { window, width, height, state } if tm.win.id == window => {
                         tm.focused = state & wire::STATE_FOCUSED != 0;
                         if tm.win.resize(width, height).is_ok() {
                             let (oc, or) = (tm.cols, tm.rows);
@@ -324,11 +277,9 @@ pub fn main(s: *const Startup) -> i32 {
                         }
                         tm.full = true;
                     }
-                    Event::Focus { window, focused } if t.as_ref().is_some_and(|tm| tm.win.id == window) => {
-                        if let Some(tm) = t.as_mut() {
-                            tm.focused = focused;
-                            tm.full = true;
-                        }
+                    Event::Focus { window, focused } if tm.win.id == window => {
+                        tm.focused = focused;
+                        tm.full = true;
                     }
                     Event::Key { key: kv, .. } => {
                         if kv & key::RELEASE == 0 {
@@ -339,16 +290,12 @@ pub fn main(s: *const Startup) -> i32 {
                         let k = if wheel > 0 { key::PAGE_UP } else { key::PAGE_DOWN };
                         proto::send(view, term::VIEW_KEY, u64::from(k), 0);
                     }
-                    Event::FrameDone { window, .. } if t.as_ref().is_some_and(|tm| tm.win.id == window) => {
-                        if let Some(tm) = t.as_mut() {
-                            tm.in_flight = false;
-                        }
+                    Event::FrameDone { window, .. } if tm.win.id == window => {
+                        tm.in_flight = false;
                     }
                     _ => {}
                 }
-                if let Some(tm) = t.as_mut() {
-                    tm.draw(&mut text, &theme, settings.theme == dosawmi::ThemeId::HighContrast);
-                }
+                tm.draw(&mut text, &theme, settings.theme == dosawmi::ThemeId::HighContrast);
             },
         }
     }

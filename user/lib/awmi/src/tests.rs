@@ -209,6 +209,7 @@ fn alpha_blend_and_status_codec() {
         launcher_open: true,
         fonts: true,
         apps: 3,
+        locked: true,
     };
     let mut buf = [0u8; STATUS_BYTES];
     st.encode(&mut buf);
@@ -416,7 +417,7 @@ fn launcher_opens_on_super_tap_and_searches() {
     for &c in b"foreign" {
         wm.handle_key(u32::from(c), true);
     }
-    let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); 29];
+    let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); 24 + crate::launcher::SETTING_COUNT];
     assert_eq!(wm.launcher.results(&mut r), 1);
     assert_eq!(r[0], LaunchTarget::App { owner: 9, app: 1 });
     wm.handle_key(0x1B, true);
@@ -435,7 +436,7 @@ fn launcher_opens_on_super_tap_and_searches() {
     // A program that goes away loses its entries.
     wm.remove_client(9);
     wm.toggle_launcher();
-    assert_eq!(wm.launcher.results(&mut r), 2 + 5);
+    assert_eq!(wm.launcher.results(&mut r), 2 + crate::launcher::SETTING_COUNT);
 }
 
 #[test]
@@ -600,4 +601,172 @@ fn dock_pinned_apps_and_per_output_scale() {
     // Disconnecting owner 7 removes the pinned pill from the dock.
     wm.remove_client(7);
     assert_eq!(wm.dock_layout_for(prim).pinned_count, 0);
+}
+
+#[test]
+fn lock_screen_hides_windows_blocks_escape_and_wipes_passphrase() {
+    use crate::lock::{LockIdentity, LockMode, LockReason};
+    use crate::perm::{PERM_ALLOW, PERM_CANCEL};
+
+    let mut wm = WmState::new();
+    wm.layout.add_output(0, 800, 600, 60_000, false).unwrap();
+    let w1 = wm.create_window(1, b"secret-app", TrustTier::Native, 300, 200, win_flags::DEFAULT, b"Secret").unwrap();
+    let client_r = wm.window(w1).unwrap().client_rect(wm.chrome);
+
+    // Super+L triggers LockSession when unlocked.
+    const SUPER: u32 = 1 << 19;
+    const CTRL: u32 = 1 << 17;
+    const ALT: u32 = 1 << 18;
+    assert_eq!(wm.handle_key(SUPER | u32::from(b'l'), true), WmAction::LockSession);
+    assert_eq!(wm.handle_key(CTRL | ALT | u32::from(b'l'), true), WmAction::LockSession);
+
+    // Engage lock screen with bright-magenta secret window underneath.
+    let ids = [LockIdentity::new(1, b"user", b"Local User", true, true)];
+    wm.lock.set_identities(&ids, 1, true);
+    wm.engage_lock(LockMode::Locked, LockReason::Manual);
+    assert!(wm.lock.active);
+
+    // Super+Esc, Ctrl+Alt+Esc, Super tap, and client input are ALL blocked while locked!
+    assert_eq!(wm.handle_key(SUPER | 0x1B, true), WmAction::None);
+    assert_eq!(wm.handle_key(CTRL | ALT | 0x1B, true), WmAction::None);
+    assert_eq!(wm.handle_key(KEY_META, true), WmAction::None);
+    assert_eq!(wm.handle_key(KEY_META, false), WmAction::None);
+    assert!(!wm.launcher.open);
+    assert_eq!(wm.handle_pointer(0, 0, Some(Point::new(client_r.x + 10, client_r.y + 10)), 1), WmAction::None);
+
+    // Composite output: ZERO bright-magenta client pixels may appear anywhere on screen!
+    let magenta = rgb(0xFF, 0x00, 0xFF);
+    let mut surf = vec![0u8; (client_r.w * client_r.h * 4) as usize];
+    for c in surf.as_chunks_mut::<4>().0 {
+        *c = magenta.to_le_bytes();
+    }
+    let mut fb = vec![0u32; 800 * 600];
+    let mut canvas = Canvas::new(&mut fb, 800, 600, 800).unwrap();
+    let prim = wm.layout.primary().unwrap();
+    wm.composite_output(prim, &mut canvas, &mut BitmapText, |_| {
+        Some(SurfaceView { bytes: &surf, width: client_r.w, height: client_r.h, pitch_bytes: client_r.w * 4 })
+    });
+    assert!(!fb.contains(&magenta), "lock screen leaked client window pixels!");
+
+    // Typing passphrase goes ONLY to lock screen and submits UnlockAttempt on Enter.
+    for &c in b"s3cret" {
+        assert_eq!(wm.handle_key(u32::from(c), true), WmAction::None);
+    }
+    assert_eq!(wm.lock.passphrase(), b"s3cret");
+    assert_eq!(wm.handle_key(0x0D, true), WmAction::UnlockAttempt { identity_id: 1 });
+    wm.lock.set_error(b"Invalid passphrase");
+    assert_eq!(wm.lock.pass_len(), 0);
+    wm.disengage_lock();
+    assert!(!wm.lock.active);
+
+    // Compositor modal permission prompt traps input until answered.
+    wm.open_perm_prompt(42, b"files", b"Files", 0b110);
+    assert!(wm.perm_prompt.active);
+    assert_eq!(wm.handle_key(u32::from(b'a'), true), WmAction::None);
+    assert_eq!(wm.handle_key(0x0D, true), WmAction::PermPromptResult { request_id: 42, choice: PERM_ALLOW });
+    assert!(!wm.perm_prompt.active);
+    wm.open_perm_prompt(43, b"files", b"Files", 0b10);
+    assert_eq!(wm.handle_key(0x1B, true), WmAction::PermPromptResult { request_id: 43, choice: PERM_CANCEL });
+}
+
+#[test]
+fn custom_cursors_and_lock_screen_tpm_badge_colors() {
+    use crate::lock::{LockIdentity, LockMode, LockReason};
+    use crate::pixel::{CursorKind, write_hw_cursor_64x64_kind};
+
+    // 1. Every custom cursor has non-empty silhouette, valid hotspot inside sprite, and crisp HW 64x64 blit.
+    let all = [
+        CursorKind::Default,
+        CursorKind::Pointer,
+        CursorKind::Text,
+        CursorKind::Move,
+        CursorKind::ResizeEW,
+        CursorKind::ResizeNS,
+        CursorKind::ResizeNWSE,
+        CursorKind::ResizeNESW,
+    ];
+    let mut hw = vec![0u8; 64 * 64 * 4];
+    for kind in all {
+        let (w, h) = kind.size();
+        let (hx, hy) = kind.hotspot();
+        assert!(w >= 9 && h >= 9 && (hx as u32) < w && (hy as u32) < h, "{kind:?}");
+        let (rhx, rhy) = write_hw_cursor_64x64_kind(kind, &mut hw);
+        assert_eq!((rhx, rhy), (hx as u32, hy as u32));
+        assert!(hw.as_chunks::<4>().0.iter().any(|c| c[3] == 0xFF), "empty hw cursor for {kind:?}");
+    }
+
+    // 2. Context-aware cursor transitions on window edges/corners, buttons, drag, dock, and lock screen.
+    let mut wm = WmState::new();
+    wm.layout.add_output(0, 1280, 720, 60_000, false).unwrap();
+    let wid = wm.create_window(1, b"demo", TrustTier::Native, 400, 300, win_flags::DEFAULT, b"Demo").unwrap();
+    let f = wm.window(wid).unwrap().frame;
+
+    // Right edge -> ResizeEW, bottom edge -> ResizeNS, top-left -> ResizeNWSE, top-right -> ResizeNESW.
+    wm.handle_pointer(0, 0, Some(Point::new(f.x + f.w as i32 - 1, f.y + f.h as i32 / 2)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::ResizeEW);
+    wm.handle_pointer(0, 0, Some(Point::new(f.x + f.w as i32 / 2, f.y + f.h as i32 - 1)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::ResizeNS);
+    wm.handle_pointer(0, 0, Some(Point::new(f.x + 1, f.y + 1)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::ResizeNWSE);
+    wm.handle_pointer(0, 0, Some(Point::new(f.x + f.w as i32 - 1, f.y + 1)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::ResizeNESW);
+
+    // Close button -> Pointer; Titlebar drag -> Move; release -> Default.
+    wm.handle_pointer(0, 0, Some(Point::new(f.x + f.w as i32 - 12, f.y + 14)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::Pointer);
+    let tb = Point::new(f.x + 80, f.y + 14);
+    wm.handle_pointer(0, 0, Some(tb), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::Default);
+    wm.handle_pointer(0, 0, Some(tb), 1);
+    assert_eq!(wm.cursor_kind, CursorKind::Move);
+    wm.handle_pointer(0, 0, Some(Point::new(tb.x + 20, tb.y + 10)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::Default);
+
+    // 3. Lock screen TPM 2.0 badge colour reflects hardware presence and sealing state.
+    let theme = Theme::DARK_SLATE;
+    let sealed_id = [LockIdentity::new(1, b"user", b"Local User", true, true)];
+    let soft_id = [LockIdentity::new(1, b"user", b"Local User", false, true)];
+    wm.lock.set_identities(&sealed_id, 1, true);
+    assert_eq!(wm.lock.tpm_badge_color(&theme), theme.status_ok);
+    wm.lock.set_identities(&soft_id, 1, true);
+    assert_eq!(wm.lock.tpm_badge_color(&theme), theme.trust_sandbox);
+    wm.lock.set_identities(&soft_id, 1, false);
+    assert_eq!(wm.lock.tpm_badge_color(&theme), theme.ind_alert_red);
+
+    // Lock screen passphrase field shows Text cursor and desktop background shows Default.
+    wm.engage_lock(LockMode::Locked, LockReason::Manual);
+    wm.handle_pointer(0, 0, Some(Point::new(10, 10)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::Default);
+    wm.handle_pointer(0, 0, Some(Point::new(640, 360)), 0);
+    assert_eq!(wm.cursor_kind, CursorKind::Text);
+}
+
+#[test]
+fn mode_switch_refits_pointer_snapped_and_floating_windows() {
+    let mut wm = WmState::new();
+    wm.layout.add_output(1, 2560, 1440, 60_000, false).unwrap();
+    let max_id = wm.create_window(1, b"settings", TrustTier::Native, 800, 600, win_flags::DEFAULT, b"Settings").unwrap();
+    let flt_id = wm.create_window(2, b"term", TrustTier::Native, 600, 400, win_flags::DEFAULT, b"Terminal").unwrap();
+    wm.snap_window(max_id, SnapState::Maximized);
+    if let Some(w) = wm.window_mut(flt_id) {
+        w.frame = Rect::new(2000, 1050, 600, 400);
+        w.saved_floating = w.frame;
+    }
+    wm.pointer = Point::new(2400, 1300);
+
+    // Switch output to a smaller 240 Hz mode and verify full damage + clamped geometry.
+    wm.damage.clear();
+    wm.layout.clear();
+    wm.layout.add_output(1, 1920, 1080, 240_000, false).unwrap();
+    wm.fit_windows_to_layout();
+
+    assert!(!wm.damage.is_empty());
+    assert!(wm.pointer.x < 1920 && wm.pointer.y < 1080);
+    let out = wm.layout.primary().unwrap();
+    let work = wm.layout.work_area(out, wm.dock_cfg);
+    assert_eq!(wm.window(max_id).unwrap().frame, work);
+    let ff = wm.window(flt_id).unwrap().frame;
+    assert!(ff.x >= work.x && ff.y >= work.y);
+    assert!(ff.x + ff.w as i32 <= work.x + work.w as i32);
+    assert!(ff.y + ff.h as i32 <= work.y + work.h as i32);
 }

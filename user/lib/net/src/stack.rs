@@ -69,8 +69,10 @@ struct PendingDns {
 /// Public resolvers asked when the network's own DNS servers do not answer (Cloudflare, Quad9,
 /// Google), so name lookup works on networks whose DHCP DNS is missing or broken.
 pub const PUBLIC_DNS: [Ipv4Addr; 3] = [[1, 1, 1, 1], [9, 9, 9, 9], [8, 8, 8, 8]];
-/// Queries per lookup (one a second): the configured servers first, then the public ones.
+/// Queries per lookup: the configured servers first, then the public ones.
 const DNS_ATTEMPTS: u8 = 5;
+/// Retry interval between DNS servers when the previous server does not answer.
+const DNS_RETRY_MS: u64 = 750;
 
 struct DnsCacheEntry {
     hostname: String,
@@ -95,6 +97,10 @@ pub struct NetStack {
     pub dns_server2: Ipv4Addr,
     /// When the configured servers do not answer, ask public resolvers (`PUBLIC_DNS`).
     pub dns_fallback: bool,
+    /// True when IPv4 was configured manually (disables automatic DHCP overrides on link flap).
+    pub static_mode: bool,
+    /// True when DNS servers were explicitly configured by the user (preserved across DHCP renewals).
+    pub custom_dns: bool,
     pub bootfile: String,
     pub dhcp_state: DhcpState,
     dhcp_xid: u32,
@@ -132,6 +138,8 @@ impl NetStack {
             dns_port: 53,
             dns_server2: IP_UNSPECIFIED,
             dns_fallback: true,
+            static_mode: false,
+            custom_dns: false,
             bootfile: String::new(),
             dhcp_state: DhcpState::Idle,
             dhcp_xid: 0,
@@ -164,12 +172,79 @@ impl NetStack {
         self.netmask = netmask;
         self.gateway = gateway;
         self.dns_server = dns;
+        self.static_mode = true;
+        self.custom_dns = dns != IP_UNSPECIFIED;
         self.dhcp_state = DhcpState::Bound;
+        self.dns_cache.clear();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_static_full(
+        &mut self,
+        ip: Ipv4Addr,
+        netmask: Ipv4Addr,
+        gateway: Ipv4Addr,
+        dns1: Ipv4Addr,
+        dns2: Ipv4Addr,
+        dns_port: u16,
+        dns_fallback: bool,
+    ) {
+        self.ip = ip;
+        self.netmask = if netmask == IP_UNSPECIFIED { [255, 255, 255, 0] } else { netmask };
+        self.gateway = gateway;
+        self.dns_server = dns1;
+        self.dns_server2 = dns2;
+        self.dns_port = if dns_port == 0 { 53 } else { dns_port };
+        self.dns_fallback = dns_fallback;
+        self.static_mode = true;
+        self.custom_dns = dns1 != IP_UNSPECIFIED || dns2 != IP_UNSPECIFIED;
+        self.dhcp_state = DhcpState::Bound;
+        self.dns_cache.clear();
+        // Announce our static IP via gratuitous ARP and pre-resolve the gateway MAC.
+        if ip != IP_UNSPECIFIED {
+            self.send_arp_request(ip);
+        }
+        if gateway != IP_UNSPECIFIED && gateway != ip {
+            self.send_arp_request(gateway);
+        }
+    }
+
+    pub fn enable_dhcp(
+        &mut self,
+        dns1_override: Ipv4Addr,
+        dns2_override: Ipv4Addr,
+        dns_port: u16,
+        dns_fallback: bool,
+        now_ms: u64,
+    ) {
+        let was_bound_dhcp = !self.static_mode && self.dhcp_state == DhcpState::Bound;
+        self.static_mode = false;
+        self.dns_fallback = dns_fallback;
+        self.dns_port = if dns_port == 0 { 53 } else { dns_port };
+        let has_override = dns1_override != IP_UNSPECIFIED || dns2_override != IP_UNSPECIFIED;
+        if has_override {
+            self.dns_server = dns1_override;
+            self.dns_server2 = dns2_override;
+            self.custom_dns = true;
+        } else {
+            self.dns_server = IP_UNSPECIFIED;
+            self.dns_server2 = IP_UNSPECIFIED;
+            self.custom_dns = false;
+        }
+        self.dns_cache.clear();
+        // If we are already bound via DHCP and only changing DNS overrides, keep the live
+        // lease up with zero downtime; otherwise (static->DHCP, unbound, or DNS reset/renew)
+        // run DHCP discovery to obtain a fresh lease and router-assigned DNS.
+        if !was_bound_dhcp || !has_override {
+            self.start_dhcp(now_ms);
+        }
     }
 
     pub fn set_dns(&mut self, ip: Ipv4Addr, port: u16) {
         self.dns_server = ip;
-        self.dns_port = port;
+        self.dns_port = if port == 0 { 53 } else { port };
+        self.custom_dns = ip != IP_UNSPECIFIED;
+        self.dns_cache.clear();
     }
 
     fn next_rand(&mut self) -> u32 {
@@ -325,18 +400,25 @@ impl NetStack {
                 if let Some(gw) = msg.router.or(self.dhcp_offer_router) {
                     self.gateway = gw;
                 }
-                if let Some(dns) = msg.dns.or(self.dhcp_offer_dns) {
-                    self.dns_server = dns;
-                } else if self.gateway != IP_UNSPECIFIED {
-                    self.dns_server = self.gateway;
-                }
-                if let Some(dns2) = msg.dns2 {
-                    self.dns_server2 = dns2;
+                if !self.custom_dns {
+                    if let Some(dns) = msg.dns.or(self.dhcp_offer_dns) {
+                        self.dns_server = dns;
+                    } else if self.gateway != IP_UNSPECIFIED {
+                        self.dns_server = self.gateway;
+                    }
+                    if let Some(dns2) = msg.dns2 {
+                        self.dns_server2 = dns2;
+                    }
                 }
                 if !msg.bootfile.is_empty() {
                     self.bootfile = msg.bootfile;
                 }
                 self.dhcp_state = DhcpState::Bound;
+                // Proactively resolve the default gateway's MAC so the first DNS/ping packet
+                // leaves immediately instead of stalling on an initial ARP round-trip.
+                if self.gateway != IP_UNSPECIFIED {
+                    self.send_arp_request(self.gateway);
+                }
             }
             (DhcpState::Requesting, DHCP_NAK) => {
                 self.start_dhcp(now_ms);
@@ -695,6 +777,28 @@ impl NetStack {
                 });
                 return;
             }
+            // If a server explicitly returns SERVFAIL/NOTIMP/REFUSED (e.g. a router refusing
+            // recursion), immediately fail over to the next configured/public resolver.
+            if udp.payload.len() >= 12 {
+                let id = u16::from_be_bytes([udp.payload[0], udp.payload[1]]);
+                let flags = u16::from_be_bytes([udp.payload[2], udp.payload[3]]);
+                let rcode = flags & 0x000F;
+                if id == expected_id && (flags & 0x8000) != 0 && matches!(rcode, 2 | 4 | 5) {
+                    if self.dns_pending[pos].retries + 1 < DNS_ATTEMPTS {
+                        self.dns_pending[pos].retries += 1;
+                        self.dns_pending[pos].last_tx_ms = now_ms;
+                        let attempt = self.dns_pending[pos].retries;
+                        let lport = self.dns_pending[pos].local_port;
+                        let host = self.dns_pending[pos].hostname.clone();
+                        if let (Some(q), Some((sip, sport))) = (build_dns_query(expected_id, &host), self.dns_server_for(attempt))
+                            && let Some(pkt) = build_udp(self.ip, sip, lport, sport, &q)
+                        {
+                            self.send_ipv4(self.ip, sip, PROTO_UDP, &pkt, now_ms);
+                        }
+                    }
+                    return;
+                }
+            }
         }
         if let Some(sock) = self.udp.iter_mut().find(|u| u.local_port == udp.dst_port) {
             if sock.rx.len() >= MAX_UDP_RX {
@@ -760,7 +864,7 @@ impl NetStack {
         // Retry pending DNS queries, each time with the next server.
         let mut resend_dns: Vec<(u8, u16, Vec<u8>)> = Vec::new();
         self.dns_pending.retain_mut(|d| {
-            if now_ms.saturating_sub(d.last_tx_ms) >= 1_000 {
+            if now_ms.saturating_sub(d.last_tx_ms) >= DNS_RETRY_MS {
                 if d.retries + 1 >= DNS_ATTEMPTS {
                     return false;
                 }

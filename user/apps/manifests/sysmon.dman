@@ -1,0 +1,16 @@
+kind = "app"
+name = "sysmon"
+title = "System Monitor"
+version = "1.0.0"
+binary = "sysmon.dx"
+description = "Inspect services, handles, verified apps, and system logs"
+pinned = false
+autostart = false
+
+[permissions]
+required = ["window", "system:query", "apps:query"]
+
+[quota]
+memory = "48M"
+handles = 256
+threads = 4

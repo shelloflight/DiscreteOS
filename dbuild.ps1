@@ -33,7 +33,9 @@ if (-not $needBuild) {
              @(Get-ChildItem (Join-Path $Root 'user\lib\fs\src') -Filter *.rs -Recurse) +
              @(Get-ChildItem (Join-Path $Root 'user\lib\crypto\src') -Filter *.rs -Recurse) +
              @(Get-ChildItem (Join-Path $Root 'user\lib\net\src') -Filter *.rs -Recurse) +
-             @(Get-ChildItem (Join-Path $Root 'user\lib\font\src') -Filter *.rs -Recurse)
+             @(Get-ChildItem (Join-Path $Root 'user\lib\font\src') -Filter *.rs -Recurse) +
+             @(Get-ChildItem (Join-Path $Root 'user\lib\app\src') -Filter *.rs -Recurse) +
+             @(Get-ChildItem (Join-Path $Root 'user\lib\identity\src') -Filter *.rs -Recurse)
     if (@($watch | Where-Object { $_.LastWriteTimeUtc -gt $binTime }).Count -gt 0) {
         $needBuild = $true
     }

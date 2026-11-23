@@ -6,7 +6,9 @@
 //! - `MEASURE` (ABI v7): the right to record a decision in the measurement log (PCR 10,
 //!   `measure`): the service manager records each manifest it accepts or refuses;
 //! - `KLOG` (ABI v8): the right to read the kernel log (`klog_read`; kernel addresses filtered),
-//!   which the service manager grants to the log service.
+//!   which the service manager grants to the log service;
+//! - `TPM_SEAL` (ABI v16): the right to seal and unseal small credentials under the TPM 2.0
+//!   owner Storage Root Key (`tpm_seal`, `tpm_unseal`), granted to the identity service.
 //!
 //! The kernel gives them to `init` only; init passes them on deliberately.
 
@@ -16,6 +18,7 @@ pub const KIND_VMEX: u32 = 1;
 pub const KIND_POWER: u32 = 2;
 pub const KIND_MEASURE: u32 = 3;
 pub const KIND_KLOG: u32 = 4;
+pub const KIND_TPM_SEAL: u32 = 5;
 
 pub struct ResourceObj {
     pub header: Header,

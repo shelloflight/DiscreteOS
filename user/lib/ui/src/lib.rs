@@ -26,4 +26,4 @@ mod tests;
 
 pub use font_text::{FontText, TextStyle};
 pub use ui::Ui;
-pub use view::{Align, ButtonKind, Key, Length, Node, Tone, button, caption, checkbox, column, divider, heading, input, item, label, mono, panel, progress, row, scroll, slider, spacer, text, toggle};
+pub use view::{Align, ButtonKind, Key, Length, Node, Tone, button, caption, checkbox, column, divider, heading, input, item, label, mono, panel, progress, row, scroll, slider, spacer, text, textarea, toggle};

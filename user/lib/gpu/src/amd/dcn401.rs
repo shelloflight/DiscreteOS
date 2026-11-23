@@ -27,7 +27,7 @@ impl DcnRegs for Dcn401 {
         4
     }
     fn max_aux(&self) -> u8 {
-        4
+        5
     }
 
     // ---- HUBP / HUBPREQ / HUBPRET ----

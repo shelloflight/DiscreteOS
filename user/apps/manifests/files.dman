@@ -1,0 +1,16 @@
+kind = "app"
+name = "files"
+title = "Files"
+version = "1.0.0"
+binary = "files.dx"
+description = "Browse and manage files in your identity namespace"
+pinned = true
+autostart = false
+
+[permissions]
+required = ["window", "files:read", "files:write"]
+
+[quota]
+memory = "32M"
+handles = 128
+threads = 4

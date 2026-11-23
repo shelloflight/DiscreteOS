@@ -16,6 +16,7 @@ use crate::font_text::{FontText, TextStyle};
 use crate::view::{Align, ButtonKind, Key, Kind, Length, Node, Tone};
 
 const TRANSITION_NS: u64 = 110_000_000;
+const DOUBLE_CLICK_NS: u64 = 450_000_000;
 
 /// Key values (`libd::proto::key`).
 mod k {
@@ -107,6 +108,7 @@ pub struct Ui<M> {
     content_h: Vec<(Key, u32)>,
     trans: Vec<(Key, u64)>,
     slider_drag: Option<Key>,
+    last_click: Option<(Key, u64)>,
 }
 
 fn find<T: Copy>(v: &[(Key, T)], key: Key) -> Option<T> {
@@ -206,6 +208,7 @@ impl Cx<'_> {
             Kind::Toggle { label, .. } => (self.s(44) + self.text.width(TextStyle::Body, label), self.lh(TextStyle::Body).max(self.s(18)) + self.s(10)),
             Kind::Slider { .. } => (self.s(220), self.s(28)),
             Kind::Input { .. } => (self.s(260), self.lh(TextStyle::Body) + self.s(18)),
+            Kind::TextArea { .. } => (self.s(360), self.lh(TextStyle::Mono) * 8 + self.s(16)),
             Kind::Item { label, detail, .. } => {
                 (self.text.width(TextStyle::Body, label) + self.text.width(TextStyle::Small, detail) + self.s(48), self.lh(TextStyle::Body) + self.s(18))
             }
@@ -309,7 +312,8 @@ fn visual_hash<M>(n: &Node<M>) -> u64 {
         Kind::Button { label, kind, on_press } => h.bytes(label.as_bytes()).u64(*kind as u64 | u64::from(on_press.is_some()) << 8),
         Kind::Checkbox { label, checked, .. } | Kind::Toggle { label, on: checked, .. } => h.bytes(label.as_bytes()).u64(u64::from(*checked)),
         Kind::Slider { value, min, max, .. } => h.u64(*value as u64).u64(*min as u64).u64(*max as u64),
-        Kind::Input { value, placeholder, .. } => h.bytes(value.as_bytes()).bytes(b"\0").bytes(placeholder.as_bytes()),
+        Kind::Input { value, placeholder, secret, .. } => h.bytes(value.as_bytes()).bytes(b"\0").bytes(placeholder.as_bytes()).u64(u64::from(*secret)),
+        Kind::TextArea { value, placeholder, .. } => h.bytes(value.as_bytes()).bytes(b"\0").bytes(placeholder.as_bytes()),
         Kind::Item { label, detail, selected, .. } => h.bytes(label.as_bytes()).bytes(b"\0").bytes(detail.as_bytes()).u64(u64::from(*selected)),
         Kind::Progress { permille } => h.u64(u64::from(*permille)),
         _ => h,
@@ -339,6 +343,7 @@ impl<M: Clone> Ui<M> {
             content_h: Vec::new(),
             trans: Vec::new(),
             slider_drag: None,
+            last_click: None,
         }
     }
 
@@ -411,6 +416,9 @@ impl<M: Clone> Ui<M> {
         }
         if self.hover.is_some_and(|f| !alive(f, &self.laid)) {
             self.hover = None;
+        }
+        if self.last_click.is_some_and(|(k, _)| !alive(k, &self.laid)) {
+            self.last_click = None;
         }
         let laid = &self.laid;
         self.carets.retain(|e| alive(e.0, laid));
@@ -604,7 +612,12 @@ impl<M: Clone> Ui<M> {
                 match &n.kind {
                     Kind::Button { on_press: Some(m), .. } if base == 0x0A || base == 0x0D || base == b' ' as u32 => out.push(m.clone()),
                     Kind::Checkbox { on_toggle: Some(m), .. } | Kind::Toggle { on_toggle: Some(m), .. } if base == 0x0A || base == 0x0D || base == b' ' as u32 => out.push(m.clone()),
-                    Kind::Item { on_select: Some(m), .. } if base == 0x0A || base == 0x0D || base == b' ' as u32 => out.push(m.clone()),
+                    Kind::Item { on_select, on_activate, .. } if base == 0x0A || base == 0x0D => {
+                        if let Some(m) = on_activate.as_ref().or(on_select.as_ref()) {
+                            out.push(m.clone());
+                        }
+                    }
+                    Kind::Item { on_select: Some(m), .. } if base == b' ' as u32 => out.push(m.clone()),
                     Kind::Slider { value, min, max, step, on_change: Some(f) } => {
                         let v = match base {
                             k::LEFT | k::DOWN => Some(value - step),
@@ -637,6 +650,68 @@ impl<M: Clone> Ui<M> {
                             k::END | 0x05 => (None, value.len()),
                             0x15 => (Some(String::from(&value[caret..])), 0), // Ctrl+U: clear to the start
                             0x20..=0x7E if mods == 0 && value.len() < 1024 => {
+                                let mut s = String::with_capacity(value.len() + 1);
+                                s.push_str(&value[..caret]);
+                                s.push(char::from(base as u8));
+                                s.push_str(&value[caret..]);
+                                (Some(s), caret + 1)
+                            }
+                            _ => (None, caret),
+                        };
+                        set(&mut self.carets, fkey, new_caret);
+                        if let Some(v) = new_val {
+                            out.push(f(v));
+                        }
+                    }
+                    Kind::TextArea { value, on_change: Some(f), .. } => {
+                        let caret = find(&self.carets, fkey).unwrap_or(value.len()).min(value.len());
+                        let caret = (0..=caret).rev().find(|&i| value.is_char_boundary(i)).unwrap_or(0);
+                        let prev = value[..caret].char_indices().last().map_or(0, |(i, _)| i);
+                        let next = value[caret..].chars().next().map_or(caret, |c| caret + c.len_utf8());
+                        let line_start = value[..caret].rfind('\n').map_or(0, |i| i + 1);
+                        let line_end = value[caret..].find('\n').map_or(value.len(), |i| caret + i);
+                        let col = value[line_start..caret].chars().count();
+                        let (new_val, new_caret): (Option<String>, usize) = match base {
+                            0x0A | 0x0D if mods == 0 && value.len() < 65536 => {
+                                let mut s = String::with_capacity(value.len() + 1);
+                                s.push_str(&value[..caret]);
+                                s.push('\n');
+                                s.push_str(&value[caret..]);
+                                (Some(s), caret + 1)
+                            }
+                            0x08 if caret > 0 => (Some([&value[..prev], &value[caret..]].concat()), prev),
+                            k::DELETE if caret < value.len() => (Some([&value[..caret], &value[next..]].concat()), caret),
+                            k::LEFT => (None, prev),
+                            k::RIGHT => (None, next),
+                            k::HOME => (None, line_start),
+                            k::END => (None, line_end),
+                            k::UP => {
+                                if line_start == 0 {
+                                    (None, 0)
+                                } else {
+                                    let prev_end = line_start - 1;
+                                    let prev_start = value[..prev_end].rfind('\n').map_or(0, |i| i + 1);
+                                    let target = value[prev_start..prev_end]
+                                        .char_indices()
+                                        .nth(col)
+                                        .map_or(prev_end, |(i, _)| prev_start + i);
+                                    (None, target)
+                                }
+                            }
+                            k::DOWN => {
+                                if line_end >= value.len() {
+                                    (None, value.len())
+                                } else {
+                                    let next_start = line_end + 1;
+                                    let next_end = value[next_start..].find('\n').map_or(value.len(), |i| next_start + i);
+                                    let target = value[next_start..next_end]
+                                        .char_indices()
+                                        .nth(col)
+                                        .map_or(next_end, |(i, _)| next_start + i);
+                                    (None, target)
+                                }
+                            }
+                            0x20..=0x7E if mods == 0 && value.len() < 65536 => {
                                 let mut s = String::with_capacity(value.len() + 1);
                                 s.push_str(&value[..caret]);
                                 s.push(char::from(base as u8));
@@ -714,11 +789,41 @@ impl<M: Clone> Ui<M> {
                             out.push(f(v));
                         }
                     }
-                    Kind::Input { value, .. } if down => {
+                    Kind::Input { value, secret, .. } if down => {
                         let st = text.style(TextStyle::Body);
                         let pad = (8 * u32::from(self.settings.text_scale) / 100) as i32;
-                        let i = text.engine.index_at(st, value, x - l.rect.x - pad);
-                        set(&mut self.carets, l.key, i);
+                        let masked;
+                        let shown = if *secret {
+                            masked = "*".repeat(value.chars().count());
+                            masked.as_str()
+                        } else {
+                            value.as_str()
+                        };
+                        let i = text.engine.index_at(st, shown, x - l.rect.x - pad);
+                        let idx = if *secret {
+                            value.char_indices().nth(i).map_or(value.len(), |(b, _)| b)
+                        } else {
+                            i
+                        };
+                        set(&mut self.carets, l.key, idx);
+                    }
+                    Kind::TextArea { value, .. } if down => {
+                        let st = text.style(TextStyle::Mono);
+                        let pad = (8 * u32::from(self.settings.text_scale) / 100) as i32;
+                        let lh = text.line_height(TextStyle::Mono).max(12) as i32;
+                        let scroll_y = find(&self.scrolls, l.key).unwrap_or(0);
+                        let target_line = ((y - l.rect.y - pad + scroll_y).max(0) / lh) as usize;
+                        let mut off = 0usize;
+                        let mut chosen = value.len();
+                        for (cur_line, line) in value.split('\n').enumerate() {
+                            if cur_line == target_line {
+                                let col_b = text.engine.index_at(st, line, x - l.rect.x - pad);
+                                chosen = (off + col_b).min(value.len());
+                                break;
+                            }
+                            off += line.len() + 1;
+                        }
+                        set(&mut self.carets, l.key, chosen);
                     }
                     _ => {}
                 }
@@ -730,10 +835,29 @@ impl<M: Clone> Ui<M> {
                     && let Some(n) = nodes.get(t)
                 {
                     match &n.kind {
-                        Kind::Button { on_press: Some(m), .. } => out.push(m.clone()),
-                        Kind::Checkbox { on_toggle: Some(m), .. } | Kind::Toggle { on_toggle: Some(m), .. } => out.push(m.clone()),
-                        Kind::Item { on_select: Some(m), .. } => out.push(m.clone()),
-                        _ => {}
+                        Kind::Button { on_press: Some(m), .. } => {
+                            self.last_click = None;
+                            out.push(m.clone());
+                        }
+                        Kind::Checkbox { on_toggle: Some(m), .. } | Kind::Toggle { on_toggle: Some(m), .. } => {
+                            self.last_click = None;
+                            out.push(m.clone());
+                        }
+                        Kind::Item { on_select, on_activate, .. } => {
+                            let is_double = self
+                                .last_click
+                                .is_some_and(|(k, t)| k == pk && self.now.saturating_sub(t) <= DOUBLE_CLICK_NS);
+                            if is_double && let Some(m) = on_activate {
+                                self.last_click = None;
+                                out.push(m.clone());
+                            } else {
+                                self.last_click = Some((pk, self.now));
+                                if let Some(m) = on_select {
+                                    out.push(m.clone());
+                                }
+                            }
+                        }
+                        _ => self.last_click = None,
                     }
                 }
             }
@@ -867,7 +991,7 @@ impl<M: Clone> Ui<M> {
                 }
                 c.fill_circle(clip, r.x + pad + pos, mid, kr, t.text_primary);
             }
-            Kind::Input { value, placeholder, .. } => {
+            Kind::Input { value, placeholder, secret, .. } => {
                 let border = if focused { t.accent_ring } else { mix(t.border_inactive, t.border_active, hov) };
                 c.fill_rounded_rect(clip, r, t.radius, t.input_bg, border);
                 if focused && t.focus_ring > 1 {
@@ -877,11 +1001,19 @@ impl<M: Clone> Ui<M> {
                 let inner = Rect::new(r.x + pad, r.y, r.w.saturating_sub(pad as u32 * 2), r.h).intersect(clip);
                 let st = text.style(TextStyle::Body);
                 let caret = find(&self.carets, l.key).unwrap_or(value.len()).min(value.len());
+                let masked;
+                let (shown, shown_caret) = if *secret {
+                    masked = "*".repeat(value.chars().count());
+                    let cc = value[..caret].chars().count();
+                    (masked.as_str(), cc)
+                } else {
+                    (value.as_str(), caret)
+                };
                 let mut carets = Vec::new();
-                text.engine.caret_positions(st, value, &mut carets);
-                let cx = (carets.iter().find(|e| e.0 >= caret).map_or(0, |e| e.1) / 64) as i32;
+                text.engine.caret_positions(st, shown, &mut carets);
+                let cx = (carets.iter().find(|e| e.0 >= shown_caret).map_or(0, |e| e.1) / 64) as i32;
                 let shift = (cx - inner.w as i32 + 4).max(0);
-                if value.is_empty() {
+                if shown.is_empty() {
                     text.draw_str(c, inner, r.x + pad, mid, placeholder, TextStyle::Body, t.text_muted, inner.w);
                 } else {
                     let m = text.metrics(TextStyle::Body);
@@ -891,7 +1023,7 @@ impl<M: Clone> Ui<M> {
                         r.x + pad - shift,
                         mid + (m.ascent - m.descent) / 2,
                         st,
-                        value,
+                        shown,
                         t.text_primary,
                         i32::MAX,
                     );
@@ -899,6 +1031,42 @@ impl<M: Clone> Ui<M> {
                 if focused {
                     let lh = text.line_height(TextStyle::Body) as i32;
                     c.fill_rect(inner, Rect::new(r.x + pad + cx - shift, mid - lh / 2 + 1, 2, (lh - 2).max(2) as u32), t.accent_ring);
+                }
+            }
+            Kind::TextArea { value, placeholder, .. } => {
+                let border = if focused { t.accent_ring } else { mix(t.border_inactive, t.border_active, hov) };
+                c.fill_rounded_rect(clip, r, t.radius, t.input_bg, border);
+                if focused && t.focus_ring > 1 {
+                    c.fill_rounded_rect(clip, r.inset(1), t.radius.saturating_sub(1), 0, border);
+                }
+                let pad = s(8) as i32;
+                let inner = Rect::new(r.x + pad, r.y + pad, r.w.saturating_sub(pad as u32 * 2), r.h.saturating_sub(pad as u32 * 2)).intersect(clip);
+                let st = text.style(TextStyle::Mono);
+                let lh = text.line_height(TextStyle::Mono).max(12) as i32;
+                let asc = text.metrics(TextStyle::Mono).ascent;
+                let caret = find(&self.carets, l.key).unwrap_or(value.len()).min(value.len());
+                let caret_line = value[..caret].bytes().filter(|&b| b == b'\n').count() as i32;
+                let vis_lines = (inner.h as i32 / lh).max(1);
+                let first_line = (caret_line - vis_lines + 1).max(0);
+                if value.is_empty() && !placeholder.is_empty() {
+                    text.draw_at(c, inner, r.x + pad, r.y + pad + asc, placeholder, st, t.text_muted, inner.w);
+                } else {
+                    let mut off = 0usize;
+                    for (idx, line) in value.split('\n').enumerate() {
+                        let li = idx as i32;
+                        if li >= first_line && li < first_line + vis_lines + 1 {
+                            let y_top = r.y + pad + (li - first_line) * lh;
+                            text.draw_at(c, inner, r.x + pad, y_top + asc, line, st, t.text_primary, inner.w);
+                            if focused && caret >= off && caret <= off + line.len() {
+                                let local_c = caret - off;
+                                let mut carets = Vec::new();
+                                text.engine.caret_positions(st, line, &mut carets);
+                                let cx = (carets.iter().find(|e| e.0 >= local_c).map_or(0, |e| e.1) / 64) as i32;
+                                c.fill_rect(inner, Rect::new(r.x + pad + cx, y_top + 1, 2, (lh - 2).max(2) as u32), t.accent_ring);
+                            }
+                        }
+                        off += line.len() + 1;
+                    }
                 }
             }
             Kind::Item { label, detail, selected, .. } => {
@@ -924,7 +1092,7 @@ impl<M: Clone> Ui<M> {
             }
             _ => {}
         }
-        if ring && !matches!(n.kind, Kind::Input { .. } | Kind::Slider { .. }) {
+        if ring && !matches!(n.kind, Kind::Input { .. } | Kind::TextArea { .. } | Kind::Slider { .. }) {
             let w = t.focus_ring.max(1);
             let out = w as i32 + 1;
             let o = Rect::new(r.x - out, r.y - out, r.w + 2 * out as u32, r.h + 2 * out as u32);

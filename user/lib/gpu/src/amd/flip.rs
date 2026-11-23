@@ -814,10 +814,11 @@ pub fn encode_dsc_1_2_pps(width: u32, height: u32, bpc: u8, target_bpp: u8, slic
     pps
 }
 
-/// Snapshot of OTG/DCCG/MSA/DSC registers captured before a guarded mode switch for instant revert.
+/// Snapshot of OTG/DCCG/MSA/HUBP/DPP registers captured before a guarded mode switch for instant revert.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SavedModeRegs {
     pub pipe: u8,
+    pub enc: u8,
     pub h_total: u32,
     pub h_blank: u32,
     pub h_sync: u32,
@@ -837,13 +838,48 @@ pub struct SavedModeRegs {
     pub msa_color: u32,
     pub msa_misc: u32,
     pub dp_pix_fmt: u32,
+    pub dp_vid_timing: u32,
+    pub dp_vid_m: u32,
+    pub dp_vid_n: u32,
+    pub dp_steer_fifo: u32,
+    pub vp_start: u32,
+    pub vp_dim: u32,
+    pub surf_pitch: u32,
+    pub surf_addr_lo: u32,
+    pub surf_addr_hi: u32,
+    pub dpp_base_idx: u8,
+    pub dpp_size_regs: [(u32, u32); 4],
+    pub dpp_size_count: usize,
+    pub restore_surface: bool,
 }
 
 impl SavedModeRegs {
     pub fn capture<I: RegIo>(io: &I, dcn: &DcnAccess, pipe: u8) -> Self {
+        Self::capture_ex(io, dcn, pipe, pipe, &[], false)
+    }
+
+    pub fn capture_ex<I: RegIo>(
+        io: &I,
+        dcn: &DcnAccess,
+        pipe: u8,
+        enc: u8,
+        dpp_size_offs: &[u32],
+        restore_surface: bool,
+    ) -> Self {
         let r = dcn.regs;
+        let dpp_base_idx = r.cnvc_pixel_format(pipe).base_idx;
+        let mut dpp_size_regs = [(0u32, 0u32); 4];
+        let mut dpp_size_count = 0usize;
+        for &off in dpp_size_offs.iter().take(4) {
+            let reg = super::dcn::RegAddr::new(dpp_base_idx, off);
+            if let Some(val) = dcn.r_dcn(io, reg) {
+                dpp_size_regs[dpp_size_count] = (off, val);
+                dpp_size_count += 1;
+            }
+        }
         Self {
             pipe,
+            enc,
             h_total: dcn.r_dcn(io, r.otg_h_total(pipe)).unwrap_or(0),
             h_blank: dcn.r_dcn(io, r.otg_h_blank(pipe)).unwrap_or(0),
             h_sync: dcn.r_dcn(io, r.otg_h_sync_a(pipe)).unwrap_or(0),
@@ -856,21 +892,66 @@ impl SavedModeRegs {
             dto_phase: dcn.r_dcn(io, r.dccg_dp_dto_phase(pipe)).unwrap_or(0),
             dto_modulo: dcn.r_dcn(io, r.dccg_dp_dto_modulo(pipe)).unwrap_or(0),
             pixel_rate_div: r.dccg_otg_pixel_rate_div().and_then(|reg| dcn.r_dcn(io, reg)),
-            msa1: dcn.r_dcn(io, r.dp_msa_timing_param1(pipe)).unwrap_or(0),
-            msa2: dcn.r_dcn(io, r.dp_msa_timing_param2(pipe)).unwrap_or(0),
-            msa3: dcn.r_dcn(io, r.dp_msa_timing_param3(pipe)).unwrap_or(0),
-            msa4: dcn.r_dcn(io, r.dp_msa_timing_param4(pipe)).unwrap_or(0),
-            msa_color: dcn.r_dcn(io, r.dp_msa_colorimetry(pipe)).unwrap_or(0),
-            msa_misc: dcn.r_dcn(io, r.dp_msa_misc(pipe)).unwrap_or(0),
-            dp_pix_fmt: dcn.r_dcn(io, r.dp_pixel_format(pipe)).unwrap_or(0),
+            msa1: dcn.r_dcn(io, r.dp_msa_timing_param1(enc)).unwrap_or(0),
+            msa2: dcn.r_dcn(io, r.dp_msa_timing_param2(enc)).unwrap_or(0),
+            msa3: dcn.r_dcn(io, r.dp_msa_timing_param3(enc)).unwrap_or(0),
+            msa4: dcn.r_dcn(io, r.dp_msa_timing_param4(enc)).unwrap_or(0),
+            msa_color: dcn.r_dcn(io, r.dp_msa_colorimetry(enc)).unwrap_or(0),
+            msa_misc: dcn.r_dcn(io, r.dp_msa_misc(enc)).unwrap_or(0),
+            dp_pix_fmt: dcn.r_dcn(io, r.dp_pixel_format(enc)).unwrap_or(0),
+            dp_vid_timing: dcn.r_dcn(io, r.dp_vid_timing(enc)).unwrap_or(0),
+            dp_vid_m: dcn.r_dcn(io, r.dp_vid_m(enc)).unwrap_or(0),
+            dp_vid_n: dcn.r_dcn(io, r.dp_vid_n(enc)).unwrap_or(0),
+            dp_steer_fifo: dcn.r_dcn(io, r.dp_steer_fifo(enc)).unwrap_or(0),
+            vp_start: dcn.r_dcn(io, r.hubp_viewport_start(pipe)).unwrap_or(0),
+            vp_dim: dcn.r_dcn(io, r.hubp_viewport_dim(pipe)).unwrap_or(0),
+            surf_pitch: dcn.r_dcn(io, r.hubp_surface_pitch(pipe)).unwrap_or(0),
+            surf_addr_lo: dcn.r_dcn(io, r.hubp_earliest_inuse(pipe))
+                .or_else(|| dcn.r_dcn(io, r.hubp_primary_addr(pipe)))
+                .unwrap_or(0),
+            surf_addr_hi: dcn.r_dcn(io, r.hubp_earliest_inuse_hi(pipe))
+                .or_else(|| dcn.r_dcn(io, r.hubp_primary_addr_hi(pipe)))
+                .unwrap_or(0),
+            dpp_base_idx,
+            dpp_size_regs,
+            dpp_size_count,
+            restore_surface,
         }
     }
 
-    /// Restore all captured OTG/DCCG/MSA registers atomically under `OTG_MASTER_UPDATE_LOCK`.
+    /// Override the saved HUBP primary surface address (e.g. locking a boot-mode snapshot to the
+    /// exact untouched UEFI GOP MC address so `release_display()` always returns to the text console).
+    pub fn with_surface_addr(mut self, mc_addr: u64) -> Self {
+        let (lo, hi) = encode_surface_addr(mc_addr);
+        self.surf_addr_lo = lo;
+        self.surf_addr_hi = hi;
+        self.restore_surface = true;
+        self
+    }
+
+    /// Decoded HUBP primary surface MC address stored in this snapshot.
+    pub const fn surface_mc_addr(&self) -> u64 {
+        super::dcn::decode_surface_addr(self.surf_addr_lo, self.surf_addr_hi)
+    }
+
+    /// Restore all captured OTG/DCCG/MSA/HUBP/DPP registers atomically under `OTG_MASTER_UPDATE_LOCK`.
     pub fn restore<I: RegIo>(&self, io: &mut I, dcn: &DcnAccess) {
         let r = dcn.regs;
         let p = self.pipe;
+        let e = self.enc;
         dcn.w_dcn(io, r.otg_master_update_lock(p), 1);
+        if self.restore_surface {
+            dcn.w_dcn(io, r.hubp_viewport_start(p), self.vp_start);
+            dcn.w_dcn(io, r.hubp_viewport_dim(p), self.vp_dim);
+            dcn.w_dcn(io, r.hubp_surface_pitch(p), self.surf_pitch);
+            for &(off, val) in &self.dpp_size_regs[..self.dpp_size_count] {
+                dcn.w_dcn(io, super::dcn::RegAddr::new(self.dpp_base_idx, off), val);
+            }
+            let flip_ctl = dcn.r_dcn(io, r.hubp_flip_control(p)).unwrap_or(0);
+            dcn.w_dcn(io, r.hubp_flip_control(p), flip_ctl & !FLIP_TYPE_IMMEDIATE);
+            dcn.w_dcn(io, r.hubp_primary_addr_hi(p), self.surf_addr_hi);
+            dcn.w_dcn(io, r.hubp_primary_addr(p), self.surf_addr_lo);
+        }
         dcn.w_dcn(io, r.otg_h_total(p), self.h_total);
         dcn.w_dcn(io, r.otg_h_blank(p), self.h_blank);
         dcn.w_dcn(io, r.otg_h_sync_a(p), self.h_sync);
@@ -885,15 +966,34 @@ impl SavedModeRegs {
         dcn.w_dcn(io, r.dccg_dp_dto_phase(p), self.dto_phase);
         dcn.w_dcn(io, r.dccg_dp_dto_modulo(p), self.dto_modulo);
         dcn.w_dcn(io, r.dccg_otg_pixel_rate_cntl(p), self.dto_cntl);
-        dcn.w_dcn(io, r.dp_msa_timing_param1(p), self.msa1);
-        dcn.w_dcn(io, r.dp_msa_timing_param2(p), self.msa2);
-        dcn.w_dcn(io, r.dp_msa_timing_param3(p), self.msa3);
-        dcn.w_dcn(io, r.dp_msa_timing_param4(p), self.msa4);
-        dcn.w_dcn(io, r.dp_msa_colorimetry(p), self.msa_color);
-        dcn.w_dcn(io, r.dp_msa_misc(p), self.msa_misc);
-        dcn.w_dcn(io, r.dp_pixel_format(p), self.dp_pix_fmt);
+        dcn.w_dcn(io, r.dp_msa_timing_param1(e), self.msa1);
+        dcn.w_dcn(io, r.dp_msa_timing_param2(e), self.msa2);
+        dcn.w_dcn(io, r.dp_msa_timing_param3(e), self.msa3);
+        dcn.w_dcn(io, r.dp_msa_timing_param4(e), self.msa4);
+        dcn.w_dcn(io, r.dp_msa_colorimetry(e), self.msa_color);
+        dcn.w_dcn(io, r.dp_msa_misc(e), self.msa_misc);
+        dcn.w_dcn(io, r.dp_pixel_format(e), self.dp_pix_fmt);
+        dcn.w_dcn(io, r.dp_vid_timing(e), self.dp_vid_timing);
+        dcn.w_dcn(io, r.dp_vid_n(e), self.dp_vid_n);
+        dcn.w_dcn(io, r.dp_vid_m(e), self.dp_vid_m);
+        dcn.w_dcn(io, r.dp_steer_fifo(e), self.dp_steer_fifo);
         dcn.w_dcn(io, r.otg_master_update_lock(p), 0);
     }
+}
+
+/// Pulse `DP_STEER_FIFO_RESET` (bit 0) on DisplayPort stream encoder `enc` after changing pixel
+/// clock or OTG timing so the pixel-to-symbol steering FIFO realigns without overflowing.
+pub fn reset_dp_steer_fifo<I: RegIo, D: FnMut(u32)>(
+    io: &mut I,
+    dcn: &DcnAccess,
+    enc: u8,
+    mut delay_us: D,
+) {
+    let reg = dcn.regs.dp_steer_fifo(enc);
+    let cur = dcn.r_dcn(io, reg).unwrap_or(0);
+    dcn.w_dcn(io, reg, cur | 1);
+    delay_us(100);
+    dcn.w_dcn(io, reg, cur & !1);
 }
 
 /// Derive the active DCCG DP DTO source clock (in kHz, e.g. DTBCLK ~600-1200 MHz on DCN 4.0.1)
@@ -953,11 +1053,53 @@ pub fn program_mode_regs<I: RegIo>(
     dsc_bpp: u8,
     bpc: u8,
 ) -> SavedModeRegs {
-    let saved = SavedModeRegs::capture(io, dcn, pipe);
+    program_mode_regs_ex(io, dcn, pipe, pipe, timing, refclk_khz, use_dsc, dsc_bpp, bpc, None, None, &[])
+}
+
+/// Extended mode-programming helper supporting explicit DIG encoder routing and optional
+/// HUBP/DPP surface geometry reprogramming when changing resolution.
+#[allow(clippy::too_many_arguments)]
+pub fn program_mode_regs_ex<I: RegIo>(
+    io: &mut I,
+    dcn: &DcnAccess,
+    pipe: u8,
+    enc: u8,
+    timing: &DetailedTiming,
+    refclk_khz: u32,
+    use_dsc: bool,
+    dsc_bpp: u8,
+    bpc: u8,
+    new_pitch_pixels: Option<u32>,
+    new_mc_addr: Option<u64>,
+    dpp_size_offs: &[u32],
+) -> SavedModeRegs {
+    let update_surf = new_pitch_pixels.is_some() || new_mc_addr.is_some();
+    let saved = SavedModeRegs::capture_ex(io, dcn, pipe, enc, dpp_size_offs, update_surf);
     let r = dcn.regs;
     let otg = OtgTiming::from_detailed(timing);
 
     dcn.w_dcn(io, r.otg_master_update_lock(pipe), 1);
+
+    // 0. Optional HUBP + DPP geometry reprogramming for resolution changes.
+    if update_surf {
+        let dim = (otg.h_active & 0x3FFF) | ((otg.v_active & 0x3FFF) << 16);
+        dcn.w_dcn(io, r.hubp_viewport_start(pipe), 0);
+        dcn.w_dcn(io, r.hubp_viewport_dim(pipe), dim);
+        if let Some(pp) = new_pitch_pixels {
+            dcn.w_dcn(io, r.hubp_surface_pitch(pipe), pp.saturating_sub(1) & 0x3FFF);
+        }
+        let dpp_base = r.cnvc_pixel_format(pipe).base_idx;
+        for &off in dpp_size_offs.iter().take(4) {
+            dcn.w_dcn(io, super::dcn::RegAddr::new(dpp_base, off), dim);
+        }
+        if let Some(mc) = new_mc_addr {
+            let (lo, hi) = encode_surface_addr(mc);
+            let flip_ctl = dcn.r_dcn(io, r.hubp_flip_control(pipe)).unwrap_or(0);
+            dcn.w_dcn(io, r.hubp_flip_control(pipe), flip_ctl & !FLIP_TYPE_IMMEDIATE);
+            dcn.w_dcn(io, r.hubp_primary_addr_hi(pipe), hi);
+            dcn.w_dcn(io, r.hubp_primary_addr(pipe), lo);
+        }
+    }
 
     // 1. OTG horizontal & vertical timing.
     dcn.w_dcn(io, r.otg_h_total(pipe), otg.h_total.saturating_sub(1) & 0x7FFF);
@@ -971,6 +1113,8 @@ pub fn program_mode_regs<I: RegIo>(
     dcn.w_dcn(io, r.otg_v_sync_a_cntl(pipe), u32::from(!otg.v_sync_pos));
 
     // 2. DCCG DP pixel-rate DTO (`dcn401_dccg.c`).
+    // Preserve firmware's live `OTG_PIXEL_RATE_DIV` K1/K2 bits when the target pixel clock fits
+    // fractionally (`pclk < refclk`), avoiding clobbering DCN 4.0.1 divider fields.
     let refclk = refclk_khz.max(100_000);
     let (dto_int, dto_phase) = if timing.pixel_clock_khz >= refclk.saturating_mul(2) {
         (1u32, refclk.saturating_sub(1))
@@ -979,7 +1123,9 @@ pub fn program_mode_regs<I: RegIo>(
     };
     dcn.w_dcn(io, r.dccg_dp_dto_phase(pipe), dto_phase);
     dcn.w_dcn(io, r.dccg_dp_dto_modulo(pipe), refclk);
-    if let Some(div_reg) = r.dccg_otg_pixel_rate_div() {
+    if dto_int != 0
+        && let Some(div_reg) = r.dccg_otg_pixel_rate_div()
+    {
         let mut div = dcn.r_dcn(io, div_reg).unwrap_or(0);
         // DPDTO{0..3}_INT bits sit at shifts 1, 6, 11, 16 (`dcn_4_1_0_sh_mask.h`).
         let shift = 1 + u32::from(pipe.min(3)) * 5;
@@ -989,25 +1135,30 @@ pub fn program_mode_regs<I: RegIo>(
     let cntl = dcn.r_dcn(io, r.dccg_otg_pixel_rate_cntl(pipe)).unwrap_or(0);
     dcn.w_dcn(io, r.dccg_otg_pixel_rate_cntl(pipe), cntl | (1 << 4)); // DP_DTO_ENABLE
 
-    // 3. DP Main Stream Attributes (MSA) & pixel format (`dcn401_dio_stream_encoder.c`).
+    // 3. DP Main Stream Attributes (MSA), automatic M/N tracking, & pixel format on DIG `enc`.
     let h_start = otg.h_blank_end;
     let v_start = otg.v_blank_end;
-    dcn.w_dcn(io, r.dp_msa_timing_param1(pipe), ((otg.h_total & 0xFFFF) << 16) | (otg.v_total & 0xFFFF));
-    dcn.w_dcn(io, r.dp_msa_timing_param2(pipe), ((h_start & 0xFFFF) << 16) | (v_start & 0xFFFF));
+    dcn.w_dcn(io, r.dp_msa_timing_param1(enc), ((otg.h_total & 0xFFFF) << 16) | (otg.v_total & 0xFFFF));
+    dcn.w_dcn(io, r.dp_msa_timing_param2(enc), ((h_start & 0xFFFF) << 16) | (v_start & 0xFFFF));
     let msa3 = (otg.v_sync_width & 0x7FFF)
         | (u32::from(!otg.v_sync_pos) << 15)
         | ((otg.h_sync_width & 0x7FFF) << 16)
         | (u32::from(!otg.h_sync_pos) << 31);
-    dcn.w_dcn(io, r.dp_msa_timing_param3(pipe), msa3);
-    dcn.w_dcn(io, r.dp_msa_timing_param4(pipe), ((otg.h_active & 0xFFFF) << 16) | (otg.v_active & 0xFFFF));
+    dcn.w_dcn(io, r.dp_msa_timing_param3(enc), msa3);
+    dcn.w_dcn(io, r.dp_msa_timing_param4(enc), ((otg.h_active & 0xFFFF) << 16) | (otg.v_active & 0xFFFF));
 
     let depth_code = if bpc >= 10 { 2u32 } else { 1u32 }; // 1 = 8bpc, 2 = 10bpc
     let enc_type = u32::from(use_dsc); // 0 = uncompressed, 1 = DSC compressed
-    dcn.w_dcn(io, r.dp_pixel_format(pipe), enc_type | (depth_code << 8));
+    dcn.w_dcn(io, r.dp_pixel_format(enc), enc_type | (depth_code << 8));
 
     // MSA_MISC0: bits[7:5] = bpc (1=8bpc, 2=10bpc), bit 0 = synchronous clock.
     let misc0 = ((if bpc >= 10 { 2u32 } else { 1u32 }) << 5) | 1;
-    dcn.w_dcn(io, r.dp_msa_colorimetry(pipe), misc0 << 24);
+    dcn.w_dcn(io, r.dp_msa_colorimetry(enc), misc0 << 24);
+
+    // Enable hardware M/N auto-generation (`DP_VID_M_N_GEN_EN = 1`) so DisplayPort clock
+    // regeneration tracks the new pixel clock automatically across 60 Hz <-> 240 Hz transitions.
+    let vid_timing = dcn.r_dcn(io, r.dp_vid_timing(enc)).unwrap_or(0);
+    dcn.w_dcn(io, r.dp_vid_timing(enc), vid_timing | 1);
 
     // 4. Optional DSC 1.2 PPS programming (`dcn401_dsc.c`).
     if use_dsc {
@@ -1062,28 +1213,30 @@ pub fn set_vrr<I: RegIo>(
     let mut dbuf = dcn.r_dcn(io, r.otg_double_buffer_control(pipe)).unwrap_or(0);
     dbuf = (dbuf & !(0x3 << 24)) | (2 << 24);
     dcn.w_dcn(io, r.otg_double_buffer_control(pipe), dbuf);
-    // OTG_V_TOTAL_MIN_SEL=1 (bit 0), OTG_V_TOTAL_MAX_SEL=1 (bit 1), SET_V_TOTAL_MIN_MASK=(1<<1) at bit 16.
-    dcn.w_dcn(io, r.otg_v_total_control(pipe), 0x3 | ((1 << 1) << 16));
+    // OTG_V_TOTAL_MIN_SEL=1 (bit 0), OTG_V_TOTAL_MAX_SEL=1 (bit 1), FORCE_LOCK_ON_EVENT=0 (bit 2),
+    // OTG_SET_V_TOTAL_MIN_MASK_EN=1 (bit 3), OTG_SET_V_TOTAL_MIN_MASK=(1<<1) at bits[19:16] (HUBP flip).
+    dcn.w_dcn(io, r.otg_v_total_control(pipe), 0xB | ((1 << 1) << 16));
     true
 }
 
 /// Enable or disable 10-bit HDR10 scanout format (`ARGB2101010` + 10bpc DP MSA + VSC SDP bit).
 pub fn set_hdr<I: RegIo>(io: &mut I, dcn: &DcnAccess, pipe: u8, enable_hdr10: bool) {
     let r = dcn.regs;
+    let enc = super::dcn::find_pipe_dig_encoder(io, dcn, pipe);
     let surf_cfg = dcn.r_dcn(io, r.hubp_surface_config(pipe)).unwrap_or(0);
     let fmt = if enable_hdr10 { DCN_FMT_ARGB2101010 } else { DCN_FMT_ARGB8888 };
     dcn.w_dcn(io, r.hubp_surface_config(pipe), (surf_cfg & !0x7F) | fmt);
 
-    let dp_fmt = dcn.r_dcn(io, r.dp_pixel_format(pipe)).unwrap_or(0);
+    let dp_fmt = dcn.r_dcn(io, r.dp_pixel_format(enc)).unwrap_or(0);
     let depth = if enable_hdr10 { 2u32 } else { 1u32 };
-    dcn.w_dcn(io, r.dp_pixel_format(pipe), (dp_fmt & !(0x7 << 8)) | (depth << 8));
+    dcn.w_dcn(io, r.dp_pixel_format(enc), (dp_fmt & !(0x7 << 8)) | (depth << 8));
 
     // MSA_MISC1 bit 6 = use VSC SDP for BT.2020/HDR colorimetry (`dcn401_dio_stream_encoder.c`).
-    let mut misc1 = dcn.r_dcn(io, r.dp_msa_misc(pipe)).unwrap_or(0);
+    let mut misc1 = dcn.r_dcn(io, r.dp_msa_misc(enc)).unwrap_or(0);
     if enable_hdr10 {
         misc1 |= 1 << 6;
     } else {
         misc1 &= !(1 << 6);
     }
-    dcn.w_dcn(io, r.dp_msa_misc(pipe), misc1);
+    dcn.w_dcn(io, r.dp_msa_misc(enc), misc1);
 }

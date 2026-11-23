@@ -228,11 +228,12 @@ impl Term {
         (out, (cur % cols, cur / cols))
     }
 
-    /// The compositor gave the screen back (or went away): draw every cell again.
+    /// The compositor gave the screen back (or display mode changed): draw every cell again.
     fn reclaim(&mut self) {
-        if self.released {
-            self.released = false;
-            self.scr.invalidate();
+        let was_released = self.released;
+        self.released = false;
+        self.scr.invalidate();
+        if was_released {
             println!("terminal: display reclaimed");
         }
     }
@@ -312,6 +313,7 @@ impl Term {
                 self.scr.put(start + i, 0, cell(ch, attr));
             }
         }
+        self.scr.flush();
     }
 
     fn render_view(&mut self) {
@@ -755,6 +757,7 @@ fn main(s: *const Startup) -> i32 {
                             }
                             term::DISPLAY_RECLAIM => {
                                 t.reclaim();
+                                t.render();
                                 true
                             }
                             _ => false,

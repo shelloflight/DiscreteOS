@@ -19,6 +19,7 @@ const ARB_SW_DONE_USING: u32 = 1 << 17;
 const ARB_STATUS_SHIFT: u32 = 2;
 const ARB_STATUS_MASK: u32 = 0x3;
 const ARB_STATUS_SW_OWNED: u32 = 1;
+const ARB_STATUS_DMCU_OWNED: u32 = 2;
 
 // AUX_CONTROL bits.
 const AUX_EN: u32 = 1 << 0;
@@ -49,17 +50,20 @@ const AUX_SW_ERROR_MASK: u32 = AUX_SW_RX_OVERFLOW
 const AUX_SW_REPLY_COUNT_SHIFT: u32 = 24;
 const AUX_SW_REPLY_COUNT_MASK: u32 = 0x1F;
 
-// AUX_SW_DATA bits.
+// AUX_SW_DATA bits (`dce_aux.c`: explicit index requires AUTOINCREMENT_DISABLE=1).
 const AUX_SW_DATA_READ: u32 = 1 << 0;
 const AUX_SW_DATA_SHIFT: u32 = 8;
+const AUX_SW_AUTOINCREMENT_DISABLE: u32 = 1 << 31;
 
 // Standard DPCD addresses.
 pub const DPCD_REV: u32 = 0x0000;
+pub const DPCD_DOWN_STREAM_PORT_COUNT: u32 = 0x0007;
 pub const DPCD_DSC_SUPPORT: u32 = 0x0060;
 pub const DPCD_LINK_BW_SET: u32 = 0x0100;
 pub const DPCD_LANE_COUNT_SET: u32 = 0x0101;
 pub const DPCD_TRAINING_PATTERN_SET: u32 = 0x0102;
 pub const DPCD_TRAINING_LANE0_SET: u32 = 0x0103;
+pub const DPCD_DOWNSPREAD_CTRL: u32 = 0x0107;
 pub const DPCD_MAIN_LINK_CODING_SET: u32 = 0x0108;
 pub const DPCD_DSC_ENABLE: u32 = 0x0160;
 pub const DPCD_LANE0_1_STATUS: u32 = 0x0202;
@@ -67,13 +71,18 @@ pub const DPCD_ADJUST_REQUEST_LANE0_1: u32 = 0x0206;
 pub const DPCD_EXT_CAP_BASE: u32 = 0x2200;
 pub const DPCD_UHBR_CAPS: u32 = 0x2215;
 
+/// `DPCD_DOWN_STREAM_PORT_COUNT` (0x0007) bit 6: sink supports ignoring MSA timing params (Adaptive-Sync/VRR).
+pub const DPCD_MSA_TIMING_PAR_IGNORED: u8 = 1 << 6;
+/// `DPCD_DOWNSPREAD_CTRL` (0x0107) bit 7: enable Adaptive-Sync / VRR on the DisplayPort sink.
+pub const DPCD_IGNORE_MSA_TIMING_PARAM: u8 = 1 << 7;
+
 // I2C addresses for E-DDC EDID.
 const I2C_EDDC_SEGMENT: u32 = 0x30;
 const I2C_EDID_ADDR: u32 = 0x50;
 
 const MAX_DEFER_RETRIES: usize = 7;
 const MAX_TIMEOUT_RETRIES: usize = 3;
-const POLL_LIMIT: usize = 20_000;
+const POLL_LIMIT: usize = 4_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuxError {
@@ -111,26 +120,31 @@ fn aux_xfer<I: RegIo, D: FnMut(u32)>(
     let status_reg = r.aux_sw_status(aux);
     let data_reg = r.aux_sw_data(aux);
 
-    // Acquire SW AUX arbitration.
+    // Acquire SW AUX arbitration (never block if arbiter stays idle/0 when DMUB is not running;
+    // only fail with `ArbBusy` when DMCU explicitly holds ownership).
     let arb = dcn.r_dcn(io, arb_reg).ok_or(AuxError::Protocol)?;
     if arb == 0xFFFF_FFFF {
         return Err(AuxError::Disconnected);
     }
     dcn.w_dcn(io, arb_reg, arb | ARB_SW_USE_REQ);
     let mut owned = false;
-    for _ in 0..1024 {
+    for iter in 0..512 {
         let cur = dcn.r_dcn(io, arb_reg).unwrap_or(0);
-        if ((cur >> ARB_STATUS_SHIFT) & ARB_STATUS_MASK) == ARB_STATUS_SW_OWNED {
+        let st = (cur >> ARB_STATUS_SHIFT) & ARB_STATUS_MASK;
+        if st == ARB_STATUS_SW_OWNED || (st != ARB_STATUS_DMCU_OWNED && iter >= 64) {
             owned = true;
             break;
         }
+        if (iter & 15) == 15 {
+            delay_us(5);
+        }
     }
     if !owned {
-        dcn.w_dcn(io, arb_reg, arb | ARB_SW_DONE_USING);
+        dcn.w_dcn(io, arb_reg, ARB_SW_DONE_USING);
         return Err(AuxError::ArbBusy);
     }
 
-    // Ensure AUX channel is enabled.
+    // Ensure AUX channel is enabled (preserve HPD selection and timing configuration).
     let ctrl = dcn.r_dcn(io, ctrl_reg).unwrap_or(0);
     if (ctrl & AUX_EN) == 0 {
         dcn.w_dcn(io, ctrl_reg, ctrl | AUX_EN);
@@ -160,23 +174,27 @@ fn aux_xfer<I: RegIo, D: FnMut(u32)>(
             }
         };
 
-        // Load FIFO via AUX_SW_DATA (explicit index in bits [20:16]).
+        // Load TX FIFO via AUX_SW_DATA with explicit index (`AUTOINCREMENT_DISABLE = 1` ensures
+        // hardware honors `AUX_SW_INDEX` regardless of any stale internal index from firmware).
         for (i, &b) in pkt[..wr_bytes].iter().enumerate() {
-            let word = (u32::from(b) << AUX_SW_DATA_SHIFT) | ((i as u32) << 16);
+            let word = AUX_SW_AUTOINCREMENT_DISABLE | (u32::from(b) << AUX_SW_DATA_SHIFT) | ((i as u32) << 16);
             dcn.w_dcn(io, data_reg, word);
         }
 
         // Kick transaction.
         dcn.w_dcn(io, sw_ctrl_reg, ((wr_bytes as u32) << AUX_SW_WR_BYTES_SHIFT) | AUX_SW_GO);
 
-        // Poll until AUX_SW_DONE.
+        // Poll until AUX_SW_DONE with short microsecond pacing so fast PCIe CPUs wait out 1 Mbps replies.
         let mut status = 0u32;
         let mut done = false;
-        for _ in 0..POLL_LIMIT {
+        for iter in 0..POLL_LIMIT {
             status = dcn.r_dcn(io, status_reg).unwrap_or(0);
             if (status & AUX_SW_DONE) != 0 {
                 done = true;
                 break;
+            }
+            if (iter & 15) == 15 {
+                delay_us(10);
             }
         }
         dcn.w_dcn(io, int_reg, AUX_SW_DONE_ACK);
@@ -206,8 +224,8 @@ fn aux_xfer<I: RegIo, D: FnMut(u32)>(
             break Err(AuxError::Protocol);
         }
 
-        // Switch FIFO to read mode at index 0.
-        dcn.w_dcn(io, data_reg, AUX_SW_DATA_READ);
+        // Read reply header at explicit FIFO index 0 (`AUTOINCREMENT_DISABLE = 1`).
+        dcn.w_dcn(io, data_reg, AUX_SW_AUTOINCREMENT_DISABLE | AUX_SW_DATA_READ);
         let hdr_raw = dcn.r_dcn(io, data_reg).unwrap_or(0);
         let reply_hdr = ((hdr_raw >> AUX_SW_DATA_SHIFT) & 0xFF) as u8;
         let reply_code = reply_hdr >> 4;
@@ -238,7 +256,8 @@ fn aux_xfer<I: RegIo, D: FnMut(u32)>(
         }
 
         let data_bytes = reply_count.saturating_sub(1).min(rx_data.len());
-        for slot in rx_data.iter_mut().take(data_bytes) {
+        for (k, slot) in rx_data.iter_mut().take(data_bytes).enumerate() {
+            dcn.w_dcn(io, data_reg, AUX_SW_AUTOINCREMENT_DISABLE | (((k + 1) as u32) << 16) | AUX_SW_DATA_READ);
             let w = dcn.r_dcn(io, data_reg).unwrap_or(0);
             *slot = ((w >> AUX_SW_DATA_SHIFT) & 0xFF) as u8;
         }
@@ -399,6 +418,8 @@ pub struct DpLinkState {
     pub dsc_supported: bool,
     pub dsc_enabled: bool,
     pub dsc_version: u8,
+    /// Sink advertises Adaptive-Sync / FreeSync (`DPCD 0x0007` bit 6 `MSA_TIMING_PAR_IGNORED`).
+    pub msa_timing_par_ignored: bool,
     pub dpcd_000: [u8; 16],
     pub dpcd_060: [u8; 4],
     pub dpcd_100: [u8; 2],
@@ -456,6 +477,7 @@ impl DpLinkState {
         let dsc_supported = (dpcd_060[0] & 0x01) != 0;
         let dsc_version = dpcd_060[1];
         let dsc_enabled = (dpcd_160 & 0x01) != 0;
+        let msa_timing_par_ignored = (dpcd_000[7] & DPCD_MSA_TIMING_PAR_IGNORED) != 0;
 
         Self {
             dpcd_rev,
@@ -470,6 +492,7 @@ impl DpLinkState {
             dsc_supported,
             dsc_enabled,
             dsc_version,
+            msa_timing_par_ignored,
             dpcd_000,
             dpcd_060,
             dpcd_100,
@@ -524,6 +547,39 @@ pub struct DpAuxProbe {
     pub edid_blocks_read: u8,
 }
 
+/// Read base EDID block + any CTA-861 / DisplayID extension blocks over I2C-over-AUX (`0x50`).
+fn read_edid_blocks<I: RegIo, D: FnMut(u32)>(
+    io: &mut I,
+    dcn: &DcnAccess,
+    aux: u8,
+    delay_us: &mut D,
+) -> (Option<EdidInfo>, u8) {
+    let mut edid_raw = [0u8; EDID_BLOCK_LEN * MAX_EDID_BLOCKS];
+    let mut blocks_read = 0u8;
+    let mut blk0 = [0u8; EDID_BLOCK_LEN];
+    if aux_read_edid_block(io, dcn, aux, 0, &mut blk0, &mut *delay_us).is_ok() {
+        edid_raw[..EDID_BLOCK_LEN].copy_from_slice(&blk0);
+        blocks_read = 1;
+        let ext_cnt = blk0[126].min((MAX_EDID_BLOCKS - 1) as u8);
+        for bidx in 1..=ext_cnt {
+            let mut ext = [0u8; EDID_BLOCK_LEN];
+            if aux_read_edid_block(io, dcn, aux, bidx, &mut ext, &mut *delay_us).is_ok() {
+                let off = usize::from(bidx) * EDID_BLOCK_LEN;
+                edid_raw[off..off + EDID_BLOCK_LEN].copy_from_slice(&ext);
+                blocks_read += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    let edid = if blocks_read > 0 {
+        edid::parse_edid(&edid_raw[..usize::from(blocks_read) * EDID_BLOCK_LEN]).ok()
+    } else {
+        None
+    };
+    (edid, blocks_read)
+}
+
 /// Perform a strictly **read-only** DP AUX probe on connector `aux` (DPCD caps + link state + multi-block EDID).
 /// Issues zero DPCD write transactions.
 pub fn probe_dp_aux_readonly<I: RegIo, D: FnMut(u32)>(
@@ -533,9 +589,15 @@ pub fn probe_dp_aux_readonly<I: RegIo, D: FnMut(u32)>(
     mut delay_us: D,
 ) -> Result<DpAuxProbe, AuxError> {
     let mut dpcd_000 = [0u8; 16];
-    let n0 = aux_native_read(io, dcn, aux, DPCD_REV, &mut dpcd_000, &mut delay_us)?;
-    if n0 < 3 || dpcd_000[0] == 0 {
-        return Err(AuxError::Disconnected);
+    let dpcd_res = aux_native_read(io, dcn, aux, DPCD_REV, &mut dpcd_000, &mut delay_us);
+    let dpcd_ok = dpcd_res.as_ref().is_ok_and(|&n| n >= 3 && dpcd_000[0] != 0);
+    if !dpcd_ok {
+        // Fallback: some passive DP++/branch adapters answer I2C-over-AUX EDID even without DPCD.
+        let (edid, blocks_read) = read_edid_blocks(io, dcn, aux, &mut delay_us);
+        if edid.is_some() {
+            return Ok(DpAuxProbe { aux_idx: aux, link: DpLinkState::default(), edid, edid_blocks_read: blocks_read });
+        }
+        return Err(dpcd_res.err().unwrap_or(AuxError::Disconnected));
     }
     let mut dpcd_060 = [0u8; 4];
     let _ = aux_native_read(io, dcn, aux, DPCD_DSC_SUPPORT, &mut dpcd_060, &mut delay_us);
@@ -562,47 +624,92 @@ pub fn probe_dp_aux_readonly<I: RegIo, D: FnMut(u32)>(
     }
 
     let link = DpLinkState::decode(dpcd_000, dpcd_060, dpcd_100, dpcd_202, dpcd_160[0], dpcd_108[0], uhbr_caps);
+    let (edid, blocks_read) = read_edid_blocks(io, dcn, aux, &mut delay_us);
 
-    // Read base EDID block + any CTA-861 / DisplayID extension blocks over I2C-over-AUX.
-    let mut edid_raw = [0u8; EDID_BLOCK_LEN * MAX_EDID_BLOCKS];
-    let mut blocks_read = 0u8;
-    let mut blk0 = [0u8; EDID_BLOCK_LEN];
-    if aux_read_edid_block(io, dcn, aux, 0, &mut blk0, &mut delay_us).is_ok() {
-        edid_raw[..EDID_BLOCK_LEN].copy_from_slice(&blk0);
-        blocks_read = 1;
-        let ext_cnt = blk0[126].min((MAX_EDID_BLOCKS - 1) as u8);
-        for bidx in 1..=ext_cnt {
-            let mut ext = [0u8; EDID_BLOCK_LEN];
-            if aux_read_edid_block(io, dcn, aux, bidx, &mut ext, &mut delay_us).is_ok() {
-                let off = usize::from(bidx) * EDID_BLOCK_LEN;
-                edid_raw[off..off + EDID_BLOCK_LEN].copy_from_slice(&ext);
-                blocks_read += 1;
-            } else {
-                break;
+    Ok(DpAuxProbe { aux_idx: aux, link, edid, edid_blocks_read: blocks_read })
+}
+
+/// Probe all AUX channels (0..max_aux) read-only, returning the first connected DisplayPort sink
+/// along with per-channel error diagnostics for any channels that failed.
+pub fn probe_first_connected_aux_diag<I: RegIo, D: FnMut(u32)>(
+    io: &mut I,
+    dcn: &DcnAccess,
+    mut delay_us: D,
+) -> (Option<DpAuxProbe>, [Option<AuxError>; 6]) {
+    let mut errs = [None; 6];
+    let mut first_no_edid: Option<DpAuxProbe> = None;
+    let limit = dcn.regs.max_aux().min(6);
+    for aux in 0..limit {
+        match probe_dp_aux_readonly(io, dcn, aux, &mut delay_us) {
+            Ok(p) => {
+                if p.edid.is_some() {
+                    return (Some(p), errs);
+                }
+                if first_no_edid.is_none() {
+                    first_no_edid = Some(p);
+                }
+            }
+            Err(e) => {
+                errs[usize::from(aux)] = Some(e);
             }
         }
     }
-    let edid = if blocks_read > 0 {
-        edid::parse_edid(&edid_raw[..usize::from(blocks_read) * EDID_BLOCK_LEN]).ok()
-    } else {
-        None
-    };
+    (first_no_edid, errs)
+}
 
-    Ok(DpAuxProbe { aux_idx: aux, link, edid, edid_blocks_read: blocks_read })
+/// Enable or disable DisplayPort Adaptive-Sync / FreeSync on the sink by toggling
+/// `IGNORE_MSA_TIMING_PARAM` (bit 7) in `DPCD_DOWNSPREAD_CTRL` (`0x0107`) over DP AUX.
+/// Preserves all other downspread bits. Returns `true` if the sink acknowledged the write.
+pub fn set_dp_adaptive_sync<I: RegIo, D: FnMut(u32)>(
+    io: &mut I,
+    dcn: &DcnAccess,
+    aux: u8,
+    enable: bool,
+    mut delay_us: D,
+) -> bool {
+    let mut cur = [0u8; 1];
+    let _ = aux_native_read(io, dcn, aux, DPCD_DOWNSPREAD_CTRL, &mut cur, &mut delay_us);
+    let next = if enable {
+        cur[0] | DPCD_IGNORE_MSA_TIMING_PARAM
+    } else {
+        cur[0] & !DPCD_IGNORE_MSA_TIMING_PARAM
+    };
+    aux_native_write(io, dcn, aux, DPCD_DOWNSPREAD_CTRL, &[next], &mut delay_us).is_ok()
+}
+
+/// Check whether the DisplayPort sink still has Clock Recovery + Channel Equalization locked
+/// on `active_lanes` by reading `DPCD_LANE0_1_STATUS` (`0x0202..=0x0205`).
+pub fn check_dp_link_locked<I: RegIo, D: FnMut(u32)>(
+    io: &mut I,
+    dcn: &DcnAccess,
+    aux: u8,
+    active_lanes: u8,
+    mut delay_us: D,
+) -> Option<bool> {
+    if active_lanes == 0 {
+        return None;
+    }
+    let mut st = [0u8; 4];
+    aux_native_read(io, dcn, aux, DPCD_LANE0_1_STATUS, &mut st, &mut delay_us).ok()?;
+    let lanes = usize::from(active_lanes).min(4);
+    let mut locked = lanes == 1 || (st[2] & 0x01) != 0;
+    for lane in 0..lanes {
+        let b = st[lane / 2];
+        let nib = if lane % 2 == 0 { b & 0x0F } else { (b >> 4) & 0x0F };
+        if (nib & 0x07) != 0x07 {
+            locked = false;
+        }
+    }
+    Some(locked)
 }
 
 /// Probe all AUX channels (0..max_aux) read-only and return the first connected DisplayPort sink.
 pub fn probe_first_connected_aux<I: RegIo, D: FnMut(u32)>(
     io: &mut I,
     dcn: &DcnAccess,
-    mut delay_us: D,
+    delay_us: D,
 ) -> Option<DpAuxProbe> {
-    for aux in 0..dcn.regs.max_aux() {
-        if let Ok(p) = probe_dp_aux_readonly(io, dcn, aux, &mut delay_us) {
-            return Some(p);
-        }
-    }
-    None
+    probe_first_connected_aux_diag(io, dcn, delay_us).0
 }
 
 // ---- DP Link Training Engine (for high-refresh mode setting) ------------------------------------

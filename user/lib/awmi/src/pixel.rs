@@ -380,16 +380,25 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    /// Blit the software pointer cursor at `(cx, cy)` when an output lacks `CAP_HW_CURSOR`.
+    /// Blit the default software pointer cursor at `(cx, cy)` when an output lacks `CAP_HW_CURSOR`.
     pub fn draw_sw_cursor(&mut self, clip: Rect, cx: i32, cy: i32) {
-        for (ry, row) in CURSOR_SHAPE.iter().enumerate() {
-            for (rx, &ch) in row.iter().enumerate() {
-                let col = match ch {
+        self.draw_sw_cursor_kind(clip, cx, cy, CursorKind::Default);
+    }
+
+    /// Blit a context-aware minimal software cursor (`kind`) with its hotspot anchored at `(cx, cy)`.
+    pub fn draw_sw_cursor_kind(&mut self, clip: Rect, cx: i32, cy: i32, kind: CursorKind) {
+        let (hx, hy) = kind.hotspot();
+        let ox = cx - hx;
+        let oy = cy - hy;
+        let (w, h) = kind.size();
+        for ry in 0..h {
+            for rx in 0..w {
+                let col = match kind.pixel_at(rx, ry) {
                     b'#' => 0xFF10_141C,
                     b'W' => 0xFFF2_F5FA,
                     _ => continue,
                 };
-                self.put_pixel(clip, cx + rx as i32, cy + ry as i32, col);
+                self.put_pixel(clip, ox + rx as i32, oy + ry as i32, col);
             }
         }
     }
@@ -401,6 +410,73 @@ pub enum WinIcon {
     Maximize,
     Restore,
     Close,
+}
+
+/// Clean minimal compositor cursor shapes matching D-OS's flat Dark Slate / High Contrast aesthetic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursorKind {
+    #[default]
+    Default,
+    Pointer,
+    Text,
+    Move,
+    ResizeEW,
+    ResizeNS,
+    ResizeNWSE,
+    ResizeNESW,
+}
+
+impl CursorKind {
+    /// Pixel dimensions `(width, height)` of this cursor sprite.
+    pub const fn size(self) -> (u32, u32) {
+        match self {
+            Self::Default => (CURSOR_W, CURSOR_H),
+            Self::Pointer => (15, 19),
+            Self::Text => (9, 17),
+            Self::Move => (17, 17),
+            Self::ResizeEW => (17, 9),
+            Self::ResizeNS => (9, 17),
+            Self::ResizeNWSE | Self::ResizeNESW => (15, 15),
+        }
+    }
+
+    /// Hotspot `(hot_x, hot_y)` relative to the sprite's top-left corner.
+    pub const fn hotspot(self) -> (i32, i32) {
+        match self {
+            Self::Default => (0, 0),
+            Self::Pointer => (4, 0),
+            Self::Text => (4, 8),
+            Self::Move => (8, 8),
+            Self::ResizeEW => (8, 4),
+            Self::ResizeNS => (4, 8),
+            Self::ResizeNWSE | Self::ResizeNESW => (7, 7),
+        }
+    }
+
+    /// Screen-space bounding box of this cursor when anchored at pointer position `p`.
+    pub const fn bounds_at(self, p: crate::geom::Point) -> Rect {
+        let (w, h) = self.size();
+        let (hx, hy) = self.hotspot();
+        Rect::new(p.x - hx, p.y - hy, w, h)
+    }
+
+    /// Glyph cell at `(x, y)`: `b'#'` = dark core, `b'W'` = crisp light outline, `b'.'` = transparent.
+    pub const fn pixel_at(self, x: u32, y: u32) -> u8 {
+        let (w, h) = self.size();
+        if x >= w || y >= h {
+            return b'.';
+        }
+        match self {
+            Self::Default => CURSOR_SHAPE[y as usize][x as usize],
+            Self::Pointer => CURSOR_POINTER[y as usize][x as usize],
+            Self::Text => CURSOR_TEXT[y as usize][x as usize],
+            Self::Move => CURSOR_MOVE[y as usize][x as usize],
+            Self::ResizeEW => CURSOR_RESIZE_EW[y as usize][x as usize],
+            Self::ResizeNS => CURSOR_RESIZE_EW[x as usize][y as usize],
+            Self::ResizeNWSE => CURSOR_RESIZE_NWSE[y as usize][x as usize],
+            Self::ResizeNESW => CURSOR_RESIZE_NWSE[y as usize][(w - 1 - x) as usize],
+        }
+    }
 }
 
 /// Clean minimal 12x18 dark-core, crisp light-outline pointer arrow.
@@ -428,21 +504,126 @@ const CURSOR_SHAPE: [&[u8; 12]; 18] = [
     b"......WW....",
 ];
 
-/// Populate a 64x64 ARGB8888 hardware cursor image (`64 * 64 * 4 = 16384` bytes, hotspot `(0, 0)`).
-pub fn write_hw_cursor_64x64(out: &mut [u8]) {
+/// Clean minimal 15x19 pointing hand for clickable buttons, dock pills, and rows.
+const CURSOR_POINTER: [&[u8; 15]; 19] = [
+    b"...WW..........",
+    b"..W##W.........",
+    b"..W##W.........",
+    b"..W##W.........",
+    b"..W##W.........",
+    b"..W##WW........",
+    b"..W##W#WW......",
+    b".WW##W#W#WW....",
+    b"W#W##W#W#W#W...",
+    b"W##W#######W...",
+    b".W#########W...",
+    b".W#########W...",
+    b"..W########W...",
+    b"..W#######W....",
+    b"...W######W....",
+    b"...W#####W.....",
+    b"....W####W.....",
+    b"....W####W.....",
+    b".....WWWW......",
+];
+
+/// Crisp minimal 9x17 I-beam for text inputs.
+const CURSOR_TEXT: [&[u8; 9]; 17] = [
+    b"WWWW.WWWW",
+    b"W##WWW##W",
+    b".WW###WW.",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b"...W#W...",
+    b".WW###WW.",
+    b"W##WWW##W",
+    b"WWWW.WWWW",
+];
+
+/// Clean minimal 17x9 opposing horizontal arrows (transposed for vertical resize).
+const CURSOR_RESIZE_EW: [&[u8; 17]; 9] = [
+    b"....WW.....WW....",
+    b"...W#W.....W#W...",
+    b"..W##W.....W##W..",
+    b".W###WWWWWWW###W.",
+    b"W###############W",
+    b".W###WWWWWWW###W.",
+    b"..W##W.....W##W..",
+    b"...W#W.....W#W...",
+    b"....WW.....WW....",
+];
+
+/// Clean minimal 15x15 opposing NW-SE diagonal arrows (horizontally mirrored for NE-SW).
+const CURSOR_RESIZE_NWSE: [&[u8; 15]; 15] = [
+    b"WWWWWW.........",
+    b"W####W.........",
+    b"W###WW.........",
+    b"W###W..........",
+    b"W#WW#W.........",
+    b"WWW.W#W........",
+    b".....W#W.......",
+    b"......W#W......",
+    b".......W#W.....",
+    b"........W#W.WWW",
+    b".........W#WW#W",
+    b"..........W###W",
+    b".........WW###W",
+    b".........W####W",
+    b".........WWWWWW",
+];
+
+/// Clean minimal 17x17 four-way opposing arrows for moving windows.
+const CURSOR_MOVE: [&[u8; 17]; 17] = [
+    b"........W........",
+    b".......W#W.......",
+    b"......W###W......",
+    b".....W#####W.....",
+    b".....WWW#WWW.....",
+    b"...WW..W#W..WW...",
+    b"..W#W..W#W..W#W..",
+    b".W##WWWW#WWWW##W.",
+    b"W###############W",
+    b".W##WWWW#WWWW##W.",
+    b"..W#W..W#W..W#W..",
+    b"...WW..W#W..WW...",
+    b".....WWW#WWW.....",
+    b".....W#####W.....",
+    b"......W###W......",
+    b".......W#W.......",
+    b"........W........",
+];
+
+/// Populate a 64x64 ARGB8888 hardware cursor image for `kind` and return its `(hot_x, hot_y)`.
+pub fn write_hw_cursor_64x64_kind(kind: CursorKind, out: &mut [u8]) -> (u32, u32) {
     if out.len() < 64 * 64 * 4 {
-        return;
+        return (0, 0);
     }
     out[..64 * 64 * 4].fill(0);
-    for (y, row) in CURSOR_SHAPE.iter().enumerate() {
-        for (x, &ch) in row.iter().enumerate() {
-            let px: u32 = match ch {
+    let (w, h) = kind.size();
+    for y in 0..h.min(64) {
+        for x in 0..w.min(64) {
+            let px: u32 = match kind.pixel_at(x, y) {
                 b'#' => 0xFF10_141C,
                 b'W' => 0xFFF2_F5FA,
                 _ => 0,
             };
-            let o = (y * 64 + x) * 4;
+            let o = ((y as usize) * 64 + (x as usize)) * 4;
             out[o..o + 4].copy_from_slice(&px.to_le_bytes());
         }
     }
+    let (hx, hy) = kind.hotspot();
+    (hx.max(0) as u32, hy.max(0) as u32)
+}
+
+/// Populate a 64x64 ARGB8888 hardware cursor image (`64 * 64 * 4 = 16384` bytes, hotspot `(0, 0)`).
+pub fn write_hw_cursor_64x64(out: &mut [u8]) {
+    let _ = write_hw_cursor_64x64_kind(CursorKind::Default, out);
 }

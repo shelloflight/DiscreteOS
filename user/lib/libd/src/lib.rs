@@ -24,6 +24,7 @@ extern crate alloc;
 
 #[cfg(feature = "capi")]
 pub mod capi;
+pub mod appmgr;
 pub mod audio;
 pub mod awmi;
 pub mod chan;
@@ -32,6 +33,7 @@ pub mod gpu;
 pub mod handle;
 #[cfg(feature = "alloc")]
 pub mod heap;
+pub mod identity;
 pub mod log;
 pub mod net;
 pub mod proto;

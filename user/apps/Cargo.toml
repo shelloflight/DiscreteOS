@@ -1,0 +1,33 @@
+# D-OS core native GUI applications (packaged as signed `.dapp` bundles):
+# File Manager (`files.dapp`), Text Editor (`editor.dapp`), Settings (`settings.dapp`),
+# and System Monitor (`sysmon.dapp`). Terminal (`terminal.dapp`) is built from `user/awmi`.
+[package]
+name = "apps"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata.dos]
+dx = ["files", "editor", "settings", "sysmon"]
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+dosawmi = { path = "../lib/awmi" }
+dosui = { path = "../lib/ui" }
+dosfont = { path = "../lib/font" }
+dosapp = { path = "../lib/app" }
+dosid = { path = "../lib/identity" }
+dosaudio = { path = "../lib/audio" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

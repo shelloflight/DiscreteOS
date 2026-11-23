@@ -4,7 +4,9 @@
 use crate::dock::{DockHit, DockLayout, DockPinnedEntry, DockTrayState, DockWindowEntry, MAX_DOCK_PINNED, MAX_DOCK_WINDOWS};
 use crate::geom::{DamageSet, Point, Rect};
 use crate::launcher::{LaunchTarget, Launcher, OPEN_NS, Outcome, Setting, UiSettings};
-use crate::pixel::{CURSOR_H, CURSOR_W, Canvas, WinIcon};
+use crate::lock::{LockMode, LockOutcome, LockReason, LockScreen};
+use crate::perm::{PermOutcome, PermPrompt};
+use crate::pixel::{Canvas, CursorKind, WinIcon};
 use crate::proto::{MAX_IDENTITY_BYTES, MAX_TITLE_BYTES, TrustTier, sanitize_label, win_flags, win_state};
 use crate::text::{TextRender, TextRole};
 use crate::theme::{ChromeMetrics, DockConfig, Theme};
@@ -254,6 +256,20 @@ impl ResizeEdge {
     pub const fn any(self) -> bool {
         self.left || self.right || self.top || self.bottom
     }
+
+    pub const fn cursor_kind(self) -> CursorKind {
+        if (self.left && self.top) || (self.right && self.bottom) {
+            CursorKind::ResizeNWSE
+        } else if (self.right && self.top) || (self.left && self.bottom) {
+            CursorKind::ResizeNESW
+        } else if self.left || self.right {
+            CursorKind::ResizeEW
+        } else if self.top || self.bottom {
+            CursorKind::ResizeNS
+        } else {
+            CursorKind::Default
+        }
+    }
 }
 
 /// Metadata for one isolated client window.
@@ -423,6 +439,12 @@ pub enum WmAction {
     Launch { owner: u32, app: u8 },
     /// The user picked a built-in action in the launcher.
     Setting(Setting),
+    /// User pressed `Super+L` or `Ctrl+Alt+L` (or picked Lock screen in launcher).
+    LockSession,
+    /// User submitted a passphrase on the compositor lock/login screen for `identity_id`.
+    UnlockAttempt { identity_id: u32 },
+    /// User answered the compositor modal permission prompt.
+    PermPromptResult { request_id: u32, choice: u8 },
 }
 
 /// Client surface pixel provider callback for compositing.
@@ -447,12 +469,17 @@ pub struct WmState {
     pub focused: Option<u32>,
     pub hovered: Option<u32>,
     pub pointer: Point,
+    pub cursor_kind: CursorKind,
     pub buttons: u8,
     pub drag: DragOp,
     pub damage: DamageSet,
     cascade_step: i32,
     /// The launcher (tap `Super`, `Alt+F1`).
     pub launcher: Launcher,
+    /// Compositor-drawn unforgeable lock / login screen.
+    pub lock: LockScreen,
+    /// Compositor-drawn unforgeable permission prompt modal.
+    pub perm_prompt: PermPrompt,
     /// Theme, text size, motion (applied by `apply_settings`).
     pub settings: UiSettings,
     /// Monotonic time (ns), set by the compositor before input and compositing (animations).
@@ -497,11 +524,14 @@ impl WmState {
             focused: None,
             hovered: None,
             pointer: Point::ZERO,
+            cursor_kind: CursorKind::Default,
             buttons: 0,
             drag: DragOp::None,
             damage: DamageSet::new(),
             cascade_step: 0,
             launcher: Launcher::new(),
+            lock: LockScreen::new(),
+            perm_prompt: PermPrompt::new(),
             settings: UiSettings::DEFAULT,
             now_ns: 0,
             line_h: 16,
@@ -534,14 +564,163 @@ impl WmState {
         self.damage_all();
     }
 
+    /// Re-fit pointer and all windows after outputs are added, removed, or change resolution.
+    pub fn fit_windows_to_layout(&mut self) {
+        let desk = self.layout.desktop_bounds();
+        if desk.w > 0 && desk.h > 0 {
+            let inside = |layout: &OutputLayout, p: Point| {
+                layout.as_slice().iter().any(|o| o.online && o.bounds.contains_point(p))
+            };
+            if !inside(&self.layout, self.pointer) {
+                self.pointer = Point::new(
+                    self.pointer.x.clamp(desk.x, desk.x + desk.w as i32 - 1),
+                    self.pointer.y.clamp(desk.y, desk.y + desk.h as i32 - 1),
+                );
+            }
+            if !inside(&self.layout, self.pointer)
+                && let Some(p) = self.layout.primary()
+            {
+                self.pointer = Point::new(p.bounds.x + p.bounds.w as i32 / 2, p.bounds.y + p.bounds.h as i32 / 2);
+            }
+        }
+        let ids: [Option<u32>; MAX_WINDOWS] = core::array::from_fn(|i| self.windows[i].as_ref().map(|w| w.id));
+        let chrome = self.chrome;
+        let min_w = chrome.min_client_w + chrome.border_w * 2;
+        let min_h = chrome.min_client_h + chrome.title_h + chrome.border_w;
+        for id in ids.into_iter().flatten() {
+            let center = self.window(id).map(|w| Point::new(w.frame.x + w.frame.w as i32 / 2, w.frame.y + w.frame.h as i32 / 2));
+            let Some(out) = center.and_then(|c| self.layout.output_at(c)).or_else(|| self.layout.primary()) else { continue };
+            let work = self.layout.work_area(out, self.dock_cfg);
+            if work.w == 0 || work.h == 0 {
+                continue;
+            }
+            if let Some(w) = self.window_mut(id) {
+                if w.snap != SnapState::Floating {
+                    w.frame = w.snap.target_rect(work);
+                } else {
+                    let nw = w.frame.w.min(work.w).max(min_w.min(work.w));
+                    let nh = w.frame.h.min(work.h).max(min_h.min(work.h));
+                    let max_x = work.x + work.w.saturating_sub(nw) as i32;
+                    let max_y = work.y + work.h.saturating_sub(nh) as i32;
+                    w.frame = Rect::new(w.frame.x.clamp(work.x, max_x), w.frame.y.clamp(work.y, max_y), nw, nh);
+                    w.saved_floating = w.frame;
+                }
+            }
+        }
+        self.sync_cursor_kind();
+        self.damage_all();
+    }
+
+    pub fn engage_lock(&mut self, mode: LockMode, reason: LockReason) {
+        self.launcher.hide();
+        self.perm_prompt.close();
+        self.drag = DragOp::None;
+        self.super_tap = false;
+        self.lock.engage(mode, reason);
+        self.cursor_kind = self.compute_cursor_kind();
+        self.damage_all();
+    }
+
+    pub fn disengage_lock(&mut self) {
+        self.lock.unlock();
+        self.cursor_kind = self.compute_cursor_kind();
+        self.damage_all();
+    }
+
+    pub fn open_perm_prompt(&mut self, request_id: u32, app_name: &[u8], app_title: &[u8], perm_mask: u32) {
+        self.launcher.hide();
+        self.drag = DragOp::None;
+        self.perm_prompt.open(request_id, app_name, app_title, perm_mask);
+        self.sync_cursor_kind();
+        self.damage_launcher_output();
+    }
+
     pub fn toggle_launcher(&mut self) {
+        if self.lock.active || self.perm_prompt.active {
+            return;
+        }
         if self.launcher.open {
             self.launcher.hide();
         } else {
             self.launcher.show(self.now_ns);
             self.drag = DragOp::None;
         }
+        self.sync_cursor_kind();
         self.damage_launcher_output();
+    }
+
+    /// Determine the context-aware minimal cursor shape for the current pointer position and state.
+    pub fn compute_cursor_kind(&self) -> CursorKind {
+        let p = self.pointer;
+        if self.lock.active {
+            if let Some(prim) = self.layout.primary()
+                && prim.bounds.contains_point(p)
+            {
+                let local = Point::new(p.x - prim.bounds.x, p.y - prim.bounds.y);
+                return self.lock.cursor_at(local, prim.bounds.w, prim.bounds.h, self.line_h);
+            }
+            return CursorKind::Default;
+        }
+        if self.perm_prompt.active {
+            if let Some(prim) = self.layout.primary()
+                && prim.bounds.contains_point(p)
+            {
+                let local = Point::new(p.x - prim.bounds.x, p.y - prim.bounds.y);
+                return self.perm_prompt.cursor_at(local, prim.bounds.w, prim.bounds.h, self.line_h);
+            }
+            return CursorKind::Default;
+        }
+        if self.launcher.open {
+            if let Some(prim) = self.layout.primary()
+                && prim.bounds.contains_point(p)
+            {
+                let local = Point::new(p.x - prim.bounds.x, p.y - prim.bounds.y);
+                let rects = self.launcher.rects(prim.bounds.w, prim.bounds.h, self.line_h);
+                if rects.field.contains_point(local) {
+                    return CursorKind::Text;
+                }
+                if rects.rows[..rects.n].iter().any(|r| r.contains_point(local)) {
+                    return CursorKind::Pointer;
+                }
+            }
+            return CursorKind::Default;
+        }
+        match self.drag {
+            DragOp::Move { .. } => return CursorKind::Move,
+            DragOp::Resize { edge, .. } => return edge.cursor_kind(),
+            DragOp::None => {}
+        }
+        if let Some(prim) = self.layout.primary()
+            && prim.bounds.contains_point(p)
+        {
+            let local = Point::new(p.x - prim.bounds.x, p.y - prim.bounds.y);
+            let dl = self.dock_layout_for(prim);
+            if matches!(dl.hit_test(local), DockHit::Pinned(..) | DockHit::Window(_) | DockHit::Workspace(_)) {
+                return CursorKind::Pointer;
+            }
+        }
+        if let Some(wid) = self.window_at(p)
+            && let Some(w) = self.window(wid)
+        {
+            return match w.hit_test(p, self.chrome) {
+                WinHit::Resize(edge) => edge.cursor_kind(),
+                WinHit::BtnClose | WinHit::BtnMinimize | WinHit::BtnMaximize => CursorKind::Pointer,
+                WinHit::TitleBar | WinHit::Client | WinHit::None => CursorKind::Default,
+            };
+        }
+        CursorKind::Default
+    }
+
+    /// Recompute `self.cursor_kind`, damaging both old and new software cursor rects if it changed.
+    pub fn sync_cursor_kind(&mut self) {
+        let next = self.compute_cursor_kind();
+        if next != self.cursor_kind {
+            if self.layout.output_at(self.pointer).is_some_and(|o| !o.hw_cursor) {
+                self.damage.add(self.cursor_kind.bounds_at(self.pointer));
+                self.damage.add(next.bounds_at(self.pointer));
+            }
+            self.cursor_kind = next;
+        }
     }
 
     fn damage_launcher_output(&mut self) {
@@ -644,7 +823,7 @@ impl WmState {
         self.windows.iter().flatten().find(|w| w.id == id)
     }
 
-    fn window_mut(&mut self, id: u32) -> Option<&mut Window> {
+    pub(crate) fn window_mut(&mut self, id: u32) -> Option<&mut Window> {
         self.windows.iter_mut().flatten().find(|w| w.id == id)
     }
 
@@ -748,7 +927,7 @@ impl WmState {
         if w.owner != owner {
             return false;
         }
-        if w.minimized || w.workspace != active_ws {
+        if self.lock.active || w.minimized || w.workspace != active_ws {
             return true;
         }
         let client = w.client_rect(chrome);
@@ -975,6 +1154,43 @@ impl WmState {
         let has_ctrl = (key_val & CTRL) != 0;
         let has_shift = (key_val & SHIFT) != 0;
 
+        // 1. Lock / login screen has absolute priority: blocks Super, launcher, clients, and ExitSession!
+        if self.lock.active {
+            self.super_tap = false;
+            return match self.lock.key(key_val, pressed) {
+                LockOutcome::None => WmAction::None,
+                LockOutcome::Changed => {
+                    self.damage_launcher_output();
+                    WmAction::None
+                }
+                LockOutcome::Submit { identity_id } => {
+                    self.damage_launcher_output();
+                    WmAction::UnlockAttempt { identity_id }
+                }
+            };
+        }
+
+        // 2. Unforgeable compositor permission prompt modal: blocks client key delivery.
+        if self.perm_prompt.active {
+            self.super_tap = false;
+            if pressed && base == 0x1B && (has_super || (has_ctrl && has_alt)) {
+                self.perm_prompt.close();
+                self.damage_launcher_output();
+                return WmAction::ExitSession;
+            }
+            return match self.perm_prompt.key(base, pressed) {
+                PermOutcome::None => WmAction::None,
+                PermOutcome::Changed => {
+                    self.damage_launcher_output();
+                    WmAction::None
+                }
+                PermOutcome::Decided { request_id, choice } => {
+                    self.damage_launcher_output();
+                    WmAction::PermPromptResult { request_id, choice }
+                }
+            };
+        }
+
         // Super alone: a tap (down and up with nothing between) opens or closes the launcher.
         // It is the window manager's key: programs never see it.
         if base == KEY_META {
@@ -1022,6 +1238,10 @@ impl WmState {
             // Exit GUI session back to shell: Super+Esc or Ctrl+Alt+Esc.
             if base == 0x1B && (has_super || (has_ctrl && has_alt)) {
                 return WmAction::ExitSession;
+            }
+            // Lock session: Super+L or Ctrl+Alt+L.
+            if (base == u32::from(b'l') || base == u32::from(b'L')) && (has_super || (has_ctrl && has_alt)) {
+                return WmAction::LockSession;
             }
             // Alt+Tab window switcher.
             if has_alt && !has_ctrl && !has_super && base == u32::from(b'\t') {
@@ -1090,26 +1310,68 @@ impl WmState {
     /// Handle pointer movement/buttons/wheel (either relative `(dx, dy)` or absolute `abs`).
     pub fn handle_pointer(&mut self, dx: i32, dy: i32, abs: Option<Point>, buttons: u8) -> WmAction {
         let old_ptr = self.pointer;
+        let old_kind = self.cursor_kind;
         let next = match abs {
             Some(p) => self.layout.clamp_point(p),
             None => self.layout.clamp_point(Point::new(old_ptr.x.saturating_add(dx), old_ptr.y.saturating_add(dy))),
         };
         let moved = next != old_ptr;
         if moved {
-            // Damage old & new software-cursor rects on outputs lacking hardware cursor.
+            // Damage old software-cursor rect on outputs lacking hardware cursor.
             if self.layout.output_at(old_ptr).is_some_and(|o| !o.hw_cursor) {
-                self.damage.add(Rect::new(old_ptr.x, old_ptr.y, CURSOR_W, CURSOR_H));
-            }
-            if self.layout.output_at(next).is_some_and(|o| !o.hw_cursor) {
-                self.damage.add(Rect::new(next.x, next.y, CURSOR_W, CURSOR_H));
+                self.damage.add(old_kind.bounds_at(old_ptr));
             }
             self.pointer = next;
         }
+        let action = self.handle_pointer_inner(next, buttons);
+        self.sync_cursor_kind();
+        if moved && self.layout.output_at(next).is_some_and(|o| !o.hw_cursor) {
+            self.damage.add(self.cursor_kind.bounds_at(next));
+        }
+        action
+    }
 
+    fn handle_pointer_inner(&mut self, next: Point, buttons: u8) -> WmAction {
         let prev_buttons = self.buttons;
         self.buttons = buttons;
         let left_pressed = (buttons & 1) != 0 && (prev_buttons & 1) == 0;
         let left_released = (buttons & 1) == 0 && (prev_buttons & 1) != 0;
+
+        // 1. Lock screen: traps all pointer input; zero delivery to dock or clients.
+        if self.lock.active {
+            if let Some(prim) = self.layout.primary()
+                && prim.bounds.contains_point(next)
+            {
+                let local = Point::new(next.x - prim.bounds.x, next.y - prim.bounds.y);
+                match self.lock.pointer(local, left_pressed, prim.bounds.w, prim.bounds.h, self.line_h) {
+                    LockOutcome::None => {}
+                    LockOutcome::Changed => self.damage_launcher_output(),
+                    LockOutcome::Submit { identity_id } => {
+                        self.damage_launcher_output();
+                        return WmAction::UnlockAttempt { identity_id };
+                    }
+                }
+            }
+            return WmAction::None;
+        }
+
+        // 2. Permission prompt modal: traps pointer input until answered.
+        if self.perm_prompt.active {
+            if let Some(prim) = self.layout.primary()
+                && prim.bounds.contains_point(next)
+            {
+                let local = Point::new(next.x - prim.bounds.x, next.y - prim.bounds.y);
+                match self.perm_prompt.pointer(local, left_pressed, prim.bounds.w, prim.bounds.h, self.line_h) {
+                    PermOutcome::None => {}
+                    PermOutcome::Changed => self.damage_launcher_output(),
+                    PermOutcome::Decided { request_id, choice } => {
+                        self.damage_launcher_output();
+                        return WmAction::PermPromptResult { request_id, choice };
+                    }
+                }
+            }
+            return WmAction::None;
+        }
 
         // The open launcher is modal: the pointer selects and opens its rows, a click elsewhere
         // closes it, and nothing reaches the windows meanwhile.
@@ -1428,6 +1690,17 @@ impl WmState {
             return local_damage;
         }
 
+        // When locked, render ONLY the opaque compositor lock/login screen (zero client window pixels!).
+        if self.lock.active {
+            for &clip in local_damage.as_slice() {
+                self.lock.render(canvas, clip, &self.theme, text, &self.tray, output.primary, self.line_h);
+                if !output.hw_cursor && output.bounds.contains_point(self.pointer) {
+                    canvas.draw_sw_cursor_kind(clip, self.pointer.x - output.bounds.x, self.pointer.y - output.bounds.y, self.cursor_kind);
+                }
+            }
+            return local_damage;
+        }
+
         // Collect visible windows on the active workspace, sorted bottom-to-top by z_order.
         let mut order = [0usize; MAX_WINDOWS];
         let mut count = 0usize;
@@ -1602,14 +1875,16 @@ impl WmState {
                 dl.render_with_pinned(canvas, clip, &self.theme, self.dock_cfg, &dock_pinned[..dock_pn], &dock_entries[..dock_n], &self.tray, text);
             }
 
-            // 5. The launcher over everything but the pointer.
+            // 5. The launcher or permission prompt modal over everything but the pointer.
             if let Some(ref lr) = launcher {
                 self.launcher.render(canvas, clip, &self.theme, text, lr, self.settings, self.progress(self.launcher.opened_at));
+            } else if output.primary && self.perm_prompt.active {
+                self.perm_prompt.render(canvas, clip, &self.theme, text, self.line_h);
             }
 
             // 6. Software pointer cursor fallback if adapter lacks hardware cursor.
             if !output.hw_cursor && output.bounds.contains_point(self.pointer) {
-                canvas.draw_sw_cursor(clip, self.pointer.x - output.bounds.x, self.pointer.y - output.bounds.y);
+                canvas.draw_sw_cursor_kind(clip, self.pointer.x - output.bounds.x, self.pointer.y - output.bounds.y, self.cursor_kind);
             }
         }
 

@@ -30,7 +30,9 @@ use libd::sync::{Mutex, Once};
 use libd::sys::{self, Handle, SpawnHandle};
 use libd::{Channel, Event, Owned, Startup, heap, println, thread};
 
+mod app;
 mod awmi;
+mod identity;
 mod svc;
 
 libd::entry!(_start, main);
@@ -571,6 +573,14 @@ fn main(s: *const Startup) -> i32 {
         return awmi::client("svc-awmi-a", 0x00D0_3030, b"Alpha", None, b'a');
     } else if a.starts_with(b"svc-awmi-b") {
         return awmi::client("svc-awmi-b", 0x0030_C050, b"Beta", Some(b"system: fake"), b'b');
+    } else if a.starts_with(b"svc-id-ungranted") {
+        return identity::ungranted();
+    } else if a.starts_with(b"svc-id-full") {
+        return identity::full();
+    } else if a.starts_with(b"svc-app-ungranted") {
+        return app::ungranted();
+    } else if a.starts_with(b"svc-app-full") {
+        return app::full();
     }
     let ok = test_abi()
         && test_handles()

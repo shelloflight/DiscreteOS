@@ -45,6 +45,8 @@ enum HostTest {
     Gpu,
     Awmi,
     Ui,
+    Identity,
+    App,
     Aml,
     Kaslr,
     Static,
@@ -1388,6 +1390,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         TestCase::host_case("gpu-host", HostTest::Gpu),
         TestCase::host_case("awmi-host", HostTest::Awmi),
         TestCase::host_case("ui-host", HostTest::Ui),
+        TestCase::host_case("identity-host", HostTest::Identity),
+        TestCase::host_case("app-host", HostTest::App),
         TestCase::host_case("aml-host", HostTest::Aml),
 
         TestCase::boot("audio-hda")
@@ -1742,6 +1746,51 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             .keys_vec(desktop_keys(), "terminal: view attached")
             .expect(&DESKTOP_EXPECT)
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC", "refused ("]),
+
+        TestCase::boot("identity-tpm")
+            .def("IDENTITY")
+            .devices()
+            .qemu(&["-device", "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1024,yres=768"])
+            .timeout(150)
+            .must_exit()
+            .expect(&[
+                "TPM: TPM 2.0 (simulator",
+                "identity: ready,",
+                "sealing: TPM 2.0 SRK",
+                "svc-id-ungranted: PASSED (no TPM_SEAL or identity endpoints)",
+                "svc-id-full: no-root policy OK",
+                "svc-id-full: non-root standard identity OK",
+                "svc-id-full: TPM 2.0 credential seal OK",
+                "svc-id-full: lock screen covers window & blocks shortcuts/input OK",
+                "svc-id-full: TPM 2.0 unseal & backoff throttle OK",
+                "svc-id-full: Super+L, idle auto-lock, and sleep lock OK",
+                "files: namespace places: /home, /system, /sys",
+                "svc-id-full: per-identity namespace isolation OK",
+                "svc-id-full: PASSED",
+                "init: identity test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]),
+
+        TestCase::boot("apps-virtio")
+            .def("APP")
+            .devices()
+            .qemu(&["-device", "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1024,yres=768"])
+            .timeout(150)
+            .must_exit()
+            .expect(&[
+                "appmgr: ready, 5 verified .dapp bundle(s)",
+                "svc-app-ungranted: PASSED (no appmgr or awmi.launcher endpoints)",
+                "svc-app-full: 5 core .dapp bundles verified",
+                "svc-app-full: .dapp signature enforcement OK",
+                "svc-app-full: core native apps open with verified identities",
+                "svc-app-full: compositor permission prompt OK",
+                "svc-app-full: live permission revocation & re-grant OK",
+                "svc-app-full: PASSED",
+                "init: app test: PASSED",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]),
 
         // D-AWMI on the firmware framebuffer (UEFI GOP: write-combining blits, software cursor).
         TestCase::boot("awmi-gop")
@@ -2892,6 +2941,8 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
         HostTest::Awmi => host_cargo_test(env, "user/lib/awmi", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Ui => Ok(host_cargo_test(env, "user/lib/font", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?
             && host_cargo_test(env, "user/lib/ui", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?),
+        HostTest::Identity => host_cargo_test(env, "user/lib/identity", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
+        HostTest::App => host_cargo_test(env, "user/lib/app", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Aml => host_aml_test(env),
         HostTest::Crypto => host_crypto_test(env),
         HostTest::Kaslr => host_kaslr_test(env),
@@ -3397,7 +3448,7 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
     let cargo = env.cargo()?;
     let clippy_dir = env.build.join("clippy");
     let cargo_env = env.cargo_env_pairs();
-    let standalone: [(&str, &[&str]); 12] = [
+    let standalone: [(&str, &[&str]); 14] = [
         ("kernel/rust", &[]),
         ("kernel/aml", &["--all-targets"]),
         ("user/lib/audio", &["--all-targets"]),
@@ -3406,6 +3457,8 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
         ("user/lib/awmi", &["--all-targets"]),
         ("user/lib/font", &["--all-targets"]),
         ("user/lib/ui", &["--all-targets"]),
+        ("user/lib/identity", &["--all-targets"]),
+        ("user/lib/app", &["--all-targets"]),
         ("user/lib/crypto", &["--all-targets"]),
         ("user/lib/fs", &["--all-targets"]),
         ("user/lib/dman", &["--all-targets"]),
@@ -3447,6 +3500,9 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
         ("net", &[]),
         ("gpu", &[]),
         ("awmi", &[]),
+        ("identity", &[]),
+        ("appmgr", &[]),
+        ("apps", &[]),
         ("init", &[]),
         ("log", &[]),
         ("clock", &[]),

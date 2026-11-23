@@ -1,0 +1,16 @@
+kind = "app"
+name = "terminal"
+title = "Terminal"
+version = "1.0.0"
+binary = "console.dx"
+description = "Interactive D-OS shell session"
+pinned = true
+autostart = true
+
+[permissions]
+required = ["window", "terminal"]
+
+[quota]
+memory = "32M"
+handles = 128
+threads = 4

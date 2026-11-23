@@ -13,8 +13,9 @@ use crate::theme::{Theme, ThemeId};
 
 pub const MAX_LAUNCH_APPS: usize = 24;
 pub const LAUNCH_LABEL_BYTES: usize = 32;
-/// Entries per program.
-pub const MAX_APPS_PER_CLIENT: usize = 4;
+/// Entries per program (appmgr registers up to 16 native .dapp apps).
+pub const MAX_APPS_PER_CLIENT: usize = 16;
+pub const SETTING_COUNT: usize = 6;
 const MAX_QUERY: usize = 32;
 /// Rows shown at once.
 pub const MAX_ROWS: usize = 8;
@@ -30,11 +31,20 @@ pub enum Setting {
     TextSmaller,
     /// Reduce motion on/off.
     MotionToggle,
+    /// Engage the compositor lock screen.
+    LockScreen,
     /// End the session (back to the text console).
     LeaveDesktop,
 }
 
-const SETTINGS: [Setting; 5] = [Setting::ThemeToggle, Setting::TextLarger, Setting::TextSmaller, Setting::MotionToggle, Setting::LeaveDesktop];
+const SETTINGS: [Setting; SETTING_COUNT] = [
+    Setting::ThemeToggle,
+    Setting::TextLarger,
+    Setting::TextSmaller,
+    Setting::MotionToggle,
+    Setting::LockScreen,
+    Setting::LeaveDesktop,
+];
 
 /// What a launcher row opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +101,7 @@ impl UiSettings {
             Setting::TextLarger => self.larger(),
             Setting::TextSmaller => self.smaller(),
             Setting::MotionToggle => UiSettings { reduce_motion: !self.reduce_motion, ..self },
-            Setting::LeaveDesktop => self,
+            Setting::LockScreen | Setting::LeaveDesktop => self,
         }
     }
 }
@@ -179,6 +189,7 @@ fn setting_words(s: Setting) -> &'static [u8] {
         Setting::TextLarger => b"larger text size bigger zoom font accessibility",
         Setting::TextSmaller => b"smaller text size zoom font accessibility",
         Setting::MotionToggle => b"reduce motion animation accessibility",
+        Setting::LockScreen => b"lock screen security sign out sleep",
         Setting::LeaveDesktop => b"leave desktop exit text console shell quit",
     }
 }
@@ -216,6 +227,7 @@ pub fn setting_label(s: Setting, cur: UiSettings, out: &mut [u8; 48]) -> usize {
             put(b"%)");
         }
         Setting::MotionToggle => put(if cur.reduce_motion { b"Motion: turn animations back on" } else { b"Motion: reduce motion" }),
+        Setting::LockScreen => put(b"Lock screen (Super+L)"),
         Setting::LeaveDesktop => put(b"Leave the desktop (text console)"),
     }
     n
@@ -318,7 +330,7 @@ impl Launcher {
     }
 
     /// The matching rows, apps first: (target, index among apps or settings).
-    pub fn results(&self, out: &mut [LaunchTarget; MAX_LAUNCH_APPS + 5]) -> usize {
+    pub fn results(&self, out: &mut [LaunchTarget; MAX_LAUNCH_APPS + SETTING_COUNT]) -> usize {
         let q = self.query();
         let mut n = 0;
         for a in &self.apps[..self.napps] {
@@ -337,7 +349,7 @@ impl Launcher {
     }
 
     fn selected(&self) -> Option<LaunchTarget> {
-        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + 5];
+        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + SETTING_COUNT];
         let n = self.results(&mut r);
         (n > 0).then(|| r[self.sel.min(n - 1)])
     }
@@ -346,7 +358,7 @@ impl Launcher {
     pub fn key(&mut self, base: u32) -> Outcome {
         const UP: u32 = 0x101;
         const DOWN: u32 = 0x102;
-        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + 5];
+        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + SETTING_COUNT];
         let n = self.results(&mut r);
         match base {
             0x1B => Outcome::Close,
@@ -381,7 +393,7 @@ impl Launcher {
 
     /// Where the launcher is on an output of `out_w` x `out_h`, for a body line height.
     pub fn rects(&self, out_w: u32, out_h: u32, line_h: u32) -> LauncherRects {
-        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + 5];
+        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + SETTING_COUNT];
         let n = self.results(&mut r).min(MAX_ROWS);
         let row_h = (line_h + 18).max(34);
         let field_h = (line_h + 24).max(42);
@@ -409,7 +421,7 @@ impl Launcher {
         if !rects.panel.contains_point(p) {
             return (false, None);
         }
-        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + 5];
+        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + SETTING_COUNT];
         let n = self.results(&mut r);
         for (i, row) in rects.rows.iter().enumerate().take(rects.n) {
             let idx = self.first_row() + i;
@@ -454,7 +466,7 @@ impl Launcher {
         let lh = text.line_height(TextRole::Large) as i32;
         canvas.fill_rect(clip, Rect::new(caret_x + 1, fy - lh / 2 + 2, 2, (lh - 4).max(4) as u32), theme.accent_ring);
 
-        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + 5];
+        let mut r = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_LAUNCH_APPS + SETTING_COUNT];
         let n = self.results(&mut r);
         if n == 0 {
             if let Some(&row) = rects.rows.first() {
@@ -499,6 +511,7 @@ impl Launcher {
                             Setting::TextLarger => "\u{F00E}",
                             Setting::TextSmaller => "\u{F010}",
                             Setting::MotionToggle => "\u{F04C}",
+                            Setting::LockScreen => "\u{F023}",
                             Setting::LeaveDesktop => "\u{F120}",
                         };
                         let iw = text.measure(icon.as_bytes(), TextRole::Icon).min(22);

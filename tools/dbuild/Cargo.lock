@@ -6,10 +6,24 @@ version = 4
 name = "dbuild"
 version = "0.1.0"
 dependencies = [
+ "dosapp",
  "doscrypt",
  "dosfont",
  "dosfs",
  "dosnet",
+]
+
+[[package]]
+name = "dman"
+version = "0.1.0"
+
+[[package]]
+name = "dosapp"
+version = "1.0.0"
+dependencies = [
+ "dman",
+ "doscrypt",
+ "dosid",
 ]
 
 [[package]]
@@ -23,6 +37,14 @@ version = "0.1.0"
 [[package]]
 name = "dosfs"
 version = "0.1.0"
+
+[[package]]
+name = "dosid"
+version = "1.0.0"
+dependencies = [
+ "dman",
+ "doscrypt",
+]
 
 [[package]]
 name = "dosnet"

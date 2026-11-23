@@ -232,6 +232,17 @@ mod selftest {
             check!(t, tpm.pcr_extend(16, &d).is_ok());
             check!(t, tpm.pcr_read(16) == Ok(measure::extend(&[0; 32], &d)));
             check!(t, tpm.pcr_read(24).is_err());
+            // Seal & unseal under the owner SRK; wrong auth and tampered blobs are refused.
+            let secret = [0xA5u8; 32];
+            let auth = b"pass-key-32-bytes-derived-secret";
+            let sealed = tpm.seal(auth, &secret);
+            check!(t, sealed.is_ok());
+            if let Ok(mut blob) = sealed {
+                check!(t, tpm.unseal(auth, &blob) == Ok(secret.to_vec()));
+                check!(t, tpm.unseal(b"wrong-auth", &blob).is_err());
+                blob[12] ^= 1;
+                check!(t, tpm.unseal(auth, &blob).is_err());
+            }
         }
         for (f, want) in [
             (SimFault::Truncated, Error::Protocol("short response")),

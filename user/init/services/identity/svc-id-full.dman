@@ -1,0 +1,21 @@
+name = "svc-id-full"
+image = "ltest.dx"
+args = "svc-id-full"
+group = "test"
+after = ["identity", "awmi", "appmgr", "gpu"]
+description = "identity test: TPM 2.0 sealing, no-root policy, unforgeable lock screen, and isolation"
+
+[grants]
+log = true
+identity = ["admin", "query"]
+awmi = ["admin", "query", "window"]
+appmgr = ["admin", "query"]
+namespace = ["*"]
+
+[quota]
+memory = "32M"
+handles = 256
+threads = 4
+
+[restart]
+policy = "never"

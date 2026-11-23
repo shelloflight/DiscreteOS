@@ -4,6 +4,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "appmgr",
+    "apps",
     "audio",
     "awmi",
     "clock",
@@ -11,6 +13,7 @@ members = [
     "devmgr",
     "fstest",
     "gpu",
+    "identity",
     "init",
     "lib/libd",
     "log",
@@ -22,11 +25,13 @@ members = [
     "tools",
 ]
 exclude = [
+    "lib/app",
     "lib/audio",
     "lib/awmi",
     "lib/crypto",
     "lib/dman",
     "lib/font",
+    "lib/identity",
     "lib/ui",
     "lib/fs",
     "lib/gpu",

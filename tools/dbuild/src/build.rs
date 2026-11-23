@@ -62,7 +62,8 @@ const SYS_BIN_PROGS: &[&str] = &[
     "gpu.dsvc",
     "awmi.dsvc",
     "awmi-demo.dsvc",
-    "console.dsvc",
+    "identity.dsvc",
+    "appmgr.dsvc",
     "log.dx",
     "terminal.dx",
     "shell.dx",
@@ -77,6 +78,15 @@ const SYS_BIN_PROGS: &[&str] = &[
     "create.dx",
 ];
 
+/// Core native `.dapp` application bundles `(app_name, binary_name)` packaged onto `sys:/apps/`.
+const CORE_DAPPS: &[(&str, &str)] = &[
+    ("terminal", "console.dx"),
+    ("files", "files.dx"),
+    ("editor", "editor.dx"),
+    ("settings", "settings.dx"),
+    ("sysmon", "sysmon.dx"),
+];
+
 fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
     match ktest {
         Some("USER" | "SPEC" | "PROFILE" | "FUZZ" | "ATTEST" | "ATTESTTPM" | "SMAP" | "SMEP" | "CETUSER") => {
@@ -87,7 +97,7 @@ fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
             "utest.dx" | "dcmpl.dx" | "w1.exe" | "w1_32.exe" | "w1fault.exe" | "w1bad.exe" | "l1" | "w2.exe" | "l2"
         ),
         Some("LIBD") => matches!(name, "ltest.dx" | "ctest.dx"),
-        Some("SERVICES" | "TIME" | "AUDIO" | "NET" | "GPU" | "AWMI") => name == "ltest.dx",
+        Some("SERVICES" | "TIME" | "AUDIO" | "NET" | "GPU" | "AWMI" | "IDENTITY" | "APP") => name == "ltest.dx",
         Some("STORAGE" | "READONLY") => name == "fstest.dx",
         Some("HWBENCH") => matches!(name, "utest.dx" | "fstest.dx"),
         _ => false,
@@ -152,6 +162,28 @@ fn build_sys_files(
                 files.push((format!("{sub}/{name}"), f));
             }
         }
+    }
+
+    // Core native `.dapp` signed bundles (`sys:/apps/<name>.dapp`).
+    let apps_man_dir = env.root.join("user").join("apps").join("manifests");
+    let apps_about = env.root.join("user").join("apps").join("res").join("about.txt");
+    for &(app_name, bin_name) in CORE_DAPPS {
+        let p = user_programs
+            .iter()
+            .find(|e| e.name == bin_name)
+            .ok_or_else(|| format!("sys image: missing app binary '{bin_name}'"))?;
+        let man_path = apps_man_dir.join(format!("{app_name}.dman"));
+        let dapp_out = sig_dir.join(format!("{app_name}.dapp"));
+        img::build_dapp(
+            seed,
+            app_name,
+            &man_path,
+            bin_name,
+            &p.path,
+            &[("res/about.txt", apps_about.as_path())],
+            &dapp_out,
+        )?;
+        files.push((format!("apps/{app_name}.dapp"), dapp_out));
     }
 
     // Compile the curated in-tree public TLS root CA bundle into compact binary DER (`sys:/certs/roots.der`).
@@ -493,6 +525,8 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         Some("NET") => Some("net"),
         Some("GPU") => Some("gpu"),
         Some("AWMI") => Some("awmi"),
+        Some("IDENTITY") => Some("identity"),
+        Some("APP") => Some("app"),
         _ => None,
     } {
         manifests.extend(collect_files(&man_dir.join(sub), "dman", false));
@@ -723,6 +757,28 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
             ("DOS/SERVICES/TAMPERED.DMAN".into(), tampered),
             ("DOS/SERVICES/TAMPERED.DSIG".into(), tsig),
         ]);
+    }
+
+    if opts.kernel_test.as_deref() == Some("APP") {
+        let app_dir = out_dir.join("app-test");
+        fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
+        if let Some((_, valid_dapp)) = sys_files.iter().find(|(dst, _)| dst == "apps/files.dapp") {
+            let mut tampered = fs::read(valid_dapp).map_err(|e| e.to_string())?;
+            if tampered.len() > 64 {
+                tampered[40] ^= 0x5A;
+            }
+            let bad_path = app_dir.join("BAD.DAPP");
+            fs::write(&bad_path, &tampered).map_err(|e| e.to_string())?;
+            let mut unsigned = fs::read(valid_dapp).map_err(|e| e.to_string())?;
+            let sig_start = unsigned.len().saturating_sub(doscrypt::dsig::SIZE);
+            unsigned[sig_start..].fill(0);
+            let unsig_path = app_dir.join("UNSIGNED.DAPP");
+            fs::write(&unsig_path, &unsigned).map_err(|e| e.to_string())?;
+            extra_files.extend([
+                ("DOS/APPS/BAD.DAPP".into(), bad_path),
+                ("DOS/APPS/UNSIGNED.DAPP".into(), unsig_path),
+            ]);
+        }
     }
 
     // --- Disk image + SHA256SUMS ----------------------------------------------
@@ -1380,20 +1436,21 @@ fn link_rust_user_crate(
         Ok(ProgramEntry { name: out_name.to_string(), path: out_path })
     };
 
-    if let Some(dx_list) = parse_toml_string_list(&toml, "dx") {
+    let dx_list = parse_toml_string_list(&toml, "dx");
+    let dsvc_list = parse_toml_string_list(&toml, "dsvc");
+    if dx_list.is_some() || dsvc_list.is_some() {
         let mut res = Vec::new();
-        for d in dx_list {
-            let sym = format!("dx_{}", d.replace('-', "_"));
-            res.push(link_one(&format!("{d}.dx"), &sym)?);
+        if let Some(dsvc_list) = dsvc_list {
+            for d in dsvc_list {
+                let sym = format!("dsvc_{}", d.replace('-', "_"));
+                res.push(link_one(&format!("{d}.dsvc"), &sym)?);
+            }
         }
-        return Ok(res);
-    }
-
-    if let Some(dsvc_list) = parse_toml_string_list(&toml, "dsvc") {
-        let mut res = Vec::new();
-        for d in dsvc_list {
-            let sym = format!("dsvc_{}", d.replace('-', "_"));
-            res.push(link_one(&format!("{d}.dsvc"), &sym)?);
+        if let Some(dx_list) = dx_list {
+            for d in dx_list {
+                let sym = format!("dx_{}", d.replace('-', "_"));
+                res.push(link_one(&format!("{d}.dx"), &sym)?);
+            }
         }
         return Ok(res);
     }

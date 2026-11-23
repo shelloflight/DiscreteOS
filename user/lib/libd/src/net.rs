@@ -42,6 +42,7 @@ pub const OP_SOCK_KICK: u32 = 725;
 pub const OP_SOCK_EVENT: u32 = 726;
 pub const OP_SOCK_CLOSE: u32 = 727;
 pub const OP_UDP_OPEN: u32 = 728;
+pub const OP_SET_CONFIG: u32 = 729;
 
 // Client socket IoRing SQE ops.
 pub const RING_SEND: u32 = 1;
@@ -115,10 +116,13 @@ pub struct NetStatus {
     pub mac: [u8; 6],
     pub link_up: bool,
     pub dhcp_bound: bool,
+    pub static_mode: bool,
+    pub dns_fallback: bool,
     pub ip: [u8; 4],
     pub netmask: [u8; 4],
     pub gateway: [u8; 4],
     pub dns: [u8; 4],
+    pub dns2: [u8; 4],
     pub dns_port: u16,
     pub rx_packets: u64,
     pub tx_packets: u64,
@@ -134,10 +138,13 @@ impl NetStatus {
             mac: [0; 6],
             link_up: false,
             dhcp_bound: false,
+            static_mode: false,
+            dns_fallback: true,
             ip: [0; 4],
             netmask: [0; 4],
             gateway: [0; 4],
             dns: [0; 4],
+            dns2: [0; 4],
             dns_port: 53,
             rx_packets: 0,
             tx_packets: 0,
@@ -161,7 +168,10 @@ impl NetStatus {
     pub fn encode(&self, out: &mut [u8; NET_STATUS_BYTES]) {
         out.fill(0);
         out[0..6].copy_from_slice(&self.mac);
-        out[6] = u8::from(self.link_up) | (u8::from(self.dhcp_bound) << 1);
+        out[6] = u8::from(self.link_up)
+            | (u8::from(self.dhcp_bound) << 1)
+            | (u8::from(self.static_mode) << 2)
+            | (u8::from(self.dns_fallback) << 3);
         out[8..12].copy_from_slice(&self.ip);
         out[12..16].copy_from_slice(&self.netmask);
         out[16..20].copy_from_slice(&self.gateway);
@@ -169,6 +179,7 @@ impl NetStatus {
         out[24..26].copy_from_slice(&self.dns_port.to_le_bytes());
         out[26] = (self.name_len as usize).min(32) as u8;
         out[27] = (self.bootfile_len as usize).min(48) as u8;
+        out[28..32].copy_from_slice(&self.dns2);
         out[32..40].copy_from_slice(&self.rx_packets.to_le_bytes());
         out[40..48].copy_from_slice(&self.tx_packets.to_le_bytes());
         let nl = (self.name_len as usize).min(32);
@@ -185,6 +196,8 @@ impl NetStatus {
         s.mac.copy_from_slice(&src[0..6]);
         s.link_up = (src[6] & 1) != 0;
         s.dhcp_bound = (src[6] & 2) != 0;
+        s.static_mode = (src[6] & 4) != 0;
+        s.dns_fallback = (src[6] & 8) != 0;
         s.ip.copy_from_slice(&src[8..12]);
         s.netmask.copy_from_slice(&src[12..16]);
         s.gateway.copy_from_slice(&src[16..20]);
@@ -192,6 +205,7 @@ impl NetStatus {
         s.dns_port = u16::from_le_bytes([src[24], src[25]]);
         s.name_len = src[26].min(32);
         s.bootfile_len = src[27].min(48);
+        s.dns2.copy_from_slice(&src[28..32]);
         s.rx_packets = u64::from_le_bytes([
             src[32], src[33], src[34], src[35], src[36], src[37], src[38], src[39],
         ]);
@@ -203,6 +217,88 @@ impl NetStatus {
             .copy_from_slice(&src[80..80 + s.bootfile_len as usize]);
         Some(s)
     }
+}
+
+/// Fixed-size network interface configuration payload for `OP_SET_CONFIG` (24 bytes).
+pub const NET_CONFIG_BYTES: usize = 24;
+
+/// Interface IPv4 & DNS configuration (`net.control` required).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetConfig {
+    /// True = automatic DHCPv4 lease (with optional custom DNS overrides if non-zero).
+    /// False = manual static IPv4 (`ip`, `netmask`, `gateway`, `dns1`, `dns2`).
+    pub dhcp: bool,
+    pub ip: [u8; 4],
+    pub netmask: [u8; 4],
+    pub gateway: [u8; 4],
+    pub dns1: [u8; 4],
+    pub dns2: [u8; 4],
+    pub dns_port: u16,
+    pub dns_fallback: bool,
+}
+
+impl NetConfig {
+    pub const fn encode(&self) -> [u8; NET_CONFIG_BYTES] {
+        let mut out = [0u8; NET_CONFIG_BYTES];
+        out[0] = (if self.dhcp { 1 } else { 0 }) | (if self.dns_fallback { 2 } else { 0 });
+        let p = self.dns_port.to_le_bytes();
+        out[2] = p[0];
+        out[3] = p[1];
+        out[4] = self.ip[0];
+        out[5] = self.ip[1];
+        out[6] = self.ip[2];
+        out[7] = self.ip[3];
+        out[8] = self.netmask[0];
+        out[9] = self.netmask[1];
+        out[10] = self.netmask[2];
+        out[11] = self.netmask[3];
+        out[12] = self.gateway[0];
+        out[13] = self.gateway[1];
+        out[14] = self.gateway[2];
+        out[15] = self.gateway[3];
+        out[16] = self.dns1[0];
+        out[17] = self.dns1[1];
+        out[18] = self.dns1[2];
+        out[19] = self.dns1[3];
+        out[20] = self.dns2[0];
+        out[21] = self.dns2[1];
+        out[22] = self.dns2[2];
+        out[23] = self.dns2[3];
+        out
+    }
+
+    pub fn decode(src: &[u8]) -> Option<Self> {
+        if src.len() < NET_CONFIG_BYTES {
+            return None;
+        }
+        Some(Self {
+            dhcp: (src[0] & 1) != 0,
+            dns_fallback: (src[0] & 2) != 0,
+            dns_port: u16::from_le_bytes([src[2], src[3]]),
+            ip: [src[4], src[5], src[6], src[7]],
+            netmask: [src[8], src[9], src[10], src[11]],
+            gateway: [src[12], src[13], src[14], src[15]],
+            dns1: [src[16], src[17], src[18], src[19]],
+            dns2: [src[20], src[21], src[22], src[23]],
+        })
+    }
+}
+
+/// Apply full IPv4 & DNS configuration (DHCP or Static) on `net.control`.
+pub fn set_config(ch: Handle, cfg: &NetConfig) -> Result<(), i64> {
+    if ch == 0 {
+        return Err(sys::ERR_ACCESS_DENIED);
+    }
+    let mut req = [0u8; HEADER + NET_CONFIG_BYTES];
+    Header { txid: 0, op: OP_SET_CONFIG, status: 0, a: 0, b: 0 }.put(&mut req);
+    req[HEADER..HEADER + NET_CONFIG_BYTES].copy_from_slice(&cfg.encode());
+    let mut rep = [0u8; HEADER];
+    let n = sys::channel_call(ch, &req, &mut rep, CALL_TIMEOUT_NS)? as usize;
+    let h = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if h.status != 0 {
+        return Err(i64::from(h.status));
+    }
+    Ok(())
 }
 
 /// Query network interface status from `net.status`, `net.control`, `net.client`, or `net.icmp`.

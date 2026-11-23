@@ -654,6 +654,62 @@ pub const fn frame_count_diff(now: u32, before: u32) -> u32 {
     now.wrapping_sub(before) & 0x00FF_FFFF
 }
 
+/// Locate the active DIG stream encoder fed by `pipe` (matching `DIG_ENABLE` and `DIG_SOURCE_SELECT`).
+/// Falls back to `pipe` if no active DIG encoder explicitly selects `pipe`.
+pub fn find_pipe_dig_encoder<I: RegIo>(io: &I, dcn: &DcnAccess, pipe: u8) -> u8 {
+    let r = dcn.regs;
+    for enc in 0..r.max_pipes() {
+        let Some(be) = dcn.r_dcn(io, r.dig_be_en_cntl(enc)) else {
+            continue;
+        };
+        if be == 0xFFFF_FFFF || (be & 1) == 0 {
+            continue;
+        }
+        let Some(fe) = dcn.r_dcn(io, r.dig_fe_cntl(enc)) else {
+            continue;
+        };
+        if (fe & 0xF) == u32::from(pipe) {
+            return enc;
+        }
+    }
+    pipe
+}
+
+/// Read-only scan of the DPP block for `pipe` (`cnvc_pixel_format..cm_hdr_mult`) to locate
+/// active geometry registers (`DSCL_RECOUT_SIZE`, `DSCL_MPC_SIZE`) holding `(height << 16) | width`.
+/// Returns `(reg_offsets, count)`; capped to `<= 4` matches so ambiguous patterns are ignored.
+pub fn probe_pipe_dpp_size_regs<I: RegIo>(
+    io: &I,
+    dcn: &DcnAccess,
+    pipe: u8,
+    width: u32,
+    height: u32,
+) -> ([u32; 4], usize) {
+    let mut out = [0u32; 4];
+    if width < 320 || height < 200 || width > 0x3FFF || height > 0x3FFF {
+        return (out, 0);
+    }
+    let target = (width & 0x3FFF) | ((height & 0x3FFF) << 16);
+    let r = dcn.regs;
+    let start = r.cnvc_pixel_format(pipe);
+    let end = r.cm_hdr_mult(pipe);
+    if start.base_idx != end.base_idx || end.off <= start.off + 1 || end.off - start.off > 512 {
+        return (out, 0);
+    }
+    let mut n = 0usize;
+    for off in (start.off + 1)..end.off {
+        let reg = RegAddr::new(start.base_idx, off);
+        if dcn.r_dcn(io, reg) == Some(target) {
+            if n >= out.len() {
+                return ([0; 4], 0);
+            }
+            out[n] = off;
+            n += 1;
+        }
+    }
+    (out, n)
+}
+
 // ---- Scanout + Cursor VRAM Allocator ------------------------------------------------------------
 
 /// Top-of-VRAM safety margin (16 MiB) reserved for IP Discovery (-64 KiB), PSP TMR, and VBIOS tables.

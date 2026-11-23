@@ -73,6 +73,9 @@ pub const EVT_LAUNCH: u32 = 927;
 /// Settings: `a` = theme | text scale (percent) << 8 | reduce motion << 24; payload = the
 /// theme (`dosawmi::THEME_BYTES`).
 pub const EVT_SETTINGS: u32 = 928;
+/// `awmi.launcher`: user answered the compositor permission prompt (`a` = request_id, `b` = choice:
+/// 1 = Allow, 2 = Deny & Launch, 3 = Cancel).
+pub const EVT_PERM_RESULT: u32 = 929;
 
 // ---- `awmi.admin`, `awmi.query`, `awmi.indicator` (calls) ---------------------------------------
 
@@ -105,6 +108,20 @@ pub const DISPLAY_SET_MODE: u8 = 0;
 pub const DISPLAY_SET_VRR: u8 = 1;
 pub const DISPLAY_SET_HDR: u8 = 2;
 pub const DISPLAY_SET_SCALE: u8 = 3;
+/// `awmi.admin`: engage the unforgeable compositor lock/login screen (`a` = reason 1..4, `b` = mode 1..2).
+pub const OP_LOCK: u32 = 937;
+pub const LOCK_REASON_BOOT: u64 = 1;
+pub const LOCK_REASON_MANUAL: u64 = 2;
+pub const LOCK_REASON_IDLE: u64 = 3;
+pub const LOCK_REASON_SLEEP: u64 = 4;
+pub const LOCK_MODE_LOGIN: u64 = 1;
+pub const LOCK_MODE_LOCKED: u64 = 2;
+/// `awmi.admin`: push updated idle timeout & sleep-lock policy to the compositor
+/// (`a` = idle_timeout_secs | (lock_on_sleep << 32)).
+pub const OP_SET_LOCK_POLICY: u32 = 938;
+/// `awmi.launcher`: open the unforgeable compositor permission prompt (`a` = request_id,
+/// `b` = perm_mask, payload = `<app_name>\0<app_title>`).
+pub const OP_PERM_PROMPT: u32 = 939;
 
 // ---- `awmi.admin`, compositor in test mode only ---------------------------------------------------
 
@@ -121,6 +138,8 @@ pub const OP_TEST_ADD_OUTPUT: u32 = 944;
 /// Composite, then reply with a hash of the primary output's backbuffer (`a`) and the number of
 /// pixels differing from the desktop background (`b`): what tests check about rendering.
 pub const OP_TEST_FRAME: u32 = 945;
+/// Test mode: advance idle tracking past `idle_timeout_secs` to trigger idle auto-lock immediately.
+pub const OP_TEST_IDLE_EXPIRE: u32 = 946;
 
 // ---- flags & bits -------------------------------------------------------------------------------
 
@@ -166,6 +185,9 @@ pub fn query_endpoint() -> Handle {
 }
 pub fn indicator_endpoint() -> Handle {
     svc::endpoint(b"awmi.indicator")
+}
+pub fn launcher_endpoint() -> Handle {
+    svc::endpoint(b"awmi.launcher")
 }
 
 /// A call with an optional handle; the reply header.
@@ -268,10 +290,49 @@ pub fn register_app(ep: Handle, app: u8, label: &[u8]) -> Result<(), i64> {
     register_app_pinned(ep, app, label, false)
 }
 
-/// Register launcher entry `app` (0-3) with `label`, optionally pinned in the floating dock.
+/// Register launcher entry `app` (0-15) with `label`, optionally pinned in the floating dock.
 pub fn register_app_pinned(ep: Handle, app: u8, label: &[u8], pinned: bool) -> Result<(), i64> {
     let flags = if pinned { APP_FLAG_PINNED } else { 0 };
     simple(ep, OP_APP_REGISTER, u64::from(app), flags, &label[..label.len().min(32)]).map(|_| ())
+}
+
+/// Register launcher entry on `awmi.launcher` with explicit `<label>\0<verified_app_id>`.
+pub fn register_launcher_app(ep: Handle, app: u8, label: &[u8], app_id: &[u8], pinned: bool) -> Result<(), i64> {
+    let mut p = [0u8; 64];
+    let ll = label.len().min(32);
+    let il = app_id.len().min(24);
+    p[..ll].copy_from_slice(&label[..ll]);
+    p[ll] = 0;
+    p[ll + 1..ll + 1 + il].copy_from_slice(&app_id[..il]);
+    let flags = if pinned { APP_FLAG_PINNED } else { 0 };
+    simple(ep, OP_APP_REGISTER, u64::from(app), flags, &p[..ll + 1 + il]).map(|_| ())
+}
+
+/// Engage the compositor lock/login screen (`awmi.admin`).
+pub fn lock_session(ep: Handle, reason: u64, mode: u64) -> Result<(), i64> {
+    simple(ep, OP_LOCK, reason, mode, &[]).map(|_| ())
+}
+
+/// Push updated idle auto-lock & sleep-lock policy to `awmi` (`awmi.admin`).
+pub fn set_lock_policy(ep: Handle, idle_timeout_secs: u32, lock_on_sleep: bool) -> Result<(), i64> {
+    let a = u64::from(idle_timeout_secs) | (u64::from(lock_on_sleep) << 32);
+    simple(ep, OP_SET_LOCK_POLICY, a, 0, &[]).map(|_| ())
+}
+
+/// Open the compositor permission prompt modal (`awmi.launcher`).
+pub fn open_perm_prompt(ep: Handle, request_id: u32, perm_mask: u32, app_name: &[u8], app_title: &[u8]) -> Result<(), i64> {
+    let mut p = [0u8; 64];
+    let nl = app_name.len().min(24);
+    let tl = app_title.len().min(32);
+    p[..nl].copy_from_slice(&app_name[..nl]);
+    p[nl] = 0;
+    p[nl + 1..nl + 1 + tl].copy_from_slice(&app_title[..tl]);
+    simple(ep, OP_PERM_PROMPT, u64::from(request_id), u64::from(perm_mask), &p[..nl + 1 + tl]).map(|_| ())
+}
+
+/// Test mode (`awmi.admin`): force idle timer expiry to trigger idle auto-lock.
+pub fn test_idle_expire(ep: Handle) -> Result<(), i64> {
+    simple(ep, OP_TEST_IDLE_EXPIRE, 0, 0, &[]).map(|_| ())
 }
 
 /// Change settings (`which`: `SET_*` bits); the settings now.
@@ -393,6 +454,8 @@ pub struct Status {
     pub fonts: bool,
     /// Launcher entries registered by programs.
     pub apps: u8,
+    /// Compositor lock / login screen is engaged.
+    pub locked: bool,
 }
 
 impl Status {
@@ -422,6 +485,7 @@ impl Status {
             launcher_open: b[60] != 0,
             fonts: b[61] != 0,
             apps: b[62],
+            locked: b[63] != 0,
         })
     }
 }
@@ -532,6 +596,8 @@ pub enum Event {
     Launch { app: u8 },
     /// `settings` as in `EVT_SETTINGS`; `theme` the encoded colours (`THEME_LEN` bytes used).
     Settings { settings: u64, theme: [u8; THEME_MAX] },
+    /// `awmi.launcher`: compositor modal permission prompt answer.
+    PermResult { request_id: u32, choice: u8 },
 }
 
 /// Room for an encoded theme in `Event::Settings`.
@@ -564,6 +630,7 @@ impl Event {
                 theme[..n].copy_from_slice(&body[..n]);
                 Self::Settings { settings: h.a, theme }
             }
+            EVT_PERM_RESULT => Self::PermResult { request_id: h.a as u32, choice: h.b as u8 },
             _ => return None,
         })
     }

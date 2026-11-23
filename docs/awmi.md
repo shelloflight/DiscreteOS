@@ -7,17 +7,19 @@ everything back when the session ends.
 
 A normal boot goes straight to a **desktop** session: the service manager starts the compositor
 with `autostart`, and the session begins as soon as a display is there. If there is no display
-within 20 s, the text console stays. The terminal window (`console.dsvc`) shows the same shell
-session as the text console. A line `desktop = off` in `esp:/DOS/BOOT.CFG` boots to the text
-console instead; the shell's `gui` starts the desktop from there. Fonts, the toolkit, themes, the
-launcher and accessibility are described in [ui.md](ui.md).
+within 20 s, the text console stays. The terminal window (`terminal.dapp`, launched by `appmgr`
+with `autostart = true`) shows the same shell session as the text console. If a user identity has
+an enrolled passphrase — or `lock = on` is set in `esp:/DOS/BOOT.CFG` — the session starts behind
+the compositor-drawn login/lock screen ([identity.md](identity.md)). A line `desktop = off` in
+`esp:/DOS/BOOT.CFG` boots to the text console instead; the shell's `gui` starts the desktop from
+there. Fonts, the toolkit, themes, the launcher and accessibility are described in [ui.md](ui.md).
 
 **Code:** `user/lib/awmi` (`dosawmi`: `no_std`, `#![forbid(unsafe_code)]` geometry and bounded damage
 tracking, alpha compositing, rounded/hairline drawing, built-in 8x16 font, theme, window manager,
-dock, launcher, themes, wire codecs), `user/awmi` (`awmi.dsvc`, `awmi-demo.dsvc`, `console.dsvc`),
-`user/lib/libd/src/awmi.rs` (client protocol), `user/init/services/awmi.dman`, `awmi-demo.dman`,
-`console.dman`.
-**Tests:** `awmi-host`, `awmi-virtio`, `awmi-gop`, `desktop-virtio`, `desktop-gop`.
+dock, launcher, lock screen, permission prompt, wire codecs), `user/awmi` (`awmi.dsvc`,
+`awmi-demo.dsvc`, `console.dx` bundled in `terminal.dapp`), `user/lib/libd/src/awmi.rs` (client
+protocol), `user/init/services/awmi.dman`, `awmi-demo.dman`.
+**Tests:** `awmi-host`, `awmi-virtio`, `awmi-gop`, `desktop-virtio`, `desktop-gop`, `identity-tpm`, `apps-virtio`.
 
 ## Session lifecycle
 
@@ -39,9 +41,12 @@ dock, launcher, themes, wire codecs), `user/awmi` (`awmi.dsvc`, `awmi-demo.dsvc`
    `CAP_ASYNC_FLIP` use event-driven vsync pacing (`OP_PRESENT_MULTI` -> unsolicited
    `EVT_FLIP_DONE` from the driver's vblank/flip interrupt, tying `EVT_FRAME_DONE` to real vertical
    blank with zero idle CPU and stepping down cleanly on late frames); synchronous outputs use a
-   refresh-paced timer (supporting up to 540+ Hz). Bursts coalesce into one frame per refresh. A
-   single output with `CAP_HW_CURSOR` uses the hardware cursor and pushes pointer moves immediately
-   without recompositing; otherwise the cursor is drawn in software.
+   refresh-paced timer (supporting up to 540+ Hz). Bursts coalesce into one frame per refresh. The
+   compositor selects context-aware minimal cursors (`Default`, `Pointer`, `Text`, `Move`, and
+   4-axis resize arrows `ResizeEW`/`NS`/`NWSE`/`NESW`) based on what is under the pointer; a single
+   output with `CAP_HW_CURSOR` uploads the active shape and hotspot to the hardware cursor plane
+   and pushes moves immediately without recompositing, while all other outputs (including native
+   AMD DCN tear-free flips) render the cursor directly into the damaged backbuffer.
 4. **End:** `Super+Esc` (`Ctrl+Alt+Esc` inside a VM, where the host takes `Super`) or
    `OP_SESSION_STOP`: every window closes (`EVT_SESSION` 0), native outputs call
    `OP_RELEASE_DISPLAY` to restore the firmware GOP framebuffer, the grab is released, and the
@@ -68,8 +73,9 @@ alert (red) indicators, and the UTC clock.
 | `Super+1`..`4` / `Super+Shift+1`..`4` | switch workspace / move the focused window there |
 | `Alt+Tab` | next window |
 | `Super+Q` | ask the focused window to close (`EVT_CLOSE`) |
+| `Super+L` | engage the unforgeable compositor lock screen ([identity.md](identity.md)) |
 | `Super` (tap), `Alt+F1` | open or close the launcher ([ui.md](ui.md#launcher)) |
-| `Super+Esc`, `Ctrl+Alt+Esc` | end the session |
+| `Super+Esc`, `Ctrl+Alt+Esc` | end the session (disabled while locked) |
 
 `Super` itself is never delivered to windows: a tap opens the launcher, and with another key it
 is a shortcut.
@@ -86,7 +92,8 @@ Pointers: USB HID mice (relative), `virtio-input` relative mice and absolute tab
 | A program draws only its own windows | its pixels are a VMO it created; the compositor maps a read-only duplicate and never writes it |
 | A program cannot see other windows | no handle to another program's VMO, no way to name another program's window (ids are checked against the creating channel: `ERR_ACCESS_DENIED`), no readback outside test mode |
 | Input goes where the user is | keys to the focused window only, pointer events to the window under the pointer only, in window-local coordinates |
-| The title bar cannot lie | the service manager attaches each client's verified service name and trust tier to its channel (`provides.identify`); the trust dot and name come from there, the program sets only the title after them |
+| The title bar cannot lie | the service manager attaches each client's verified service or app name and trust tier to its channel (`provides.identify`); the compositor always enforces `FLAG_DECORATED` so apps cannot hide chrome or draw fake title bars or lock screens |
+| Lock & permission overlays cannot be forged | the lock/login screen (`identity.session`) and permission prompt (`awmi.launcher`) are drawn exclusively by the compositor above every window and capture all input; apps never receive keys or pointer events while locked or prompted |
 | Indicators cannot be forged | `MIC LIVE` comes from the audio service (open capture streams, `audio.control`), the alert from `awmi.indicator` holders only |
 
 Trust tiers: **system** (group `system`), **native** (other services), **sandbox** (anything that may
@@ -99,13 +106,15 @@ hairline border.
 [grants]
 awmi = ["window"]      # create and draw its own windows; input for them while focused
 awmi = ["query"]       # the compositor's status (OP_STATUS)
-awmi = ["admin"]       # start and stop the session (the shell's `gui`), settings, plus status
+awmi = ["admin"]       # start and stop the session, settings, display mode/scale, lock control, plus status
 awmi = ["indicator"]   # set the dock's security alert
+awmi = ["launcher"]    # register up to 16 .dapp launcher/dock entries and trigger permission prompts (appmgr only)
 ```
 
 `awmi.dsvc` itself holds `gpu = ["display"]`, `audio = ["control"]` (microphone and mute state),
-`net = ["status"]` (read-only link state), `devmgr.input`, `terminal.display`, `clock.time`, and
-read-only `sys:/` (fonts and themes).
+`net = ["status"]` (read-only link state), `identity = ["session"]` (exclusively for lock/login
+authentication), `devmgr.input`, `terminal.display`, `clock.time`, and read-only `sys:/` (fonts and
+themes).
 
 ## Client protocol (`libd::awmi`)
 
@@ -118,27 +127,31 @@ Requests are calls on the client's channel; events arrive on the same channel (t
 | `OP_COMMIT` (902) | window | show the buffer; payload = up to 16 damage rectangles (window-local); `EVT_FRAME_DONE` follows |
 | `OP_SET_TITLE` (903), `OP_DESTROY` (904) | window | the program's own windows only |
 | `OP_FONTS` (905) | window | one read-only VMO handle: the font pack; `a` = its size |
-| `OP_APP_REGISTER` (906) | window | a launcher entry: `a` = entry 0-3, `b` = `APP_FLAG_PINNED` (1) to pin in dock, payload = label (32 bytes) |
-| `OP_SESSION_START` (930), `OP_SESSION_STOP` (931) | admin | `a`: `SESSION_DEMO` (1) opens the demo windows, `SESSION_DESKTOP` (2) the terminal window |
-| `OP_STATUS` (932) | query, admin | session, outputs, mode, windows, workspace, indicators, frames, input counters, settings, launcher, fonts, entries |
+| `OP_APP_REGISTER` (906) | window, launcher | a launcher entry: `a` = entry 0-3 (window) or 0-15 (launcher), `b` = `APP_FLAG_PINNED` (1) to pin in dock, payload = label (32 bytes) |
+| `OP_SESSION_START` (930), `OP_SESSION_STOP` (931) | admin | `a`: `SESSION_DEMO` (1) opens the demo windows, `SESSION_DESKTOP` (2) starts the desktop session |
+| `OP_STATUS` (932) | query, admin | session, locked state, outputs, mode, windows, workspace, indicators, frames, input counters, settings, launcher, fonts, entries |
 | `OP_INDICATOR` (933) | indicator | `IND_SECURITY_ALERT` |
 | `OP_SETTINGS` (934) | admin | `a` = settings (theme, text size << 8, reduce motion << 24), `b` = which (`SET_*`) |
 | `OP_FLIP_TEST` (935) | admin | `a` = adapter id (0 = first), `b` = duration ms; releases terminal, runs `gpu::flip_test`, restores terminal |
 | `OP_SET_DISPLAY` (936) | admin | `a` = adapter id \| subop (`DISPLAY_SET_MODE`/`VRR`/`HDR`/`SCALE`) << 32; safe display mode/refresh, VRR, HDR10, and per-output scale control |
-| `OP_TEST_*` (940-945) | admin, test mode only | inject keys and pointer events, read back a backbuffer pixel, list windows, add a virtual output, hash a frame |
+| `OP_LOCK` (937) | admin | engage the unforgeable lock/login screen (`a` = reason 1..4, `b` = mode 1..2) |
+| `OP_SET_LOCK_POLICY` (938) | admin | update idle timeout seconds and lock-on-sleep policy |
+| `OP_PERM_PROMPT` (939) | launcher | display compositor-drawn permission prompt (`a` = request id, `b` = permission mask, payload = `<app>\0<title>`); answered with `EVT_PERM_RESULT` (929) |
+| `OP_TEST_*` (940-946) | admin, test mode only | inject keys and pointer events, read back a backbuffer pixel, list windows, add a virtual output, hash a frame, expire idle timer (`OP_TEST_IDLE_EXPIRE`, 946) |
 
 Events: `EVT_CONFIGURE` (size and state after a snap, resize, maximize, minimize, focus change),
 `EVT_KEY`, `EVT_POINTER`, `EVT_FOCUS`, `EVT_CLOSE`, `EVT_FRAME_DONE`, `EVT_SESSION` (`a` bit 0
 active, bit 1 demo, bit 2 desktop), `EVT_LAUNCH` (`a` = the entry opened), `EVT_SETTINGS` (`a` =
-settings, payload = the theme's colours).
+settings, payload = the theme's colours), `EVT_PERM_RESULT` (929, `awmi.launcher`: user choice for
+`OP_PERM_PROMPT`).
 `libd::awmi::Window` creates a window with its own buffer, `resize`s it on `EVT_CONFIGURE` and
 `commit`s damage.
 
 Window programs that ship with the desktop, all ordinary `awmi.window` clients:
 
-- `console.dsvc`: the terminal window. It needs `terminal.view` as well: the terminal lays the
-  session out for the window's grid in a VMO the console maps read-only, says which rows changed,
-  and takes the keys typed in the window. It opens on a desktop session and from the launcher.
+- Core `.dapp` native apps (`terminal.dapp`, `files.dapp`, `editor.dapp`, `settings.dapp`,
+  `sysmon.dapp`): managed and launched by `appmgr.dsvc` ([apps.md](apps.md)). `terminal.dapp`
+  bundles `console.dx` and connects to `terminal.view`, opening automatically on a desktop session.
 - `awmi-demo.dsvc`: the toolkit's example apps, Widgets (a tour of the controls, all local to its
   window, with a theme preview that re-themes only that window) and About D-OS (the
   shortcuts), from the launcher or `gui demo`.

@@ -175,6 +175,10 @@ pub struct Manifest {
     pub manage_services: bool,
     /// ... and switch the machine off or restart it (a clean shutdown first).
     pub manage_power: bool,
+    /// ... and link verified `.dapp` app channels to system endpoints (`appmgr`).
+    pub manage_apps: bool,
+    /// The TPM 2.0 credential sealing resource (`grants.tpm-seal`; `identity.dsvc`).
+    pub tpm_seal: bool,
     /// The tool manifests and the tools' program images (the shell).
     pub tools: bool,
     /// Audio capabilities (`grants.audio`: `playback`, `capture`, `control`).
@@ -191,11 +195,19 @@ pub struct Manifest {
     pub gpu_display: bool,
     pub gpu_render: bool,
     /// Compositor & window manager capabilities (`grants.awmi`: `window`, `admin`, `query`,
-    /// `indicator`).
+    /// `indicator`, `launcher`).
     pub awmi_window: bool,
     pub awmi_admin: bool,
     pub awmi_query: bool,
     pub awmi_indicator: bool,
+    pub awmi_launcher: bool,
+    /// User identity capabilities (`grants.identity`: `session`, `admin`, `query`).
+    pub identity_session: bool,
+    pub identity_admin: bool,
+    pub identity_query: bool,
+    /// Application manager capabilities (`grants.appmgr`: `query`, `admin`).
+    pub appmgr_query: bool,
+    pub appmgr_admin: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
@@ -321,12 +333,15 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "power", Want::Bool),
     ("grants", "kernel-log", Want::Bool),
     ("grants", "boot-time", Want::Bool),
+    ("grants", "tpm-seal", Want::Bool),
     ("grants", "manager", Want::Strings),
     ("grants", "tools", Want::Bool),
     ("grants", "audio", Want::Strings),
     ("grants", "net", Want::Strings),
     ("grants", "gpu", Want::Strings),
     ("grants", "awmi", Want::Strings),
+    ("grants", "identity", Want::Strings),
+    ("grants", "appmgr", Want::Strings),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -378,6 +393,8 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         boot_time: false,
         manage_services: false,
         manage_power: false,
+        manage_apps: false,
+        tpm_seal: false,
         tools: false,
         audio_playback: false,
         audio_capture: false,
@@ -393,6 +410,12 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         awmi_admin: false,
         awmi_query: false,
         awmi_indicator: false,
+        awmi_launcher: false,
+        identity_session: false,
+        identity_admin: false,
+        identity_query: false,
+        appmgr_query: false,
+        appmgr_admin: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -450,6 +473,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                 "grants.power" => m.power = *b,
                 "grants.kernel-log" => m.kernel_log = *b,
                 "grants.boot-time" => m.boot_time = *b,
+                "grants.tpm-seal" => m.tpm_seal = *b,
                 "grants.tools" => m.tools = *b,
                 _ => return Err(bad("known")),
             },
@@ -544,7 +568,8 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                             match s.as_str() {
                                 "services" => m.manage_services = true,
                                 "power" => m.manage_power = true,
-                                _ => return Err(invalid("unknown manager right (services, power)", s)),
+                                "apps" => m.manage_apps = true,
+                                _ => return Err(invalid("unknown manager right (services, power, apps)", s)),
                             }
                         }
                     }
@@ -640,9 +665,55 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                                     m.awmi_indicator = true;
                                     "indicator"
                                 }
-                                _ => return Err(invalid("unknown awmi right (window, admin, query, indicator)", s)),
+                                "launcher" => {
+                                    m.awmi_launcher = true;
+                                    "launcher"
+                                }
+                                _ => return Err(invalid("unknown awmi right (window, admin, query, indicator, launcher)", s)),
                             };
                             let c = Connect { service: "awmi".to_string(), endpoint: ep.to_string() };
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
+                            }
+                        }
+                    }
+                    "grants.identity" => {
+                        for s in &list {
+                            let ep = match s.as_str() {
+                                "session" => {
+                                    m.identity_session = true;
+                                    "session"
+                                }
+                                "admin" => {
+                                    m.identity_admin = true;
+                                    "admin"
+                                }
+                                "query" => {
+                                    m.identity_query = true;
+                                    "query"
+                                }
+                                _ => return Err(invalid("unknown identity right (session, admin, query)", s)),
+                            };
+                            let c = Connect { service: "identity".to_string(), endpoint: ep.to_string() };
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
+                            }
+                        }
+                    }
+                    "grants.appmgr" => {
+                        for s in &list {
+                            let ep = match s.as_str() {
+                                "query" => {
+                                    m.appmgr_query = true;
+                                    "query"
+                                }
+                                "admin" => {
+                                    m.appmgr_admin = true;
+                                    "admin"
+                                }
+                                _ => return Err(invalid("unknown appmgr right (query, admin)", s)),
+                            };
+                            let c = Connect { service: "appmgr".to_string(), endpoint: ep.to_string() };
                             if !m.connect.contains(&c) {
                                 m.connect.push(c);
                             }
@@ -711,8 +782,21 @@ pub fn summary(m: &Manifest) -> String {
     if m.boot_time {
         add("boot time");
     }
-    if m.manage_services || m.manage_power {
-        add(&format!("manager ({}{}{})", if m.manage_services { "services" } else { "" }, if m.manage_services && m.manage_power { ", " } else { "" }, if m.manage_power { "power" } else { "" }));
+    if m.tpm_seal {
+        add("TPM seal");
+    }
+    if m.manage_services || m.manage_power || m.manage_apps {
+        let mut parts: Vec<&str> = Vec::new();
+        if m.manage_services {
+            parts.push("services");
+        }
+        if m.manage_power {
+            parts.push("power");
+        }
+        if m.manage_apps {
+            parts.push("apps");
+        }
+        add(&format!("manager ({})", parts.join(", ")));
     }
     if m.tools {
         add("tools");
@@ -759,14 +843,38 @@ pub fn summary(m: &Manifest) -> String {
         }
         add(&format!("gpu ({})", parts.join(", ")));
     }
-    if m.awmi_window || m.awmi_admin || m.awmi_query || m.awmi_indicator {
+    if m.awmi_window || m.awmi_admin || m.awmi_query || m.awmi_indicator || m.awmi_launcher {
         let mut parts: Vec<&str> = Vec::new();
-        for (on, name) in [(m.awmi_window, "window"), (m.awmi_admin, "admin"), (m.awmi_query, "query"), (m.awmi_indicator, "indicator")] {
+        for (on, name) in [
+            (m.awmi_window, "window"),
+            (m.awmi_admin, "admin"),
+            (m.awmi_query, "query"),
+            (m.awmi_indicator, "indicator"),
+            (m.awmi_launcher, "launcher"),
+        ] {
             if on {
                 parts.push(name);
             }
         }
         add(&format!("awmi ({})", parts.join(", ")));
+    }
+    if m.identity_session || m.identity_admin || m.identity_query {
+        let mut parts: Vec<&str> = Vec::new();
+        for (on, name) in [(m.identity_session, "session"), (m.identity_admin, "admin"), (m.identity_query, "query")] {
+            if on {
+                parts.push(name);
+            }
+        }
+        add(&format!("identity ({})", parts.join(", ")));
+    }
+    if m.appmgr_query || m.appmgr_admin {
+        let mut parts: Vec<&str> = Vec::new();
+        for (on, name) in [(m.appmgr_query, "query"), (m.appmgr_admin, "admin")] {
+            if on {
+                parts.push(name);
+            }
+        }
+        add(&format!("appmgr ({})", parts.join(", ")));
     }
     if m.identify {
         add("verified client identity");

@@ -1,0 +1,27 @@
+# User identity and TPM 2.0 credential sealing service.
+# Holds the TPM_SEAL kernel resource and manages per-identity namespaces, explicit capability
+# sets, and sealed credentials (no root user, no ambient authority).
+name = "identity"
+image = "identity.dsvc"
+group = "system"
+after = ["storaged"]
+description = "user identities and TPM 2.0 credential sealing"
+
+[provides]
+endpoints = ["session", "admin", "query"]
+identify = true
+
+[grants]
+log = true
+tpm-seal = true
+namespace = ["*"]
+
+[quota]
+memory = "32M"
+handles = 256
+threads = 4
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

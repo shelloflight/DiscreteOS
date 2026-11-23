@@ -1,0 +1,3 @@
+Discrete OS Core Native Application Bundle
+Licensed under GPL-3.0-or-later.
+Fast, Secure, Practical.

@@ -1027,7 +1027,30 @@ impl GpuSvc {
                         match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
                             Ok(rn) => {
                                 let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
+                                let mut changed_id = None;
+                                if dh.status == 0 {
+                                    let old_w = ad.info.width;
+                                    let old_h = ad.info.height;
+                                    let (modes, mon, mon_len) = Self::query_pci_modes(*dch);
+                                    if let Some(cur) = modes.iter().find(|m| (m.flags & gpu::MODE_FLAG_CURRENT) != 0)
+                                        && cur.width > 0
+                                        && cur.height > 0
+                                    {
+                                        ad.info.width = cur.width;
+                                        ad.info.height = cur.height;
+                                    }
+                                    let modes_changed = ad.modes != modes || ad.info.width != old_w || ad.info.height != old_h;
+                                    ad.modes = modes;
+                                    ad.info.monitor = mon;
+                                    ad.info.monitor_len = mon_len;
+                                    if modes_changed {
+                                        changed_id = Some(ad.info.id);
+                                    }
+                                }
                                 Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
+                                if let Some(cid) = changed_id {
+                                    self.broadcast_adapters_changed(cid);
+                                }
                             }
                             Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
                         }

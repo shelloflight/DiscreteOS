@@ -1,0 +1,30 @@
+# D-OS application manager (`appmgr.dsvc`): verifies `.dapp` bundles via kernel `vmo_verify`,
+# manages per-identity revocable permissions, drives the compositor permission prompt, and
+# spawns verified apps with exact granted capabilities and per-identity namespaces.
+[package]
+name = "appmgr"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[package.metadata.dos]
+dsvc = ["appmgr"]
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+test = false
+bench = false
+
+[dependencies]
+libd = { path = "../lib/libd", features = ["alloc"] }
+dosapp = { path = "../lib/app" }
+dosid = { path = "../lib/identity" }
+doscrypt = { path = "../lib/crypto" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

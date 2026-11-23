@@ -42,7 +42,15 @@ const CC_NV_READ: u32 = 0x14E;
 const CC_START_AUTH_SESSION: u32 = 0x176;
 const CC_POLICY_SECRET: u32 = 0x151;
 const CC_ACTIVATE_CREDENTIAL: u32 = 0x147;
+const CC_CREATE: u32 = 0x153;
+const CC_LOAD: u32 = 0x157;
+const CC_UNSEAL: u32 = 0x15E;
 const RC_INITIALIZE: u32 = 0x100;
+const SEAL_MAGIC: &[u8; 4] = b"DTPM";
+const SEAL_VERSION: u16 = 1;
+pub const SEAL_AUTH_MAX: usize = 64;
+pub const SEAL_DATA_MAX: usize = 128;
+pub const SEAL_BLOB_MAX: usize = 1024;
 const RS_PW: u32 = 0x4000_0009;
 const CAP_TPM_PROPERTIES: u32 = 6;
 const PT_MANUFACTURER: u32 = 0x105;
@@ -117,7 +125,11 @@ impl Cmd {
     }
     /// The authorization area: one password session with an empty password.
     fn pw(&mut self) -> &mut Self {
-        self.u32(9).u32(RS_PW).u16(0).u8(0).u16(0)
+        self.pw_auth(&[])
+    }
+    /// The authorization area: one password session carrying `auth`.
+    fn pw_auth(&mut self, auth: &[u8]) -> &mut Self {
+        self.u32((9 + auth.len()) as u32).u32(RS_PW).u16(0).u8(0).tpm2b(auth)
     }
     fn done(mut self) -> Vec<u8> {
         let n = self.0.len() as u32;
@@ -223,8 +235,12 @@ impl Tpm {
 
     /// One command; checks the response header. Returns the response.
     fn command(&mut self, cmd: Vec<u8>) -> Result<Vec<u8>, Error> {
+        self.command_slice(&cmd)
+    }
+
+    fn command_slice(&mut self, cmd: &[u8]) -> Result<Vec<u8>, Error> {
         let mut rsp = vec![0u8; RSP_MAX];
-        let got = self.t.exchange(&cmd, &mut rsp)?;
+        let got = self.t.exchange(cmd, &mut rsp)?;
         if !(10..=rsp.len()).contains(&got) {
             return Err(Error::Protocol("short response"));
         }
@@ -239,6 +255,13 @@ impl Tpm {
         }
         rsp.truncate(got);
         Ok(rsp)
+    }
+
+    /// Like `command`, wiping `cmd` afterwards (used when `cmd` carries a credential or password).
+    fn command_wipe(&mut self, mut cmd: Vec<u8>) -> Result<Vec<u8>, Error> {
+        let res = self.command_slice(&cmd);
+        doscrypt::ct::wipe_bytes(&mut cmd);
+        res
     }
 
     /// Request up to `n` bytes (capped at 48 per TPM 2.0 spec) of hardware entropy (`TPM2_GetRandom`).
@@ -414,6 +437,93 @@ impl Tpm {
         let r = self.command(c.done())?;
         let mut p = Rsp::params(&r, 0)?;
         p.tpm2b()?.try_into().map_err(|_| Error::Protocol("ActivateCredential: not 32 bytes"))
+    }
+
+    /// Seal `data` (1..=128 bytes) protected by `auth` (0..=64 bytes) under an ECC P-256 Storage
+    /// Root Key in the owner hierarchy. Returns a `DTPM` sealed blob. Transient handles are always
+    /// flushed before returning.
+    pub fn seal(&mut self, auth: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
+        if auth.len() > SEAL_AUTH_MAX || data.is_empty() || data.len() > SEAL_DATA_MAX {
+            return Err(Error::Protocol("seal input out of range"));
+        }
+        let (srk_tmpl, srk_n) = doscrypt::tpm::srk_ecc_template();
+        let srk = self.create_primary(RH_OWNER, &srk_tmpl[..srk_n])?;
+        let res = self.seal_under(srk.handle, auth, data);
+        self.flush(srk.handle);
+        res
+    }
+
+    fn seal_under(&mut self, srk: u32, auth: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
+        let (seal_tmpl, seal_n) = doscrypt::tpm::seal_keyedhash_template();
+        let mut c = Cmd::new(ST_SESSIONS, CC_CREATE);
+        c.u32(srk).pw();
+        let sens_len = (2 + auth.len() + 2 + data.len()) as u16;
+        c.u16(sens_len).tpm2b(auth).tpm2b(data);
+        c.tpm2b(&seal_tmpl[..seal_n]).u16(0).u32(0);
+        let r = self.command_wipe(c.done())?;
+        let mut p = Rsp::params(&r, 0)?;
+        let priv_area = p.tpm2b()?;
+        let pub_area = p.tpm2b()?;
+        if priv_area.is_empty() || pub_area.is_empty() || 10 + priv_area.len() + pub_area.len() > SEAL_BLOB_MAX {
+            return Err(Error::Protocol("Create: sealed blob size out of range"));
+        }
+        let mut blob = Vec::with_capacity(10 + priv_area.len() + pub_area.len());
+        blob.extend_from_slice(SEAL_MAGIC);
+        blob.extend_from_slice(&SEAL_VERSION.to_le_bytes());
+        blob.extend_from_slice(&(priv_area.len() as u16).to_le_bytes());
+        blob.extend_from_slice(priv_area);
+        blob.extend_from_slice(&(pub_area.len() as u16).to_le_bytes());
+        blob.extend_from_slice(pub_area);
+        Ok(blob)
+    }
+
+    /// Unseal a `DTPM` blob created by `seal` using `auth`. Always flushes transient handles and
+    /// wipes command/response buffers containing secrets.
+    pub fn unseal(&mut self, auth: &[u8], blob: &[u8]) -> Result<Vec<u8>, Error> {
+        if auth.len() > SEAL_AUTH_MAX || blob.len() < 10 || blob.len() > SEAL_BLOB_MAX {
+            return Err(Error::Protocol("unseal input out of range"));
+        }
+        if &blob[0..4] != SEAL_MAGIC || u16::from_le_bytes([blob[4], blob[5]]) != SEAL_VERSION {
+            return Err(Error::Protocol("unseal: bad blob header"));
+        }
+        let priv_len = usize::from(u16::from_le_bytes([blob[6], blob[7]]));
+        let pub_off = 8usize.checked_add(priv_len).ok_or(Error::Protocol("unseal: bad length"))?;
+        if pub_off + 2 > blob.len() {
+            return Err(Error::Protocol("unseal: truncated private area"));
+        }
+        let priv_area = &blob[8..pub_off];
+        let pub_len = usize::from(u16::from_le_bytes([blob[pub_off], blob[pub_off + 1]]));
+        if pub_off + 2 + pub_len != blob.len() || priv_area.is_empty() || pub_len == 0 {
+            return Err(Error::Protocol("unseal: truncated public area"));
+        }
+        let pub_area = &blob[pub_off + 2..];
+        let (srk_tmpl, srk_n) = doscrypt::tpm::srk_ecc_template();
+        let srk = self.create_primary(RH_OWNER, &srk_tmpl[..srk_n])?;
+        let res = self.unseal_under(srk.handle, auth, priv_area, pub_area);
+        self.flush(srk.handle);
+        res
+    }
+
+    fn unseal_under(&mut self, srk: u32, auth: &[u8], priv_area: &[u8], pub_area: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut c = Cmd::new(ST_SESSIONS, CC_LOAD);
+        c.u32(srk).pw().tpm2b(priv_area).tpm2b(pub_area);
+        let r = self.command(c.done())?;
+        let handle = be32(&r, 10).ok_or(SHORT)?;
+        let res = self.unseal_loaded(handle, auth);
+        self.flush(handle);
+        res
+    }
+
+    fn unseal_loaded(&mut self, handle: u32, auth: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut c = Cmd::new(ST_SESSIONS, CC_UNSEAL);
+        c.u32(handle).pw_auth(auth);
+        let mut r = self.command_wipe(c.done())?;
+        let out = {
+            let mut p = Rsp::params(&r, 0)?;
+            p.tpm2b()?.to_vec()
+        };
+        doscrypt::ct::wipe_bytes(&mut r);
+        Ok(out)
     }
 }
 
@@ -696,6 +806,14 @@ pub fn probe() -> Result<Box<dyn Transport>, &'static str> {
 
 // ---- simulator (tests) ------------------------------------------------------------------------------
 
+#[cfg(ktest)]
+enum SimObj {
+    Ek,
+    Ak,
+    Srk,
+    Sealed { auth: Vec<u8>, data: Vec<u8> },
+}
+
 /// A software TPM for testing the command layer, the log replay and attestation: the commands
 /// above, with the fixed TEST endorsement key and certificate of `doscrypt::testkeys` and a fixed
 /// attestation key. `fault` breaks responses on purpose. Never in a release kernel.
@@ -705,8 +823,8 @@ pub struct Sim {
     started: bool,
     pub fault: SimFault,
     pub commands: u32,
-    /// Loaded objects: (handle, is the EK).
-    objects: Vec<(u32, bool)>,
+    /// Loaded objects: (handle, kind).
+    objects: Vec<(u32, SimObj)>,
     /// Policy sessions: (handle, PolicySecret(endorsement) done).
     sessions: Vec<(u32, bool)>,
     next: u32,
@@ -741,6 +859,17 @@ fn sim_ek_public() -> Vec<u8> {
 }
 
 #[cfg(ktest)]
+fn sim_srk_key() -> [u8; 32] {
+    doscrypt::sha2::sha256(b"D-OS simulated TPM owner SRK (test only)")
+}
+
+#[cfg(ktest)]
+fn sim_srk_public() -> Vec<u8> {
+    let (a, n) = doscrypt::tpm::srk_ecc_template();
+    a[..n].to_vec()
+}
+
+#[cfg(ktest)]
 impl Sim {
     pub fn new() -> Sim {
         Sim { pcrs: [[0; 32]; 24], started: false, fault: SimFault::None, commands: 0, objects: Vec::new(), sessions: Vec::new(), next: 0 }
@@ -766,7 +895,8 @@ impl Sim {
         };
         // Parameters start after the handles and (with sessions) the authorization area.
         let handles = match cc {
-            CC_PCR_EXTEND | CC_CREATE_PRIMARY | CC_QUOTE | CC_READ_PUBLIC | CC_NV_READ_PUBLIC | CC_FLUSH_CONTEXT => 1,
+            CC_PCR_EXTEND | CC_CREATE_PRIMARY | CC_QUOTE | CC_READ_PUBLIC | CC_NV_READ_PUBLIC | CC_FLUSH_CONTEXT
+            | CC_CREATE | CC_LOAD | CC_UNSEAL => 1,
             CC_NV_READ | CC_POLICY_SECRET | CC_ACTIVATE_CREDENTIAL | CC_START_AUTH_SESSION => 2,
             _ => 0,
         };
@@ -819,25 +949,36 @@ impl Sim {
                 let (Ok(_), Ok(template)) = (p.tpm2b(), p.tpm2b()) else { return (VALUE, out) };
                 let is_ek = template == &doscrypt::tpm::ek_template().0[..doscrypt::tpm::ek_template().1];
                 let is_ak = template == &doscrypt::tpm::ak_template().0[..doscrypt::tpm::ak_template().1];
-                if h(0) != RH_ENDORSEMENT || !(is_ek || is_ak) {
+                let is_srk = template == &doscrypt::tpm::srk_ecc_template().0[..doscrypt::tpm::srk_ecc_template().1];
+                let (kind, public, hierarchy) = if h(0) == RH_ENDORSEMENT && is_ek {
+                    (SimObj::Ek, sim_ek_public(), RH_ENDORSEMENT)
+                } else if h(0) == RH_ENDORSEMENT && is_ak {
+                    (SimObj::Ak, sim_ak_public(), RH_ENDORSEMENT)
+                } else if h(0) == RH_OWNER && is_srk {
+                    (SimObj::Srk, sim_srk_public(), RH_OWNER)
+                } else {
                     return (VALUE, out);
-                }
-                let public = if is_ek { sim_ek_public() } else { sim_ak_public() };
+                };
                 self.next += 1;
                 let handle = 0x8000_0000 + self.next;
-                self.objects.push((handle, is_ek));
+                self.objects.push((handle, kind));
                 put32(&mut out, handle);
                 tpm2b(&mut out, &public);
                 tpm2b(&mut out, &[]); // creationData
                 tpm2b(&mut out, &[]); // creationHash
                 put16(&mut out, 0x8021);
-                put32(&mut out, RH_ENDORSEMENT);
+                put32(&mut out, hierarchy);
                 tpm2b(&mut out, &[]);
                 tpm2b(&mut out, &name_of(&public));
             }
             CC_READ_PUBLIC => {
-                let Some(&(_, ek)) = self.objects.iter().find(|o| o.0 == h(0)) else { return (HANDLE, out) };
-                let public = if ek { sim_ek_public() } else { sim_ak_public() };
+                let Some((_, kind)) = self.objects.iter().find(|o| o.0 == h(0)) else { return (HANDLE, out) };
+                let public = match kind {
+                    SimObj::Ek => sim_ek_public(),
+                    SimObj::Ak => sim_ak_public(),
+                    SimObj::Srk => sim_srk_public(),
+                    SimObj::Sealed { .. } => return (HANDLE, out),
+                };
                 tpm2b(&mut out, &public);
                 tpm2b(&mut out, &name_of(&public));
                 tpm2b(&mut out, &name_of(&public)); // qualifiedName (not checked)
@@ -851,7 +992,7 @@ impl Sim {
                 }
             }
             CC_QUOTE => {
-                if !self.objects.iter().any(|o| o.0 == h(0) && !o.1) {
+                if !self.objects.iter().any(|o| o.0 == h(0) && matches!(o.1, SimObj::Ak)) {
                     return (HANDLE, out);
                 }
                 let (Ok(extra), Ok(ALG_NULL), Ok(1), Ok(SHA256_ALG), Ok(3), Ok(sel)) = (p.tpm2b(), p.u16(), p.u32(), p.u16(), p.bytes(1).map(|b| b[0]), p.bytes(3)) else {
@@ -938,8 +1079,8 @@ impl Sim {
                 let policy = be32(auth, 9).unwrap_or(0);
                 let ok = auth.len() == 18 && be32(auth, 0) == Some(RS_PW) && self.sessions.iter().any(|s| s.0 == policy && s.1);
                 self.sessions.retain(|s| s.0 != policy);
-                let ak = self.objects.iter().any(|o| o.0 == h(0) && !o.1);
-                let ek = self.objects.iter().any(|o| o.0 == h(1) && o.1);
+                let ak = self.objects.iter().any(|o| o.0 == h(0) && matches!(o.1, SimObj::Ak));
+                let ek = self.objects.iter().any(|o| o.0 == h(1) && matches!(o.1, SimObj::Ek));
                 if !ok {
                     return (0x9A2, out); // TPM_RC_POLICY_FAIL (session 2)
                 }
@@ -956,6 +1097,87 @@ impl Sim {
                     Some(c) => tpm2b(&mut out, &c),
                     None => return (0x0A1, out), // TPM_RC_INTEGRITY-ish
                 }
+            }
+            CC_CREATE => {
+                if !self.objects.iter().any(|o| o.0 == h(0) && matches!(o.1, SimObj::Srk)) {
+                    return (HANDLE, out);
+                }
+                let (Ok(sens), Ok(in_pub)) = (p.tpm2b(), p.tpm2b()) else { return (VALUE, out) };
+                let (tmpl, tn) = doscrypt::tpm::seal_keyedhash_template();
+                if in_pub != &tmpl[..tn] {
+                    return (VALUE, out);
+                }
+                let mut sp = Rsp { b: sens, o: 0 };
+                let (Ok(user_auth), Ok(data)) = (sp.tpm2b(), sp.tpm2b()) else { return (VALUE, out) };
+                if user_auth.len() > SEAL_AUTH_MAX || data.is_empty() || data.len() > SEAL_DATA_MAX {
+                    return (VALUE, out);
+                }
+                self.next += 1;
+                let mut nonce = [0u8; 12];
+                nonce[..4].copy_from_slice(&self.next.to_le_bytes());
+                nonce[4..8].copy_from_slice(&self.commands.to_le_bytes());
+                let mut plain = Vec::with_capacity(4 + user_auth.len() + data.len());
+                put16(&mut plain, user_auth.len() as u16);
+                plain.extend_from_slice(user_auth);
+                put16(&mut plain, data.len() as u16);
+                plain.extend_from_slice(data);
+                let key = sim_srk_key();
+                let tag = doscrypt::chacha20::seal_in_place(&key, &nonce, in_pub, &mut plain);
+                let mut priv_blob = Vec::with_capacity(12 + 16 + plain.len());
+                priv_blob.extend_from_slice(&nonce);
+                priv_blob.extend_from_slice(&tag);
+                priv_blob.extend_from_slice(&plain);
+                tpm2b(&mut out, &priv_blob);
+                tpm2b(&mut out, in_pub);
+                tpm2b(&mut out, &[]); // creationData
+                tpm2b(&mut out, &[]); // creationHash
+                put16(&mut out, 0x8021);
+                put32(&mut out, RH_OWNER);
+                tpm2b(&mut out, &[]);
+            }
+            CC_LOAD => {
+                if !self.objects.iter().any(|o| o.0 == h(0) && matches!(o.1, SimObj::Srk)) {
+                    return (HANDLE, out);
+                }
+                let (Ok(in_priv), Ok(in_pub)) = (p.tpm2b(), p.tpm2b()) else { return (VALUE, out) };
+                if in_priv.len() < 28 {
+                    return (0x0A1, out);
+                }
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&in_priv[..12]);
+                let mut tag = [0u8; 16];
+                tag.copy_from_slice(&in_priv[12..28]);
+                let mut buf = in_priv[28..].to_vec();
+                let key = sim_srk_key();
+                if !doscrypt::chacha20::open_in_place(&key, &nonce, in_pub, &mut buf, &tag) {
+                    return (0x0A1, out);
+                }
+                let mut sp = Rsp { b: &buf, o: 0 };
+                let (Ok(user_auth), Ok(data)) = (sp.tpm2b(), sp.tpm2b()) else { return (0x0A1, out) };
+                if sp.o != buf.len() {
+                    return (0x0A1, out);
+                }
+                self.next += 1;
+                let handle = 0x8000_0000 + self.next;
+                self.objects.push((handle, SimObj::Sealed { auth: user_auth.to_vec(), data: data.to_vec() }));
+                put32(&mut out, handle);
+                tpm2b(&mut out, &name_of(in_pub));
+            }
+            CC_UNSEAL => {
+                let mut ap = Rsp { b: auth, o: 0 };
+                let (Ok(RS_PW), Ok(_), Ok(_), Ok(pw)) = (ap.u32(), ap.tpm2b(), ap.bytes(1), ap.tpm2b()) else {
+                    return (0x9A2, out);
+                };
+                if ap.o != auth.len() {
+                    return (0x9A2, out);
+                }
+                let Some((_, SimObj::Sealed { auth: want, data })) = self.objects.iter().find(|o| o.0 == h(0)) else {
+                    return (HANDLE, out);
+                };
+                if !doscrypt::ct::ct_eq(pw, want) {
+                    return (0x9A2, out); // TPM_RC_AUTH_FAIL
+                }
+                tpm2b(&mut out, data);
             }
             _ => return (0x143, out), // TPM_RC_COMMAND_CODE
         }
@@ -979,7 +1201,7 @@ impl Transport for Sim {
         // session response per session; errors are headers only.
         let sessions = be16(cmd, 0) == Some(ST_SESSIONS) && rc == 0;
         let handles = match be32(cmd, 6).unwrap_or(0) {
-            CC_CREATE_PRIMARY | CC_START_AUTH_SESSION => 4,
+            CC_CREATE_PRIMARY | CC_START_AUTH_SESSION | CC_LOAD => 4,
             _ => 0,
         };
         let mut out = Vec::with_capacity(params.len() + 32);

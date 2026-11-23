@@ -35,24 +35,26 @@ mod console;
 mod demo;
 
 use alloc::boxed::Box;
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use dosawmi::{
-    AwmiStatus, BitmapText, Canvas, DamageSet, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, Theme, ThemeId, TrustTier, UiSettings,
+    AwmiStatus, BitmapText, Canvas, CursorKind, DamageSet, LockIdentity, LockMode, LockReason, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, Theme, ThemeId, TrustTier, UiSettings,
     WINDOW_INFO_BYTES, WmAction, WmState, encode_window_info, split_connect,
 };
 use dosui::{FontText, fonts};
 use libd::fs as fp;
 use libd::awmi as wire;
 use libd::gpu::{self, AdapterInfo, ModeEntry};
+use libd::identity as idwire;
 use libd::proto::{self, HEADER, Header, key};
 use libd::sys::{self, Handle};
 use libd::{Mapping, Port, Startup, println, svc, term, time};
 
 libd::entry!(dsvc_awmi, main);
 libd::entry!(dsvc_awmi_demo, demo::main);
-libd::entry!(dsvc_console, console::main);
+libd::entry!(dx_console, console::main);
 
 const KEY_CTL: u64 = 1;
 const KEY_INPUT: u64 = 2;
@@ -78,6 +80,7 @@ enum Role {
     Admin,
     Query,
     Indicator,
+    Launcher,
 }
 
 struct Client {
@@ -141,6 +144,15 @@ fn pixels_of(map: &mut Mapping, len_px: usize) -> &mut [u32] {
     unsafe { core::slice::from_raw_parts_mut(bytes.as_mut_ptr().cast::<u32>(), len_px) }
 }
 
+struct RegisteredApp {
+    owner: u32,
+    app: u8,
+    label: Vec<u8>,
+    identity: Vec<u8>,
+    trust: TrustTier,
+    pinned: bool,
+}
+
 struct Awmi {
     port: Port,
     ctl: Handle,
@@ -150,8 +162,15 @@ struct Awmi {
     clock: Handle,
     audio: Handle,
     net: Handle,
+    identity: Handle,
     test_mode: bool,
     firmware_display: bool,
+    lock_at_boot_cfg: bool,
+    idle_timeout_ns: u64,
+    lock_on_sleep: bool,
+    last_input_ns: u64,
+    session_notified: bool,
+    pending_perm_owner: u32,
     clients: Vec<Client>,
     next_client: u32,
     wm: Box<WmState>,
@@ -176,13 +195,20 @@ struct Awmi {
     pace_skip_until: u64,
     /// The pointer moved since the last frame (hardware cursor position to update if software/deferred).
     cursor_moved: bool,
-    cursor_vmo: Handle,
+    cursor_map: Option<Mapping>,
+    hw_cursor_kind: CursorKind,
     /// Indicators set over `awmi.indicator`, and the microphone state polled from the audio service.
     ext_indicators: u64,
     mic_live: bool,
     clock_base: Option<time::Base>,
-    /// A present failed: the GPU restarted; outputs are attached again at the next frame.
+    /// Output list or mode changed: outputs are reconciled at the next frame.
     reattach: bool,
+    /// A present failed: force re-attaching client backbuffer VMOs even if dimensions match.
+    force_reattach_fb: bool,
+    /// Post-modeset redraw timer: DisplayPort monitors take ~1-2.5s to re-lock on refresh changes;
+    /// schedule a handful of full-frame repaints so the desktop is always live once the panel wakes.
+    modeset_redraw_at: u64,
+    modeset_redraw_left: u8,
     /// The vector text engine over the font pack (None: the bitmap font draws).
     text: Option<FontText<'static>>,
     /// The font pack VMO and its size (shared read-only with window programs).
@@ -195,8 +221,8 @@ struct Awmi {
     scale_set: bool,
     /// Per-output explicit scale overrides (`(adapter_id, scale_pct)`).
     output_scales: Vec<(u32, u16)>,
-    /// Launcher entries programs registered: (client, entry, label, pinned); replayed into each session.
-    apps: Vec<(u32, u8, Vec<u8>, bool)>,
+    /// Launcher entries programs/appmgr registered; replayed into each session.
+    apps: Vec<RegisteredApp>,
     /// What the session was started with (`SESSION_DEMO`, `SESSION_DESKTOP`).
     session_flags: u64,
     /// Boot: start a desktop session once a display is there (until this time).
@@ -277,6 +303,20 @@ impl Awmi {
                     };
                     match h.op {
                         svc::CONNECT if hnd != 0 => self.connect(&buf[HEADER..n], h.b, hnd),
+                        svc::SUSPEND => {
+                            if hnd != 0 {
+                                sys::handle_close(hnd);
+                            }
+                            if self.active && self.lock_on_sleep && !self.wm.lock.active {
+                                self.engage_lock_screen(LockMode::Locked, LockReason::Sleep);
+                                self.flush();
+                            }
+                            if h.txid != 0 {
+                                let mut rep = [0u8; HEADER];
+                                Header { txid: h.txid, op: svc::SUSPEND, status: 0, a: 0, b: 0 }.put(&mut rep);
+                                sys::channel_write(self.ctl, &rep);
+                            }
+                        }
                         svc::SHUTDOWN => {
                             if hnd != 0 {
                                 sys::handle_close(hnd);
@@ -336,12 +376,14 @@ impl Awmi {
             b"clock.time" => Self::replace(&mut self.clock, hnd),
             b"audio.control" => Self::replace(&mut self.audio, hnd),
             b"net.status" => Self::replace(&mut self.net, hnd),
+            b"identity.session" => Self::replace(&mut self.identity, hnd),
             // Our own endpoints: a client, with the identity the service manager verified.
-            b"window" | b"admin" | b"query" | b"indicator" => {
+            b"window" | b"admin" | b"query" | b"indicator" | b"launcher" => {
                 let role = match ep {
                     b"window" => Role::Window,
                     b"admin" => Role::Admin,
                     b"query" => Role::Query,
+                    b"launcher" => Role::Launcher,
                     _ => Role::Indicator,
                 };
                 self.clients.retain(|c| c.ch != 0);
@@ -359,6 +401,10 @@ impl Awmi {
                 self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_CLIENT_BASE + u64::from(id));
                 if role == Role::Window && self.active {
                     self.send_settings(hnd);
+                    if self.session_notified {
+                        self.send_session(hnd, true);
+                    }
+                } else if role == Role::Launcher && self.active && self.session_notified {
                     self.send_session(hnd, true);
                 }
             }
@@ -431,7 +477,9 @@ impl Awmi {
     }
 
     fn key(&mut self, k: u32) {
-        self.wm.now_ns = sys::clock_ns();
+        let now = sys::clock_ns();
+        self.wm.now_ns = now;
+        self.last_input_ns = now;
         let pressed = k & key::RELEASE == 0;
         let action = self.wm.handle_key(k & !key::RELEASE, pressed);
         match action {
@@ -459,8 +507,12 @@ impl Awmi {
     }
 
     fn pointer(&mut self, dx: i32, dy: i32, abs: Option<Point>, buttons: u8, wheel: i8) {
+        self.last_input_ns = sys::clock_ns();
         let before = (self.wm.pointer, self.wm.buttons);
         let action = self.wm.handle_pointer(dx, dy, abs, buttons);
+        if self.outs.iter().any(|o| o.hw_cursor) && self.wm.cursor_kind != self.hw_cursor_kind {
+            self.upload_cursor();
+        }
         if self.wm.pointer != before.0 {
             if let Some(o) = self.outs.iter().find(|o| o.hw_cursor) {
                 // Hardware cursor moves immediately without triggering a frame composite.
@@ -487,10 +539,116 @@ impl Awmi {
         self.sync_windows();
     }
 
+    fn sync_lock_identities(&mut self) -> (bool, bool) {
+        if self.identity == 0 {
+            let mut list = [LockIdentity::EMPTY; 1];
+            list[0] = LockIdentity::new(1, b"user", b"Local User", false, false);
+            self.wm.lock.set_identities(&list, 1, false);
+            return (false, false);
+        }
+        let mut lock_at_boot = false;
+        let mut tpm = false;
+        if let Ok(pol) = idwire::policy(self.identity) {
+            self.idle_timeout_ns = u64::from(pol.idle_timeout_secs) * SEC;
+            self.lock_on_sleep = pol.lock_on_sleep;
+            lock_at_boot = pol.lock_at_boot;
+            tpm = pol.tpm_available;
+        }
+        let mut infos = [idwire::IdentityInfo::default(); dosawmi::MAX_LOCK_IDENTITIES];
+        let cnt = idwire::list(self.identity, &mut infos).unwrap_or(0);
+        let mut active_id = 1u32;
+        let mut active_enrolled = false;
+        let mut lock_ids = [LockIdentity::EMPTY; dosawmi::MAX_LOCK_IDENTITIES];
+        for (i, info) in infos[..cnt].iter().enumerate() {
+            lock_ids[i] = LockIdentity::new(
+                info.id,
+                info.name_str().as_bytes(),
+                info.display_str().as_bytes(),
+                info.seal == idwire::SEAL_TPM2,
+                info.enrolled,
+            );
+            if info.active {
+                active_id = info.id;
+                active_enrolled = info.enrolled;
+            }
+        }
+        if cnt > 0 {
+            self.wm.lock.set_identities(&lock_ids[..cnt], active_id, tpm);
+        }
+        (active_enrolled, lock_at_boot)
+    }
+
+    fn engage_lock_screen(&mut self, mode: LockMode, reason: LockReason) {
+        let _ = self.sync_lock_identities();
+        self.wm.engage_lock(mode, reason);
+        let why = match reason {
+            LockReason::Boot => "boot sign-in",
+            LockReason::Manual => "manual",
+            LockReason::Idle => "idle timeout",
+            LockReason::Sleep => "before sleep",
+        };
+        println!("awmi: session locked ({})", why);
+    }
+
+    fn broadcast_session(&self, active: bool) {
+        let chans: Vec<Handle> = self
+            .clients
+            .iter()
+            .filter(|c| matches!(c.role, Role::Window | Role::Launcher) && c.ch != 0)
+            .map(|c| c.ch)
+            .collect();
+        for ch in chans {
+            self.send_session(ch, active);
+        }
+    }
+
     fn act(&mut self, action: WmAction) {
         match action {
             WmAction::RequestClose { owner, window_id } => self.send_to(owner, wire::EVT_CLOSE, u64::from(window_id), 0),
             WmAction::ExitSession | WmAction::Setting(Setting::LeaveDesktop) => self.session_stop("the user left the session"),
+            WmAction::LockSession | WmAction::Setting(Setting::LockScreen) => {
+                self.engage_lock_screen(LockMode::Locked, LockReason::Manual);
+            }
+            WmAction::UnlockAttempt { identity_id } => {
+                let mut pass = [0u8; dosawmi::lock::MAX_PASS_BYTES];
+                let plen = self.wm.lock.pass_len().min(pass.len());
+                pass[..plen].copy_from_slice(&self.wm.lock.passphrase()[..plen]);
+                self.wm.lock.clear_passphrase();
+                let res = if self.identity != 0 {
+                    idwire::authenticate(self.identity, identity_id, &pass[..plen])
+                } else {
+                    Ok(identity_id)
+                };
+                pass.fill(0);
+                core::hint::black_box(&pass);
+                match res {
+                    Ok(uid) => {
+                        self.wm.disengage_lock();
+                        self.last_input_ns = sys::clock_ns();
+                        println!("awmi: session unlocked (identity #{})", uid);
+                        if !self.session_notified {
+                            self.session_notified = true;
+                            self.broadcast_session(true);
+                        }
+                    }
+                    Err((_, retry_secs)) => {
+                        if retry_secs > 0 {
+                            let msg = format!("Too many attempts; retry in {}s", retry_secs);
+                            self.wm.lock.set_error(msg.as_bytes());
+                        } else {
+                            self.wm.lock.set_error(b"Invalid passphrase");
+                        }
+                        self.wm.damage_all();
+                    }
+                }
+            }
+            WmAction::PermPromptResult { request_id, choice } => {
+                let owner = self.pending_perm_owner;
+                self.pending_perm_owner = 0;
+                if owner != 0 {
+                    self.send_to(owner, wire::EVT_PERM_RESULT, u64::from(request_id), u64::from(choice));
+                }
+            }
             WmAction::Launch { owner, app } => {
                 println!("awmi: launcher: opening entry {} of client {}", app, owner);
                 self.send_to(owner, wire::EVT_LAUNCH, u64::from(app), 0);
@@ -627,7 +785,8 @@ impl Awmi {
         let chosen = self.choose_adapters();
         let (virtuals, mut old): (Vec<OutBuf>, Vec<OutBuf>) = self.outs.drain(..).partition(|o| o.adapter == 0);
         let mut kept: Vec<OutBuf> = Vec::new();
-        for (a, hz) in &chosen {
+        let mut to_alloc: Vec<(gpu::AdapterInfo, u32, bool, bool, bool)> = Vec::new();
+        for &(a, hz) in &chosen {
             let (w, h) = (a.width, a.height);
             let hw = chosen.len() == 1 && a.caps & gpu::CAP_HW_CURSOR != 0;
             let async_flip = a.caps & gpu::CAP_ASYNC_FLIP != 0;
@@ -636,15 +795,43 @@ impl Awmi {
                 o.adapter == a.id
                     && o.width == w
                     && o.height == h
-                    && o.refresh_mhz == *hz
                     && o.restarts == a.restarts
-                    && o.native_match == native_match
-                    && o.hw_cursor == hw
-                    && !self.reattach
+                    && !self.force_reattach_fb
             }) {
-                kept.push(old.remove(i));
+                let mut reused = old.remove(i);
+                if reused.refresh_mhz != hz
+                    || reused.hw_cursor != hw
+                    || reused.async_flip != async_flip
+                    || reused.native_match != native_match
+                {
+                    println!(
+                        "awmi: output: adapter #{} '{}' {}x{} @ {}.{:02} Hz (reused backbuffer){}{}",
+                        a.id,
+                        a.name_str(),
+                        w,
+                        h,
+                        hz / 1000,
+                        hz % 1000 / 10,
+                        if native_match { ", native" } else { "" },
+                        if async_flip { ", async flip" } else { "" }
+                    );
+                }
+                reused.refresh_mhz = hz;
+                reused.hw_cursor = hw;
+                reused.async_flip = async_flip;
+                reused.native_match = native_match;
+                kept.push(reused);
                 continue;
             }
+            to_alloc.push((a, hz, hw, async_flip, native_match));
+        }
+        // Release incompatible backbuffers before allocating new ones so peak memory stays bounded.
+        for o in old {
+            sys::vmar_unmap(libd::root_vmar(), o.map.addr, o.map.len);
+            sys::handle_close(o.map.vmo);
+        }
+        for (a, hz, hw, async_flip, native_match) in to_alloc {
+            let (w, h) = (a.width, a.height);
             let len = u64::from(w) * u64::from(h) * 4;
             let Ok(map) = Mapping::new(len) else {
                 println!("awmi: no memory for a {}x{} backbuffer", w, h);
@@ -671,7 +858,7 @@ impl Awmi {
                         map,
                         width: w,
                         height: h,
-                        refresh_mhz: *hz,
+                        refresh_mhz: hz,
                         hw_cursor: hw,
                         async_flip,
                         native_match,
@@ -684,11 +871,15 @@ impl Awmi {
                 }
             }
         }
-        for o in old {
-            sys::vmar_unmap(libd::root_vmar(), o.map.addr, o.map.len);
-            sys::handle_close(o.map.vmo);
+        if !chosen.is_empty() && kept.is_empty() {
+            // Transient attach failure: keep retrying instead of stranding the desktop with 0 outputs.
+            self.reattach = true;
+            self.force_reattach_fb = true;
+            self.next_frame = sys::clock_ns() + 100 * MS;
+        } else {
+            self.reattach = false;
+            self.force_reattach_fb = false;
         }
-        self.reattach = false;
         kept.extend(virtuals);
         self.outs = kept;
         self.relayout();
@@ -705,23 +896,29 @@ impl Awmi {
                 .map_or_else(|| dosawmi::Output::recommended_scale(o.width), |&(_, sc)| sc);
             self.wm.layout.add_output_scaled(o.adapter, o.width, o.height, o.refresh_mhz, o.hw_cursor, scale);
         }
-        self.wm.damage_all();
+        self.wm.fit_windows_to_layout();
+        self.sync_windows();
     }
 
     fn upload_cursor(&mut self) {
         let Some(o) = self.outs.iter().find(|o| o.hw_cursor) else { return };
         let adapter = o.adapter;
-        if self.cursor_vmo == 0 {
-            let Ok(mut m) = Mapping::new(64 * 64 * 4) else { return };
-            dosawmi::write_hw_cursor_64x64(m.bytes_mut());
-            self.cursor_vmo = m.vmo;
+        let kind = self.wm.cursor_kind;
+        if self.cursor_map.is_none() {
+            let Ok(m) = Mapping::new(64 * 64 * 4) else { return };
+            self.cursor_map = Some(m);
         }
-        if let Err(e) = gpu::set_cursor(self.gpu, adapter, self.cursor_vmo, 0, 0) {
+        let Some(m) = self.cursor_map.as_mut() else { return };
+        let (hx, hy) = dosawmi::write_hw_cursor_64x64_kind(kind, m.bytes_mut());
+        let vmo = m.vmo;
+        if let Err(e) = gpu::set_cursor(self.gpu, adapter, vmo, hx, hy) {
             println!("awmi: hardware cursor refused ({}): software cursor", sys::status(e));
             for o in &mut self.outs {
                 o.hw_cursor = false;
             }
             self.relayout();
+        } else {
+            self.hw_cursor_kind = kind;
         }
     }
 
@@ -746,9 +943,9 @@ impl Awmi {
         }
         self.wm.now_ns = sys::clock_ns();
         self.apply_settings();
-        for (owner, app, label, pinned) in &self.apps {
-            if let Some(c) = self.clients.iter().find(|c| c.id == *owner && c.ch != 0) {
-                self.wm.register_app_ex(*owner, *app, label, &c.identity[..c.identity_len], c.trust, *pinned);
+        for a in &self.apps {
+            if self.clients.iter().any(|c| c.id == a.owner && c.ch != 0) {
+                self.wm.register_app_ex(a.owner, a.app, &a.label, &a.identity, a.trust, a.pinned);
             }
         }
         self.term_call(term::DISPLAY_RELEASE);
@@ -759,15 +956,24 @@ impl Awmi {
         }
         self.cursor_moved = true;
         self.active = true;
+        self.last_input_ns = sys::clock_ns();
         self.next_tray = 0;
         self.poll_tray();
+        let (enrolled, lock_at_boot) = self.sync_lock_identities();
+        let require_login = (enrolled || lock_at_boot || self.lock_at_boot_cfg) && !self.test_mode;
+        if require_login {
+            self.wm.engage_lock(LockMode::Login, LockReason::Boot);
+            self.session_notified = false;
+            println!("awmi: session locked at boot (awaiting user sign-in)");
+        } else {
+            self.session_notified = true;
+        }
         self.wm.damage_all();
         self.next_frame = 0;
         let d = self.wm.layout.desktop_bounds();
         println!("awmi: session started: {} output(s), desktop {}x{}{}", n, d.w, d.h, if self.test_mode { " (test hooks on)" } else { "" });
-        let chans: Vec<Handle> = self.clients.iter().filter(|c| c.role == Role::Window && c.ch != 0).map(|c| c.ch).collect();
-        for ch in chans {
-            self.send_session(ch, true);
+        if self.session_notified {
+            self.broadcast_session(true);
         }
         Ok(n as u32)
     }
@@ -777,10 +983,9 @@ impl Awmi {
             return;
         }
         self.active = false;
-        let chans: Vec<Handle> = self.clients.iter().filter(|c| c.role == Role::Window && c.ch != 0).map(|c| c.ch).collect();
-        for ch in chans {
-            self.send_session(ch, false);
-        }
+        self.session_notified = false;
+        self.pending_perm_owner = 0;
+        self.broadcast_session(false);
         self.surfaces.clear();
         *self.wm = WmState::new();
         // Virtual outputs (test mode) end with the session.
@@ -793,11 +998,18 @@ impl Awmi {
         self.flip_pending = false;
         self.flip_deadline = 0;
         self.pace_skip_until = 0;
+        self.modeset_redraw_at = 0;
+        self.modeset_redraw_left = 0;
         // Hand native scanout back to the firmware GOP framebuffer before the terminal reclaims the screen.
+        let mut released_any = false;
         for o in &self.outs {
             if o.adapter != 0 && o.native_match {
                 let _ = gpu::release_display(self.gpu, o.adapter);
+                released_any = true;
             }
+        }
+        if !released_any && self.gpu != 0 {
+            let _ = gpu::release_display(self.gpu, 0);
         }
         self.grab(false);
         self.term_call(term::DISPLAY_RECLAIM);
@@ -1002,9 +1214,13 @@ impl Awmi {
         }
         if failed {
             self.reattach = true;
+            self.force_reattach_fb = true;
             self.flip_pending = false;
             self.flip_deadline = 0;
             self.wm.damage_all();
+        }
+        if self.outs.iter().any(|o| o.hw_cursor) && self.wm.cursor_kind != self.hw_cursor_kind {
+            self.upload_cursor();
         }
         if self.cursor_moved {
             self.cursor_moved = false;
@@ -1040,7 +1256,12 @@ impl Awmi {
 
     /// A frame is due: damage, owed frames, the cursor, an animation.
     fn due(&self) -> bool {
-        !self.wm.damage.is_empty() || self.cursor_moved || self.reattach || self.wm.animating() || self.surfaces.iter().any(|s| s.pending.is_some())
+        !self.wm.damage.is_empty()
+            || self.cursor_moved
+            || (self.outs.iter().any(|o| o.hw_cursor) && self.wm.cursor_kind != self.hw_cursor_kind)
+            || self.reattach
+            || self.wm.animating()
+            || self.surfaces.iter().any(|s| s.pending.is_some())
     }
 
     /// The font pack for a window program: a read-only duplicate of the pack VMO.
@@ -1102,7 +1323,7 @@ impl Awmi {
                     if let Some(c) = self.clients.iter_mut().find(|c| c.id == id) {
                         c.ch = 0;
                     }
-                    self.apps.retain(|a| a.0 != id);
+                    self.apps.retain(|a| a.owner != id);
                     self.surfaces.retain(|s| s.owner != id);
                     self.wm.remove_client(id);
                     self.sync_windows();
@@ -1209,7 +1430,14 @@ impl Awmi {
                                 self.flip_pending = false;
                                 self.flip_deadline = 0;
                                 self.pace_skip_until = 0;
-                                self.wm.damage_all();
+                                self.next_frame = 0;
+                                if self.active {
+                                    self.wm.damage_all();
+                                    self.modeset_redraw_left = 4;
+                                    self.modeset_redraw_at = sys::clock_ns() + 400 * MS;
+                                } else {
+                                    self.term_call(term::DISPLAY_RECLAIM);
+                                }
                                 ok(0, 0)
                             }
                             Err(e) => err(e),
@@ -1265,20 +1493,70 @@ impl Awmi {
                     _ => err(sys::ERR_INVALID_ARGS),
                 }
             }
-            wire::OP_APP_REGISTER if role == Role::Window => {
+            wire::OP_LOCK if admin => {
+                if !self.active {
+                    return err(sys::ERR_BAD_STATE);
+                }
+                let reason = match h.a {
+                    wire::LOCK_REASON_BOOT => LockReason::Boot,
+                    wire::LOCK_REASON_IDLE => LockReason::Idle,
+                    wire::LOCK_REASON_SLEEP => LockReason::Sleep,
+                    _ => LockReason::Manual,
+                };
+                let mode = if h.b == wire::LOCK_MODE_LOGIN { LockMode::Login } else { LockMode::Locked };
+                self.engage_lock_screen(mode, reason);
+                ok(0, 0)
+            }
+            wire::OP_SET_LOCK_POLICY if admin => {
+                let secs = (h.a as u32).min(86_400);
+                self.idle_timeout_ns = u64::from(secs) * SEC;
+                self.lock_on_sleep = ((h.a >> 32) & 1) != 0;
+                ok(0, 0)
+            }
+            wire::OP_PERM_PROMPT if role == Role::Launcher => {
+                if !self.active || self.wm.lock.active {
+                    return err(sys::ERR_BAD_STATE);
+                }
+                let (app_name, app_title) = match payload.iter().position(|&b| b == 0) {
+                    Some(nul) => (&payload[..nul], &payload[nul + 1..]),
+                    None => (payload, payload),
+                };
+                self.pending_perm_owner = id;
+                self.wm.open_perm_prompt(h.a as u32, app_name, app_title, h.b as u32);
+                ok(0, 0)
+            }
+            wire::OP_APP_REGISTER if role == Role::Window || role == Role::Launcher => {
                 let app = h.a as u8;
                 let pinned = (h.b & wire::APP_FLAG_PINNED) != 0;
-                let label: Vec<u8> = payload[..payload.len().min(dosawmi::launcher::LAUNCH_LABEL_BYTES)].to_vec();
-                if usize::from(app) >= dosawmi::launcher::MAX_APPS_PER_CLIENT || label.is_empty() || h.a > 0xFF {
+                let max_per = if role == Role::Launcher { dosawmi::launcher::MAX_APPS_PER_CLIENT } else { 4 };
+                let (raw_label, raw_ident, eff_trust) = if role == Role::Launcher {
+                    let (lbl, aid) = match payload.iter().position(|&b| b == 0) {
+                        Some(nul) => (&payload[..nul], &payload[nul + 1..]),
+                        None => (payload, &identity[..identity_len]),
+                    };
+                    (lbl, aid, TrustTier::Native)
+                } else {
+                    (payload, &identity[..identity_len], trust)
+                };
+                let label: Vec<u8> = raw_label[..raw_label.len().min(dosawmi::launcher::LAUNCH_LABEL_BYTES)].to_vec();
+                let ident: Vec<u8> = raw_ident[..raw_ident.len().min(MAX_IDENTITY_BYTES)].to_vec();
+                if usize::from(app) >= max_per || label.is_empty() || h.a > 0xFF {
                     return err(sys::ERR_INVALID_ARGS);
                 }
-                if self.apps.len() >= dosawmi::launcher::MAX_LAUNCH_APPS && !self.apps.iter().any(|a| a.0 == id && a.1 == app) {
+                if self.apps.len() >= dosawmi::launcher::MAX_LAUNCH_APPS && !self.apps.iter().any(|a| a.owner == id && a.app == app) {
                     return err(sys::ERR_NO_RESOURCES);
                 }
-                self.apps.retain(|a| !(a.0 == id && a.1 == app));
-                self.apps.push((id, app, label.clone(), pinned));
+                self.apps.retain(|a| !(a.owner == id && a.app == app));
+                self.apps.push(RegisteredApp {
+                    owner: id,
+                    app,
+                    label: label.clone(),
+                    identity: ident.clone(),
+                    trust: eff_trust,
+                    pinned,
+                });
                 if self.active {
-                    self.wm.register_app_ex(id, app, &label, &identity[..identity_len], trust, pinned);
+                    self.wm.register_app_ex(id, app, &label, &ident, eff_trust, pinned);
                 }
                 ok(0, 0)
             }
@@ -1296,7 +1574,8 @@ impl Awmi {
                     return err(sys::ERR_NO_RESOURCES);
                 }
                 let (w, hh) = ((h.a as u32).clamp(1, 8192), ((h.a >> 32) as u32).clamp(1, 8192));
-                let flags = (h.b as u32) & wire::FLAGS_DEFAULT;
+                // Server-side decorations are mandatory so no client can imitate the lock screen.
+                let flags = ((h.b as u32) & wire::FLAGS_DEFAULT) | wire::FLAG_DECORATED;
                 let title = &payload[..payload.len().min(wire::MAX_TITLE)];
                 let Some(win) = self.wm.create_window(id, &identity[..identity_len], trust, w, hh, flags, title) else {
                     return err(sys::ERR_NO_RESOURCES);
@@ -1420,6 +1699,16 @@ impl Awmi {
                 println!("awmi: test: virtual output {}x{} added right of the others", w, hh);
                 ok(self.wm.layout.count as u64, 0)
             }
+            wire::OP_TEST_IDLE_EXPIRE if test && self.active => {
+                if self.idle_timeout_ns == 0 {
+                    return err(sys::ERR_BAD_STATE);
+                }
+                self.last_input_ns = sys::clock_ns().saturating_sub(self.idle_timeout_ns.saturating_add(SEC));
+                if !self.wm.lock.active {
+                    self.engage_lock_screen(LockMode::Locked, LockReason::Idle);
+                }
+                ok(0, 0)
+            }
             _ => err(sys::ERR_ACCESS_DENIED),
         }
     }
@@ -1482,6 +1771,7 @@ impl Awmi {
             launcher_open: self.active && self.wm.launcher.open,
             fonts: self.text.is_some(),
             apps: self.apps.len() as u8,
+            locked: self.active && self.wm.lock.active,
         }
     }
 }
@@ -1495,6 +1785,7 @@ fn main(s: *const Startup) -> i32 {
     let test_mode = has_arg(b"test");
     let autostart = has_arg(b"autostart");
     let firmware_display = has_arg(b"firmware-display");
+    let lock_at_boot_cfg = has_arg(b"lock-at-boot");
     let Ok(port) = Port::new(256) else { return 1 };
     let (text, pack_vmo, pack_len) = match load_fonts() {
         Some((map, len)) => {
@@ -1518,8 +1809,15 @@ fn main(s: *const Startup) -> i32 {
         clock: svc::endpoint(b"clock.time"),
         audio: libd::audio::control_endpoint(),
         net: libd::net::status_endpoint(),
+        identity: idwire::session_endpoint(),
         test_mode,
         firmware_display,
+        lock_at_boot_cfg,
+        idle_timeout_ns: 300 * SEC,
+        lock_on_sleep: true,
+        last_input_ns: sys::clock_ns(),
+        session_notified: false,
+        pending_perm_owner: 0,
         clients: Vec::new(),
         next_client: 1,
         wm: Box::new(WmState::new()),
@@ -1538,11 +1836,15 @@ fn main(s: *const Startup) -> i32 {
         last_flip_ns: 0,
         pace_skip_until: 0,
         cursor_moved: false,
-        cursor_vmo: 0,
+        cursor_map: None,
+        hw_cursor_kind: CursorKind::Default,
         ext_indicators: 0,
         mic_live: false,
         clock_base: None,
         reattach: false,
+        force_reattach_fb: false,
+        modeset_redraw_at: 0,
+        modeset_redraw_left: 0,
         text,
         pack_vmo,
         pack_len,
@@ -1564,7 +1866,7 @@ fn main(s: *const Startup) -> i32 {
         a.port.arm(a.gpu, sys::READABLE | sys::PEER_CLOSED, KEY_GPU);
     }
     println!(
-        "awmi: ready, idle until a session starts (endpoints: window, admin, query, indicator{}{})",
+        "awmi: ready, idle until a session starts (endpoints: window, admin, query, indicator, launcher{}{})",
         if test_mode { "; test hooks on" } else { "" },
         if firmware_display { "; firmware display forced" } else { "" }
     );
@@ -1591,6 +1893,12 @@ fn main(s: *const Startup) -> i32 {
             if a.autostart_until != 0 { next_try.saturating_sub(now).max(MS) } else { sys::WAIT_FOREVER }
         } else {
             let mut until = a.next_tray;
+            if !a.wm.lock.active && a.idle_timeout_ns > 0 {
+                until = until.min(a.last_input_ns.saturating_add(a.idle_timeout_ns));
+            }
+            if a.modeset_redraw_left > 0 && a.modeset_redraw_at != 0 {
+                until = until.min(a.modeset_redraw_at);
+            }
             if a.flip_pending {
                 if a.flip_deadline != 0 {
                     until = until.min(a.flip_deadline);
@@ -1621,6 +1929,18 @@ fn main(s: *const Startup) -> i32 {
         if a.active {
             let now = sys::clock_ns();
             a.wm.now_ns = now;
+            if !a.wm.lock.active && a.idle_timeout_ns > 0 && now >= a.last_input_ns.saturating_add(a.idle_timeout_ns) {
+                a.engage_lock_screen(LockMode::Locked, LockReason::Idle);
+            }
+            if a.modeset_redraw_left > 0 && now >= a.modeset_redraw_at {
+                a.modeset_redraw_left -= 1;
+                a.modeset_redraw_at = if a.modeset_redraw_left > 0 {
+                    now + if a.modeset_redraw_left == 3 { 600 * MS } else { 700 * MS }
+                } else {
+                    0
+                };
+                a.wm.damage_all();
+            }
             a.poll_tray();
             // Recover cleanly if a driver restarted mid-flip and missed `EVT_FLIP_DONE`.
             if a.flip_pending && a.flip_deadline != 0 && now >= a.flip_deadline {

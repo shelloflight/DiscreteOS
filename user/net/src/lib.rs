@@ -384,7 +384,7 @@ impl NetSvc {
                                 nic.link_up = up;
                                 if up && !was_up {
                                     println!("net: '{}' link up", nic.name);
-                                    if nic.stack.dhcp_state != DhcpState::Bound {
+                                    if !nic.stack.static_mode && nic.stack.dhcp_state != DhcpState::Bound {
                                         nic.stack.start_dhcp(now_ms());
                                         nic.flush_tx();
                                     }
@@ -508,10 +508,13 @@ impl NetSvc {
                     st.mac = nic.stack.mac;
                     st.link_up = nic.link_up;
                     st.dhcp_bound = nic.stack.dhcp_state == DhcpState::Bound;
+                    st.static_mode = nic.stack.static_mode;
+                    st.dns_fallback = nic.stack.dns_fallback;
                     st.ip = nic.stack.ip;
                     st.netmask = nic.stack.netmask;
                     st.gateway = nic.stack.gateway;
                     st.dns = nic.stack.dns_server;
+                    st.dns2 = nic.stack.dns_server2;
                     st.dns_port = nic.stack.dns_port;
                     st.rx_packets = nic.stack.rx_packets;
                     st.tx_packets = nic.stack.tx_packets;
@@ -546,6 +549,59 @@ impl NetSvc {
                     Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0);
                 }
             }
+            net::OP_SET_CONFIG => {
+                close_hnd();
+                if role != Role::Control {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0);
+                    return;
+                }
+                let Some(cfg) = net::NetConfig::decode(payload) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0);
+                    return;
+                };
+                let Some(nic) = self.nic.as_mut() else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0);
+                    return;
+                };
+                if cfg.dhcp {
+                    nic.dhcp_offer_logged = false;
+                    nic.dhcp_logged = false;
+                    nic.stack.enable_dhcp(cfg.dns1, cfg.dns2, cfg.dns_port, cfg.dns_fallback, now);
+                    nic.flush_tx();
+                    println!(
+                        "net: configured DHCP on '{}' (dns_override={} / {}, fallback={})",
+                        nic.name,
+                        fmt_ipv4(cfg.dns1),
+                        fmt_ipv4(cfg.dns2),
+                        cfg.dns_fallback
+                    );
+                } else {
+                    if cfg.ip == [0, 0, 0, 0] {
+                        Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0);
+                        return;
+                    }
+                    nic.stack.set_static_full(
+                        cfg.ip,
+                        cfg.netmask,
+                        cfg.gateway,
+                        cfg.dns1,
+                        cfg.dns2,
+                        cfg.dns_port,
+                        cfg.dns_fallback,
+                    );
+                    nic.flush_tx();
+                    println!(
+                        "net: configured static IPv4 {} mask {} gw {} dns {} / {} (fallback={})",
+                        fmt_ipv4(nic.stack.ip),
+                        fmt_ipv4(nic.stack.netmask),
+                        fmt_ipv4(nic.stack.gateway),
+                        fmt_ipv4(nic.stack.dns_server),
+                        fmt_ipv4(nic.stack.dns_server2),
+                        nic.stack.dns_fallback
+                    );
+                }
+                Self::reply(ch, h.txid, h.op, 0, 0, 0);
+            }
             net::OP_DNS_RESOLVE => {
                 close_hnd();
                 if role != Role::Client && role != Role::Icmp {
@@ -573,7 +629,7 @@ impl NetSvc {
                     ch,
                     txid: h.txid,
                     query_id: qid,
-                    deadline_ms: now.saturating_add(5_000),
+                    deadline_ms: now.saturating_add(6_500),
                 });
             }
             net::OP_PING => {
@@ -894,6 +950,24 @@ impl NetSvc {
         while i < self.pending_dns.len() {
             if now >= self.pending_dns[i].deadline_ms {
                 let d = self.pending_dns.remove(i);
+                if let Some(nic) = self.nic.as_ref() {
+                    let probe = if nic.stack.dns_server != [0; 4] { nic.stack.dns_server } else { [1, 1, 1, 1] };
+                    let (hop, mac) = nic.stack.next_hop_mac(probe, now);
+                    let arp = match mac {
+                        Some(m) => format!("via {} ({})", fmt_ipv4(hop), fmt_mac(m)),
+                        None => format!("no ARP reply from {}", fmt_ipv4(hop)),
+                    };
+                    println!(
+                        "net: dns query {:#x} timed out (dns {} / {}, fallback={}, {}; frames rx {} tx {})",
+                        d.query_id,
+                        fmt_ipv4(nic.stack.dns_server),
+                        fmt_ipv4(nic.stack.dns_server2),
+                        nic.stack.dns_fallback,
+                        arp,
+                        nic.stack.rx_packets,
+                        nic.stack.tx_packets
+                    );
+                }
                 Self::reply(d.ch, d.txid, net::OP_DNS_RESOLVE, sys::ERR_TIMED_OUT as i32, 0, 0);
             } else {
                 i += 1;

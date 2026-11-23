@@ -16,9 +16,11 @@ bench = false
 
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
+dosapp = { path = "../lib/app" }
 dosaudio = { path = "../lib/audio" }
 doscrypt = { path = "../lib/crypto" }
 dosgpu = { path = "../lib/gpu" }
+dosid = { path = "../lib/identity" }
 dosnet = { path = "../lib/net", features = ["tls-server"] }
 
 [lints.rust]

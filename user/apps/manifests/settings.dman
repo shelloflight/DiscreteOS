@@ -1,0 +1,27 @@
+kind = "app"
+name = "settings"
+title = "Settings"
+version = "1.0.0"
+binary = "settings.dx"
+description = "Display, appearance, audio, network, identity, and app permissions"
+pinned = true
+autostart = false
+
+[permissions]
+required = [
+    "window",
+    "display:query",
+    "display:admin",
+    "audio:control",
+    "net:status",
+    "net:control",
+    "identity:query",
+    "identity:admin",
+    "apps:query",
+    "apps:admin",
+]
+
+[quota]
+memory = "48M"
+handles = 256
+threads = 4

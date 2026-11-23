@@ -10,7 +10,8 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [package.metadata.dos]
-dsvc = ["awmi", "awmi-demo", "console"]
+dsvc = ["awmi", "awmi-demo"]
+dx = ["console"]
 
 [lib]
 crate-type = ["staticlib"]

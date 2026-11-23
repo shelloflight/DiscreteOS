@@ -33,6 +33,8 @@ pub const KIND_DRIVER: u32 = 3;
 pub const KIND_PACKAGE: u32 = 4;
 /// A service manifest (`.dman`): data the service manager trusts, never runnable.
 pub const KIND_MANIFEST: u32 = 5;
+/// An application bundle (`.dapp`): verified data archive whose inner binary carries its own `KIND_PROGRAM` signature.
+pub const KIND_APP: u32 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

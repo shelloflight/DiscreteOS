@@ -26,7 +26,9 @@ The kernel decides what code may run, before the image is parsed:
 | Unsigned | `vmo_allow_unsigned(vmo, vmex)` by a holder of the VMEX resource |
 
 Both calls seal the VMO first, so nothing can change it afterwards. `vmo_verify` also checks
-signed service manifests (kind 5): the manifest is known genuine, but never becomes runnable.
+signed service manifests (kind 5) and `.dapp` application bundles (kind 6, [apps.md](apps.md)):
+they are verified as genuine data and never become runnable directly (a `.dapp`'s inner executable
+must carry its own `KIND_PROGRAM` `.dsig`).
 
 ## Keys
 
@@ -43,7 +45,7 @@ signed service manifests (kind 5): the manifest is known genuine, but never beco
 | 0 | 4 | magic `DSIG` |
 | 4 | 2 | version 1 |
 | 6 | 2 | algorithm 1 (Ed25519) |
-| 8 | 4 | kind: 1 kernel, 2 program, 3 driver, 4 package, 5 manifest |
+| 8 | 4 | kind: 1 kernel, 2 program, 3 driver, 4 package, 5 manifest, 6 app (`.dapp` bundle) |
 | 12 | 4 | flags (0) |
 | 16 | 16 | key id |
 | 32 | 8 | content size |
@@ -66,7 +68,8 @@ On UEFI machines with a TPM, the loader also extends PCR 8 through TCG2. The ker
 driver (ACPI `TPM2` table: TIS, or CRB started by register, by the TPM device's ACPI `_DSM` as AMD
 firmware TPMs need, or both) replays the log into the TPM and mirrors every later measurement; if
 the TPM fails, the kernel's log stays authoritative. The TPM also quotes PCRs 8 and 10 for remote
-attestation ([attestation.md](attestation.md)). kdb `measure` prints the
+attestation ([attestation.md](attestation.md)) and seals user identity credentials under the owner
+SRK via `TPM_SEAL`/`TPM_UNSEAL` ([identity.md](identity.md)). kdb `measure` prints the
 log and PCRs.
 
 ## Tests

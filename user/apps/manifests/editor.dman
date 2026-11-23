@@ -1,0 +1,17 @@
+kind = "app"
+name = "editor"
+title = "Text Editor"
+version = "1.0.0"
+binary = "editor.dx"
+description = "Edit plain-text files in your identity namespace"
+pinned = false
+autostart = false
+
+[permissions]
+required = ["window", "files:read"]
+prompt = ["files:write"]
+
+[quota]
+memory = "32M"
+handles = 128
+threads = 4

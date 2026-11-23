@@ -35,12 +35,15 @@ connect = ["storaged.disks"]
 audio = ["playback"]        # optional audio capabilities: "playback", "capture", "control"
 net = ["client"]            # optional network capabilities: "client", "icmp", "control", "status"
 gpu = ["query"]             # optional GPU capabilities: "query", "display", "render"
-awmi = ["window"]           # optional compositor capabilities: "window", "admin", "query", "indicator"
+awmi = ["window"]           # optional compositor capabilities: "window", "admin", "query", "indicator", "launcher"
+identity = ["query"]        # optional identity capabilities: "query", "admin", "session"
+appmgr = ["query"]          # optional app manager capabilities: "query", "admin"
 namespace = ["/system=system:r"]   # /<path>=<volume>:r | rw | rwa; or ["*"] / ["*:r"]: every volume
-manager = ["services", "power"]     # a channel to the manager: list/stop/restart services; power
+manager = ["services", "power"]     # a channel to the manager: "services", "power", "apps"
 tools = false               # the tool manifests and their programs (the shell; docs/shell.md)
 vmex = false
 power = false
+tpm-seal = false            # TPM 2.0 credential sealing resource (identity service only)
 kernel-log = false          # the kernel log reader (the log service)
 boot-time = false           # the firmware's time at boot (the clock service)
 
@@ -70,10 +73,12 @@ for another name. `dbuild img sign <seed> manifest <name>.dman <file> <out.dsig>
 
 On a normal boot the service manager starts the compositor with the argument `autostart`, so the
 machine comes up on the desktop ([awmi.md](awmi.md)). In the optional `DOS/BOOT.CFG` on the boot
-volume, `desktop = off` (or `no`, `false`, `0`) keeps the text console instead, and
-`display = firmware` (or `gop`) passes `firmware-display` to the compositor so it stays on the
-UEFI GOP framebuffer instead of switching to a native PCI display driver. The file is not signed
-because it can only restrict the desktop or native display takeover: it grants nothing.
+volume, `desktop = off` (or `no`, `false`, `0`) keeps the text console instead, `display = firmware`
+(or `gop`) passes `firmware-display` to the compositor so it stays on the UEFI GOP framebuffer
+instead of switching to a native PCI display driver, and `lock = on` (or `yes`, `true`, `1`)
+engages the compositor login/lock screen on boot ([identity.md](identity.md)). The file is not
+signed because it can only restrict the desktop, display takeover, or boot lock policy: it grants
+nothing.
 
 ### Checks across manifests
 
@@ -97,11 +102,13 @@ was configured to grant ([attestation.md](attestation.md)).
 | `audio` | audio endpoints (`audio.playback`, `audio.capture`, `audio.control`); microphone capture requires explicit `capture` ([audio.md](audio.md)) |
 | `net` | network endpoints (`net.client`, `net.icmp`, `net.control`, read-only `net.status`); no grant means no network access ([networking.md](networking.md)) |
 | `gpu` | GPU endpoints (`gpu.query`, `gpu.display`, `gpu.render`); separates read-only inspection, display scanout, and command submission ([graphics.md](graphics.md)) |
-| `awmi` | compositor endpoints (`awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator`) ([awmi.md](awmi.md)) |
+| `awmi` | compositor endpoints (`awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator`, `awmi.launcher`) ([awmi.md](awmi.md)) |
+| `identity` | identity endpoints (`identity.query`, `identity.admin`, `identity.session`) ([identity.md](identity.md)) |
+| `appmgr` | application manager endpoints (`appmgr.query`, `appmgr.admin`) ([apps.md](apps.md)) |
 | `namespace` | each volume's root, narrowed to the rights granted, at its path ([storage.md](storage.md)); `*`: every volume at `/<volume>`, with at most the rights the volume has |
-| `manager` | a channel to the manager (`tool::TAG_MANAGER`): `MGR_LIST`, `MGR_STOP`, `MGR_RESTART`, `MGR_OBJECTS` with `services`; `MGR_POWER` with `power` (a clean shutdown, then the power) |
+| `manager` | a channel to the manager (`tool::TAG_MANAGER`): `MGR_LIST`, `MGR_STOP`, `MGR_RESTART`, `MGR_OBJECTS` with `services`; `MGR_POWER` with `power`; `MGR_LINK` with `apps` (links verified `.dapp` apps to whitelisted service endpoints) |
 | `tools` | every accepted tool manifest (`tool::TAG_TOOL_MANIFEST`, read-only) and each tool's program |
-| `vmex`, `power` | the VMEX / POWER resource |
+| `vmex`, `power`, `tpm-seal` | the VMEX / POWER / TPM_SEAL resource |
 | `kernel-log` | the KLOG resource (`klog_read`); the manager also sends it every service's `log-level` |
 | `boot-time` | the boot-time record (UEFI only) |
 
@@ -141,8 +148,9 @@ waits on the kernel's power-button event, startup tag `POWER_BUTTON`; [acpi.md](
    the last started first among those free to stop (`SHUTDOWN`, 5 s, then it is ended).
 3. Then `system_power`.
 
-For ACPI S3 sleep (`MGR_POWER` with `POWER_SUSPEND`, e.g. `power sleep`), init sends `SYNC` to
-every volume provider, sends `SUSPEND` to `devmgr` to quiesce and stop drivers, calls
+For ACPI S3 sleep (`MGR_POWER` with `POWER_SUSPEND`, e.g. `power sleep`), init sends `SUSPEND` to
+`awmi` first so the compositor engages the lock screen when sleep-lock policy is active, sends
+`SYNC` to every volume provider, sends `SUSPEND` to `devmgr` to quiesce and stop drivers, calls
 `system_power(..., POWER_SUSPEND)`, and sends `RESUME` to `devmgr` upon wake.
 
 ## The system today
@@ -157,10 +165,11 @@ every volume provider, sends `SUSPEND` to `devmgr` to quiesce and stop drivers, 
 | `net` | log, `devmgr.net`, `clock.time` | `net.client`, `net.icmp`, `net.control`, `net.status` |
 | `gpu` | log, the `display` device, `devmgr.gpu` | `gpu.query`, `gpu.display`, `gpu.render` |
 | `terminal` | log, the `display` device, `devmgr.input` | `terminal.session`, `terminal.indicator`, `terminal.display`, `terminal.view` |
-| `awmi` | log, `gpu.display`, `audio.control`, `net.status`, `devmgr.input`, `terminal.display`, `clock.time`, `sys:/` read-only (fonts, themes) | `awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator` (identified clients) |
-| `console` | log, `awmi.window`, `terminal.view` | |
+| `identity` | log, `tpm-seal`, `/data` | `identity.query`, `identity.admin`, `identity.session` |
+| `awmi` | log, `gpu.display`, `audio.control`, `net.status`, `identity.session`, `devmgr.input`, `terminal.display`, `clock.time`, `sys:/` read-only (fonts, themes) | `awmi.window`, `awmi.admin`, `awmi.query`, `awmi.indicator`, `awmi.launcher` (identified clients) |
+| `appmgr` | log, `awmi.launcher`, `identity.query`, `manager` (`apps`), `sys:/` read-only, `/data` (no `vmex`) | `appmgr.query`, `appmgr.admin` |
 | `awmi-demo` | log, `awmi.window` | |
-| `shell` | log, `terminal.session`, `log.read`, `clock.time`, `audio.*`, `net.*`, `gpu.query`, `awmi.admin`, `awmi.query`, every volume, the manager (services, power), the tools | |
+| `shell` | log, `terminal.session`, `log.read`, `clock.time`, `audio.*`, `net.*`, `gpu.query`, `awmi.admin`, `awmi.query`, `identity.query`, `identity.admin`, `appmgr.query`, `appmgr.admin`, every volume, the manager (services, power), the tools | |
 
 ### The log service
 

@@ -14,7 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define DOS_ABI_VERSION 15
+#define DOS_ABI_VERSION 16
 
 typedef uint32_t dos_handle_t;
 #define DOS_HANDLE_INVALID 0u
@@ -124,6 +124,8 @@ enum {
     DOS_SYS_GET_RANDOM,
     /* ABI v15: physical base address of a device memory BAR */
     DOS_SYS_DEVICE_BAR_ADDR,
+    /* ABI v16: TPM 2.0 credential sealing */
+    DOS_SYS_TPM_SEAL, DOS_SYS_TPM_UNSEAL,
     DOS_SYS_COUNT,
     DOS_SYS_KTEST_SMAP = 0xF000,     /* test kernels only */
     DOS_SYS_KTEST_SMEP = 0xF001,
@@ -220,6 +222,7 @@ struct dos_exception_msg {
 #define DOS_TAG_KLOG        11            /* resource (ABI v8): may read the kernel log (init; the log service) */
 #define DOS_TAG_BOOT_TIME   12            /* ABI v8: the wall-clock time the loader read (32-byte VMO; UEFI only) */
 #define DOS_TAG_POWER_BUTTON 13           /* ABI v11: event signaled on each power-button press (init) */
+#define DOS_TAG_TPM_SEAL    14            /* resource (ABI v16): TPM 2.0 credential sealing (init; identity) */
 #define DOS_TAG_USER        0x10000       /* first tag for handles a spawner passes */
 
 struct dos_startup_handle { dos_handle_t handle; uint32_t tag; };
@@ -468,6 +471,15 @@ static inline int64_t dos_attest_activate(const uint8_t *challenge, uint8_t out[
 static inline int64_t dos_get_random(void *buf, uint64_t len, uint64_t flags) { return DOS_SC(DOS_SYS_GET_RANDOM, buf, len, flags, 0, 0, 0); }
 /* ABI v15: physical base address of memory BAR `bar` (INSPECT on device). */
 static inline int64_t dos_device_bar_addr(dos_handle_t dev, uint32_t bar) { return DOS_SC(DOS_SYS_DEVICE_BAR_ADDR, dev, bar, 0, 0, 0, 0); }
+/* ABI v16: TPM 2.0 credential sealing under the owner SRK (needs DOS_TAG_TPM_SEAL). */
+struct dos_tpm_seal_args {
+    uint64_t auth, auth_len;
+    uint64_t input, input_len;
+    uint64_t output, output_cap;
+};
+_Static_assert(sizeof(struct dos_tpm_seal_args) == 48, "dos_tpm_seal_args layout");
+static inline int64_t dos_tpm_seal(dos_handle_t res, const struct dos_tpm_seal_args *args) { return DOS_SC(DOS_SYS_TPM_SEAL, res, args, 0, 0, 0, 0); }
+static inline int64_t dos_tpm_unseal(dos_handle_t res, const struct dos_tpm_seal_args *args) { return DOS_SC(DOS_SYS_TPM_UNSEAL, res, args, 0, 0, 0, 0); }
 
 /* ---- storage (docs/storage.md; mirrors user/lib/libd/src/fs.rs) ---------------------------
  * Service messages start with a 32-byte header; VOLUME carries a channel to a volume's root. */

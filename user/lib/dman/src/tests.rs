@@ -28,6 +28,8 @@ const SEEDS: &[&[u8]] = &[
     include_bytes!("../../../init/services/gpu/svc-gpu-full.dman"),
     include_bytes!("../../../init/services/awmi.dman"),
     include_bytes!("../../../init/services/awmi-demo.dman"),
+    include_bytes!("../../../init/services/identity.dman"),
+    include_bytes!("../../../init/services/appmgr.dman"),
     include_bytes!("../../../init/services/awmi/svc-awmi-ungranted.dman"),
     include_bytes!("../../../init/services/awmi/svc-awmi-a.dman"),
     include_bytes!("../../../init/services/awmi/svc-awmi-b.dman"),
@@ -309,7 +311,7 @@ fn the_shell_manifest_grants_its_session() {
     let s = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
     assert!(s.tools && s.manage_services && s.manage_power && s.log && s.vmex);
     assert_eq!(s.namespace, vec![NsGrant { path: "*".into(), volume: "*".into(), rights: NS_READ | NS_WRITE }]);
-    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, audio.playback, audio.control, net.client, net.icmp, net.control, gpu.query, awmi.admin, awmi.query, every volume, VMEX, manager (services, power), tools, audio (playback, control), net (client, icmp, control), gpu (query), awmi (admin, query)");
+    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, audio.playback, audio.control, net.client, net.icmp, net.control, gpu.query, awmi.admin, awmi.query, identity.admin, identity.query, appmgr.admin, appmgr.query, every volume, VMEX, manager (services, power), tools, audio (playback, control), net (client, icmp, control), gpu (query), awmi (admin, query), identity (admin, query), appmgr (query, admin)");
     assert!(s.awmi_admin && s.awmi_query && !s.awmi_window && !s.awmi_indicator && !s.identify);
     assert!(refused("name = \"x\"
 image = \"x.dx\"
@@ -483,12 +485,16 @@ fn fuzz_tool_manifests() {
 fn the_compositor_manifests() {
     let a = parse(include_bytes!("../../../init/services/awmi.dman")).unwrap();
     assert_eq!((a.name.as_str(), a.image.as_str(), a.group), ("awmi", "awmi.dsvc", Group::System));
-    assert!(a.identify && a.gpu_display && !a.gpu_query && a.audio_control && !a.audio_capture && a.net_status && !a.net_client && !a.net_icmp);
-    assert_eq!(a.endpoints, vec!["window".to_string(), "admin".to_string(), "query".to_string(), "indicator".to_string()]);
-    for (svc, ep) in [("gpu", "display"), ("audio", "control"), ("net", "status"), ("devmgr", "input"), ("terminal", "display"), ("clock", "time")] {
+    assert!(a.identify && a.gpu_display && !a.gpu_query && a.audio_control && !a.audio_capture && a.net_status && !a.net_client && !a.net_icmp && a.identity_session);
+    assert_eq!(a.endpoints, vec!["window".to_string(), "admin".to_string(), "query".to_string(), "indicator".to_string(), "launcher".to_string()]);
+    for (svc, ep) in [("gpu", "display"), ("audio", "control"), ("net", "status"), ("identity", "session"), ("devmgr", "input"), ("terminal", "display"), ("clock", "time")] {
         assert!(a.connect.contains(&Connect { service: svc.into(), endpoint: ep.into() }), "{}.{}", svc, ep);
     }
-    assert!(summary(&a).ends_with("gpu (display), verified client identity"));
+    assert!(summary(&a).ends_with("identity (session), verified client identity"));
+    let idm = parse(include_bytes!("../../../init/services/identity.dman")).unwrap();
+    assert!(idm.tpm_seal && idm.identify && idm.endpoints == vec!["session".to_string(), "admin".to_string(), "query".to_string()]);
+    let apm = parse(include_bytes!("../../../init/services/appmgr.dman")).unwrap();
+    assert!(!apm.vmex && apm.manage_apps && apm.awmi_launcher && apm.identity_query);
     let d = parse(include_bytes!("../../../init/services/awmi-demo.dman")).unwrap();
     assert!(d.awmi_window && !d.awmi_admin && !d.awmi_query && !d.awmi_indicator);
     assert_eq!(d.connect, vec![Connect { service: "awmi".into(), endpoint: "window".into() }]);

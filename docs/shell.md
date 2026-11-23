@@ -24,7 +24,7 @@ data ▸ copy report.txt /backup
 | Process | Holds | Does not hold |
 |---|---|---|
 | `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge, `terminal.display` to the compositor, which stops and restarts its drawing for a graphical session, and `terminal.view` to the terminal window) |
-| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, `awmi.admin`, `awmi.query`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting, any window's pixels |
+| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, `awmi.admin`, `awmi.query`, `identity.query`, `identity.admin`, `appmgr.query`, `appmgr.admin`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting, `identity.session`, `tpm-seal`, any window's pixels |
 | a tool | an output channel, one node per path argument with the rights its manifest declares, the log | the namespace, endpoints, anything else of the shell |
 
 The terminal and the shell are separate so that neither gets the other's authority: a bug in the
@@ -94,11 +94,17 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   [networking.md](networking.md)), `gpu [modes [id] | display [id] | flip-test [id] [ms] | mode <w> <h> <hz> [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]`
   (`display`, GPU adapters, modes, live DCN/DPCD/EDID display probe, hardware page-flip test,
   guarded refresh/mode switching, VRR, HDR10, per-output scale, VRAM, and IOMMU status;
-  [graphics.md](graphics.md)), `gui [demo | status | theme dark|contrast |
+  [graphics.md](graphics.md)), `gui [demo | status | lock | theme dark|contrast |
   text 100-200 | motion on|off]` (`awmi`: start the desktop, with the example apps too for `demo`,
-  back with `Super+Esc` or `Ctrl+Alt+Esc`; `status`: the compositor's state; `theme`, `text`,
-  `motion`: the accessibility settings; [awmi.md](awmi.md), [ui.md](ui.md)), `power off | restart | sleep` (the manager stops every service
-  cleanly first), `clear`, `run <tool> [arguments]`.
+  back with `Super+Esc` or `Ctrl+Alt+Esc`; `status`: the compositor's state; `lock`: engage the
+  unforgeable lock screen; `theme`, `text`, `motion`: the accessibility settings;
+  [awmi.md](awmi.md), [ui.md](ui.md)), `identity [list | policy | create <name> [standard|operator]
+  | enroll <name> <pass> | switch <name> | lock-policy <idle_s> <sleep on|off>]` (`id`, `whoami`:
+  manage non-root D-OS identities, TPM-sealed credentials and lock policy;
+  [identity.md](identity.md)), `apps [list | launch <name> | stop <name> | perms <name> | grant
+  <name> <perm> | revoke <name> <perm> | verify <path>]` (`app`: inspect, launch, stop and
+  grant/revoke permissions on signed `.dapp` bundles; [apps.md](apps.md)), `power off | restart |
+  sleep` (the manager stops every service cleanly first), `clear`, `run <tool> [arguments]`.
 - **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
   (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place
   (with the session's rights there) as its working directory, an output channel and the wall

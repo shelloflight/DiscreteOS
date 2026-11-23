@@ -280,9 +280,11 @@ pub fn verify_quote<'a>(
 
 pub const ALG_RSA: u16 = 0x0001;
 pub const ALG_AES: u16 = 0x0006;
+pub const ALG_KEYEDHASH: u16 = 0x0008;
 pub const ALG_CFB: u16 = 0x0043;
 pub const OBJ_USER_WITH_AUTH: u32 = 1 << 6;
 pub const OBJ_ADMIN_WITH_POLICY: u32 = 1 << 7;
+pub const OBJ_NO_DA: u32 = 1 << 10;
 
 /// The TCG EK Credential Profile's RSA 2048 endorsement-key template ("L-1"): a restricted
 /// decryption key whose use needs PolicySecret(TPM_RH_ENDORSEMENT). Created from the TPM's
@@ -296,6 +298,11 @@ pub const EK_POLICY: [u8; 32] = [
 /// The attestation key the kernel creates: ECC P-256, restricted signing (ECDSA-SHA256), usable
 /// with its (empty) password.
 pub const AK_CREATE_ATTRIBUTES: u32 = AK_ATTRIBUTES | OBJ_USER_WITH_AUTH;
+/// ECC P-256 Storage Root Key (owner hierarchy) for sealing identity credentials.
+pub const SRK_ATTRIBUTES: u32 =
+    OBJ_FIXED_TPM | OBJ_FIXED_PARENT | OBJ_SENSITIVE_DATA_ORIGIN | OBJ_USER_WITH_AUTH | OBJ_NO_DA | OBJ_RESTRICTED | OBJ_DECRYPT;
+/// Sealed data child object (TPM_ALG_KEYEDHASH, bound to this TPM and parent, password-protected).
+pub const SEAL_ATTRIBUTES: u32 = OBJ_FIXED_TPM | OBJ_FIXED_PARENT | OBJ_USER_WITH_AUTH | OBJ_NO_DA;
 
 /// Fixed-capacity big-endian writer.
 struct Writer<const N: usize> {
@@ -338,6 +345,23 @@ pub fn ak_template() -> ([u8; 64], usize) {
     w.u16(ALG_ECC).u16(ALG_SHA256).u32(AK_CREATE_ATTRIBUTES).tpm2b(&[]);
     w.u16(ALG_NULL).u16(ALG_ECDSA).u16(ALG_SHA256).u16(ECC_NIST_P256).u16(ALG_NULL);
     w.tpm2b(&[]).tpm2b(&[]);
+    (w.b, w.n)
+}
+
+/// `TPMT_PUBLIC` of the ECC P-256 Storage Root Key template (owner hierarchy, AES-128-CFB).
+pub fn srk_ecc_template() -> ([u8; 64], usize) {
+    let mut w = Writer::<64>::new();
+    w.u16(ALG_ECC).u16(ALG_SHA256).u32(SRK_ATTRIBUTES).tpm2b(&[]);
+    w.u16(ALG_AES).u16(128).u16(ALG_CFB).u16(ALG_NULL).u16(ECC_NIST_P256).u16(ALG_NULL);
+    w.tpm2b(&[]).tpm2b(&[]);
+    (w.b, w.n)
+}
+
+/// `TPMT_PUBLIC` of a keyed-hash sealed data object (no sign/decrypt; password-protected).
+pub fn seal_keyedhash_template() -> ([u8; 32], usize) {
+    let mut w = Writer::<32>::new();
+    w.u16(ALG_KEYEDHASH).u16(ALG_SHA256).u32(SEAL_ATTRIBUTES).tpm2b(&[]);
+    w.u16(ALG_NULL).tpm2b(&[]);
     (w.b, w.n)
 }
 

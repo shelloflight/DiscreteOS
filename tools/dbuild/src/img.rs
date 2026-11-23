@@ -141,9 +141,10 @@ fn dsig_kind(s: &str) -> Result<u32, String> {
         "driver" => KIND_DRIVER,
         "package" => KIND_PACKAGE,
         "manifest" => KIND_MANIFEST,
+        "app" => KIND_APP,
         _ => {
             return Err(format!(
-                "unknown signature kind '{s}' (kernel, program, driver, package, manifest)"
+                "unknown signature kind '{s}' (kernel, program, driver, package, manifest, app)"
             ));
         }
     })
@@ -191,6 +192,38 @@ pub fn sign_file(
     let content = read_file(input)?;
     let d = doscrypt::dsig::sign(&k, dsig_kind(kind)?, name, &content);
     std::fs::write(output, d).map_err(|e| format!("{}: {e}", output.display()))
+}
+
+/// Deterministically build and sign a `.dapp` v1 application bundle (outer `KIND_APP` + inner
+/// `KIND_PROGRAM` binary signature).
+pub fn build_dapp(
+    seed_path: &Path,
+    app_name: &str,
+    manifest_path: &Path,
+    binary_name: &str,
+    binary_path: &Path,
+    resources: &[(&str, &Path)],
+    output: &Path,
+) -> Result<(), String> {
+    let key = read_seed(seed_path)?;
+    let man_bytes = read_file(manifest_path)?;
+    let bin_bytes = read_file(binary_path)?;
+    let bin_sig = doscrypt::dsig::sign(&key, doscrypt::dsig::KIND_PROGRAM, binary_name, &bin_bytes);
+    let bin_sig_name = format!("{binary_name}.dsig");
+    let mut res_owned: Vec<(&str, Vec<u8>)> = Vec::with_capacity(resources.len());
+    for &(rname, rpath) in resources {
+        res_owned.push((rname, read_file(rpath)?));
+    }
+    let mut inputs = Vec::with_capacity(3 + res_owned.len());
+    inputs.push(dosapp::BundleInput { kind: dosapp::ENTRY_MANIFEST, name: "manifest.dman", data: &man_bytes });
+    inputs.push(dosapp::BundleInput { kind: dosapp::ENTRY_BINARY, name: binary_name, data: &bin_bytes });
+    inputs.push(dosapp::BundleInput { kind: dosapp::ENTRY_BINARY_SIG, name: &bin_sig_name, data: &bin_sig });
+    for (rname, rdata) in &res_owned {
+        inputs.push(dosapp::BundleInput { kind: dosapp::ENTRY_RESOURCE, name: rname, data: rdata });
+    }
+    let bundle = dosapp::build_bundle(&key, app_name, &inputs)
+        .map_err(|e| format!("build_dapp {app_name}: {e:?}"))?;
+    std::fs::write(output, bundle).map_err(|e| format!("{}: {e}", output.display()))
 }
 
 pub fn make_sata(out: &Path) -> Result<(), String> {

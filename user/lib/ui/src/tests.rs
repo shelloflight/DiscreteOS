@@ -282,6 +282,101 @@ fn theme_and_text_scale_relayout_everything() {
     assert_eq!(ThemeId::HighContrast.builtin(), Theme::HIGH_CONTRAST);
 }
 
+fn accepted_or_ok_secret_and_textarea() -> bool {
+    let mut text = text();
+    let mut ui: Ui<String> = Ui::new(Theme::DARK_SLATE, UiSettings::DEFAULT);
+    ui.resize(400, 300, &text);
+    let mut pass = String::from("abc");
+    let mut body = String::from("line1\nline2");
+    let build = |p: &str, b: &str| {
+        column([
+            input(p).secret().on_change(|s| format!("P:{s}")),
+            textarea(b).placeholder("Type here").on_change(|s| format!("B:{s}")),
+        ])
+        .padding(8)
+        .gap(8)
+    };
+    ui.set_view(build(&pass, &body), &text);
+    let mut fb = vec![0u32; 400 * 300];
+    let mut c = Canvas::new(&mut fb, 400, 300, 400).unwrap();
+    let _ = ui.paint(&mut c, &mut text);
+
+    // Tab to secret input and type 'd'.
+    let _ = ui.key(TAB, &text);
+    for m in ui.key(u32::from(b'd'), &text) {
+        if let Some(rest) = m.strip_prefix("P:") {
+            pass = String::from(rest);
+        }
+    }
+    assert_eq!(pass, "abcd");
+    ui.set_view(build(&pass, &body), &text);
+
+    // Tab to textarea, press Enter, type 'z', Up arrow, type '!'.
+    let _ = ui.key(TAB, &text);
+    for k in [0x0Du32, u32::from(b'z'), 0x101u32, u32::from(b'!')] {
+        for m in ui.key(k, &text) {
+            if let Some(rest) = m.strip_prefix("B:") {
+                body = String::from(rest);
+            }
+        }
+        ui.set_view(build(&pass, &body), &text);
+    }
+    assert_eq!(body, "line1\nl!ine2\nz");
+    let mut c = Canvas::new(&mut fb, 400, 300, 400).unwrap();
+    let _ = ui.paint(&mut c, &mut text);
+    true
+}
+
+#[test]
+fn secret_input_and_multiline_textarea() {
+    assert!(accepted_or_ok_secret_and_textarea());
+}
+
+#[test]
+fn item_double_click_and_enter_activate() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Ev {
+        Sel(usize),
+        Act(usize),
+    }
+    let text = text();
+    let mut ui: Ui<Ev> = Ui::new(Theme::DARK_SLATE, UiSettings::DEFAULT);
+    ui.resize(320, 240, &text);
+    let build = |sel: usize| {
+        column([
+            item("services/", sel == 0).detail("Folder").key(10).on_select(Ev::Sel(0)).on_activate(Ev::Act(0)),
+            item("readme.txt", sel == 1).detail("128 B").key(11).on_select(Ev::Sel(1)).on_activate(Ev::Act(1)),
+        ])
+        .padding(8)
+        .gap(4)
+    };
+    ui.set_view(build(0), &text);
+
+    // Single click on row 0 emits Sel(0).
+    ui.set_time(1_000_000_000);
+    let _ = ui.pointer(40, 20, 1, 0, &text);
+    assert_eq!(ui.pointer(40, 20, 0, 0, &text), vec![Ev::Sel(0)]);
+
+    // Second click within 250 ms emits Act(0) and resets the double-click latch.
+    ui.set_time(1_250_000_000);
+    let _ = ui.pointer(40, 20, 1, 0, &text);
+    assert_eq!(ui.pointer(40, 20, 0, 0, &text), vec![Ev::Act(0)]);
+
+    // Immediate third click starts a fresh single-click sequence -> Sel(0).
+    ui.set_time(1_350_000_000);
+    let _ = ui.pointer(40, 20, 1, 0, &text);
+    assert_eq!(ui.pointer(40, 20, 0, 0, &text), vec![Ev::Sel(0)]);
+
+    // Slow click (> 450 ms later) emits Sel(0), NOT Act(0).
+    ui.set_time(2_000_000_000);
+    let _ = ui.pointer(40, 20, 1, 0, &text);
+    assert_eq!(ui.pointer(40, 20, 0, 0, &text), vec![Ev::Sel(0)]);
+
+    // Keyboard: Space selects, Enter activates.
+    assert_eq!(ui.key(b' ' as u32, &text), vec![Ev::Sel(0)]);
+    assert_eq!(ui.key(0x0D, &text), vec![Ev::Act(0)]);
+}
+
 #[test]
 fn font_text_ellipsis_and_roles() {
     let mut t = text();

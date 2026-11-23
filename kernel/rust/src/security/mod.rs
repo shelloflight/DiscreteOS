@@ -94,10 +94,10 @@ pub unsafe extern "C" fn dkrnl_security_init(firmware: u32, flags: u32, kernel_d
     csprng::init();
     // Remote attestation: this boot's key, measured right after the kernel (attest.rs).
     let ak = attest::init(firmware, flags & BOOT_KERNEL_VERIFIED != 0);
-    // The attest-tpm test: the simulated TPM (TEST keys) stands in for hardware.
-    #[cfg(ktest_attesttpm)]
+    // The attest-tpm and identity tests: the simulated TPM (TEST keys) stands in for hardware.
+    #[cfg(any(ktest_attesttpm, ktest_identity))]
     let found = tpm::Tpm::new(alloc::boxed::Box::new(tpm::Sim::new()));
-    #[cfg(not(ktest_attesttpm))]
+    #[cfg(not(any(ktest_attesttpm, ktest_identity)))]
     let found = tpm::probe().map_err(tpm::Error::Protocol).and_then(tpm::Tpm::new);
     match found {
         Ok(t) => {
@@ -132,13 +132,13 @@ fn sig_status(e: dsig::Error) -> Status {
     }
 }
 
-/// `vmo_verify`: seal `v`, check `d` (a `.dsig` of kind program, driver or manifest) against
+/// `vmo_verify`: seal `v`, check `d` (a `.dsig` of kind program, driver, manifest or app) against
 /// its contents and the D-OS key and measure it. Programs and drivers become Signed (spawnable); a
-/// manifest (ABI v7) is data and never becomes runnable: the caller only learns it is genuine. Bytes past the signed size must be zero, so
-/// nothing unsigned can hide in the VMO's last page.
+/// manifest or app bundle is data and never becomes runnable: the caller only learns it is genuine.
+/// Bytes past the signed size must be zero, so nothing unsigned can hide in the VMO's last page.
 pub fn verify_vmo(v: &Vmo, d: &[u8]) -> Result<dsig::Header, Status> {
     let h = dsig::parse(d).map_err(sig_status)?;
-    if h.kind != dsig::KIND_PROGRAM && h.kind != dsig::KIND_DRIVER && h.kind != dsig::KIND_MANIFEST {
+    if h.kind != dsig::KIND_PROGRAM && h.kind != dsig::KIND_DRIVER && h.kind != dsig::KIND_MANIFEST && h.kind != dsig::KIND_APP {
         return Err(Status::BadSignature);
     }
     if h.size > v.size() {
@@ -160,13 +160,34 @@ pub fn verify_vmo(v: &Vmo, d: &[u8]) -> Result<dsig::Header, Status> {
     }
     let h = dsig::verify_hashed(d, trusted_key(), h.size, &s.finish()).map_err(sig_status)?;
     v.set_name_once(h.name_str());
-    if h.kind != dsig::KIND_MANIFEST {
+    if h.kind != dsig::KIND_MANIFEST && h.kind != dsig::KIND_APP {
         v.set_trust(Trust::Signed);
     }
     let mut text = crate::fmtbuf::FmtBuf::<{ measure::TEXT_MAX }>::new();
     let _ = core::fmt::Write::write_fmt(&mut text, format_args!("signed {}", h.name_str()));
     measure::measure(measure::PCR_CODE, &sha256(&d[..dsig::SIGNED]), core::str::from_utf8(text.as_bytes()).unwrap_or("?"), false);
     Ok(h)
+}
+
+/// Seal `data` (1..=128 bytes) protected by `auth` (0..=64 bytes) under the TPM 2.0 owner SRK.
+pub fn tpm_seal(auth: &[u8], data: &[u8]) -> Result<alloc::vec::Vec<u8>, Status> {
+    match measure::with_tpm(|t| t.seal(auth, data)) {
+        Some(Ok(blob)) => Ok(blob),
+        Some(Err(tpm::Error::Tpm(_))) => Err(Status::AccessDenied),
+        Some(Err(_)) => Err(Status::BadState),
+        None => Err(Status::NotSupported),
+    }
+}
+
+/// Unseal a `DTPM` blob created by `tpm_seal` using `auth`.
+pub fn tpm_unseal(auth: &[u8], blob: &[u8]) -> Result<alloc::vec::Vec<u8>, Status> {
+    match measure::with_tpm(|t| t.unseal(auth, blob)) {
+        Some(Ok(data)) => Ok(data),
+        Some(Err(tpm::Error::Tpm(_))) => Err(Status::AccessDenied),
+        Some(Err(tpm::Error::Protocol(_))) => Err(Status::InvalidArgs),
+        Some(Err(tpm::Error::Timeout)) => Err(Status::TimedOut),
+        None => Err(Status::NotSupported),
+    }
 }
 
 /// `vmo_allow_unsigned` (the caller holds VMEX): seal `v`, mark it Unsigned, measure its contents.

@@ -79,9 +79,11 @@ pub const TAG_KLOG: u32 = 11;
 pub const TAG_BOOT_TIME: u32 = 12;
 /// The power-button event (ABI v11): signaled on each press; init clears it.
 pub const TAG_POWER_BUTTON: u32 = 13;
+/// The TPM_SEAL resource (ABI v16): seal/unseal credentials under the TPM 2.0 owner SRK.
+pub const TAG_TPM_SEAL: u32 = 14;
 pub const TAG_USER: u32 = 0x1_0000;
 pub const STARTUP_MAGIC: u32 = 0x5353_4F44;
-pub const ABI_VERSION: u32 = 15;
+pub const ABI_VERSION: u32 = 16;
 pub const PAGE: u64 = 4096;
 
 pub const DEV_KIND_PCI: u32 = 1;
@@ -185,8 +187,10 @@ pub mod nr {
     pub const VMAR_DESTROY: u64 = 72;
     pub const GET_RANDOM: u64 = 73;
     pub const DEVICE_BAR_ADDR: u64 = 74;
+    pub const TPM_SEAL: u64 = 75;
+    pub const TPM_UNSEAL: u64 = 76;
     /// Syscalls this ABI version defines (numbers below it).
-    pub const COUNT: u64 = 75;
+    pub const COUNT: u64 = 77;
 }
 
 /// One raw syscall. Prefer the typed wrappers; this is for port submissions and tests.
@@ -893,4 +897,47 @@ pub fn get_random(out: &mut [u8], flags: u64) -> Result<(), i64> {
         }
     }
     Ok(())
+}
+
+/// Arguments for `tpm_seal` / `tpm_unseal` (ABI v16, `struct dos_tpm_seal_args`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TpmSealArgs {
+    pub auth: u64,
+    pub auth_len: u64,
+    pub input: u64,
+    pub input_len: u64,
+    pub output: u64,
+    pub output_cap: u64,
+}
+const _: () = assert!(core::mem::size_of::<TpmSealArgs>() == 48);
+
+/// Maximum TPM-sealed blob size (`DTPM` container).
+pub const TPM_SEAL_BLOB_MAX: usize = 1024;
+
+/// ABI v16, with `TAG_TPM_SEAL`: seal `secret` (1..=128 bytes) protected by `auth` (0..=64 bytes)
+/// under the TPM 2.0 owner Storage Root Key. Returns the blob length written to `out`.
+pub fn tpm_seal(res_h: Handle, auth: &[u8], secret: &[u8], out: &mut [u8]) -> Result<usize, i64> {
+    let args = TpmSealArgs {
+        auth: auth.as_ptr() as u64,
+        auth_len: auth.len() as u64,
+        input: secret.as_ptr() as u64,
+        input_len: secret.len() as u64,
+        output: out.as_mut_ptr() as u64,
+        output_cap: out.len() as u64,
+    };
+    res(sc(nr::TPM_SEAL, u64::from(res_h), &args as *const TpmSealArgs as u64, 0, 0, 0, 0)).map(|v| v as usize)
+}
+
+/// ABI v16, with `TAG_TPM_SEAL`: unseal `blob` with `auth` under the TPM 2.0 owner SRK.
+pub fn tpm_unseal(res_h: Handle, auth: &[u8], blob: &[u8], out: &mut [u8]) -> Result<usize, i64> {
+    let args = TpmSealArgs {
+        auth: auth.as_ptr() as u64,
+        auth_len: auth.len() as u64,
+        input: blob.as_ptr() as u64,
+        input_len: blob.len() as u64,
+        output: out.as_mut_ptr() as u64,
+        output_cap: out.len() as u64,
+    };
+    res(sc(nr::TPM_UNSEAL, u64::from(res_h), &args as *const TpmSealArgs as u64, 0, 0, 0, 0)).map(|v| v as usize)
 }

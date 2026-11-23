@@ -57,6 +57,58 @@ impl DetailedTiming {
     pub const fn raw_bandwidth_kbps(&self, bpc: u8) -> u64 {
         (self.pixel_clock_khz as u64).saturating_mul(3 * (bpc as u64))
     }
+
+    /// Synthesize a VESA CVT 1.2 Reduced Blanking v2 timing for `(width, height)` at `refresh_mhz`.
+    /// Pure integer math, suitable for high-refresh LCD/OLED panels over DisplayPort or HDMI.
+    pub fn cvt_rb(width: u32, height: u32, refresh_mhz: u32) -> Option<Self> {
+        if !(320..=MAX_DIM).contains(&width)
+            || !(200..=MAX_DIM).contains(&height)
+            || !(24_000..=1_000_000).contains(&refresh_mhz)
+        {
+            return None;
+        }
+        // CVT-RB v2 fixed horizontal blanking: 80 pixels (8 FP, 32 sync, 40 BP).
+        const H_BLANK: u32 = 80;
+        const H_FP: u32 = 8;
+        const H_SYNC: u32 = 32;
+        // CVT-RB v2 fixed vertical sync (8 lines) & back porch (6 lines), minimum 460 us VBI.
+        const V_SYNC: u32 = 8;
+        const V_BP: u32 = 6;
+        const MIN_VBI_US: u128 = 460;
+
+        let rf = u128::from(refresh_mhz);
+        let denom = 1_000_000_000u128.saturating_sub(MIN_VBI_US.saturating_mul(rf));
+        let vbi = if denom > 100_000_000 {
+            let num = MIN_VBI_US.saturating_mul(u128::from(height)).saturating_mul(rf);
+            (num.div_ceil(denom) as u32).max(V_SYNC + V_BP + 1)
+        } else {
+            (height / 8).max(V_SYNC + V_BP + 1)
+        };
+        let v_blank = vbi.min(2048);
+        let v_front_porch = v_blank.saturating_sub(V_SYNC + V_BP).max(1);
+        let h_total = width.saturating_add(H_BLANK);
+        let v_total = height.saturating_add(v_blank);
+        let pclk = ((u128::from(h_total) * u128::from(v_total) * rf + 500_000) / 1_000_000) as u32;
+        if pclk == 0 {
+            return None;
+        }
+        let actual_mhz = compute_refresh_mhz(pclk, h_total, v_total);
+        Some(Self {
+            pixel_clock_khz: pclk,
+            h_active: width,
+            h_blank: H_BLANK,
+            h_front_porch: H_FP,
+            h_sync_width: H_SYNC,
+            v_active: height,
+            v_blank,
+            v_front_porch,
+            v_sync_width: V_SYNC,
+            h_sync_pos: true,
+            v_sync_pos: false,
+            refresh_mhz: actual_mhz,
+            preferred: false,
+        })
+    }
 }
 
 /// Parsed summary of an EDID 1.x image (1 to 4 128-byte blocks).
@@ -228,6 +280,26 @@ pub fn parse_edid(raw: &[u8]) -> Result<EdidInfo, EdidError> {
         }
     }
 
+    // Standard timings (bytes 38..53: eight 2-byte descriptors) synthesized via CVT-RB v2.
+    for slot in 0..8usize {
+        let b0 = blk[38 + slot * 2];
+        let b1 = blk[39 + slot * 2];
+        if (b0 == 0x01 && b1 == 0x01) || (b0 == 0x00 && b1 == 0x00) {
+            continue;
+        }
+        let w = (u32::from(b0) + 31) * 8;
+        let h = match b1 >> 6 {
+            0 => if version == 1 && revision >= 3 { (w * 10) / 16 } else { w },
+            1 => (w * 3) / 4,
+            2 => (w * 4) / 5,
+            _ => (w * 9) / 16,
+        };
+        let hz = (u32::from(b1 & 0x3F) + 60) * 1000;
+        if let Some(t) = DetailedTiming::cvt_rb(w, h, hz) {
+            push_timing(&mut info, t);
+        }
+    }
+
     // Established timings (bytes 35..37) as fallback modes if space remains.
     let est = [
         (35usize, 1u8 << 0, 800u32, 600u32, 60_000u32),
@@ -318,7 +390,29 @@ fn parse_cta861_ext(ext: &[u8], info: &mut EdidInfo) {
             break;
         }
         let body = &ext[data_start..data_end];
-        if tag == 3 && body.len() >= 7 {
+        if tag == 2 {
+            // CTA-861 Video Data Block: Short Video Descriptors (VICs).
+            for &svd in body {
+                let vic = svd & 0x7F;
+                let native = (svd & 0x80) != 0;
+                let mode = match vic {
+                    4 => Some((1280u32, 720u32, 60_000u32)),
+                    16 => Some((1920, 1080, 60_000)),
+                    47 => Some((1280, 720, 120_000)),
+                    63 => Some((1920, 1080, 120_000)),
+                    95 => Some((3840, 2160, 30_000)),
+                    97 => Some((3840, 2160, 60_000)),
+                    118 => Some((3840, 2160, 120_000)),
+                    _ => None,
+                };
+                if let Some((w, h, hz)) = mode
+                    && let Some(mut t) = DetailedTiming::cvt_rb(w, h, hz)
+                {
+                    t.preferred = native && info.timing_count == 0;
+                    push_timing(info, t);
+                }
+            }
+        } else if tag == 3 && body.len() >= 7 {
             // Vendor-Specific Data Block: AMD FreeSync IEEE OUI = 0x00001A (bytes [0x1A, 0x00, 0x00]).
             if body[0] == 0x1A && body[1] == 0x00 && body[2] == 0x00 {
                 let vmin = u16::from(body[5]);

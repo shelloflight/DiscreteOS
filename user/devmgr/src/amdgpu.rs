@@ -24,16 +24,17 @@ use core::sync::atomic::{Ordering, fence};
 use dosgpu::amd::dp_aux::{self as aux, DpAuxProbe, dpcd_rate_label};
 use dosgpu::amd::dcn::{
     self, ActivePipe, DcnAccess, FbWindow, GopInfo, RegIo, ScanoutLayout, allocate_scanout_buffers,
-    frame_count_diff, measure_refresh_mhz, probe_active_pipes, read_frame_count,
+    find_pipe_dig_encoder, frame_count_diff, measure_refresh_mhz, probe_active_pipes,
+    probe_pipe_dpp_size_regs, read_frame_count,
 };
 use dosgpu::amd::flip::{
     self, CursorSize, FlipEngine, FlipPoll, HwCursor, IhController, IhEvent, ModeBandwidthPlan,
-    SelfCheckState, plan_mode_bandwidth, program_mode_regs,
+    SavedModeRegs, SelfCheckState, plan_mode_bandwidth, program_mode_regs_ex,
 };
 use dosgpu::amd::{self, AmdGpuInfo, DiscoverySummary};
-use dosgpu::edid::EdidInfo;
+use dosgpu::edid::{DetailedTiming, EdidInfo};
 use dosgpu::{
-    DamageRect, MAX_AGE_RECTS, MAX_DIM, PixelFormat, blit_rect_wc, blit_rect_wc_10bpc,
+    DamageRect, MAX_AGE_RECTS, MAX_DIM, MAX_FB_BYTES, PixelFormat, blit_rect_wc, blit_rect_wc_10bpc,
 };
 use libd::gpu::{
     self, DisplayProbeInfo, FlipTestResult, GopInfoWire, MODE_FLAG_CURRENT, MODE_FLAG_PREFERRED,
@@ -43,7 +44,7 @@ use libd::proto;
 use libd::sys::{self, Handle};
 use libd::{Dma, Mapping, Port, Startup, println};
 
-use crate::gpu_drv::{self, FbPin, GpuAnnounce, GpuDriver, KEY_IRQ0};
+use crate::gpu_drv::{self, GpuAnnounce, GpuDriver, KEY_IRQ0};
 
 /// DMA buffer layout (7 x 4 KiB = 28 KiB, pinned in the device's IOMMU domain):
 /// - Page 0 (0x0000): PM4 ring
@@ -60,7 +61,7 @@ const IH_WPTR_OFF: u64 = 5 * 4096;
 const IH_DUMMY_OFF: u64 = 6 * 4096;
 
 const FALLBACK_VRAM_MAP_MAX: u64 = 32 << 20;
-const MAX_FBS: usize = 4;
+const MAX_FBS: usize = 2;
 
 /// Borrowed MMIO view implementing `RegIo` so `AmdGpu` can mutate state while performing MMIO.
 struct MmioRef<'a>(&'a Mapping);
@@ -91,8 +92,12 @@ fn delay_us(us: u32) {
 
 struct AmdFb {
     fb_id: u32,
+    vmo: Handle,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    format: u32,
     map: Mapping,
-    pin: FbPin,
 }
 
 impl Drop for AmdFb {
@@ -100,7 +105,23 @@ impl Drop for AmdFb {
         if self.map.len != 0 {
             let _ = sys::vmar_unmap(libd::root_vmar(), self.map.addr, self.map.len);
         }
+        if self.vmo != 0 {
+            sys::handle_close(self.vmo);
+        }
     }
+}
+
+/// Complete original UEFI GOP display state preserved so `release_display()` can always restore
+/// both hardware timing/surface registers and driver scanout geometry cleanly.
+#[derive(Clone, Copy)]
+struct BootModeState {
+    regs: SavedModeRegs,
+    pipe: ActivePipe,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    measured_mhz: u32,
+    layout: ScanoutLayout,
 }
 
 struct AmdGpu {
@@ -114,7 +135,6 @@ struct AmdGpu {
     vram_map: Option<Mapping>,
     vram_map_off: u64,
     ring_dma: Dma,
-    scratch: Mapping,
     irq: Handle,
     iommu: bool,
     vram_mib: u32,
@@ -124,6 +144,11 @@ struct AmdGpu {
     pipes: [ActivePipe; 6],
     pipe_count: usize,
     primary_slot: usize,
+    dig_enc: u8,
+    dpp_size_regs: [u32; 4],
+    dpp_size_count: usize,
+    boot_state: Option<BootModeState>,
+    mode_switched: bool,
     measured_mhz: u32,
     aux_probe: Option<DpAuxProbe>,
     gop: Option<GopInfo>,
@@ -352,7 +377,9 @@ impl AmdGpu {
             && p.gop_matched
             && self.flip.as_ref().is_some_and(FlipEngine::is_verified)
         {
-            caps |= gpu::CAP_NATIVE_GOP_MATCH | gpu::CAP_PAGE_FLIP | gpu::CAP_ASYNC_FLIP | gpu::CAP_HW_CURSOR;
+            // Omit `CAP_HW_CURSOR` on AMD DCN so D-AWMI renders crisp context-aware cursors
+            // directly into its buffer-age damaged backbuffer over tear-free DCN vsync flips.
+            caps |= gpu::CAP_NATIVE_GOP_MATCH | gpu::CAP_PAGE_FLIP | gpu::CAP_ASYNC_FLIP | gpu::CAP_VRR;
         }
         if let Some(ed) = self.edid() {
             if ed.vrr_min_hz >= 24 && ed.vrr_max_hz > ed.vrr_min_hz {
@@ -459,6 +486,10 @@ impl AmdGpu {
 
         self.primary_slot = slot;
         let ap = self.pipes[slot];
+        self.dig_enc = find_pipe_dig_encoder(&MmioRef(&self.mmio), &dcn, ap.pipe);
+        let (dpp_regs, dpp_cnt) = probe_pipe_dpp_size_regs(&MmioRef(&self.mmio), &dcn, ap.pipe, ap.width(), ap.height());
+        self.dpp_size_regs = dpp_regs;
+        self.dpp_size_count = dpp_cnt;
         let Some(gop_off) = ap.vram_off else {
             self.set_note(b"scanout MC addr outside MMHUB window");
             return;
@@ -529,6 +560,39 @@ impl AmdGpu {
                 let mut io = MmioRef(&self.mmio);
                 eng.restore_original(&mut io, &dcn);
                 eng.age.mark_all_dirty();
+
+                // Snapshot the pristine UEFI GOP timing + geometry locked to `orig_mc` so
+                // `release_display()` can always restore the boot text console cleanly after any mode switch.
+                let boot_regs = SavedModeRegs::capture_ex(
+                    &io,
+                    &dcn,
+                    ap.pipe,
+                    self.dig_enc,
+                    &self.dpp_size_regs[..self.dpp_size_count],
+                    true,
+                )
+                .with_surface_addr(orig_mc);
+                self.boot_state = Some(BootModeState {
+                    regs: boot_regs,
+                    pipe: ap,
+                    width: ap.width(),
+                    height: ap.height(),
+                    pitch: ap.pitch_bytes,
+                    measured_mhz: refresh_mhz,
+                    layout,
+                });
+                self.mode_switched = false;
+
+                // Wait briefly for the self-check restore back to GOP to latch so no stale
+                // `FLIP_PENDING_BIT` lingers into the first desktop frame.
+                let restore_dl = sys::clock_ns() + 60_000_000;
+                while sys::clock_ns() < restore_dl {
+                    let (pend, ear) = eng.read_hw_status(&io, &dcn);
+                    if !pend && ear == orig_mc {
+                        break;
+                    }
+                    libd::handle::sleep(500_000);
+                }
 
                 // Initialize OSSSYS IH ring DMA for zero-polling vblank/flip completion when MSI/MSI-X is bound.
                 self.ih_verified = false;
@@ -641,22 +705,49 @@ impl AmdGpu {
         }
     }
 
-    /// Wait synchronously for an in-flight flip to latch (bounded to 3 frame intervals) so
-    /// we NEVER overwrite a buffer that is on screen or pending.
+    /// Wait synchronously for an in-flight flip (software or hardware `FLIP_PENDING_BIT`) to latch
+    /// so we NEVER overwrite a buffer that is on screen or pending.
     fn wait_in_flight_flip(&mut self) {
         let Some(dcn) = self.dcn else { return };
-        let timeout_ns = self.flip.as_ref().map_or(50_000_000, |f| f.frame_interval_ns() * 3);
+        let timeout_ns = self.flip.as_ref().map_or(50_000_000, |f| (f.frame_interval_ns() * 3).max(20_000_000));
         let dl = sys::clock_ns() + timeout_ns;
-        while self.flip.as_ref().is_some_and(|f| f.pending_buf.is_some()) && sys::clock_ns() < dl {
+        while sys::clock_ns() < dl {
+            if self.ih.active {
+                self.drain_ih_ring();
+            }
             self.check_pending_flip();
-            if self.flip.as_ref().is_some_and(|f| f.pending_buf.is_some()) {
-                let sleep_ns = match (self.flip.as_ref(), self.active_pipe()) {
-                    (Some(f), Some(ap)) if !self.ih_ready() => f.ns_until_vblank(&MmioRef(&self.mmio), &dcn, &ap.timing).min(500_000),
-                    _ => 200_000,
-                };
-                libd::handle::sleep(sleep_ns);
+            let still_busy = self.flip.as_ref().is_some_and(|f| {
+                f.pending_buf.is_some() || f.read_hw_status(&MmioRef(&self.mmio), &dcn).0
+            });
+            if !still_busy {
+                break;
+            }
+            let sleep_ns = match (self.flip.as_ref(), self.active_pipe()) {
+                (Some(f), Some(ap)) if !self.ih_ready() => f.ns_until_vblank(&MmioRef(&self.mmio), &dcn, &ap.timing).min(500_000),
+                _ => 200_000,
+            };
+            libd::handle::sleep(sleep_ns);
+        }
+    }
+
+    fn disable_dsc(&mut self, dcn: &DcnAccess, pipe: u8) {
+        let r = dcn.regs;
+        {
+            let mut io = MmioRef(&self.mmio);
+            if let Some(fwd) = r.dsc_forward_config(pipe) {
+                dcn.w_dcn(&mut io, fwd, 0);
+            }
+            if let Some(cfg0) = r.dscc_config0() {
+                dcn.w_dcn(&mut io, cfg0, 0);
             }
         }
+        if let Some(aux_p) = self.aux_probe.as_mut() {
+            let aux_idx = aux_p.aux_idx;
+            let mut io = MmioRef(&self.mmio);
+            let _ = aux::aux_native_write(&mut io, dcn, aux_idx, aux::DPCD_DSC_ENABLE, &[0x00], delay_us);
+            aux_p.link.dsc_enabled = false;
+        }
+        self.dsc_enabled = false;
     }
 
     fn draw_flip_test_pattern(
@@ -731,10 +822,21 @@ impl GpuDriver for AmdGpu {
                 push(out, &mut count, m.width, m.height, m.refresh_mhz, m.preferred);
             }
         }
-        // Standard fallbacks if no EDID was read.
-        if count <= 1 {
-            for &(w, h) in &[(3840, 2160), (2560, 1440), (1920, 1080), (1280, 800)] {
-                push(out, &mut count, w, h, 60_000, false);
+        // Standard high-refresh & resolution CVT-RB v2 fallbacks when EDID was unavailable.
+        if count <= 1 && cur_w >= 320 && cur_h >= 200 {
+            for &hz in &[240_000u32, 165_000, 144_000, 120_000, 60_000] {
+                push(out, &mut count, cur_w, cur_h, hz, false);
+            }
+            for &(w, h, hz) in &[
+                (3840u32, 2160u32, 60_000u32),
+                (2560, 1440, 144_000),
+                (2560, 1440, 60_000),
+                (1920, 1080, 240_000),
+                (1920, 1080, 144_000),
+                (1920, 1080, 60_000),
+                (1280, 800, 60_000),
+            ] {
+                push(out, &mut count, w, h, hz, false);
             }
         }
         count
@@ -819,6 +921,12 @@ impl GpuDriver for AmdGpu {
                 out.flags |= gpu::PROBE_HDR_SUPPORTED;
             }
         }
+        if (out.flags & gpu::PROBE_VRR_SUPPORTED) == 0 && self.flip.as_ref().is_some_and(FlipEngine::is_verified) {
+            let cur_hz = ((self.measured_mhz + 500) / 1000).clamp(48, 540) as u16;
+            out.vrr_min_hz = if cur_hz >= 60 { 48 } else { 40 };
+            out.vrr_max_hz = cur_hz.max(out.vrr_min_hz + 1);
+            out.flags |= gpu::PROBE_VRR_SUPPORTED;
+        }
         if self.vrr_enabled {
             out.flags |= gpu::PROBE_VRR_ENABLED;
         }
@@ -860,13 +968,43 @@ impl GpuDriver for AmdGpu {
     }
 
     fn attach_fb(&mut self, vmo: Handle, width: u32, height: u32, pitch: u32, format: u32) -> Result<u32, i64> {
+        if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM || pitch < width.saturating_mul(4) {
+            sys::handle_close(vmo);
+            return Err(sys::ERR_INVALID_ARGS);
+        }
         let map_len = u64::from(pitch).saturating_mul(u64::from(height));
-        let map = Mapping::of_ro(vmo, map_len)?;
-        let pin = FbPin::pin(self.dev, &mut self.scratch, vmo, width, height, pitch, format)?;
-        let slot = self.fbs.iter().position(|s| s.is_none()).unwrap_or(0);
+        if map_len == 0 || map_len > MAX_FB_BYTES {
+            sys::handle_close(vmo);
+            return Err(sys::ERR_INVALID_ARGS);
+        }
+        match sys::vmo_size(vmo) {
+            Ok(sz) if sz >= map_len && sz <= MAX_FB_BYTES => {}
+            Ok(_) => {
+                sys::handle_close(vmo);
+                return Err(sys::ERR_OUT_OF_RANGE);
+            }
+            Err(e) => {
+                sys::handle_close(vmo);
+                return Err(e);
+            }
+        }
+        // Scanout blits copy CPU-side into WC BAR 0 VRAM, so read-only CPU mapping suffices and
+        // avoids pinning client system RAM into the GPU's DMA address space (no scatter-gather limit).
+        let map = match Mapping::of_ro(vmo, map_len) {
+            Ok(m) => m,
+            Err(e) => {
+                sys::handle_close(vmo);
+                return Err(e);
+            }
+        };
         let fb_id = self.next_fb_id;
         self.next_fb_id += 1;
-        self.fbs[slot] = Some(AmdFb { fb_id, map, pin });
+        let slot = self
+            .fbs
+            .iter()
+            .position(|s| s.is_none())
+            .unwrap_or_else(|| (fb_id as usize).wrapping_sub(1) % MAX_FBS);
+        self.fbs[slot] = Some(AmdFb { fb_id, vmo, width, height, pitch, format, map });
         if let Some(f) = self.flip.as_mut() {
             f.age.mark_all_dirty();
         }
@@ -896,67 +1034,71 @@ impl GpuDriver for AmdGpu {
         let Some(ap) = self.active_pipe() else {
             return Err(sys::ERR_BAD_STATE);
         };
-        if width != ap.width() || height != ap.height() {
-            println!(
-                "amdgpu: mode {}x{} rejected (active pipe is {}x{}; same-resolution refresh switching supported)",
-                width,
-                height,
-                ap.width(),
-                ap.height()
-            );
-            return Err(sys::ERR_NOT_SUPPORTED);
-        }
-        // Find matching detailed timing in EDID.
+        let want_mhz = if refresh_mhz >= 24_000 { refresh_mhz } else { self.measured_mhz.max(60_000) };
+
+        // Prefer an exact/close EDID detailed timing; fall back to VESA CVT-RB v2 synthesis.
         let timing = self
             .edid()
             .and_then(|ed| {
                 ed.timings()
                     .iter()
-                    .filter(|t| t.h_active == width && t.v_active == height)
-                    .min_by_key(|t| t.refresh_mhz.abs_diff(refresh_mhz))
+                    .filter(|t| t.h_active == width && t.v_active == height && t.refresh_mhz.abs_diff(want_mhz) <= 2_500)
+                    .min_by_key(|t| t.refresh_mhz.abs_diff(want_mhz))
                     .copied()
             })
-            .ok_or(sys::ERR_NOT_SUPPORTED)?;
+            .or_else(|| DetailedTiming::cvt_rb(width, height, want_mhz))
+            .ok_or(sys::ERR_INVALID_ARGS)?;
 
         let bpc = if self.hdr_enabled { 10 } else { 8 };
-        let allow_dsc = (flags & 1) != 0;
-        let allow_retrain = (flags & 2) != 0;
-        let mut use_dsc = false;
-        let mut dsc_bpp = 8u8;
+        let _ = flags;
+        let use_dsc = false;
+        let dsc_bpp = 8u8;
 
-        if let Some(aux_p) = self.aux_probe {
+        // Without GPU-side DP PHY link-training microcode or DSC PPS SDP stream framing, never
+        // overwrite sink DPCD `LINK_BW_SET` or `DSC_ENABLE` (doing so drops the live firmware link
+        // and blanks the panel). Only switch to modes that fit the currently trained DP link.
+        if let Some(aux_p) = self.aux_probe
+            && aux_p.link.active_lanes > 0
+            && aux_p.link.active_link_rate_mbps > 0
+        {
             match plan_mode_bandwidth(&aux_p.link, &timing, bpc) {
                 ModeBandwidthPlan::FitsCurrentLink => {}
-                ModeBandwidthPlan::NeedsDscOnCurrentLink { target_bpp } => {
-                    if !allow_dsc {
-                        return Err(sys::ERR_NOT_SUPPORTED);
-                    }
-                    use_dsc = true;
-                    dsc_bpp = target_bpp;
+                ModeBandwidthPlan::NeedsDscOnCurrentLink { .. } => {
+                    println!(
+                        "amdgpu: mode {}x{}@{} Hz needs DSC ({} Mbps > active {} Mbps): refused to avoid blank screen",
+                        width,
+                        height,
+                        timing.refresh_mhz / 1000,
+                        timing.raw_bandwidth_kbps(bpc) / 1000,
+                        aux_p.link.active_bandwidth_kbps() / 1000
+                    );
+                    self.set_note(b"mode needs DSC over active DP link (kept)");
+                    return Err(sys::ERR_NOT_SUPPORTED);
                 }
-                ModeBandwidthPlan::NeedsRetrain { lanes, rate_code, is_uhbr, use_dsc: need_dsc, target_bpp } => {
-                    if !allow_retrain || (need_dsc && !allow_dsc) {
-                        return Err(sys::ERR_NOT_SUPPORTED);
-                    }
-                    let mut io = MmioRef(&self.mmio);
-                    let tr = aux::train_dp_link(&mut io, &dcn, aux_p.aux_idx, lanes, rate_code, is_uhbr, delay_us)
-                        .map_err(|_| i64::from(proto::ERR_IO))?;
-                    if !tr.cr_done || !tr.eq_done {
-                        return Err(i64::from(proto::ERR_IO));
-                    }
-                    use_dsc = need_dsc;
-                    dsc_bpp = target_bpp;
+                ModeBandwidthPlan::NeedsRetrain { lanes, rate_code, .. } => {
+                    println!(
+                        "amdgpu: mode {}x{}@{} Hz needs DP PHY retrain ({}x {} Mbps > active {}x {} Mbps): refused to avoid blank screen",
+                        width,
+                        height,
+                        timing.refresh_mhz / 1000,
+                        lanes,
+                        aux::dpcd_rate_code_to_mbps(rate_code),
+                        aux_p.link.active_lanes,
+                        aux_p.link.active_link_rate_mbps
+                    );
+                    self.set_note(b"mode needs DP link retrain (kept current)");
+                    return Err(sys::ERR_NOT_SUPPORTED);
                 }
                 ModeBandwidthPlan::ExceedsSinkCapacity => return Err(sys::ERR_OUT_OF_RANGE),
             }
-            if use_dsc {
-                let mut io = MmioRef(&self.mmio);
-                let _ = aux::aux_native_write(&mut io, &dcn, aux_p.aux_idx, aux::DPCD_DSC_ENABLE, &[0x01], delay_us);
+            if self.dsc_enabled {
+                self.disable_dsc(&dcn, ap.pipe);
             }
         }
 
-        // Derive live DCCG DTO source clock (e.g. DTBCLK on DCN 4.0.1) from active firmware
-        // registers before programming new OTG/DCCG/MSA/DSC timing guarded by verify-and-revert!
+        // Derive live DCCG DTO source clock (e.g. DTBCLK on DCN 4.0.1) BEFORE altering VRAM or
+        // hardware timing. A fractional DTO cannot synthesize a pixel clock above its live source
+        // clock without SMU/DMUB clock ramping; refuse early instead of programming a wrong clock.
         let src_clk_khz = flip::derive_dto_source_clk_khz(
             &MmioRef(&self.mmio),
             &dcn,
@@ -965,31 +1107,254 @@ impl GpuDriver for AmdGpu {
             self.measured_mhz.max(60_000),
             100_000,
         );
+        let dto_active = (dcn.r_dcn(&MmioRef(&self.mmio), dcn.regs.dccg_otg_pixel_rate_cntl(ap.pipe)).unwrap_or(0) & (1 << 4)) != 0;
+        if dto_active && timing.pixel_clock_khz >= src_clk_khz {
+            println!(
+                "amdgpu: mode {}x{}@{} Hz pclk {} kHz exceeds live DTBCLK {} kHz: refused to avoid blank screen",
+                width,
+                height,
+                timing.refresh_mhz / 1000,
+                timing.pixel_clock_khz,
+                src_clk_khz
+            );
+            self.set_note(b"mode pclk exceeds live DTBCLK (kept)");
+            return Err(sys::ERR_NOT_SUPPORTED);
+        }
+
+        // Wait for any in-flight flip before reprogramming timing or surface geometry.
+        self.wait_in_flight_flip();
+
+        let res_changed = width != ap.width() || height != ap.height();
+        let prev_layout = self.layout;
+        let mut new_layout_opt: Option<(ScanoutLayout, u32, u32, u64)> = None;
+
+        if res_changed {
+            let Some(fb_win) = self.fb_win else {
+                return Err(sys::ERR_BAD_STATE);
+            };
+            let gop_off = self.gop.and_then(|g| {
+                if self.bar0_phys != 0 && g.phys_base >= self.bar0_phys {
+                    let off = g.phys_base - self.bar0_phys;
+                    (off < self.bar0_size).then_some(off)
+                } else {
+                    ap.vram_off
+                }
+            }).or(ap.vram_off).ok_or(sys::ERR_BAD_STATE)?;
+            let gop_size = self.gop.map_or(u64::from(ap.pitch_bytes) * u64::from(ap.height()), |g| g.size);
+            let new_pitch_px = width.next_multiple_of(64);
+            let new_pitch_bytes = new_pitch_px.saturating_mul(4);
+            let vram_bytes = u64::from(self.vram_mib) << 20;
+            let reserved = self.discovery.as_ref().map_or(&[][..], DiscoverySummary::reserved);
+            let Some(nlay) = allocate_scanout_buffers(
+                gop_off,
+                gop_size,
+                new_pitch_bytes,
+                height,
+                self.bar0_size,
+                vram_bytes,
+                reserved,
+                true,
+            ) else {
+                return Err(sys::ERR_NO_MEMORY);
+            };
+            let Some(new_mc) = fb_win.vram_to_mc(nlay.buffers[0]) else {
+                return Err(sys::ERR_OUT_OF_RANGE);
+            };
+            if !self.map_vram_window(nlay.map_vram_off, nlay.map_len) {
+                if let Some(old_l) = prev_layout {
+                    let _ = self.map_vram_window(old_l.map_vram_off, old_l.map_len);
+                }
+                return Err(sys::ERR_NO_MEMORY);
+            }
+            // Pre-clear buffer 0 to Dark Slate before scanning it out.
+            let clear_len = u64::from(new_pitch_bytes) * u64::from(height);
+            if let (Some(vram), Some(dst_rel)) = (self.vram_map.as_ref(), nlay.to_map_off(nlay.buffers[0]))
+                && dst_rel + clear_len <= vram.len
+            {
+                const DARK_SLATE_PAIR: u64 = 0x000E_1016_000E_1016;
+                let mut off = 0u64;
+                while off + 8 <= clear_len {
+                    vram.w64(dst_rel + off, DARK_SLATE_PAIR);
+                    off += 8;
+                }
+                fence(Ordering::Release);
+            }
+            new_layout_opt = Some((nlay, new_pitch_px, new_pitch_bytes, new_mc));
+        }
+
+        // Fallback boot-mode snapshot if `set_mode_ex` is ever called prior to `setup_native_scanout`.
+        if self.boot_state.is_none() {
+            let orig_mc = self.flip.as_ref().map_or(ap.mc_addr, |f| f.orig_mc_addr);
+            let boot_regs = SavedModeRegs::capture_ex(
+                &MmioRef(&self.mmio),
+                &dcn,
+                ap.pipe,
+                self.dig_enc,
+                &self.dpp_size_regs[..self.dpp_size_count],
+                true,
+            )
+            .with_surface_addr(orig_mc);
+            self.boot_state = Some(BootModeState {
+                regs: boot_regs,
+                pipe: ap,
+                width: ap.width(),
+                height: ap.height(),
+                pitch: ap.pitch_bytes,
+                measured_mhz: self.measured_mhz.max(60_000),
+                layout: self.layout.unwrap_or_default(),
+            });
+        }
+
+        // Program new OTG/DCCG/MSA/DP_VID_TIMING/HUBP/DPP timing guarded by verify-and-revert,
+        // then pulse DP_STEER_FIFO_RESET so the DisplayPort stream encoder realigns cleanly.
+        let (res_pitch, res_mc) = match new_layout_opt {
+            Some((_, pp, _, mc)) => (Some(pp), Some(mc)),
+            None => (None, None),
+        };
         let saved = {
             let mut io = MmioRef(&self.mmio);
-            program_mode_regs(&mut io, &dcn, ap.pipe, &timing, src_clk_khz, use_dsc, dsc_bpp, bpc)
+            let s = program_mode_regs_ex(
+                &mut io,
+                &dcn,
+                ap.pipe,
+                self.dig_enc,
+                &timing,
+                src_clk_khz,
+                use_dsc,
+                dsc_bpp,
+                bpc,
+                res_pitch,
+                res_mc,
+                &self.dpp_size_regs[..self.dpp_size_count],
+            );
+            flip::reset_dp_steer_fifo(&mut io, &dcn, self.dig_enc, delay_us);
+            s
         };
-        // Verify OTG frame counter keeps advancing after mode switch.
+
+        // Verify OTG frame counter keeps advancing at the requested refresh rate (within +-12%),
+        // HUBP surface flip latches cleanly (`!hw_pending`), and the DP sink stays CR/EQ-locked.
         let new_hz = self.measure_pipe_refresh(&dcn, ap.pipe);
-        if new_hz.is_none() {
-            let mut io = MmioRef(&self.mmio);
-            saved.restore(&mut io, &dcn);
-            println!("amdgpu: mode {}x{}@{} Hz stalled OTG: reverted automatically", width, height, timing.refresh_mhz / 1000);
+        let rate_ok = new_hz.is_some_and(|hz| {
+            let tol = (timing.refresh_mhz / 8).max(4_000);
+            hz.abs_diff(timing.refresh_mhz) <= tol
+        });
+        let latch_ok = match res_mc {
+            Some(want_mc) => {
+                let io = MmioRef(&self.mmio);
+                let dl = sys::clock_ns() + 180_000_000;
+                let mut ok = false;
+                while sys::clock_ns() < dl {
+                    let ctl = dcn.r_dcn(&io, dcn.regs.hubp_flip_control(ap.pipe)).unwrap_or(0);
+                    let hw_pending = (ctl & (1 << 4)) != 0;
+                    let lo = dcn.r_dcn(&io, dcn.regs.hubp_earliest_inuse(ap.pipe)).unwrap_or(0);
+                    let hi = dcn.r_dcn(&io, dcn.regs.hubp_earliest_inuse_hi(ap.pipe)).unwrap_or(0);
+                    if !hw_pending && dcn::decode_surface_addr(lo, hi) == want_mc {
+                        ok = true;
+                        break;
+                    }
+                    libd::handle::sleep(500_000);
+                }
+                ok
+            }
+            None => {
+                let io = MmioRef(&self.mmio);
+                let dl = sys::clock_ns() + 50_000_000;
+                while sys::clock_ns() < dl {
+                    let ctl = dcn.r_dcn(&io, dcn.regs.hubp_flip_control(ap.pipe)).unwrap_or(0);
+                    if (ctl & (1 << 4)) == 0 {
+                        break;
+                    }
+                    libd::handle::sleep(500_000);
+                }
+                true
+            }
+        };
+        let link_ok = match self.aux_probe {
+            Some(aux_p) if aux_p.link.active_lanes > 0 => {
+                let mut io = MmioRef(&self.mmio);
+                aux::check_dp_link_locked(&mut io, &dcn, aux_p.aux_idx, aux_p.link.active_lanes, delay_us).unwrap_or(true)
+            }
+            _ => true,
+        };
+        if !rate_ok || !latch_ok || !link_ok {
+            {
+                let mut io = MmioRef(&self.mmio);
+                saved.restore(&mut io, &dcn);
+                flip::reset_dp_steer_fifo(&mut io, &dcn, self.dig_enc, delay_us);
+            }
+            if res_changed
+                && let Some(old_l) = prev_layout
+            {
+                let _ = self.map_vram_window(old_l.map_vram_off, old_l.map_len);
+            }
+            println!(
+                "amdgpu: mode {}x{}@{} Hz failed verify (meas={:?} mHz, rate_ok={}, latch_ok={}, link_ok={}): reverted automatically",
+                width,
+                height,
+                timing.refresh_mhz / 1000,
+                new_hz,
+                rate_ok,
+                latch_ok,
+                link_ok
+            );
+            self.set_note(b"mode verify failed (auto-reverted)");
             return Err(i64::from(proto::ERR_IO));
         }
-        self.pipes[self.primary_slot].timing = dcn::OtgTiming::from_detailed(&timing);
+
+        let new_otg = dcn::OtgTiming::from_detailed(&timing);
+        self.pipes[self.primary_slot].timing = new_otg;
         self.measured_mhz = new_hz.unwrap_or(timing.refresh_mhz);
         self.dsc_enabled = use_dsc;
-        if let Some(f) = self.flip.as_mut() {
+        self.mode_switched = true;
+        self.flip_deadline_ns = None;
+        self.pending_async_notify = None;
+
+        if let Some((nlay, new_pitch_px, new_pitch_bytes, new_mc)) = new_layout_opt {
+            self.pipes[self.primary_slot].viewport_w = width;
+            self.pipes[self.primary_slot].viewport_h = height;
+            self.pipes[self.primary_slot].pitch_pixels = new_pitch_px;
+            self.pipes[self.primary_slot].pitch_bytes = new_pitch_bytes;
+            self.pipes[self.primary_slot].mc_addr = new_mc;
+            self.pipes[self.primary_slot].earliest_inuse_mc = new_mc;
+            self.width = width;
+            self.height = height;
+            self.pitch = new_pitch_bytes;
+            self.layout = Some(nlay);
+            if let Some(fb_win) = self.fb_win {
+                let orig_mc = self
+                    .boot_state
+                    .map(|b| b.regs.surface_mc_addr())
+                    .filter(|&mc| mc != 0)
+                    .or_else(|| self.flip.as_ref().map(|f| f.orig_mc_addr))
+                    .unwrap_or(new_mc);
+                let mut eng = FlipEngine::new(ap.pipe, fb_win, nlay, orig_mc, width, height, self.measured_mhz);
+                eng.self_check = SelfCheckState::Verified;
+                eng.on_screen_buf = Some(0);
+                eng.age.mark_all_dirty();
+                self.flip = Some(eng);
+            }
+        } else if let Some(f) = self.flip.as_mut() {
             f.refresh_mhz = self.measured_mhz;
+            f.pending_buf = None;
+            f.pending_mc = 0;
+            f.last_flip_ns = 0;
             f.age.mark_all_dirty();
         }
+        if self.ih.active {
+            let mut io = MmioRef(&self.mmio);
+            self.ih.enable_pipe_irqs(&mut io, &dcn, ap.pipe, new_otg.v_blank_start);
+        }
+        if self.vrr_enabled {
+            let _ = self.set_vrr(true, 0, 0);
+        }
         println!(
-            "amdgpu: mode set {}x{} @ {}.{:02} Hz (src_clk={} kHz, dsc={})",
+            "amdgpu: mode set {}x{} @ {}.{:02} Hz (enc={}, dpp_regs={}, src_clk={} kHz, dsc={})",
             width,
             height,
             self.measured_mhz / 1000,
             (self.measured_mhz % 1000) / 10,
+            self.dig_enc,
+            self.dpp_size_count,
             src_clk_khz,
             use_dsc
         );
@@ -1034,14 +1399,14 @@ impl GpuDriver for AmdGpu {
             let Some(fb) = self.fbs.iter().flatten().find(|f| f.fb_id == fb_id) else {
                 return Err(sys::ERR_INVALID_ARGS);
             };
-            let w = fb.pin.width.min(self.width);
-            let h = fb.pin.height.min(self.height);
-            let fmt = PixelFormat::from_u32(fb.pin.format).unwrap_or(PixelFormat::Xrgb8888);
+            let w = fb.width.min(self.width);
+            let h = fb.height.min(self.height);
+            let fmt = PixelFormat::from_u32(fb.format).unwrap_or(PixelFormat::Xrgb8888);
             let shifts = self.gop.map_or([16, 8, 0], |g| [g.red_shift, g.green_shift, g.blue_shift]);
 
             for &dmg in &age_rects[..age_count] {
                 if self.hdr_enabled {
-                    blit_rect_wc_10bpc(fb.map.bytes(), fb.pin.pitch, fmt, self.pitch, w, h, dmg, |off, px| {
+                    blit_rect_wc_10bpc(fb.map.bytes(), fb.pitch, fmt, self.pitch, w, h, dmg, |off, px| {
                         let o = buf_rel + off;
                         if o + 4 <= vram.len {
                             vram.w32(o, px);
@@ -1050,7 +1415,7 @@ impl GpuDriver for AmdGpu {
                 } else {
                     blit_rect_wc(
                         fb.map.bytes(),
-                        fb.pin.pitch,
+                        fb.pitch,
                         fmt,
                         self.pitch,
                         shifts,
@@ -1107,14 +1472,14 @@ impl GpuDriver for AmdGpu {
         let Some(fb) = self.fbs.iter().flatten().find(|f| f.fb_id == fb_id) else {
             return Err(sys::ERR_INVALID_ARGS);
         };
-        let w = fb.pin.width.min(self.width);
-        let h = fb.pin.height.min(self.height);
-        let fmt = PixelFormat::from_u32(fb.pin.format).unwrap_or(PixelFormat::Xrgb8888);
+        let w = fb.width.min(self.width);
+        let h = fb.height.min(self.height);
+        let fmt = PixelFormat::from_u32(fb.format).unwrap_or(PixelFormat::Xrgb8888);
         let full = [DamageRect::full(w, h)];
         let list = if rects.is_empty() { &full[..] } else { rects };
         for &r in list {
             let dmg = if r.is_empty() { DamageRect::full(w, h) } else { r };
-            blit_rect_wc(fb.map.bytes(), fb.pin.pitch, fmt, self.pitch, [16, 8, 0], w, h, dmg, |off, px| {
+            blit_rect_wc(fb.map.bytes(), fb.pitch, fmt, self.pitch, [16, 8, 0], w, h, dmg, |off, px| {
                 if off + 4 <= vram.len {
                     vram.w32(off, px);
                 }
@@ -1192,12 +1557,86 @@ impl GpuDriver for AmdGpu {
         let Some(dcn) = self.dcn else {
             return Ok(());
         };
-        let mut io = MmioRef(&self.mmio);
+        self.wait_in_flight_flip();
         if self.cursor.enabled {
+            let mut io = MmioRef(&self.mmio);
             self.cursor.disable(&mut io, &dcn);
         }
-        if let Some(flip) = self.flip.as_mut() {
-            flip.restore_original(&mut io, &dcn);
+        if self.mode_switched
+            && let Some(boot) = self.boot_state
+        {
+            if self.dsc_enabled {
+                self.disable_dsc(&dcn, boot.pipe.pipe);
+            }
+            {
+                let mut io = MmioRef(&self.mmio);
+                boot.regs.restore(&mut io, &dcn);
+                flip::reset_dp_steer_fifo(&mut io, &dcn, boot.regs.enc, delay_us);
+            }
+            self.pipes[self.primary_slot] = boot.pipe;
+            self.width = boot.width;
+            self.height = boot.height;
+            self.pitch = boot.pitch;
+            self.measured_mhz = boot.measured_mhz;
+            if boot.layout.map_len > 0 {
+                let _ = self.map_vram_window(boot.layout.map_vram_off, boot.layout.map_len);
+                self.layout = Some(boot.layout);
+            }
+            let boot_mc = boot.regs.surface_mc_addr();
+            if let Some(fb_win) = self.fb_win
+                && let Some(layout) = self.layout
+            {
+                let mut eng = FlipEngine::new(
+                    boot.pipe.pipe,
+                    fb_win,
+                    layout,
+                    boot_mc,
+                    boot.width,
+                    boot.height,
+                    boot.measured_mhz,
+                );
+                eng.self_check = SelfCheckState::Verified;
+                eng.on_screen_buf = None;
+                eng.age.mark_all_dirty();
+                self.flip = Some(eng);
+            }
+            if self.ih.active {
+                let mut io = MmioRef(&self.mmio);
+                self.ih.enable_pipe_irqs(&mut io, &dcn, boot.pipe.pipe, boot.pipe.timing.v_blank_start);
+            }
+            self.mode_switched = false;
+            if boot_mc != 0 {
+                let io = MmioRef(&self.mmio);
+                let dl = sys::clock_ns() + 150_000_000;
+                while sys::clock_ns() < dl {
+                    if let Some(f) = self.flip.as_ref() {
+                        let (pend, ear) = f.read_hw_status(&io, &dcn);
+                        if !pend && ear == boot_mc {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                    libd::handle::sleep(500_000);
+                }
+            }
+        } else if let Some(flip) = self.flip.as_mut() {
+            let orig_mc = flip.orig_mc_addr;
+            {
+                let mut io = MmioRef(&self.mmio);
+                flip.restore_original(&mut io, &dcn);
+            }
+            if orig_mc != 0 {
+                let io = MmioRef(&self.mmio);
+                let dl = sys::clock_ns() + 80_000_000;
+                while sys::clock_ns() < dl {
+                    let (pend, ear) = flip.read_hw_status(&io, &dcn);
+                    if !pend && ear == orig_mc {
+                        break;
+                    }
+                    libd::handle::sleep(500_000);
+                }
+            }
         }
         self.flip_deadline_ns = None;
         self.pending_async_notify = None;
@@ -1208,15 +1647,52 @@ impl GpuDriver for AmdGpu {
         let (Some(dcn), Some(ap)) = (self.dcn, self.active_pipe()) else {
             return Err(sys::ERR_NOT_SUPPORTED);
         };
-        let (emin, emax) = self.edid().map_or((min_hz, max_hz), |e| {
-            (
+        let cur_hz = ((self.measured_mhz + 500) / 1000).clamp(48, 540) as u16;
+        let def_min = if cur_hz >= 60 { 48u16 } else { 40u16 };
+        let def_max = cur_hz.max(def_min + 1);
+        let (emin, emax) = match self.edid() {
+            Some(e) if e.vrr_min_hz >= 24 && e.vrr_max_hz > e.vrr_min_hz => (
                 if min_hz > 0 { min_hz } else { e.vrr_min_hz },
                 if max_hz > 0 { max_hz } else { e.vrr_max_hz },
+            ),
+            _ => (
+                if min_hz > 0 { min_hz } else { def_min },
+                if max_hz > 0 { max_hz } else { def_max },
+            ),
+        };
+        let (dpcd_ok, dpcd_cap) = if let Some(aux_p) = self.aux_probe {
+            let mut io = MmioRef(&self.mmio);
+            (
+                aux::set_dp_adaptive_sync(&mut io, &dcn, aux_p.aux_idx, enable, delay_us),
+                aux_p.link.msa_timing_par_ignored,
             )
-        });
+        } else {
+            (false, false)
+        };
         let mut io = MmioRef(&self.mmio);
         if flip::set_vrr(&mut io, &dcn, ap.pipe, &ap.timing, self.measured_mhz.max(60_000), emin, emax, enable) {
             self.vrr_enabled = enable;
+            if enable {
+                self.set_note(if dpcd_ok {
+                    b"VRR active (OTG DRR + DPCD Adaptive-Sync)"
+                } else {
+                    b"VRR active (OTG DRR)"
+                });
+            } else {
+                self.set_note(if self.ih_ready() {
+                    b"native DCN verified (IH IRQ active)"
+                } else {
+                    b"native DCN verified (timer pacing)"
+                });
+            }
+            println!(
+                "amdgpu: VRR {} ({}-{} Hz, dpcd_cap={}, dpcd_0x107_ok={})",
+                if enable { "enabled" } else { "disabled" },
+                emin,
+                emax,
+                dpcd_cap,
+                dpcd_ok
+            );
             Ok(())
         } else {
             Err(sys::ERR_INVALID_ARGS)
@@ -1461,10 +1937,6 @@ pub fn main(s: *const Startup) -> i32 {
         println!("amdgpu: {}: cannot pin ring/IH DMA", info.name());
         return 1;
     };
-    let Ok(scratch) = gpu_drv::alloc_pin_scratch() else {
-        println!("amdgpu: scratch mapping failed");
-        return 1;
-    };
     let irq = if info.irqs > 0 { sys::device_interrupt(dev, 0).unwrap_or(0) } else { 0 };
     let iommu = (info.flags & sys::DEV_FLAG_IOMMU) != 0;
 
@@ -1479,7 +1951,6 @@ pub fn main(s: *const Startup) -> i32 {
         vram_map: None,
         vram_map_off: 0,
         ring_dma,
-        scratch,
         irq,
         iommu,
         vram_mib: (bar0_size >> 20) as u32,
@@ -1489,6 +1960,11 @@ pub fn main(s: *const Startup) -> i32 {
         pipes: [ActivePipe::default(); 6],
         pipe_count: 0,
         primary_slot: 0,
+        dig_enc: 0,
+        dpp_size_regs: [0; 4],
+        dpp_size_count: 0,
+        boot_state: None,
+        mode_switched: false,
         measured_mhz: 60_000,
         aux_probe: None,
         gop: None,
@@ -1565,6 +2041,10 @@ pub fn main(s: *const Startup) -> i32 {
                 drv.width = ap.width();
                 drv.height = ap.height();
                 drv.pitch = ap.pitch_bytes;
+                drv.dig_enc = find_pipe_dig_encoder(&MmioRef(&drv.mmio), &dcn, ap.pipe);
+                let (dpp_regs, dpp_cnt) = probe_pipe_dpp_size_regs(&MmioRef(&drv.mmio), &dcn, ap.pipe, ap.width(), ap.height());
+                drv.dpp_size_regs = dpp_regs;
+                drv.dpp_size_count = dpp_cnt;
                 if let Some(hz) = drv.measure_pipe_refresh(&dcn, ap.pipe) {
                     drv.measured_mhz = hz;
                 }
@@ -1578,16 +2058,17 @@ pub fn main(s: *const Startup) -> i32 {
                 drv.pitch = 0;
                 drv.set_note(b"no active display pipe (unconnected)");
             }
-            // Read-only DP AUX probe (DPCD + multi-block EDID).
-            drv.aux_probe = {
+            // Read-only DP AUX probe (DPCD + multi-block EDID + per-channel diagnostics).
+            let (aux_found, aux_errs) = {
                 let mut io = MmioRef(&drv.mmio);
-                aux::probe_first_connected_aux(&mut io, &dcn, delay_us)
+                aux::probe_first_connected_aux_diag(&mut io, &dcn, delay_us)
             };
+            drv.aux_probe = aux_found;
             let dsc_en = drv.aux_probe.as_ref().is_some_and(|p| p.link.dsc_enabled);
             drv.dsc_enabled = dsc_en;
 
             println!(
-                "amdgpu: probe: {} ({}.{}.{}), {} active pipe(s), {}x{} @ {}.{:02} Hz, BAR0={:#x} ({} MiB), VRAM={} MiB",
+                "amdgpu: probe: {} ({}.{}.{}), {} active pipe(s), {}x{} @ {}.{:02} Hz, enc={}, dpp_regs={}, BAR0={:#x} ({} MiB), VRAM={} MiB",
                 dcn.version.name(),
                 dcn.dcn.major,
                 dcn.dcn.minor,
@@ -1597,6 +2078,8 @@ pub fn main(s: *const Startup) -> i32 {
                 drv.height,
                 drv.measured_mhz / 1000,
                 (drv.measured_mhz % 1000) / 10,
+                drv.dig_enc,
+                drv.dpp_size_count,
                 drv.bar0_phys,
                 drv.bar0_size >> 20,
                 drv.vram_mib,
@@ -1613,6 +2096,11 @@ pub fn main(s: *const Startup) -> i32 {
                     aux_p.link.dsc_enabled,
                     aux_p.edid_blocks_read,
                     aux_p.edid.as_ref().map_or("-", EdidInfo::name_str),
+                );
+            } else if drv.pipe_count > 0 {
+                println!(
+                    "amdgpu: DP AUX none (errs: 0={:?} 1={:?} 2={:?} 3={:?} 4={:?})",
+                    aux_errs[0], aux_errs[1], aux_errs[2], aux_errs[3], aux_errs[4]
                 );
             }
         }

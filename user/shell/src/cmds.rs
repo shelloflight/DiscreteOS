@@ -33,11 +33,13 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "log", aliases: &[], usage: "log [source]", description: "the system log (every record, or one source's)" },
     Builtin { name: "time", aliases: &["date"], usage: "time", description: "the date and time (UTC) and the time since boot" },
     Builtin { name: "audio", aliases: &["sound"], usage: "audio [vol <0-100%> | mute [on|off] | unmute | out <id|auto> | tone [hz] [ms] | mic <on|off>]", description: "audio devices, volume, mute/unmute, output switching and test tone" },
-    Builtin { name: "net", aliases: &["ip"], usage: "net [check]", description: "network interface, IP address, gateway, DNS and counters; check: find what does not work" },
+    Builtin { name: "net", aliases: &["ip"], usage: "net [check | dhcp | dns <ip|auto> [dns2] | static <ip> <mask> <gw> [dns1] [dns2]]", description: "network status, diagnostics, DHCP renewal, DNS and static IPv4 configuration" },
     Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
     Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
     Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id] | display [id] | flip-test [id] [ms] | mode <w> <h> <hz> [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]", description: "GPU adapters, live display probe, refresh/mode, VRR, HDR, scale, and page-flip test" },
-    Builtin { name: "gui", aliases: &["awmi"], usage: "gui [demo | status | theme dark|contrast | text 100-200 | motion on|off]", description: "start the desktop (D-AWMI), show its status, or change its theme, text size and motion" },
+    Builtin { name: "gui", aliases: &["awmi"], usage: "gui [demo | status | lock | theme dark|contrast | text 100-200 | motion on|off]", description: "start the desktop (D-AWMI), show its status, lock the screen, or change theme, text size and motion" },
+    Builtin { name: "identity", aliases: &["id", "whoami"], usage: "identity [list | enroll <pass> | create <name> <display> [standard|operator] | switch <name> [pass] | policy [idle <sec>|sleep on|off|boot on|off]]", description: "user identities, TPM 2.0 credential sealing, and session lock policy" },
+    Builtin { name: "apps", aliases: &["app"], usage: "apps [list | launch <name> | stop <name> | perms <name> | grant <name> <perm> | revoke <name> <perm> | verify <path>]", description: "signed .dapp bundles, launching, and live revocable permissions" },
     Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
 ];
@@ -56,11 +58,12 @@ fn text(s: &str) -> Value {
 pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let b = find(name)?;
     let max_args = match b.name {
-        "help" | "go" | "objects" | "log" | "net" => 1,
+        "help" | "go" | "objects" | "log" => 1,
         "end" | "restart" | "wait" | "power" => 1,
         "ping" | "tls" | "gui" => 2,
-        "audio" => 3,
-        "gpu" => 5,
+        "audio" | "apps" => 3,
+        "gpu" | "identity" => 5,
+        "net" => 6,
         _ => 0,
     };
     if args.len() > max_args {
@@ -83,12 +86,20 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "net" => match arg {
             None => net_cmd(sh),
             Some("check") => net_check(sh),
-            Some(other) => Err(format!("net: unknown argument '{}'; usage: net [check]", other)),
+            Some("dhcp") => net_dhcp(sh),
+            Some("dns") => net_dns(sh, &args[1..]),
+            Some("static") => net_static(sh, &args[1..]),
+            Some(other) => Err(format!(
+                "net: unknown argument '{}'; usage: net [check | dhcp | dns <ip|auto> [dns2] | static <ip> <mask> <gw> [dns1] [dns2]]",
+                other
+            )),
         },
         "ping" => ping_cmd(sh, args),
         "tls" => tls_cmd(sh, args),
         "gpu" => gpu_cmd(sh, args),
         "gui" => gui_cmd(sh, args),
+        "identity" => identity_cmd(sh, args),
+        "apps" => apps_cmd(sh, args),
         "power" => power(sh, arg),
         _ => {
             sh.clear();
@@ -625,12 +636,19 @@ fn net_cmd(sh: &Shell) -> Res {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         st.mac[0], st.mac[1], st.mac[2], st.mac[3], st.mac[4], st.mac[5]
     );
-    let state = if st.dhcp_bound {
+    let state = if st.static_mode {
+        if st.link_up { "up (static)" } else { "down (static)" }
+    } else if st.dhcp_bound {
         "up (dhcp)"
     } else if st.link_up {
         "link up (acquiring dhcp)"
     } else {
         "down"
+    };
+    let dns_str = if st.dns2 != [0; 4] {
+        format!("{}, {}", fmt_ip(st.dns), fmt_ip(st.dns2))
+    } else {
+        fmt_ip(st.dns)
     };
     Ok(alloc::vec![
         Record::new()
@@ -638,11 +656,124 @@ fn net_cmd(sh: &Shell) -> Res {
             .with("state", text(state))
             .with("ip", Value::Text(fmt_ip(st.ip)))
             .with("gateway", Value::Text(fmt_ip(st.gateway)))
-            .with("dns", Value::Text(fmt_ip(st.dns)))
+            .with("dns", Value::Text(dns_str))
             .with("mac", Value::Text(mac))
             .with("rx", Value::Int(st.rx_packets as i64))
             .with("tx", Value::Int(st.tx_packets as i64)),
     ])
+}
+
+fn net_dhcp(sh: &Shell) -> Res {
+    if sh.net_ctl == 0 {
+        return Err(String::from("net: no net.control capability granted to this session"));
+    }
+    let cfg = libd::net::NetConfig {
+        dhcp: true,
+        ip: [0; 4],
+        netmask: [0; 4],
+        gateway: [0; 4],
+        dns1: [0; 4],
+        dns2: [0; 4],
+        dns_port: 53,
+        dns_fallback: true,
+    };
+    libd::net::set_config(sh.net_ctl, &cfg).map_err(|e| format!("net dhcp: {}", sys::status(e)))?;
+    sh.write(&show::ok_line("switched to automatic DHCPv4 (acquiring lease)"));
+    Ok(Vec::new())
+}
+
+fn net_dns(sh: &Shell, args: &[String]) -> Res {
+    if sh.net_ctl == 0 {
+        return Err(String::from("net: no net.control capability granted to this session"));
+    }
+    let Some(first) = args.first().map(String::as_str) else {
+        return Err(String::from("net: usage: net dns <ip|auto> [dns2]"));
+    };
+    let st = libd::net::status(sh.net_ctl).map_err(|e| format!("net dns: {}", sys::status(e)))?;
+    let (dns1, dns2) = if first == "auto" {
+        ([0; 4], [0; 4])
+    } else {
+        let d1 = dosnet::parse_ipv4(first)
+            .ok_or_else(|| format!("net dns: invalid IPv4 address '{}'", first))?;
+        let d2 = match args.get(1).map(String::as_str) {
+            Some(s) => dosnet::parse_ipv4(s)
+                .ok_or_else(|| format!("net dns: invalid secondary IPv4 address '{}'", s))?,
+            None => [0; 4],
+        };
+        (d1, d2)
+    };
+    let cfg = libd::net::NetConfig {
+        dhcp: !st.static_mode,
+        ip: st.ip,
+        netmask: st.netmask,
+        gateway: st.gateway,
+        dns1,
+        dns2,
+        dns_port: if st.dns_port == 0 { 53 } else { st.dns_port },
+        dns_fallback: st.dns_fallback,
+    };
+    libd::net::set_config(sh.net_ctl, &cfg).map_err(|e| format!("net dns: {}", sys::status(e)))?;
+    if dns1 == [0; 4] {
+        sh.write(&show::ok_line("DNS reset to automatic (DHCP)"));
+    } else if dns2 != [0; 4] {
+        sh.write(&show::ok_line(&format!("DNS set to {}, {}", fmt_ip(dns1), fmt_ip(dns2))));
+    } else {
+        sh.write(&show::ok_line(&format!("DNS set to {}", fmt_ip(dns1))));
+    }
+    Ok(Vec::new())
+}
+
+fn net_static(sh: &Shell, args: &[String]) -> Res {
+    if sh.net_ctl == 0 {
+        return Err(String::from("net: no net.control capability granted to this session"));
+    }
+    let (Some(ip_s), Some(mask_s), Some(gw_s)) = (args.first(), args.get(1), args.get(2)) else {
+        return Err(String::from("net: usage: net static <ip> <mask> <gw> [dns1] [dns2]"));
+    };
+    let ip = dosnet::parse_ipv4(ip_s)
+        .filter(|&a| a != [0; 4])
+        .ok_or_else(|| format!("net static: invalid IPv4 address '{}'", ip_s))?;
+    let netmask = dosnet::parse_ipv4(mask_s)
+        .filter(|&a| a != [0; 4])
+        .ok_or_else(|| format!("net static: invalid subnet mask '{}'", mask_s))?;
+    let gateway = dosnet::parse_ipv4(gw_s)
+        .ok_or_else(|| format!("net static: invalid gateway '{}'", gw_s))?;
+    let st = libd::net::status(sh.net_ctl).unwrap_or_else(|_| libd::net::NetStatus::empty());
+    let (dns1, dns2) = match args.get(3) {
+        Some(d1s) => {
+            let d1 = dosnet::parse_ipv4(d1s)
+                .ok_or_else(|| format!("net static: invalid DNS address '{}'", d1s))?;
+            let d2 = match args.get(4) {
+                Some(d2s) => dosnet::parse_ipv4(d2s)
+                    .ok_or_else(|| format!("net static: invalid secondary DNS '{}'", d2s))?,
+                None => [0; 4],
+            };
+            (d1, d2)
+        }
+        None => (
+            if st.dns != [0; 4] { st.dns } else { [1, 1, 1, 1] },
+            if st.dns2 != [0; 4] { st.dns2 } else { [8, 8, 8, 8] },
+        ),
+    };
+    let cfg = libd::net::NetConfig {
+        dhcp: false,
+        ip,
+        netmask,
+        gateway,
+        dns1,
+        dns2,
+        dns_port: 53,
+        dns_fallback: st.dns_fallback,
+    };
+    libd::net::set_config(sh.net_ctl, &cfg).map_err(|e| format!("net static: {}", sys::status(e)))?;
+    sh.write(&show::ok_line(&format!(
+        "static IPv4 set: {} mask {} gw {} dns {}",
+        fmt_ip(ip),
+        fmt_ip(netmask),
+        fmt_ip(gateway),
+        fmt_ip(dns1)
+    )));
+    Ok(Vec::new())
 }
 
 /// `net check`: try each step to the internet in turn (lease, router, internet by ICMP and by
@@ -660,7 +791,7 @@ fn net_check(sh: &Shell) -> Res {
         };
         rs.push(Record::new().with("step", text(step)).with("result", text(result)).with("detail", Value::Text(detail)));
     };
-    let leased = st.name_len != 0 && st.dhcp_bound;
+    let leased = st.name_len != 0 && (st.dhcp_bound || (st.static_mode && st.ip != [0; 4]));
     row(
         "address",
         Some(leased),
@@ -671,7 +802,8 @@ fn net_check(sh: &Shell) -> Res {
         } else if !leased {
             String::from("link up, but no DHCP lease from the router yet")
         } else {
-            format!("{} via {} (gateway {}, DNS {})", fmt_ip(st.ip), st.name_str(), fmt_ip(st.gateway), fmt_ip(st.dns))
+            let mode = if st.static_mode { "static" } else { "dhcp" };
+            format!("{} ({}) via {} (gateway {}, DNS {})", fmt_ip(st.ip), mode, st.name_str(), fmt_ip(st.gateway), fmt_ip(st.dns))
         },
     );
     if !leased {
@@ -953,6 +1085,12 @@ fn gui_cmd(sh: &Shell, args: &[String]) -> Res {
             let flags = awmi::SESSION_DESKTOP | if arg == Some("demo") { awmi::SESSION_DEMO } else { 0 };
             let n = awmi::session_start_with(admin()?, flags).map_err(|e| format!("gui: the session did not start ({})", sys::status(e)))?;
             sh.write(&show::ok_line(&format!("desktop on {} output(s); Super+Esc (Ctrl+Alt+Esc in a VM) comes back here", n)));
+            Ok(Vec::new())
+        }
+        Some("lock") => {
+            awmi::lock_session(admin()?, awmi::LOCK_REASON_MANUAL, awmi::LOCK_MODE_LOCKED)
+                .map_err(|e| format!("gui: lock refused ({})", sys::status(e)))?;
+            sh.write(&show::ok_line("desktop session locked"));
             Ok(Vec::new())
         }
         Some("theme") => match value() {
@@ -1335,4 +1473,219 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
         );
     }
     Ok(rs)
+}
+
+fn identity_cmd(sh: &Shell, args: &[String]) -> Res {
+    use libd::identity::{self, IdentityInfo};
+    let q = if sh.identity_query != 0 { sh.identity_query } else { sh.identity_admin };
+    let admin = || {
+        if sh.identity_admin == 0 {
+            Err(String::from("identity: no identity.admin grant in this session"))
+        } else {
+            Ok(sh.identity_admin)
+        }
+    };
+    match args.first().map(String::as_str) {
+        None => {
+            if q == 0 {
+                return Err(String::from("identity: no identity.query grant in this session"));
+            }
+            let a = identity::active(q).map_err(|e| format!("identity: {}", sys::status(e)))?;
+            let pol = identity::policy(q).unwrap_or_default();
+            Ok(alloc::vec![
+                Record::new()
+                    .with("name", Value::Text(String::from(a.name_str())))
+                    .with("display", Value::Text(String::from(a.display_str())))
+                    .with("role", text(a.role_str()))
+                    .with("home", Value::Text(format!("/home ({})", a.home_str())))
+                    .with("seal", text(a.seal_str()))
+                    .with("idle_s", Value::Int(i64::from(pol.idle_timeout_secs)))
+                    .with("tpm", text(if pol.tpm_available { "yes" } else { "no" })),
+            ])
+        }
+        Some("list") => {
+            if q == 0 {
+                return Err(String::from("identity: no identity.query grant in this session"));
+            }
+            let mut list = [IdentityInfo::default(); 8];
+            let n = identity::list(q, &mut list).map_err(|e| format!("identity: {}", sys::status(e)))?;
+            let mut rs = Vec::new();
+            for id in &list[..n] {
+                rs.push(
+                    Record::new()
+                        .with("id", Value::Int(i64::from(id.id)))
+                        .with("name", Value::Text(String::from(id.name_str())))
+                        .with("display", Value::Text(String::from(id.display_str())))
+                        .with("role", text(id.role_str()))
+                        .with("seal", text(id.seal_str()))
+                        .with("active", text(if id.active { "*" } else { "" })),
+                );
+            }
+            Ok(rs)
+        }
+        Some("enroll") => {
+            let Some(pass) = args.get(1) else {
+                return Err(String::from("identity: usage: identity enroll <passphrase>"));
+            };
+            let kind = identity::enroll(admin()?, 0, pass.as_bytes())
+                .map_err(|e| format!("identity: enroll failed ({})", sys::status(e)))?;
+            sh.write(&show::ok_line(if kind == identity::SEAL_TPM2 {
+                "passphrase enrolled (TPM 2.0 sealed)"
+            } else {
+                "passphrase enrolled (software AEAD)"
+            }));
+            Ok(Vec::new())
+        }
+        Some("create") => {
+            let (Some(name), Some(display)) = (args.get(1), args.get(2)) else {
+                return Err(String::from("identity: usage: identity create <name> <display> [standard|operator]"));
+            };
+            if name.eq_ignore_ascii_case("root") {
+                return Err(String::from("identity: D-OS has no root user"));
+            }
+            let role = match args.get(3).map(String::as_str) {
+                None | Some("standard") => identity::ROLE_STANDARD,
+                Some("operator") => identity::ROLE_OPERATOR,
+                Some(other) => return Err(format!("identity: unknown role '{}' (standard or operator)", other)),
+            };
+            let uid = identity::create(admin()?, name, display, role)
+                .map_err(|e| format!("identity: create failed ({})", sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("created identity '{}' (#{})", name, uid)));
+            Ok(Vec::new())
+        }
+        Some("switch") => {
+            let Some(name) = args.get(1) else {
+                return Err(String::from("identity: usage: identity switch <name> [passphrase]"));
+            };
+            let pass = args.get(2).map_or(&[][..], |s| s.as_bytes());
+            identity::switch_user(admin()?, name, pass)
+                .map_err(|e| format!("identity: switch failed ({})", sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("active identity switched to '{}'", name)));
+            Ok(Vec::new())
+        }
+        Some("policy") => {
+            let mut pol = identity::policy(q).map_err(|e| format!("identity: {}", sys::status(e)))?;
+            if args.len() == 1 {
+                return Ok(alloc::vec![
+                    Record::new()
+                        .with("idle_timeout_secs", Value::Int(i64::from(pol.idle_timeout_secs)))
+                        .with("lock_on_sleep", text(if pol.lock_on_sleep { "on" } else { "off" }))
+                        .with("lock_at_boot", text(if pol.lock_at_boot { "on" } else { "off" }))
+                        .with("tpm", text(if pol.tpm_available { "yes" } else { "no" })),
+                ]);
+            }
+            match (args.get(1).map(String::as_str), args.get(2).map(String::as_str)) {
+                (Some("idle"), Some(v)) => {
+                    pol.idle_timeout_secs = v.parse::<u32>().map_err(|_| String::from("identity: idle seconds must be a number"))?;
+                }
+                (Some("sleep"), Some("on")) => pol.lock_on_sleep = true,
+                (Some("sleep"), Some("off")) => pol.lock_on_sleep = false,
+                (Some("boot"), Some("on")) => pol.lock_at_boot = true,
+                (Some("boot"), Some("off")) => pol.lock_at_boot = false,
+                _ => return Err(String::from("identity: usage: identity policy [idle <sec> | sleep on|off | boot on|off]")),
+            }
+            identity::set_policy(admin()?, pol.idle_timeout_secs, pol.lock_on_sleep, pol.lock_at_boot)
+                .map_err(|e| format!("identity: set policy failed ({})", sys::status(e)))?;
+            if sh.awmi_admin != 0 {
+                let _ = libd::awmi::set_lock_policy(sh.awmi_admin, pol.idle_timeout_secs, pol.lock_on_sleep);
+            }
+            sh.write(&show::ok_line("lock policy updated"));
+            Ok(Vec::new())
+        }
+        Some(other) => Err(format!("identity: unknown subcommand '{}'", other)),
+    }
+}
+
+fn apps_cmd(sh: &Shell, args: &[String]) -> Res {
+    use dosapp::{Permission, format_perm_mask};
+    use libd::appmgr::{self, AppInfo, DECISION_DENIED, DECISION_GRANTED, MAX_APPS};
+    let q = if sh.appmgr_query != 0 { sh.appmgr_query } else { sh.appmgr_admin };
+    let admin = || {
+        if sh.appmgr_admin == 0 {
+            Err(String::from("apps: no appmgr.admin grant in this session"))
+        } else {
+            Ok(sh.appmgr_admin)
+        }
+    };
+    match args.first().map(String::as_str) {
+        None | Some("list") => {
+            if q == 0 {
+                return Err(String::from("apps: no appmgr.query grant in this session"));
+            }
+            let mut list = [AppInfo::default(); MAX_APPS];
+            let n = appmgr::list(q, &mut list).map_err(|e| format!("apps: {}", sys::status(e)))?;
+            let mut rs = Vec::new();
+            for a in &list[..n] {
+                rs.push(
+                    Record::new()
+                        .with("name", Value::Text(String::from(a.name_str())))
+                        .with("title", Value::Text(String::from(a.title_str())))
+                        .with("version", Value::Text(String::from(a.version_str())))
+                        .with("running", Value::Int(i64::from(a.running)))
+                        .with("permissions", Value::Text(format_perm_mask(a.effective_perms))),
+                );
+            }
+            Ok(rs)
+        }
+        Some("launch") => {
+            let Some(name) = args.get(1) else {
+                return Err(String::from("apps: usage: apps launch <name>"));
+            };
+            let st = appmgr::launch(admin()?, name).map_err(|e| format!("apps: launch {} failed ({})", name, sys::status(e)))?;
+            sh.write(&show::ok_line(if st == 2 {
+                "permission prompt opened in compositor"
+            } else {
+                "application launched"
+            }));
+            Ok(Vec::new())
+        }
+        Some("stop") => {
+            let Some(name) = args.get(1) else {
+                return Err(String::from("apps: usage: apps stop <name>"));
+            };
+            let k = appmgr::stop(admin()?, name).map_err(|e| format!("apps: stop {} failed ({})", name, sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("stopped {} instance(s) of {}", k, name)));
+            Ok(Vec::new())
+        }
+        Some("perms") => {
+            let Some(name) = args.get(1) else {
+                return Err(String::from("apps: usage: apps perms <name>"));
+            };
+            if q == 0 {
+                return Err(String::from("apps: no appmgr.query grant in this session"));
+            }
+            let (eff, denied) = appmgr::perms(q, name).map_err(|e| format!("apps: {}", sys::status(e)))?;
+            Ok(alloc::vec![
+                Record::new()
+                    .with("app", Value::Text(name.clone()))
+                    .with("effective", Value::Text(format_perm_mask(eff)))
+                    .with("revoked", Value::Text(format_perm_mask(denied))),
+            ])
+        }
+        Some("grant" | "revoke") => {
+            let grant = args[0] == "grant";
+            let (Some(name), Some(pstr)) = (args.get(1), args.get(2)) else {
+                return Err(format!("apps: usage: apps {} <name> <permission>", args[0]));
+            };
+            let Some(perm) = Permission::parse(pstr) else {
+                return Err(format!("apps: unknown permission '{}'", pstr));
+            };
+            let dec = if grant { DECISION_GRANTED } else { DECISION_DENIED };
+            appmgr::set_perm(admin()?, name, perm as u8, dec)
+                .map_err(|e| format!("apps: {} failed ({})", args[0], sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("{} {} for {}", if grant { "granted" } else { "revoked" }, perm.as_str(), name)));
+            Ok(Vec::new())
+        }
+        Some("verify") => {
+            let Some(path) = args.get(1) else {
+                return Err(String::from("apps: usage: apps verify <path>"));
+            };
+            let abs = normalize(&sh.place, path);
+            appmgr::install_check(admin()?, &abs)
+                .map_err(|e| format!("apps: {} rejected ({})", abs, sys::status(e)))?;
+            sh.write(&show::ok_line(&format!("{} signature valid (Ed25519)", abs)));
+            Ok(Vec::new())
+        }
+        Some(other) => Err(format!("apps: unknown subcommand '{}'", other)),
+    }
 }

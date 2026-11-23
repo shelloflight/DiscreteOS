@@ -151,7 +151,12 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) ->
             println!("init: boot: firmware display (DOS/BOOT.CFG: display = firmware)");
         }
         if cfg.desktop {
-            let awmi_args = if cfg.firmware_display { "autostart firmware-display" } else { "autostart" };
+            let awmi_args = match (cfg.firmware_display, cfg.lock) {
+                (false, false) => "autostart",
+                (true, false) => "autostart firmware-display",
+                (false, true) => "autostart lock-at-boot",
+                (true, true) => "autostart firmware-display lock-at-boot",
+            };
             overrides.push(("awmi", awmi_args));
         } else {
             println!("init: boot: text console (DOS/BOOT.CFG: desktop = off)");
@@ -182,13 +187,15 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) ->
 struct BootCfg {
     desktop: bool,
     firmware_display: bool,
+    lock: bool,
 }
 
 /// Parse optional unsigned `esp:/DOS/BOOT.CFG`:
 /// - `desktop = off|no|false|0` starts in the text console;
-/// - `display = firmware|gop` forces the UEFI GOP framebuffer path over verified native AMD display.
+/// - `display = firmware|gop` forces the UEFI GOP framebuffer path over verified native AMD display;
+/// - `lock = on|yes|true|1` requires the compositor sign-in screen before starting the desktop.
 fn boot_cfg(m: &Mgr) -> BootCfg {
-    let mut cfg = BootCfg { desktop: true, firmware_display: false };
+    let mut cfg = BootCfg { desktop: true, firmware_display: false, lock: false };
     let Some(root) = m.volumes.iter().find(|v| v.name == "esp").and_then(|v| v.root.clone_with(fp::R_READ).ok()) else {
         return cfg;
     };
@@ -207,6 +214,8 @@ fn boot_cfg(m: &Mgr) -> BootCfg {
                 cfg.desktop = !matches!(val.as_str(), "off" | "no" | "false" | "0");
             } else if key.eq_ignore_ascii_case("display") {
                 cfg.firmware_display = matches!(val.as_str(), "firmware" | "gop");
+            } else if key.eq_ignore_ascii_case("lock") {
+                cfg.lock = matches!(val.as_str(), "on" | "yes" | "true" | "1");
             }
         }
     }
@@ -333,6 +342,8 @@ fn main(s: *const Startup) -> i32 {
         "net test" => return net_test(),
         "gpu test" => return gpu_test(),
         "awmi test" => return awmi_test(),
+        "identity test" => return identity_test(),
+        "app test" => return app_test(),
         _ => {}
     }
 
@@ -571,6 +582,52 @@ fn gpu_test() -> i32 {
     }
     m.shutdown();
     println!("init: gpu test: PASSED");
+    let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
+    println!("init: power: system_power returned {}", r);
+    1
+}
+
+/// Identity model, TPM 2.0 credential sealing, unforgeable lock screen, and idle/sleep lock test.
+fn identity_test() -> i32 {
+    let Some(mut m) = start_system(
+        &[("storaged", "test"), ("devmgr", "rw"), ("awmi", "test"), ("terminal", "mirror")],
+        &[Group::System, Group::Test],
+        true,
+    ) else {
+        return 1;
+    };
+    let state = |m: &Mgr, name: &str| m.find(name).map(|i| m.svcs[i].state);
+    let names = ["svc-id-ungranted", "svc-id-full"];
+    let ok = m.run_until(90 * SEC, |m| names.iter().all(|n| matches!(state(m, n), Some(State::Done(_)))));
+    check!(ok, "identity test services did not finish in time");
+    for s in names {
+        check!(state(&m, s) == Some(State::Done(0)), "{} ended with {:?}", s, state(&m, s));
+    }
+    m.shutdown();
+    println!("init: identity test: PASSED");
+    let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
+    println!("init: power: system_power returned {}", r);
+    1
+}
+
+/// Application bundles (`.dapp`), revocable permissions, permission prompt, and core native apps test.
+fn app_test() -> i32 {
+    let Some(mut m) = start_system(
+        &[("storaged", "test"), ("devmgr", "rw"), ("awmi", "test"), ("terminal", "mirror")],
+        &[Group::System, Group::Test],
+        true,
+    ) else {
+        return 1;
+    };
+    let state = |m: &Mgr, name: &str| m.find(name).map(|i| m.svcs[i].state);
+    let names = ["svc-app-ungranted", "svc-app-full"];
+    let ok = m.run_until(90 * SEC, |m| names.iter().all(|n| matches!(state(m, n), Some(State::Done(_)))));
+    check!(ok, "app test services did not finish in time");
+    for s in names {
+        check!(state(&m, s) == Some(State::Done(0)), "{} ended with {:?}", s, state(&m, s));
+    }
+    m.shutdown();
+    println!("init: app test: PASSED");
     let r = sys::system_power(startup(sys::TAG_POWER), sys::POWER_OFF);
     println!("init: power: system_power returned {}", r);
     1

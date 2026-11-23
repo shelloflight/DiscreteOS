@@ -68,8 +68,10 @@ column([
 ```
 
 - **Widgets:** column, row, panel, scroll, spacer, divider, text (caption, heading, label, mono;
-  tones; wrapping), button (primary, secondary, danger), checkbox, toggle, slider, text input,
-  list item, progress bar. Sizes are `Auto`, `Px` or `Fill`.
+  tones; wrapping), button (primary, secondary, danger), checkbox, toggle, slider, text input
+  (including `.secret()` masked input for passphrases), multiline monospace `textarea` (line
+  numbers, cursor navigation, scrolling), list item (single-click `on_select` plus 450 ms
+  double-click / Enter `on_activate`), progress bar. Sizes are `Auto`, `Px` or `Fill`.
 - **Shapes:** rounded rectangles, borders, focus rings and circles are anti-aliased by exact
   coverage: the signed distance from each pixel centre to the edge, in 1/256 px, integer only.
   Straight edges stay pixel-crisp; the fill and a 1 px border get separate coverage.
@@ -106,10 +108,11 @@ to open a centred search box. Typing filters the entries, Up/Down move the selec
 it, Escape or another Super tap closes the launcher. While it is open it takes every key, and the
 pointer only reaches the launcher. Super+Esc and Ctrl+Alt+Esc still leave the desktop.
 
-- **Programs' entries:** a window program registers up to 4 entries (`OP_APP_REGISTER`, 24 in all).
-  Each entry is shown with the program's verified service name, not a name the program chose.
-  Opening one sends that program `EVT_LAUNCH`.
-- **Settings:** switch theme, larger text, smaller text, reduce motion, leave the desktop.
+- **Programs' entries:** a window program registers up to 4 entries (`OP_APP_REGISTER`), while
+  `appmgr` (`awmi.launcher`) registers up to 16 verified `.dapp` entries (24 in all). Each entry is
+  shown with the program's verified name, not a name the program chose. Opening one sends that
+  program `EVT_LAUNCH`.
+- **Settings:** switch theme, larger text, smaller text, reduce motion, lock screen, leave the desktop.
 
 ## Accessibility
 

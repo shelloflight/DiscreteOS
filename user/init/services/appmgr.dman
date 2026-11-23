@@ -1,0 +1,28 @@
+# Application manager: verifies signed .dapp bundles via kernel vmo_verify, enforces
+# per-identity revocable permissions, drives the compositor permission prompt, and spawns
+# verified apps with exact capability handles and isolated namespaces. Never holds VMEX.
+name = "appmgr"
+image = "appmgr.dsvc"
+group = "system"
+after = ["storaged", "identity", "awmi"]
+description = "signed application bundles and revocable permissions"
+
+[provides]
+endpoints = ["query", "admin"]
+
+[grants]
+log = true
+namespace = ["*"]
+awmi = ["launcher"]
+identity = ["query"]
+manager = ["apps"]
+
+[quota]
+memory = "96M"
+handles = 512
+threads = 8
+
+[restart]
+policy = "always"
+limit = 5
+backoff = 100

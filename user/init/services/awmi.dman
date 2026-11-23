@@ -8,11 +8,11 @@
 name = "awmi"
 image = "awmi.dsvc"
 group = "system"
-after = ["devmgr", "gpu", "terminal", "clock", "audio", "net"]
+after = ["devmgr", "gpu", "terminal", "clock", "audio", "net", "identity"]
 description = "D-AWMI compositor and window manager"
 
 [provides]
-endpoints = ["window", "admin", "query", "indicator"]
+endpoints = ["window", "admin", "query", "indicator", "launcher"]
 identify = true
 
 [grants]
@@ -20,6 +20,7 @@ log = true
 gpu = ["display"]
 audio = ["control"]   # the dock: microphone live, output muted
 net = ["status"]      # the dock: network up (read-only)
+identity = ["session"]
 connect = ["devmgr.input", "terminal.display", "clock.time"]
 namespace = ["/sys=sys:r"]   # fonts and themes
 

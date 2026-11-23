@@ -76,8 +76,9 @@ pub(crate) enum Kind<M> {
     Checkbox { label: String, checked: bool, on_toggle: Option<M> },
     Toggle { label: String, on: bool, on_toggle: Option<M> },
     Slider { value: i32, min: i32, max: i32, step: i32, on_change: Option<Box<dyn Fn(i32) -> M>> },
-    Input { value: String, placeholder: String, on_change: Option<Box<dyn Fn(String) -> M>>, on_submit: Option<M> },
-    Item { label: String, detail: String, selected: bool, on_select: Option<M> },
+    Input { value: String, placeholder: String, secret: bool, on_change: Option<Box<dyn Fn(String) -> M>>, on_submit: Option<M> },
+    TextArea { value: String, placeholder: String, on_change: Option<Box<dyn Fn(String) -> M>> },
+    Item { label: String, detail: String, selected: bool, on_select: Option<M>, on_activate: Option<M> },
     Progress { permille: u16 },
 }
 
@@ -98,6 +99,7 @@ impl<M> Kind<M> {
             Kind::Input { .. } => 12,
             Kind::Item { .. } => 13,
             Kind::Progress { .. } => 14,
+            Kind::TextArea { .. } => 15,
         }
     }
 
@@ -108,7 +110,8 @@ impl<M> Kind<M> {
             Kind::Checkbox { on_toggle, .. } | Kind::Toggle { on_toggle, .. } => on_toggle.is_some(),
             Kind::Slider { on_change, .. } => on_change.is_some(),
             Kind::Input { on_change, .. } => on_change.is_some(),
-            Kind::Item { on_select, .. } => on_select.is_some(),
+            Kind::TextArea { on_change, .. } => on_change.is_some(),
+            Kind::Item { on_select, on_activate, .. } => on_select.is_some() || on_activate.is_some(),
             _ => false,
         }
     }
@@ -211,12 +214,17 @@ pub fn slider<M>(value: i32, min: i32, max: i32) -> Node<M> {
 
 /// A single-line text field showing `value` (the app keeps the text: `on_change` gets each edit).
 pub fn input<M>(value: impl Into<String>) -> Node<M> {
-    Node { width: Length::Px(260), ..node(Kind::Input { value: value.into(), placeholder: String::new(), on_change: None, on_submit: None }) }
+    Node { width: Length::Px(260), ..node(Kind::Input { value: value.into(), placeholder: String::new(), secret: false, on_change: None, on_submit: None }) }
 }
 
-/// A selectable row of a list.
+/// A multi-line monospace editor showing `value` (supports Enter, arrows, Home/End, scrolling).
+pub fn textarea<M>(value: impl Into<String>) -> Node<M> {
+    Node { width: Length::Fill, height: Length::Fill, ..node(Kind::TextArea { value: value.into(), placeholder: String::new(), on_change: None }) }
+}
+
+/// A selectable row of a list (supports single-click `on_select` and double-click/Enter `on_activate`).
 pub fn item<M>(label: impl Into<String>, selected: bool) -> Node<M> {
-    node(Kind::Item { label: label.into(), detail: String::new(), selected, on_select: None })
+    node(Kind::Item { label: label.into(), detail: String::new(), selected, on_select: None, on_activate: None })
 }
 
 /// Progress from 0 to 1000.
@@ -300,6 +308,13 @@ impl<M> Node<M> {
         }
         self
     }
+    /// Fired on double-click or Enter on a list row.
+    pub fn on_activate(mut self, m: M) -> Self {
+        if let Kind::Item { on_activate, .. } = &mut self.kind {
+            *on_activate = Some(m);
+        }
+        self
+    }
     pub fn on_submit(mut self, m: M) -> Self {
         if let Kind::Input { on_submit, .. } = &mut self.kind {
             *on_submit = Some(m);
@@ -307,8 +322,16 @@ impl<M> Node<M> {
         self
     }
     pub fn on_change<F: Fn(String) -> M + 'static>(mut self, f: F) -> Self {
-        if let Kind::Input { on_change, .. } = &mut self.kind {
-            *on_change = Some(Box::new(f));
+        match &mut self.kind {
+            Kind::Input { on_change, .. } | Kind::TextArea { on_change, .. } => *on_change = Some(Box::new(f)),
+            _ => {}
+        }
+        self
+    }
+    /// Mask typed characters in a text input (for passphrases).
+    pub fn secret(mut self) -> Self {
+        if let Kind::Input { secret, .. } = &mut self.kind {
+            *secret = true;
         }
         self
     }
@@ -325,8 +348,9 @@ impl<M> Node<M> {
         self
     }
     pub fn placeholder(mut self, p: impl Into<String>) -> Self {
-        if let Kind::Input { placeholder, .. } = &mut self.kind {
-            *placeholder = p.into();
+        match &mut self.kind {
+            Kind::Input { placeholder, .. } | Kind::TextArea { placeholder, .. } => *placeholder = p.into(),
+            _ => {}
         }
         self
     }

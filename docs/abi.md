@@ -1,4 +1,4 @@
-# User ABI (version 15)
+# User ABI (version 16)
 
 The interface between ring-3 programs and the kernel. It is handle-based from the first syscall:
 no paths, no PIDs, no global names. A program can only use the handles it was started with and the
@@ -10,7 +10,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 
 ## Versioning
 
-- `abi_version()` (syscall 0) returns **15**; the startup block carries it too. A program checks it
+- `abi_version()` (syscall 0) returns **16**; the startup block carries it too. A program checks it
   is at least the version it was built for.
 - **Syscall numbers are never reused or renumbered.** A removed call keeps answering
   `NOT_SUPPORTED`.
@@ -37,6 +37,7 @@ ones it creates or receives. The object model behind every call is in [objects.m
 | 13 | demand paging (lazy VMO physical frame commit with upfront quota), `vmar_destroy` (72), and `system_power` action 3 (`POWER_SUSPEND`, ACPI S3) |
 | 14 | `get_random` (73): kernel Fast-Key-Erasure ChaCha20 CSPRNG seeded from `RDSEED`/`RDRAND` and `TPM2_GetRandom` |
 | 15 | `device_bar_addr` (74): physical base address of a device memory BAR (`INSPECT`) |
+| 16 | TPM 2.0 credential sealing (`tpm_seal` 75, `tpm_unseal` 76, `TPM_SEAL` startup handle tag 14); `vmo_verify` accepts `.dapp` bundle signatures (`KIND_APP` = 6) |
 
 ## Calling convention (x86-64)
 
@@ -155,6 +156,8 @@ Handles are 32-bit (`0` is never valid). Timeouts are relative nanoseconds: `0` 
 | 72 | vmar_destroy | vmar (non-root) | 0 (unmaps all mappings/descendants and reclaims address space; `INVALID_ARGS` on root, `BAD_STATE` if already destroyed) | MAP |
 | 73 | get_random | buf, len (<= 4096), flags (`0` or `DOS_RANDOM_STRICT`) | bytes written (`BAD_STATE` with `STRICT` if no hardware entropy) | |
 | 74 | device_bar_addr | device, bar | physical base address of memory BAR `bar` (`WRONG_TYPE` for I/O or absent BAR) | INSPECT |
+| 75 | tpm_seal | TPM_SEAL resource, `const struct dos_tpm_seal_args *` | sealed blob length (`NOT_SUPPORTED` without TPM 2.0, `BUFFER_TOO_SMALL` if output too small) | MANAGE on resource |
+| 76 | tpm_unseal | TPM_SEAL resource, `const struct dos_tpm_seal_args *` | unsealed secret length (`NOT_SUPPORTED` without TPM 2.0, `ACCESS_DENIED` on bad auth/blob) | MANAGE on resource |
 
 Test kernels only: `0xF000` / `0xF001` make the kernel touch / execute a user address, to prove
 SMAP and SMEP fire.
@@ -181,10 +184,10 @@ At the entry point, RDI points at `struct dos_startup`: magic `DOSS`, ABI versio
 bytes (<= 4096), the image base and the stack.
 
 Tags: `PROC_SELF` 1, `THREAD_SELF` 2, `VMAR_ROOT` 3, `LOG` 4, `PROGRAM` 5, `VMEX` 6, `DEVICE` 7,
-`POWER` 8, `MEASURE` 9, `MANIFEST` 10, `KLOG` 11, `BOOT_TIME` 12, `POWER_BUTTON` 13, and `DOS_TAG_USER` (0x10000) and
+`POWER` 8, `MEASURE` 9, `MANIFEST` 10, `KLOG` 11, `BOOT_TIME` 12, `POWER_BUTTON` 13, `TPM_SEAL` 14, and `DOS_TAG_USER` (0x10000) and
 up for the spawner's own. `init` gets its own handles, the log, one read-only VMO per embedded program
-and per embedded service manifest (`*.dman`: data, never runnable), the VMEX, POWER, MEASURE and
-KLOG resources, the boot-time record (UEFI only: the firmware's time at boot and the monotonic
+and per embedded service manifest (`*.dman`: data, never runnable), the VMEX, POWER, MEASURE,
+KLOG and TPM_SEAL resources, the boot-time record (UEFI only: the firmware's time at boot and the monotonic
 time it corresponds to, `struct dos_boot_time`), the power-button event (`WAIT` and `SIGNAL`:
 init clears it after each press) and every device.
 Tags user space agrees on: the service manager's control channel and endpoints
@@ -255,8 +258,12 @@ allows yet.
 ## Code signing, attestation, power
 
 - `vmo_verify` checks a `.dsig` ([signing.md](signing.md)) against the kernel's key, seals the VMO,
-  and requires every byte past the signed size to be zero. `vmo_allow_unsigned` lets a VMEX holder
-  run unsigned code. Both decisions are measured into PCR 10.
+  and requires every byte past the signed size to be zero (programs/drivers become runnable;
+  manifests and `.dapp` bundles of kind 6 are verified as genuine data only). `vmo_allow_unsigned`
+  lets a VMEX holder run unsigned code. Both decisions are measured into PCR 10.
+- `tpm_seal` / `tpm_unseal` (ABI v16) need the `TPM_SEAL` resource (`identity.dsvc` only): they
+  seal and unseal user credential secrets under the TPM 2.0 owner SRK bound to an auth digest
+  ([identity.md](identity.md)).
 - `attest` returns a signed report for the caller's nonce ([attestation.md](attestation.md));
   `DOS_ATTEST_MAX` bytes hold any report. `attest_activate` answers a verifier's TPM credential
   challenge (the hardware-rooted step).

@@ -615,4 +615,27 @@ fn dns_falls_back_to_the_next_server_and_public_resolvers() {
     assert_eq!(dns_dst(&mut st), vec![[1, 1, 1, 1]]);
     st.tick(2_000);
     assert_eq!(dns_dst(&mut st), vec![[9, 9, 9, 9]]);
+
+    // Explicit SERVFAIL/REFUSED from primary DNS immediately fails over to the next resolver.
+    let mut st2 = NetStack::new([0x02, 0, 0, 0, 0, 0x51], 0x5151);
+    st2.set_static_full([192, 168, 1, 51], [255, 255, 255, 0], [192, 168, 1, 1], [192, 168, 1, 1], [8, 8, 8, 8], 53, true);
+    assert!(st2.static_mode);
+    while st2.poll_tx().is_some() {}
+    let reply2 = ArpPacket { op: 2, sha: gw_mac, spa: [192, 168, 1, 1], tha: st2.mac, tpa: st2.ip };
+    st2.on_rx_frame(&build_eth(st2.mac, gw_mac, 0x0806, &reply2.encode()), 0);
+    let qid = st2.start_dns_resolve("google.com", 0).unwrap();
+    let first = st2.poll_tx().expect("initial dns query");
+    let f_eth = EthFrame::parse(&first).unwrap();
+    let f_ip = Ipv4Packet::parse(f_eth.payload).unwrap();
+    let f_udp = UdpPacket::parse(f_ip.src, f_ip.dst, f_ip.payload).unwrap();
+    assert_eq!(f_ip.dst, [192, 168, 1, 1]);
+    // Send a DNS REFUSED (RCODE=5) reply back to the client's ephemeral port.
+    let mut refused = vec![0u8; 12];
+    refused[0..2].copy_from_slice(&qid.to_be_bytes());
+    refused[2..4].copy_from_slice(&0x8185u16.to_be_bytes()); // QR=1, RCODE=5 (REFUSED)
+    let udp_rep = build_udp([192, 168, 1, 1], st2.ip, 53, f_udp.src_port, &refused).unwrap();
+    let ip_rep = build_ipv4([192, 168, 1, 1], st2.ip, PROTO_UDP, 1, 64, &udp_rep).unwrap();
+    st2.on_rx_frame(&build_eth(st2.mac, gw_mac, ETH_TYPE_IPV4, &ip_rep), 10);
+    // Must immediately retry secondary DNS (8.8.8.8) without waiting for the retry timer!
+    assert_eq!(dns_dst(&mut st2), vec![[8, 8, 8, 8]]);
 }

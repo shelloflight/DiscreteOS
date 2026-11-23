@@ -39,6 +39,9 @@ const KEY_CTL: u64 = 2;
 const KEY_MGR: u64 = 3;
 /// The power-button event (startup tag POWER_BUTTON) fired.
 const KEY_BUTTON: u64 = 4;
+/// Read-only manager channel granted to a verified `.dapp` (e.g. System Monitor).
+const KEY_APP_MGR: u64 = 5;
+const MAX_APP_MGRS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -118,6 +121,8 @@ pub struct Mgr {
     embedded_seen: Vec<Handle>,
     /// A manager channel asked for the power (`MGR_POWER`): a clean shutdown, then this action.
     pub power_request: Option<u64>,
+    /// Read-only manager channels handed to verified `.dapp` apps via `MGR_LINK` (`manager.services-ro`).
+    app_mgrs: Vec<Option<Owned>>,
 }
 
 fn startup(tag: u32) -> Handle {
@@ -203,6 +208,7 @@ impl Mgr {
             sys_loaded: false,
             embedded_seen: Vec::new(),
             power_request: None,
+            app_mgrs: Vec::new(),
         })
     }
 
@@ -456,6 +462,11 @@ impl Mgr {
         {
             give(&mut hs, h, sys::TAG_BOOT_TIME);
         }
+        if m.tpm_seal
+            && let Some(h) = dup(startup(sys::TAG_TPM_SEAL))
+        {
+            give(&mut hs, h, sys::TAG_TPM_SEAL);
+        }
         // The tools: their manifests (read-only) and their program images.
         if m.tools {
             for e in &self.tools {
@@ -467,9 +478,9 @@ impl Mgr {
                 }
             }
         }
-        // A channel to the manager itself (list, stop and restart services; power).
+        // A channel to the manager itself (list, stop and restart services; power; app linking).
         let mut mgr_end = Owned::default();
-        if m.manage_services || m.manage_power {
+        if m.manage_services || m.manage_power || m.manage_apps {
             let (mine, theirs) = sys::channel_pair().map_err(|e| format!("no channel: {}", sys::status(e)))?;
             give(&mut hs, theirs, tool::TAG_MANAGER);
             mgr_end = Owned::from_raw(mine);
@@ -683,6 +694,11 @@ impl Mgr {
             return true;
         }
         let i = (key >> 8) as usize;
+        if (key & 0xFF) == KEY_APP_MGR {
+            self.manage_app_ro(i);
+            self.start_ready();
+            return true;
+        }
         if i < self.svcs.len() {
             match key & 0xFF {
                 KEY_PROC => self.ended(i),
@@ -798,9 +814,116 @@ impl Mgr {
         }
     }
 
+    /// Link a verified `.dapp` (on behalf of `appmgr` with `grants.manager = ["apps"]`) to a
+    /// safe whitelisted service endpoint, attaching verified identity `app_name` and `TRUST_NATIVE`.
+    fn link_app(&mut self, endpoint: &str, app_name: &str) -> Result<Handle, i64> {
+        const ALLOWED: &[&str] = &[
+            "awmi.window",
+            "awmi.admin",
+            "awmi.query",
+            "terminal.view",
+            "gpu.query",
+            "audio.control",
+            "audio.playback",
+            "net.status",
+            "net.control",
+            "log.read",
+            "clock.time",
+            "identity.query",
+            "identity.admin",
+            "appmgr.query",
+            "appmgr.admin",
+            "manager.services-ro",
+        ];
+        if !dman::valid_name(app_name) || !ALLOWED.contains(&endpoint) {
+            return Err(sys::ERR_ACCESS_DENIED);
+        }
+        if endpoint == "manager.services-ro" {
+            let (client, ours) = sys::channel_pair()?;
+            let slot = if let Some(pos) = self.app_mgrs.iter().position(Option::is_none) {
+                self.app_mgrs[pos] = Some(Owned::from_raw(ours));
+                pos
+            } else if self.app_mgrs.len() < MAX_APP_MGRS {
+                let pos = self.app_mgrs.len();
+                self.app_mgrs.push(Some(Owned::from_raw(ours)));
+                pos
+            } else {
+                sys::handle_close(client);
+                sys::handle_close(ours);
+                return Err(sys::ERR_NO_RESOURCES);
+            };
+            self.port.arm(ours, sys::READABLE | sys::PEER_CLOSED, (slot as u64) << 8 | KEY_APP_MGR);
+            return Ok(client);
+        }
+        let Some((svc_name, ep_name)) = endpoint.split_once('.') else {
+            return Err(sys::ERR_INVALID_ARGS);
+        };
+        let Some(pi) = self
+            .find(svc_name)
+            .filter(|&p| self.svcs[p].state == State::Running && self.svcs[p].m.endpoints.iter().any(|e| e == ep_name))
+        else {
+            return Err(fp::ERR_NOT_FOUND);
+        };
+        let (mine, theirs) = sys::channel_pair()?;
+        let p = &self.svcs[pi];
+        let mut msg = [0u8; HEADER + 64 + 1 + 32];
+        let tier = if p.m.identify { u64::from(libd::awmi::TRUST_NATIVE) } else { 0 };
+        Header { txid: 0, op: svc::CONNECT, status: 0, a: 0, b: tier }.put(&mut msg);
+        let mut n = ep_name.len().min(64);
+        msg[HEADER..HEADER + n].copy_from_slice(&ep_name.as_bytes()[..n]);
+        if p.m.identify {
+            let name = &app_name.as_bytes()[..app_name.len().min(32)];
+            msg[HEADER + n] = 0;
+            msg[HEADER + n + 1..HEADER + n + 1 + name.len()].copy_from_slice(name);
+            n += 1 + name.len();
+        }
+        if sys::channel_write_h(p.ctl.raw(), &msg[..HEADER + n], &[MsgHandle { handle: theirs, rights: sys::RIGHTS_SAME }]) < 0 {
+            sys::handle_close(mine);
+            return Err(sys::ERR_BAD_STATE);
+        }
+        Ok(mine)
+    }
+
+    /// Read-only manager requests from a verified `.dapp` (`manager.services-ro`): only `MGR_LIST`
+    /// and `MGR_OBJECTS` are permitted; stop, restart, power, and link are always refused.
+    fn manage_app_ro(&mut self, slot: usize) {
+        let mut buf = [0u8; HEADER + 64];
+        loop {
+            let Some(ch) = self.app_mgrs.get(slot).and_then(|o| o.as_ref()).map(Owned::raw) else { return };
+            let n = match sys::channel_read(ch, &mut buf, 0) {
+                Ok(n) => n as usize,
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.port.arm(ch, sys::READABLE | sys::PEER_CLOSED, (slot as u64) << 8 | KEY_APP_MGR);
+                    return;
+                }
+                Err(_) => {
+                    if let Some(s) = self.app_mgrs.get_mut(slot) {
+                        *s = None;
+                    }
+                    return;
+                }
+            };
+            let Some(h) = Header::get(&buf[..n]) else { continue };
+            let arg = String::from_utf8_lossy(&buf[HEADER..n]).into_owned();
+            let (status, payload) = match h.op {
+                svc::MGR_LIST => (0, self.list_records()),
+                svc::MGR_OBJECTS => match self.find(&arg) {
+                    Some(k) if self.svcs[k].proc.raw() != 0 => (0, objects_records(self.svcs[k].proc.raw())),
+                    Some(_) => (sys::ERR_BAD_STATE, b"it is not running".to_vec()),
+                    None => (fp::ERR_NOT_FOUND, b"no such service".to_vec()),
+                },
+                _ => (sys::ERR_ACCESS_DENIED, b"read-only manager channel".to_vec()),
+            };
+            let mut out = alloc::vec![0u8; HEADER];
+            Header { txid: h.txid, op: h.op, status: status as i32, a: 0, b: 0 }.put(&mut out);
+            out.extend_from_slice(&payload[..payload.len().min(libd::rec::MAX_PAYLOAD)]);
+            sys::channel_write(ch, &out);
+        }
+    }
+
     /// Requests on service `i`'s manager channel (`svc::MGR_*`), each answered with the same op.
     fn manage(&mut self, i: usize) {
-        let mut buf = [0u8; HEADER + 64];
+        let mut buf = [0u8; HEADER + 128];
         loop {
             let ch = self.svcs[i].mgr.raw();
             if ch == 0 {
@@ -815,6 +938,33 @@ impl Mgr {
                 Err(_) => return,
             };
             let Some(h) = Header::get(&buf[..n]) else { continue };
+            if h.op == svc::MGR_LINK {
+                let mut rep = [0u8; HEADER];
+                if !self.svcs[i].m.manage_apps {
+                    Header { txid: h.txid, op: h.op, status: sys::ERR_ACCESS_DENIED as i32, a: 0, b: 0 }.put(&mut rep);
+                    sys::channel_write(ch, &rep);
+                    continue;
+                }
+                let body = &buf[HEADER..n];
+                let res = match body.iter().position(|&b| b == 0) {
+                    Some(nul) => match (core::str::from_utf8(&body[..nul]), core::str::from_utf8(&body[nul + 1..])) {
+                        (Ok(ep), Ok(app)) => self.link_app(ep, app),
+                        _ => Err(sys::ERR_INVALID_ARGS),
+                    },
+                    None => Err(sys::ERR_INVALID_ARGS),
+                };
+                match res {
+                    Ok(handle) => {
+                        Header { txid: h.txid, op: h.op, status: 0, a: 0, b: 0 }.put(&mut rep);
+                        sys::channel_write_h(ch, &rep, &[MsgHandle { handle, rights: sys::RIGHTS_SAME }]);
+                    }
+                    Err(e) => {
+                        Header { txid: h.txid, op: h.op, status: e as i32, a: 0, b: 0 }.put(&mut rep);
+                        sys::channel_write(ch, &rep);
+                    }
+                }
+                continue;
+            }
             let arg = String::from_utf8_lossy(&buf[HEADER..n]).into_owned();
             let (status, payload) = self.request(i, &h, &arg);
             let mut out = alloc::vec![0u8; HEADER];
@@ -975,6 +1125,17 @@ impl Mgr {
             if sys::channel_call(s.ctl.raw(), &req, &mut rep, 10 * SEC).is_err() {
                 println!("init: {} did not confirm its volumes are durable", s.m.name);
             }
+        }
+        let awmi_ctl = self
+            .find("awmi")
+            .filter(|&i| self.svcs[i].state == State::Running)
+            .map(|i| self.svcs[i].ctl.raw())
+            .unwrap_or(0);
+        if awmi_ctl != 0 {
+            let mut req = [0u8; HEADER];
+            Header { txid: 0, op: svc::SUSPEND, status: 0, a: 0, b: 0 }.put(&mut req);
+            let mut rep = [0u8; HEADER];
+            let _ = sys::channel_call(awmi_ctl, &req, &mut rep, 5 * SEC);
         }
         let devmgr_ctl = self
             .find("devmgr")

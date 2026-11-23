@@ -21,7 +21,7 @@ use super::uaccess::{self, Pod};
 use crate::ffi;
 use crate::object::exception::{Action, Regs};
 use crate::object::quota::Limits;
-use crate::object::resource::{KIND_KLOG, KIND_MEASURE, KIND_POWER, KIND_VMEX};
+use crate::object::resource::{KIND_KLOG, KIND_MEASURE, KIND_POWER, KIND_TPM_SEAL, KIND_VMEX};
 use crate::object::{Handle, KResult, ObjType, Object, Rights, Status, default_rights, log::MAX_WRITE};
 
 pub mod nr {
@@ -113,7 +113,10 @@ pub mod nr {
     pub const GET_RANDOM: u64 = 73;
     // ABI v15: physical base address of a device memory BAR (PCI MMIO or platform display)
     pub const DEVICE_BAR_ADDR: u64 = 74;
-    pub const COUNT: u64 = 75;
+    // ABI v16: TPM 2.0 credential sealing under the owner Storage Root Key
+    pub const TPM_SEAL: u64 = 75;
+    pub const TPM_UNSEAL: u64 = 76;
+    pub const COUNT: u64 = 77;
     /// Test builds only: make the kernel touch / execute user memory without permission.
     pub const KTEST_SMAP: u64 = 0xF000;
     pub const KTEST_SMEP: u64 = 0xF001;
@@ -877,6 +880,70 @@ fn attest(nonce: u64, buf: u64, cap: u64) -> KResult<i64> {
     Ok(r.len() as i64)
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct TpmSealArgs {
+    auth: u64,
+    auth_len: u64,
+    input: u64,
+    input_len: u64,
+    output: u64,
+    output_cap: u64,
+}
+// SAFETY: repr(C), six u64 fields, no padding.
+unsafe impl Pod for TpmSealArgs {}
+const _: () = assert!(core::mem::size_of::<TpmSealArgs>() == 48);
+
+/// tpm_seal / tpm_unseal (ABI v16): with the TPM_SEAL resource, seal a short credential
+/// (1..=128 bytes) or unseal a `DTPM` blob under the TPM 2.0 owner SRK. Sensitive buffers are
+/// wiped before returning.
+fn tpm_seal_op(u: &UserThread, rh: u64, args_ptr: u64, unseal: bool) -> KResult<i64> {
+    use crate::security::tpm::{SEAL_AUTH_MAX, SEAL_BLOB_MAX, SEAL_DATA_MAX};
+    let (res, _) = u.proc.get_resource(h(rh), Rights::MANAGE)?;
+    if res.kind != KIND_TPM_SEAL {
+        return Err(Status::AccessDenied);
+    }
+    let args: TpmSealArgs = uaccess::read(args_ptr)?;
+    let auth_len = usize::try_from(args.auth_len).map_err(|_| Status::InvalidArgs)?;
+    let in_len = usize::try_from(args.input_len).map_err(|_| Status::InvalidArgs)?;
+    let out_cap = usize::try_from(args.output_cap).map_err(|_| Status::InvalidArgs)?;
+    let max_in = if unseal { SEAL_BLOB_MAX } else { SEAL_DATA_MAX };
+    if auth_len > SEAL_AUTH_MAX || in_len == 0 || in_len > max_in {
+        return Err(Status::InvalidArgs);
+    }
+    uaccess::check(args.output, out_cap as u64)?;
+    let mut auth = [0u8; SEAL_AUTH_MAX];
+    if auth_len > 0
+        && let Err(e) = uaccess::copy_from_user(&mut auth[..auth_len], args.auth)
+    {
+        doscrypt::ct::wipe_bytes(&mut auth);
+        return Err(e);
+    }
+    let mut input = alloc::vec![0u8; in_len];
+    if let Err(e) = uaccess::copy_from_user(&mut input, args.input) {
+        doscrypt::ct::wipe_bytes(&mut auth);
+        doscrypt::ct::wipe_bytes(&mut input);
+        return Err(e);
+    }
+    let res = if unseal {
+        crate::security::tpm_unseal(&auth[..auth_len], &input)
+    } else {
+        crate::security::tpm_seal(&auth[..auth_len], &input)
+    };
+    doscrypt::ct::wipe_bytes(&mut auth);
+    doscrypt::ct::wipe_bytes(&mut input);
+    let mut out = res?;
+    if out.len() > out_cap {
+        doscrypt::ct::wipe_bytes(&mut out);
+        return Err(Status::BufferTooSmall);
+    }
+    let copy_res = uaccess::copy_to_user(args.output, &out);
+    let n = out.len() as i64;
+    doscrypt::ct::wipe_bytes(&mut out);
+    copy_res?;
+    Ok(n)
+}
+
 /// attest_activate(challenge, out): answer a verifier's credential challenge with the TPM
 /// (security/attest.rs): `challenge` is the credential blob (`TPM2B_ID_OBJECT`) followed by the
 /// encrypted secret (`TPM2B_ENCRYPTED_SECRET`), `doscrypt::tpm::CHALLENGE` bytes; the 32-byte
@@ -1148,6 +1215,8 @@ fn sys_frame(u: &UserThread, n: u64, a: [u64; 6], f: Option<&mut Frame>) -> KRes
         nr::PROCESS_HANDLES => process_handles(u, a[0], a[1], a[2]),
         nr::GET_RANDOM => get_random(a[0], a[1], a[2]),
         nr::DEVICE_BAR_ADDR => device_bar_addr(u, a[0], a[1]),
+        nr::TPM_SEAL => tpm_seal_op(u, a[0], a[1], false),
+        nr::TPM_UNSEAL => tpm_seal_op(u, a[0], a[1], true),
         #[cfg(ktest)]
         nr::KTEST_SMAP => {
             // SAFETY: test builds only: makes the kernel fault on purpose (SMAP).

@@ -1,0 +1,12 @@
+name = "svc-id-ungranted"
+image = "ltest.dx"
+args = "svc-id-ungranted"
+group = "test"
+after = ["identity"]
+description = "identity test: ungranted service receives neither TPM_SEAL nor identity endpoints"
+
+[grants]
+log = true
+
+[restart]
+policy = "never"

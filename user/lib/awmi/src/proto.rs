@@ -140,6 +140,8 @@ pub struct AwmiStatus {
     pub fonts: bool,
     /// Launcher entries registered by programs.
     pub apps: u8,
+    /// Compositor lock / login screen is engaged.
+    pub locked: bool,
 }
 
 impl AwmiStatus {
@@ -163,6 +165,7 @@ impl AwmiStatus {
         out[60] = u8::from(self.launcher_open);
         out[61] = u8::from(self.fonts);
         out[62] = self.apps;
+        out[63] = u8::from(self.locked);
     }
 
     pub fn decode(b: &[u8]) -> Option<Self> {
@@ -193,6 +196,7 @@ impl AwmiStatus {
             launcher_open: b[60] != 0,
             fonts: b[61] != 0,
             apps: b[62],
+            locked: b[63] != 0,
         })
     }
 }

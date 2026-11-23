@@ -68,3 +68,6 @@ pub const MGR_STOP: u32 = 311;
 pub const MGR_RESTART: u32 = 312;
 pub const MGR_OBJECTS: u32 = 313;
 pub const MGR_POWER: u32 = 314;
+/// `grants.manager = ["apps"]` (`appmgr`): request a fresh verified client channel to a safe
+/// service endpoint (`<service>.<endpoint>\0<verified_app_name>`). Reply carries the channel handle.
+pub const MGR_LINK: u32 = 315;

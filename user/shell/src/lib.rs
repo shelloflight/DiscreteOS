@@ -102,6 +102,10 @@ pub struct Shell {
     pub gpu_query: Handle,
     pub awmi_admin: Handle,
     pub awmi_query: Handle,
+    pub identity_admin: Handle,
+    pub identity_query: Handle,
+    pub appmgr_admin: Handle,
+    pub appmgr_query: Handle,
     pub jobs: Vec<Job>,
     next_job: u32,
     /// The job whose output the terminal is waiting for.
@@ -886,6 +890,10 @@ fn main(s: *const Startup) -> i32 {
         gpu_query: svc::endpoint(b"gpu.query"),
         awmi_admin: svc::endpoint(b"awmi.admin"),
         awmi_query: svc::endpoint(b"awmi.query"),
+        identity_admin: svc::endpoint(b"identity.admin"),
+        identity_query: svc::endpoint(b"identity.query"),
+        appmgr_admin: svc::endpoint(b"appmgr.admin"),
+        appmgr_query: svc::endpoint(b"appmgr.query"),
         jobs: Vec::new(),
         next_job: 1,
         fg: None,
@@ -955,6 +963,10 @@ fn main(s: *const Startup) -> i32 {
                                     b"gpu.query" => &mut sh.gpu_query,
                                     b"awmi.admin" => &mut sh.awmi_admin,
                                     b"awmi.query" => &mut sh.awmi_query,
+                                    b"identity.admin" => &mut sh.identity_admin,
+                                    b"identity.query" => &mut sh.identity_query,
+                                    b"appmgr.admin" => &mut sh.appmgr_admin,
+                                    b"appmgr.query" => &mut sh.appmgr_query,
                                     _ => {
                                         sys::handle_close(handle);
                                         continue;

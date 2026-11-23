@@ -46,6 +46,11 @@ const REG_RDSAR_LO: u64 = 0xE4;
 const REG_RDSAR_HI: u64 = 0xE8;
 const REG_MTPS: u64 = 0xEC;
 const REG_MISC: u64 = 0xF0;
+/// RTL8125/8126/8127 Receive Side Scaling and RX queue count control registers.
+/// Must be cleared for single-queue RX so unicast IPv4/UDP/ICMP/TCP frames are not
+/// hashed into unconfigured RX queues 1..3 (e.g. after a warm reboot from Windows).
+const REG_RSS_CTRL_8125: u64 = 0x4500;
+const REG_Q_NUM_CTRL_8125: u64 = 0x4800;
 
 const CMD_TX_EN: u8 = 1 << 2;
 const CMD_RX_EN: u8 = 1 << 3;
@@ -230,6 +235,10 @@ pub fn main(s: *const Startup) -> i32 {
         mmio.w8(REG_TDFNR, 0x10);
         mmio.w8(REG_INT_CFG0_8125, 0x00);
         mmio.w16(REG_INT_CFG1_8125, 0x0000);
+        if info.bar_size[bar] >= REG_Q_NUM_CTRL_8125 + 2 {
+            mmio.w32(REG_RSS_CTRL_8125, 0);
+            mmio.w16(REG_Q_NUM_CTRL_8125, 0);
+        }
     } else {
         mmio.w8(REG_MTPS, 0x3B);
     }

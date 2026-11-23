@@ -147,6 +147,14 @@ impl Screen {
             for off in (0..map.len).step_by(4) {
                 map.w32(off, 0);
             }
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Flush buffered write-combining framebuffer pixels to VRAM.
+    pub fn flush(&self) {
+        if matches!(self.backend, Backend::Fb { .. }) {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         }
     }
 

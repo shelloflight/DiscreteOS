@@ -725,3 +725,154 @@ fn amd_dccg_dto_source_clock_derivation_and_ip_discovery_v4() {
     let parsed_v2 = amd::parse_ip_discovery(&img_v2_pad).expect("v2 with non-zero pad byte must parse as 32-bit");
     assert_eq!(parsed_v2.find(amd::HWID_DCE, 0).map(|b| b.bases[0]), Some(blocks[0].bases[0]));
 }
+
+#[test]
+fn cvt_rb_timing_synthesis_edid_vics_and_resolution_mode_switch_revert() {
+    use crate::amd::dcn::{
+        DcnAccess, DcnVersion, RegAddr, find_pipe_dig_encoder, probe_pipe_dpp_size_regs,
+    };
+    use crate::amd::flip::program_mode_regs_ex;
+    use crate::amd::sim::{DcnSim, default_ip_blocks};
+    use crate::edid::DetailedTiming;
+
+    // 1. CVT-RB v2 synthesis produces accurate pixel clocks and refresh rates across common modes.
+    for &(w, h, hz_mhz) in &[
+        (1920u32, 1080u32, 60_000u32),
+        (1920, 1080, 144_000),
+        (1920, 1080, 240_000),
+        (2560, 1440, 144_000),
+        (2560, 1440, 240_000),
+        (3840, 2160, 60_000),
+        (1280, 800, 60_000),
+    ] {
+        let t = DetailedTiming::cvt_rb(w, h, hz_mhz).expect("valid CVT-RB timing");
+        assert_eq!((t.h_active, t.v_active), (w, h));
+        assert!(t.refresh_mhz.abs_diff(hz_mhz) < 500, "{}x{}@{} got {}", w, h, hz_mhz, t.refresh_mhz);
+        assert!(t.pixel_clock_khz > 50_000);
+    }
+    assert!(DetailedTiming::cvt_rb(100, 100, 60_000).is_none());
+
+    // 2. Active DIG encoder lookup + DPP geometry discovery + resolution switch + atomic restore.
+    let blocks = default_ip_blocks(DcnVersion::Dcn401);
+    let dcn = DcnAccess::new(DcnVersion::Dcn401, blocks[0], Some(blocks[1]), Some(blocks[2]), Some(blocks[3]));
+    let mut sim = DcnSim::new(DcnVersion::Dcn401, 0x0080_0000_0000, 16 << 30);
+    let r = dcn.regs;
+    let boot_mode = DetailedTiming::cvt_rb(1920, 1080, 60_000).unwrap();
+    let boot_mc = 0x0080_0010_0000u64;
+    sim.setup_active_pipe(0, &boot_mode, 1920, boot_mc);
+
+    // Route pipe 0 to DIG encoder 2 (`DIG_BE_EN = 1`, `DIG_FE source = 0`).
+    dcn.w_dcn(&mut sim, r.dig_be_en_cntl(2), 1);
+    dcn.w_dcn(&mut sim, r.dig_fe_cntl(2), 0);
+    assert_eq!(find_pipe_dig_encoder(&sim, &dcn, 0), 2);
+
+    // Populate simulated DPP DSCL_RECOUT_SIZE and DSCL_MPC_SIZE registers with 1920x1080.
+    let dpp_base = r.cnvc_pixel_format(0).base_idx;
+    let recout_off = r.cnvc_pixel_format(0).off + 0x40;
+    let mpc_off = r.cnvc_pixel_format(0).off + 0x41;
+    let dim_1080 = 1920u32 | (1080u32 << 16);
+    dcn.w_dcn(&mut sim, RegAddr::new(dpp_base, recout_off), dim_1080);
+    dcn.w_dcn(&mut sim, RegAddr::new(dpp_base, mpc_off), dim_1080);
+
+    let (dpp_regs, dpp_n) = probe_pipe_dpp_size_regs(&sim, &dcn, 0, 1920, 1080);
+    assert_eq!(dpp_n, 2);
+    assert_eq!(&dpp_regs[..2], &[recout_off, mpc_off]);
+
+    // Switch resolution to 2560x1440 @ 144 Hz on encoder 2 with new scanout buffer.
+    let target = DetailedTiming::cvt_rb(2560, 1440, 144_000).unwrap();
+    let new_mc = 0x0080_0100_0000u64;
+    let saved = program_mode_regs_ex(
+        &mut sim,
+        &dcn,
+        0,
+        2,
+        &target,
+        1_000_000,
+        false,
+        8,
+        8,
+        Some(2560),
+        Some(new_mc),
+        &dpp_regs[..dpp_n],
+    );
+    let dim_1440 = 2560u32 | (1440u32 << 16);
+    assert_eq!(dcn.r_dcn(&sim, r.hubp_viewport_dim(0)), Some(dim_1440));
+    assert_eq!(dcn.r_dcn(&sim, r.hubp_surface_pitch(0)), Some(2559));
+    assert_eq!(dcn.r_dcn(&sim, RegAddr::new(dpp_base, recout_off)), Some(dim_1440));
+    assert_eq!(dcn.r_dcn(&sim, RegAddr::new(dpp_base, mpc_off)), Some(dim_1440));
+    assert_eq!(dcn.r_dcn(&sim, r.dp_msa_timing_param4(2)), Some((2560 << 16) | 1440));
+
+    // Full restore reverts OTG, MSA (enc 2), HUBP viewport/pitch/surface, and DPP size regs.
+    saved.restore(&mut sim, &dcn);
+    assert_eq!(dcn.r_dcn(&sim, r.hubp_viewport_dim(0)), Some(dim_1080));
+    assert_eq!(dcn.r_dcn(&sim, r.hubp_surface_pitch(0)), Some(1919));
+    assert_eq!(dcn.r_dcn(&sim, RegAddr::new(dpp_base, recout_off)), Some(dim_1080));
+    assert_eq!(dcn.r_dcn(&sim, RegAddr::new(dpp_base, mpc_off)), Some(dim_1080));
+
+    // A boot-mode snapshot pinned to the untouched GOP surface address always restores GOP
+    // even if a native scanout buffer was active when switching modes.
+    let native_buf = 0x0080_0200_0000u64;
+    let boot_snap = crate::amd::flip::SavedModeRegs::capture_ex(&sim, &dcn, 0, 2, &dpp_regs[..dpp_n], true)
+        .with_surface_addr(boot_mc);
+    assert_eq!(boot_snap.surface_mc_addr(), boot_mc);
+    let _ = program_mode_regs_ex(
+        &mut sim,
+        &dcn,
+        0,
+        2,
+        &target,
+        1_000_000,
+        false,
+        8,
+        8,
+        Some(2560),
+        Some(native_buf),
+        &dpp_regs[..dpp_n],
+    );
+    assert_eq!(
+        crate::amd::dcn::decode_surface_addr(
+            dcn.r_dcn(&sim, r.hubp_primary_addr(0)).unwrap(),
+            dcn.r_dcn(&sim, r.hubp_primary_addr_hi(0)).unwrap(),
+        ),
+        native_buf
+    );
+    boot_snap.restore(&mut sim, &dcn);
+    assert_eq!(dcn.r_dcn(&sim, r.hubp_viewport_dim(0)), Some(dim_1080));
+    assert_eq!(dcn.r_dcn(&sim, r.hubp_surface_pitch(0)), Some(1919));
+    assert_eq!(
+        crate::amd::dcn::decode_surface_addr(
+            dcn.r_dcn(&sim, r.hubp_primary_addr(0)).unwrap(),
+            dcn.r_dcn(&sim, r.hubp_primary_addr_hi(0)).unwrap(),
+        ),
+        boot_mc
+    );
+
+    // 3. Verify DP_VID_M_N_GEN_EN, DP_STEER_FIFO reset pulse, VRR OTG_SET_V_TOTAL_MIN_MASK_EN,
+    // and DPCD 0x107 Adaptive-Sync toggling.
+    dcn.w_dcn(&mut sim, r.dp_vid_timing(2), 0x100);
+    let _s2 = program_mode_regs_ex(
+        &mut sim,
+        &dcn,
+        0,
+        2,
+        &target,
+        1_000_000,
+        false,
+        8,
+        8,
+        None,
+        None,
+        &[],
+    );
+    assert_eq!(dcn.r_dcn(&sim, r.dp_vid_timing(2)).unwrap() & 1, 1, "DP_VID_M_N_GEN_EN must be set");
+    crate::amd::flip::reset_dp_steer_fifo(&mut sim, &dcn, 2, |_| {});
+    assert_eq!(dcn.r_dcn(&sim, r.dp_steer_fifo(2)).unwrap() & 1, 0, "DP_STEER_FIFO_RESET must be cleared after pulse");
+
+    let otg = crate::amd::dcn::OtgTiming::from_detailed(&target);
+    assert!(crate::amd::flip::set_vrr(&mut sim, &dcn, 0, &otg, 144_000, 48, 144, true));
+    let vctl = dcn.r_dcn(&sim, r.otg_v_total_control(0)).unwrap();
+    assert_eq!(vctl & 0xF, 0xB, "OTG_V_TOTAL_MIN/MAX_SEL + MIN_MASK_EN must be set");
+    assert_eq!((vctl >> 16) & 0xF, 0x2, "HUBP flip mask bit must be set");
+    assert!(crate::amd::flip::set_vrr(&mut sim, &dcn, 0, &otg, 144_000, 48, 144, false));
+    assert_eq!(dcn.r_dcn(&sim, r.otg_v_total_control(0)), Some(0));
+}

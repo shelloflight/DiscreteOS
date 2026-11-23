@@ -1,0 +1,20 @@
+name = "svc-app-full"
+image = "ltest.dx"
+args = "svc-app-full"
+group = "test"
+after = ["identity", "awmi", "appmgr", "gpu"]
+description = "app test: .dapp signing, permission prompt, live revocation, and core native apps"
+
+[grants]
+log = true
+appmgr = ["admin", "query"]
+awmi = ["admin", "query"]
+namespace = ["*"]
+
+[quota]
+memory = "32M"
+handles = 256
+threads = 4
+
+[restart]
+policy = "never"
