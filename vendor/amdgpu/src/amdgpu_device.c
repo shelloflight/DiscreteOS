@@ -134,8 +134,9 @@ int amdgpu_hw_ensure_vram_window(struct amdgpu_device *adev, u64 vram_base, u64 
     u64 aligned_base = vram_base & ~4095ULL;
     u64 end = (vram_base + len + 4095ULL) & ~4095ULL;
     u64 map_len = end - aligned_base;
-    if (map_len < (64ULL << 20)) {
-        map_len = (64ULL << 20);
+    u64 min_win = (adev->bar_sizes[0] >= (256ULL << 20)) ? (128ULL << 20) : (64ULL << 20);
+    if (map_len < min_win) {
+        map_len = min_win;
     }
     if (aligned_base + map_len > adev->bar_sizes[0]) {
         if (aligned_base >= adev->bar_sizes[0]) {

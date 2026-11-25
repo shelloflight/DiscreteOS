@@ -16,15 +16,14 @@
  * - Clean UEFI GOP hand-back (`reset_boot`) & S3 suspend/resume
  */
 
-#define OTG_MASTER_EN_BIT                  (1u << 0)
+#define OTG_MASTER_EN_MASK                 ((1u << 0) | (1u << 16))
 #define HUBP_BLANK_EN_BIT                  (1u << 0)
-#define FLIP_PENDING_BIT                   (1u << 4)
-#define FLIP_TYPE_IMMEDIATE_BIT            (1u << 0)
+#define FLIP_TYPE_IMMEDIATE_BIT            (1u << 1)
+#define FLIP_PENDING_BIT                   (1u << 8)
 #define DP_VID_M_N_GEN_EN_BIT              (1u << 0)
 #define DP_STEER_FIFO_RESET_BIT            (1u << 0)
 #define CURSOR_EN_BIT                      (1u << 0)
-#define CURSOR_MODE_PREMULT_ARGB           (3u << 8)
-#define CURSOR_UPDATE_LOCK_BIT             (1u << 16)
+#define CURSOR_MODE_ARGB_UNPREMUL          3u
 #define OTG_V_TOTAL_MIN_SEL_BIT            (1u << 0)
 #define OTG_V_TOTAL_MAX_SEL_BIT            (1u << 1)
 #define OTG_SET_V_TOTAL_MIN_MASK_EN_BIT    (1u << 2)
@@ -118,7 +117,12 @@ static void capture_pipe_snapshot(
     (void)dc_reg_read(adev, 2u, r->dp_vid_timing + dig_o, &snap->dp_vid_timing);
     (void)dc_reg_read(adev, 2u, r->dsc_top_control + (u32)pipe * r->dsc_stride, &snap->dsc_top_control);
 
-    snap->orig_mc_addr = decode_mc_addr(snap->hubp_primary_addr, snap->hubp_primary_addr_hi);
+    u32 e_lo = snap->hubp_primary_addr, e_hi = snap->hubp_primary_addr_hi;
+    (void)dc_reg_read(adev, 2u, r->hubp_earliest_inuse + hubp, &e_lo);
+    (void)dc_reg_read(adev, 2u, r->hubp_earliest_inuse_hi + hubp, &e_hi);
+    u64 earliest_mc = decode_mc_addr(e_lo, e_hi);
+    u64 primary_mc = decode_mc_addr(snap->hubp_primary_addr, snap->hubp_primary_addr_hi);
+    snap->orig_mc_addr = (earliest_mc != 0) ? earliest_mc : primary_mc;
     snap->valid = true;
 }
 
@@ -316,18 +320,31 @@ static int program_hw_cursor(
     u32 cx = (x < 0) ? 0u : (u32)x;
     u32 cy = (y < 0) ? 0u : (u32)y;
     u32 eff_sz = p->cursor_size ? p->cursor_size : 64u;
+    u32 hx = (x < 0) ? ((u32)hot_x + (u32)(-x)) : (u32)hot_x;
+    u32 hy = (y < 0) ? ((u32)hot_y + (u32)(-y)) : (u32)hot_y;
+    if (hx >= eff_sz) hx = eff_sz - 1u;
+    if (hy >= eff_sz) hy = eff_sz - 1u;
+    u32 pitch_code = (eff_sz == 256u) ? 2u : ((eff_sz == 128u) ? 1u : 0u);
+    u32 lines_per_chunk = (eff_sz == 256u) ? 1u : ((eff_sz == 128u) ? 2u : 3u);
     u32 lo = 0, hi = 0;
     encode_mc_addr(p->cursor_mc, &lo, &hi);
 
-    (void)dc_reg_write(adev, 2u, r->cursor_control + hubp, CURSOR_UPDATE_LOCK_BIT | CURSOR_MODE_PREMULT_ARGB | CURSOR_EN_BIT);
+    /* Program HUBP cursor address (HIGH then LOW), size, hotspot, settings, and control (dcn10_hubp.c). */
     (void)dc_reg_write(adev, 2u, r->cursor_addr_hi + hubp, hi);
     (void)dc_reg_write(adev, 2u, r->cursor_addr + hubp, lo);
     (void)dc_reg_write(adev, 2u, r->cursor_size + hubp, (((eff_sz - 1u) & 0xFFFFu) << 16) | ((eff_sz - 1u) & 0xFFFFu));
-    (void)dc_reg_write(adev, 2u, r->cursor_hot_spot + hubp, ((u32)hot_y << 16) | (u32)hot_x);
-    (void)dc_reg_write(adev, 2u, r->cursor_position + hubp, ((cy & 0xFFFFu) << 16) | (cx & 0xFFFFu));
+    (void)dc_reg_write(adev, 2u, r->cursor_hot_spot + hubp, ((hx & 0x3FFFu) << 16) | (hy & 0x3FFFu));
+    (void)dc_reg_write(adev, 2u, r->hubp_cursor_settings + hubp, 3u << 8);
     (void)dc_reg_write(adev, 2u, r->cursor_dst_offset + hubp, 0u);
-    (void)dc_reg_write(adev, 2u, r->cursor_control + hubp, CURSOR_MODE_PREMULT_ARGB | CURSOR_EN_BIT);
-    (void)dc_reg_write(adev, 2u, r->dpp_cursor_control + dpp, CURSOR_MODE_PREMULT_ARGB | CURSOR_EN_BIT);
+    /* CURSOR_POSITION: X at bits [29:15], Y at bits [14:0] (dcn_4_1_0_sh_mask.h). */
+    (void)dc_reg_write(adev, 2u, r->cursor_position + hubp, ((cx & 0x7FFFu) << 15) | (cy & 0x7FFFu));
+    u32 hubp_cur_ctl = CURSOR_EN_BIT
+        | (CURSOR_MODE_ARGB_UNPREMUL << 8)
+        | (pitch_code << 16)
+        | (lines_per_chunk << 24);
+    (void)dc_reg_write(adev, 2u, r->cursor_control + hubp, hubp_cur_ctl);
+    /* DPP CM_CUR/CNVC_CUR: CUR0_ENABLE=1 (bit 0), CUR0_MODE (bits 6:4). */
+    (void)dc_reg_write(adev, 2u, r->dpp_cursor_control + dpp, CURSOR_EN_BIT | ((CURSOR_MODE_ARGB_UNPREMUL & 0x7u) << 4));
 
     p->cursor_enabled = true;
     p->cursor_x = x;
@@ -531,21 +548,21 @@ int dc_init(struct amdgpu_device *adev) {
     for (u8 pipe = 0; pipe < r->max_pipes && pipe < DC_MAX_PIPES; pipe++) {
         u32 otg_ctl = 0, hubp_ctl = 0, ht = 0, vt = 0, hb = 0, vb = 0;
         if (!dc_reg_read(adev, 2u, r->otg_control + (u32)pipe * r->otg_stride, &otg_ctl)) continue;
-        if ((otg_ctl & OTG_MASTER_EN_BIT) == 0) continue;
+        if (otg_ctl == 0xFFFFFFFFu || (otg_ctl & OTG_MASTER_EN_MASK) == 0) continue;
         if (!dc_reg_read(adev, 2u, r->hubp_cntl + (u32)pipe * r->hubp_stride, &hubp_ctl)) continue;
-        if ((hubp_ctl & HUBP_BLANK_EN_BIT) != 0) continue;
+        if (hubp_ctl == 0xFFFFFFFFu || (hubp_ctl & HUBP_BLANK_EN_BIT) != 0) continue;
 
         (void)dc_reg_read(adev, 2u, r->otg_h_total + (u32)pipe * r->otg_stride, &ht);
         (void)dc_reg_read(adev, 2u, r->otg_v_total + (u32)pipe * r->otg_stride, &vt);
         (void)dc_reg_read(adev, 2u, r->otg_h_blank + (u32)pipe * r->otg_stride, &hb);
         (void)dc_reg_read(adev, 2u, r->otg_v_blank + (u32)pipe * r->otg_stride, &vb);
 
-        u32 h_total = (ht & 0xFFFFu) + 1u;
-        u32 v_total = (vt & 0xFFFFu) + 1u;
-        u32 h_bstart = hb & 0xFFFFu;
-        u32 h_bend = (hb >> 16) & 0xFFFFu;
-        u32 v_bstart = vb & 0xFFFFu;
-        u32 v_bend = (vb >> 16) & 0xFFFFu;
+        u32 h_total = (ht & 0x7FFFu) + 1u;
+        u32 v_total = (vt & 0x7FFFu) + 1u;
+        u32 h_bstart = hb & 0x7FFFu;
+        u32 h_bend = (hb >> 16) & 0x7FFFu;
+        u32 v_bstart = vb & 0x7FFFu;
+        u32 v_bend = (vb >> 16) & 0x7FFFu;
         u32 w = (h_bstart > h_bend) ? (h_bstart - h_bend) : 0u;
         u32 h = (v_bstart > v_bend) ? (v_bstart - v_bend) : 0u;
         if (w < 320u || w > 7680u || h < 200u || h > 4320u) continue;
@@ -557,27 +574,67 @@ int dc_init(struct amdgpu_device *adev) {
         p->dig_idx = (u8)find_dig_for_pipe(adev, r, pipe);
         p->pending_buf = -1;
 
-        /* Pair with first connected connector (or matching index). */
+        /* Pair with connected connector: prefer exact DIG match with EDID, then any EDID sink, then any connected sink. */
         p->conn_idx = 0;
+        bool paired = false;
         for (u32 ci = 0; ci < dc->connector_count; ci++) {
-            if (dc->connectors[ci].connected) {
+            if (dc->connectors[ci].connected && dc->connectors[ci].edid_blocks > 0 && ci == p->dig_idx) {
                 p->conn_idx = (u8)ci;
-                if (ci == p->dig_idx) break;
+                paired = true;
+                break;
+            }
+        }
+        if (!paired) {
+            for (u32 ci = 0; ci < dc->connector_count; ci++) {
+                if (dc->connectors[ci].connected && dc->connectors[ci].edid_blocks > 0) {
+                    p->conn_idx = (u8)ci;
+                    paired = true;
+                    break;
+                }
+            }
+        }
+        if (!paired) {
+            for (u32 ci = 0; ci < dc->connector_count; ci++) {
+                if (dc->connectors[ci].connected) {
+                    p->conn_idx = (u8)ci;
+                    if (ci == p->dig_idx) break;
+                }
             }
         }
 
         capture_pipe_snapshot(adev, r, pipe, p->dig_idx, &p->boot_snapshot);
 
-        /* Measure live refresh rate from OTG_STATUS_FRAME_COUNT over ~35 ms. */
+        /* Measure live refresh rate from OTG_STATUS_FRAME_COUNT (bounded to ~55 ms, exits early at high Hz). */
         u32 fc0 = read_otg_frame_count(adev, r, pipe);
-        u64 t0 = amdgpu_now_ns(adev);
-        amdgpu_udelay(adev, 35000u);
-        u32 fc1 = read_otg_frame_count(adev, r, pipe);
-        u64 t1 = amdgpu_now_ns(adev);
-        u32 df = frame_count_delta(fc1, fc0);
+        u32 fc_start = fc0;
+        u64 t_start = amdgpu_now_ns(adev);
+        for (u32 step = 0; step < 25u; step++) {
+            amdgpu_udelay(adev, 1000u);
+            u32 cur = read_otg_frame_count(adev, r, pipe);
+            if (cur != fc0) {
+                fc_start = cur;
+                t_start = amdgpu_now_ns(adev);
+                break;
+            }
+        }
+        u32 fc_last = fc_start;
+        u64 t_last = t_start;
+        for (u32 step = 0; step < 50u; step++) {
+            amdgpu_udelay(adev, 1000u);
+            u32 cur = read_otg_frame_count(adev, r, pipe);
+            if (cur != fc_last) {
+                fc_last = cur;
+                t_last = amdgpu_now_ns(adev);
+                if (frame_count_delta(fc_last, fc_start) >= 3u && (t_last - t_start) >= 12000000ULL) {
+                    break;
+                }
+            }
+        }
+        u32 df = frame_count_delta(fc_last, fc_start);
+        u32 total_df = frame_count_delta(fc_last, fc0);
         u32 refresh_mhz = 60000u;
-        if (df > 0 && t1 > t0) {
-            u64 dt_ns = t1 - t0;
+        if (df > 0 && t_last > t_start) {
+            u64 dt_ns = t_last - t_start;
             u64 mhz = ((u64)df * 1000000000000ULL) / dt_ns;
             if (mhz >= 24000ULL && mhz <= 1000000ULL) {
                 refresh_mhz = (u32)mhz;
@@ -612,9 +669,10 @@ int dc_init(struct amdgpu_device *adev) {
             if (adev->gmc.gop_vram_size < (8ULL << 20)) adev->gmc.gop_vram_size = (8ULL << 20);
         }
 
-        /* Allocate 3 scanout buffers sized for up to 4K (3840x2160x4 = 32 MiB max or current pitch*h). */
+        /* Allocate 3 scanout buffers: 32 MiB each on large ReBAR GPUs (supports up to 4K modesets), else 16 MiB. */
         u64 max_buf = (u64)p->pitch_bytes * (u64)h;
-        if (max_buf < (16ULL << 20)) max_buf = (16ULL << 20);
+        u64 min_buf = (adev->gmc.visible_vram_size >= (256ULL << 20)) ? (32ULL << 20) : (16ULL << 20);
+        if (max_buf < min_buf) max_buf = min_buf;
         p->scanout_buf_size = max_buf;
         p->buf_count = 0;
         for (u32 b = 0; b < DC_MAX_SCANOUT_BUFS; b++) {
@@ -647,8 +705,8 @@ int dc_init(struct amdgpu_device *adev) {
             }
         }
 
-        /* Perform fast 1-vblank flip latch verification only if we have >=2 scanout buffers. */
-        if (p->buf_count >= 2u && df > 0) {
+        /* Verified once >=2 scanout buffers are allocated and OTG frame counter is advancing. */
+        if (p->buf_count >= 2u && total_df > 0) {
             p->verified = true;
         }
 
@@ -843,6 +901,9 @@ int dc_atomic_check_and_commit(
         u64 dst_vram = p->scanout_vram[next_buf];
         u64 dst_mc = p->scanout_mc[next_buf];
         u32 copy_h = req->primary_height < p->current_mode.v_active ? req->primary_height : p->current_mode.v_active;
+        if (p->pitch_bytes > 0 && (u64)copy_h * (u64)p->pitch_bytes > p->scanout_buf_size) {
+            copy_h = (u32)(p->scanout_buf_size / (u64)p->pitch_bytes);
+        }
         u32 row_bytes = req->primary_width * 4u;
         if (row_bytes > req->primary_pitch) row_bytes = req->primary_pitch;
         if (row_bytes > p->pitch_bytes) row_bytes = p->pitch_bytes;
@@ -923,12 +984,15 @@ bool dc_poll_vblank(
         struct dc_pipe_state *p = &dc->pipes[i];
         if (p->pending_buf < 0) continue;
         u32 hubp = (u32)p->pipe_idx * dc->regs->hubp_stride;
-        u32 fctl = 0;
+        u32 fctl = 0, e_lo = 0, e_hi = 0;
         (void)dc_reg_read(adev, 2u, dc->regs->hubp_flip_control + hubp, &fctl);
+        (void)dc_reg_read(adev, 2u, dc->regs->hubp_earliest_inuse + hubp, &e_lo);
+        (void)dc_reg_read(adev, 2u, dc->regs->hubp_earliest_inuse_hi + hubp, &e_hi);
+        u64 earliest = decode_mc_addr(e_lo, e_hi);
         u64 frame_ns = p->current_mode.refresh_mhz
             ? (1000000000000ULL / (u64)p->current_mode.refresh_mhz)
             : 16666667ULL;
-        bool hw_done = ((fctl & FLIP_PENDING_BIT) == 0);
+        bool hw_done = ((fctl & FLIP_PENDING_BIT) == 0) && (earliest == 0 || earliest == p->pending_mc);
         bool timer_done = (now >= p->last_flip_ns + frame_ns);
         if (hw_done || timer_done) {
             bool late = (now > p->last_flip_ns + frame_ns * 2ULL);

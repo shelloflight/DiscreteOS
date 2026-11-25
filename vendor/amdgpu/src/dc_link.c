@@ -12,16 +12,23 @@
  * - Multi-monitor HPD hotplug scanning
  */
 
-/* DP AUX register bitmasks (AMD DCN 3.x / 4.x). */
+/* DP AUX register bitmasks (AMD DCN 3.x / 4.x, matching dcn_4_1_0_sh_mask.h & dce_aux.c). */
 #define AUX_EN_BIT                         (1u << 0)
 #define AUX_SW_GO_BIT                      (1u << 0)
 #define AUX_SW_AUTOINC_DISABLE_BIT         (1u << 31)
-#define AUX_ARB_SW_REQ_BIT                 (1u << 0)
-#define AUX_ARB_SW_DONE_BIT                (1u << 4)
-#define AUX_ARB_SW_USE_BIT                 (1u << 8)
+#define AUX_SW_DONE_ACK_BIT                (1u << 1)
+#define AUX_ARB_SW_REQ_BIT                 (1u << 16)
+#define AUX_ARB_SW_DONE_BIT                (1u << 17)
+#define AUX_ARB_STATUS_SHIFT               2u
+#define AUX_ARB_STATUS_MASK                0x3u
+#define AUX_ARB_STATUS_SW_OWNED            1u
+#define AUX_ARB_STATUS_DMCU_OWNED          2u
 #define AUX_SW_DONE_BIT                    (1u << 0)
-#define AUX_SW_TIMEOUT_BIT                 (1u << 1)
-#define AUX_SW_RX_ERR_MASK                 0x0000003Cu
+#define AUX_SW_RX_TIMEOUT_BIT              (1u << 7)
+#define AUX_SW_HPD_DISCON_BIT              (1u << 9)
+#define AUX_SW_RX_ERR_MASK                 ((1u << 8) | (1u << 10) | (1u << 11) | (1u << 12) \
+                                           | (1u << 14) | (1u << 17) | (1u << 18) | (1u << 19) \
+                                           | (1u << 20) | (1u << 22) | (1u << 23))
 #define AUX_SW_REPLY_BYTES_SHIFT           24u
 #define AUX_SW_REPLY_BYTES_MASK            0x1Fu
 
@@ -100,33 +107,47 @@ int dc_aux_transfer(
     u32 r_ctrl = regs->aux_control + stride;
     u32 r_sw_ctrl = regs->aux_sw_control + stride;
     u32 r_arb = regs->aux_arb_control + stride;
+    u32 r_intr = regs->aux_interrupt_control + stride;
     u32 r_status = regs->aux_sw_status + stride;
     u32 r_data = regs->aux_sw_data + stride;
 
-    /* Ensure AUX engine is enabled and acquire SW semaphore via AUX_ARB_CONTROL. */
+    /* Acquire SW AUX semaphore via AUX_ARB_CONTROL (fail only if DMCU explicitly holds ownership). */
+    u32 arb0 = 0;
+    if (!dc_reg_read(adev, 2u, r_arb, &arb0) || arb0 == 0xFFFFFFFFu) {
+        return -ENODEV;
+    }
+    (void)dc_reg_write(adev, 2u, r_arb, arb0 | AUX_ARB_SW_REQ_BIT);
+    bool arb_ok = false;
+    for (u32 i = 0; i < 256u; i++) {
+        u32 arb = 0;
+        if (dc_reg_read(adev, 2u, r_arb, &arb)) {
+            u32 st = (arb >> AUX_ARB_STATUS_SHIFT) & AUX_ARB_STATUS_MASK;
+            if (st == AUX_ARB_STATUS_SW_OWNED || (st != AUX_ARB_STATUS_DMCU_OWNED && i >= 32u)) {
+                arb_ok = true;
+                break;
+            }
+        }
+        if ((i & 15u) == 15u) {
+            amdgpu_udelay(adev, 5u);
+        }
+    }
+    if (!arb_ok) {
+        (void)dc_reg_write(adev, 2u, r_arb, AUX_ARB_SW_DONE_BIT);
+        return -EBUSY;
+    }
+
+    /* Ensure AUX engine is enabled (preserve HPD selection and timing configuration). */
     u32 ctrl = 0;
     if (!dc_reg_read(adev, 2u, r_ctrl, &ctrl)) {
+        (void)dc_reg_write(adev, 2u, r_arb, AUX_ARB_SW_DONE_BIT);
         return -ENODEV;
     }
     if ((ctrl & AUX_EN_BIT) == 0) {
         (void)dc_reg_write(adev, 2u, r_ctrl, ctrl | AUX_EN_BIT);
     }
-    (void)dc_reg_write(adev, 2u, r_arb, AUX_ARB_SW_REQ_BIT);
-    bool arb_ok = false;
-    for (u32 i = 0; i < 64u; i++) {
-        u32 arb = 0;
-        if (dc_reg_read(adev, 2u, r_arb, &arb) && (arb & AUX_ARB_SW_USE_BIT) != 0) {
-            arb_ok = true;
-            break;
-        }
-        amdgpu_udelay(adev, 10u);
-    }
-    if (!arb_ok) {
-        /* Some firmware/sim configurations grant SW immediately without setting SW_USE. */
-        (void)dc_reg_write(adev, 2u, r_arb, AUX_ARB_SW_REQ_BIT);
-    }
 
     bool is_read = ((cmd & 0x01u) != 0);
+    bool is_i2c = ((cmd & 0x08u) == 0);
     u8 hdr[4];
     hdr[0] = (u8)(((cmd & 0x0Fu) << 4) | ((addr >> 16) & 0x0Fu));
     hdr[1] = (u8)((addr >> 8) & 0xFFu);
@@ -134,61 +155,117 @@ int dc_aux_transfer(
     hdr[3] = (len > 0) ? (u8)(len - 1u) : 0u;
     u32 tx_bytes = (len == 0) ? 3u : (is_read ? 4u : (4u + (u32)len));
 
-    /* Write TX header + payload with index=0 and autoincrement disabled per verified DCN 4.0.1 fix. */
-    for (u32 i = 0; i < tx_bytes; i++) {
-        u8 b = (i < 4u) ? hdr[i] : (data ? data[i - 4u] : 0u);
-        u32 dw = AUX_SW_AUTOINC_DISABLE_BIT | ((i & 0x1Fu) << 16) | ((u32)b << 8);
-        (void)dc_reg_write(adev, 2u, r_data, dw);
-    }
-
-    /* Kick AUX_SW_CONTROL: AUX_SW_GO | ((tx_bytes - 1) << 16). */
-    (void)dc_reg_write(adev, 2u, r_sw_ctrl, AUX_SW_GO_BIT | (((tx_bytes - 1u) & 0x1Fu) << 16));
-
     int rc = -ETIMEDOUT;
-    for (u32 i = 0; i < 200u; i++) {
+    u32 defers = 0u;
+    u32 timeouts = 0u;
+
+    for (;;) {
+        /* Clear any stale SW_DONE interrupt status before kicking a new transaction. */
+        (void)dc_reg_write(adev, 2u, r_intr, AUX_SW_DONE_ACK_BIT);
+
+        /* Write TX header + payload with explicit index and autoincrement disabled (dce_aux.c). */
+        for (u32 i = 0; i < tx_bytes; i++) {
+            u8 b = (i < 4u) ? hdr[i] : (data ? data[i - 4u] : 0u);
+            u32 dw = AUX_SW_AUTOINC_DISABLE_BIT | ((i & 0x1Fu) << 16) | ((u32)b << 8);
+            (void)dc_reg_write(adev, 2u, r_data, dw);
+        }
+
+        /* Kick AUX_SW_CONTROL: AUX_SW_GO | (tx_bytes << 16) (exact byte count, NOT tx_bytes - 1). */
+        (void)dc_reg_write(adev, 2u, r_sw_ctrl, AUX_SW_GO_BIT | ((tx_bytes & 0x1Fu) << 16));
+
         u32 st = 0;
-        if (!dc_reg_read(adev, 2u, r_status, &st)) {
+        bool done = false;
+        bool io_err = false;
+        for (u32 i = 0; i < 400u; i++) {
+            if (!dc_reg_read(adev, 2u, r_status, &st)) {
+                io_err = true;
+                break;
+            }
+            if ((st & AUX_SW_DONE_BIT) != 0) {
+                done = true;
+                break;
+            }
+            amdgpu_udelay(adev, 10u);
+        }
+        (void)dc_reg_write(adev, 2u, r_intr, AUX_SW_DONE_ACK_BIT);
+
+        if (io_err) {
             rc = -EIO;
             break;
         }
-        if ((st & AUX_SW_DONE_BIT) != 0) {
-            if ((st & AUX_SW_TIMEOUT_BIT) != 0 || (st & AUX_SW_RX_ERR_MASK) != 0) {
-                rc = -EIO;
-                break;
+        if (!done || (st & AUX_SW_RX_TIMEOUT_BIT) != 0) {
+            timeouts++;
+            if (timeouts <= 3u) {
+                amdgpu_udelay(adev, 500u);
+                continue;
             }
-            u32 rx_cnt = (st >> AUX_SW_REPLY_BYTES_SHIFT) & AUX_SW_REPLY_BYTES_MASK;
-            if (rx_cnt == 0) {
-                rc = -EIO;
-                break;
-            }
-            /* Read reply byte 0 (ACK/NACK/DEFER) with read mode bit (bit 0 = 1). */
-            (void)dc_reg_write(adev, 2u, r_data, AUX_SW_AUTOINC_DISABLE_BIT | 1u);
-            u32 d0 = 0;
-            (void)dc_reg_read(adev, 2u, r_data, &d0);
-            u8 reply = (u8)((d0 >> 8) & 0xFFu);
-            if (reply_out) *reply_out = reply;
-            if ((reply & 0x30u) != 0) {
-                rc = -EAGAIN; /* DEFER or NACK */
-                break;
-            }
-            if (is_read && data && len > 0) {
-                u32 avail = (rx_cnt > 1u) ? (rx_cnt - 1u) : 0u;
-                u32 to_copy = avail < len ? avail : len;
-                for (u32 j = 0; j < to_copy; j++) {
-                    (void)dc_reg_write(adev, 2u, r_data, AUX_SW_AUTOINC_DISABLE_BIT | (((j + 1u) & 0x1Fu) << 16) | 1u);
-                    u32 dj = 0;
-                    (void)dc_reg_read(adev, 2u, r_data, &dj);
-                    data[j] = (u8)((dj >> 8) & 0xFFu);
-                }
-                if (to_copy < len) {
-                    rc = -EIO;
-                    break;
-                }
-            }
-            rc = 0;
+            rc = -ETIMEDOUT;
             break;
         }
-        amdgpu_udelay(adev, 25u);
+        if ((st & AUX_SW_HPD_DISCON_BIT) != 0) {
+            rc = -ENODEV;
+            break;
+        }
+        if ((st & AUX_SW_RX_ERR_MASK) != 0) {
+            timeouts++;
+            if (timeouts <= 3u) {
+                amdgpu_udelay(adev, 400u);
+                continue;
+            }
+            rc = -EIO;
+            break;
+        }
+
+        u32 rx_cnt = (st >> AUX_SW_REPLY_BYTES_SHIFT) & AUX_SW_REPLY_BYTES_MASK;
+        if (rx_cnt == 0) {
+            rc = -EIO;
+            break;
+        }
+
+        /* Read reply byte 0 at explicit FIFO index 0 with read mode bit (bit 0 = 1). */
+        (void)dc_reg_write(adev, 2u, r_data, AUX_SW_AUTOINC_DISABLE_BIT | 1u);
+        u32 d0 = 0;
+        (void)dc_reg_read(adev, 2u, r_data, &d0);
+        u8 reply = (u8)((d0 >> 8) & 0xFFu);
+        if (reply_out) *reply_out = reply;
+        u8 rcode = (u8)(reply >> 4);
+        bool is_defer = is_i2c
+            ? (((rcode & 0x0Cu) == 0x08u) || ((rcode & 0x03u) == 0x02u))
+            : ((rcode & 0x03u) == 0x02u);
+        bool is_nack = is_i2c
+            ? (((rcode & 0x0Cu) == 0x04u) || ((rcode & 0x03u) == 0x01u))
+            : ((rcode & 0x03u) == 0x01u);
+
+        if (is_defer) {
+            defers++;
+            if (defers <= 7u) {
+                amdgpu_udelay(adev, 400u);
+                continue;
+            }
+            rc = -EAGAIN;
+            break;
+        }
+        if (is_nack) {
+            rc = -EIO;
+            break;
+        }
+
+        if (is_read && data && len > 0) {
+            u32 avail = (rx_cnt > 1u) ? (rx_cnt - 1u) : 0u;
+            u32 to_copy = avail < len ? avail : len;
+            for (u32 j = 0; j < to_copy; j++) {
+                (void)dc_reg_write(adev, 2u, r_data, AUX_SW_AUTOINC_DISABLE_BIT | (((j + 1u) & 0x1Fu) << 16) | 1u);
+                u32 dj = 0;
+                (void)dc_reg_read(adev, 2u, r_data, &dj);
+                data[j] = (u8)((dj >> 8) & 0xFFu);
+            }
+            if (to_copy < len) {
+                rc = -EIO;
+                break;
+            }
+        }
+        rc = 0;
+        break;
     }
 
     (void)dc_reg_write(adev, 2u, r_arb, AUX_ARB_SW_DONE_BIT);
@@ -242,11 +319,14 @@ static u8 read_edid_over_aux(struct amdgpu_device *adev, const struct dc_reg_tab
         return 0;
     }
     for (u32 chunk = 0; chunk < 8u; chunk++) {
-        u8 cmd = (chunk + 1u < 8u) ? (AUX_CMD_I2C_READ | AUX_CMD_I2C_MOT) : AUX_CMD_I2C_READ;
-        if (dc_aux_transfer(adev, regs, aux_idx, cmd, 0x50u, &out[chunk * 16u], 16u, &rep) != 0) {
+        if (dc_aux_transfer(adev, regs, aux_idx, AUX_CMD_I2C_READ | AUX_CMD_I2C_MOT, 0x50u, &out[chunk * 16u], 16u, &rep) != 0) {
+            (void)dc_aux_transfer(adev, regs, aux_idx, AUX_CMD_I2C_READ, 0x50u, NULL, 0u, &rep);
             return 0;
         }
     }
+    /* Address-only I2C STOP (MOT=0, 0 data bytes). */
+    (void)dc_aux_transfer(adev, regs, aux_idx, AUX_CMD_I2C_READ, 0x50u, NULL, 0u, &rep);
+
     static const u8 hdr[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
     if (memcmp(out, hdr, 8u) != 0 || !edid_checksum_ok(out)) {
         return 0;
@@ -265,12 +345,12 @@ static u8 read_edid_over_aux(struct amdgpu_device *adev, const struct dc_reg_tab
         }
         bool ok = true;
         for (u32 chunk = 0; chunk < 8u; chunk++) {
-            u8 cmd = (chunk + 1u < 8u) ? (AUX_CMD_I2C_READ | AUX_CMD_I2C_MOT) : AUX_CMD_I2C_READ;
-            if (dc_aux_transfer(adev, regs, aux_idx, cmd, 0x50u, &out[b * 128u + chunk * 16u], 16u, &rep) != 0) {
+            if (dc_aux_transfer(adev, regs, aux_idx, AUX_CMD_I2C_READ | AUX_CMD_I2C_MOT, 0x50u, &out[b * 128u + chunk * 16u], 16u, &rep) != 0) {
                 ok = false;
                 break;
             }
         }
+        (void)dc_aux_transfer(adev, regs, aux_idx, AUX_CMD_I2C_READ, 0x50u, NULL, 0u, &rep);
         if (ok && edid_checksum_ok(&out[b * 128u])) {
             blocks++;
         } else {

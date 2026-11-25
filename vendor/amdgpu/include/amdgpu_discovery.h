@@ -11,13 +11,13 @@
 #define AMDGPU_MEM_RSV_SIGNATURE           0x0049524Du /* "MRI"  */
 #define AMDGPU_GC_TABLE_ID                 0x4347u
 
-#define AMDGPU_MAX_IP_BLOCKS               64u
-#define AMDGPU_MAX_IP_SEGMENTS             6u
+#define AMDGPU_MAX_IP_BLOCKS               128u
+#define AMDGPU_MAX_IP_SEGMENTS             8u
 #define AMDGPU_MAX_MEM_RESERVED            16u
 
-/* Standard AMD Hardware Block IDs (HWID). */
+/* Official AMD IP Hardware IDs (soc15_hw_ip.h). */
 #define AMDGPU_HWID_MP1                    1u
-#define AMDGPU_HWID_MP0                    2u
+#define AMDGPU_HWID_MP0                    255u
 #define AMDGPU_HWID_THM                    3u
 #define AMDGPU_HWID_SMUIO                  4u
 #define AMDGPU_HWID_FUSE                   5u
@@ -25,22 +25,21 @@
 #define AMDGPU_HWID_PWR                    10u
 #define AMDGPU_HWID_GC                     11u
 #define AMDGPU_HWID_UVD                    12u
+#define AMDGPU_HWID_VCN                    12u
 #define AMDGPU_HWID_AUDIO_AZ               13u
 #define AMDGPU_HWID_ACP                    14u
 #define AMDGPU_HWID_DCI                    15u
-#define AMDGPU_HWID_DMU                    16u
 #define AMDGPU_HWID_RSMU                   17u
-#define AMDGPU_HWID_DCE                    18u
-#define AMDGPU_HWID_OSSSYS                 20u
-#define AMDGPU_HWID_HDP                    21u
-#define AMDGPU_HWID_SDMA0                  22u
-#define AMDGPU_HWID_SDMA1                  23u
-#define AMDGPU_HWID_MMHUB                  24u
-#define AMDGPU_HWID_ATHUB                  25u
-#define AMDGPU_HWID_NBIO                   27u
-#define AMDGPU_HWID_PCIE                   30u
-#define AMDGPU_HWID_DF                     31u
-#define AMDGPU_HWID_VCN                    37u
+#define AMDGPU_HWID_MMHUB                  34u
+#define AMDGPU_HWID_ATHUB                  35u
+#define AMDGPU_HWID_OSSSYS                 40u
+#define AMDGPU_HWID_HDP                    41u
+#define AMDGPU_HWID_SDMA0                  42u
+#define AMDGPU_HWID_SDMA1                  43u
+#define AMDGPU_HWID_NBIO                   108u /* NBIF_HWID */
+#define AMDGPU_HWID_DMU                    271u /* DMU_HWID (DCN display engine) */
+#define AMDGPU_HWID_DCE                    271u
+#define AMDGPU_HWID_DIO                    272u
 
 struct amdgpu_ip_block {
     u16 hw_id;

@@ -40,12 +40,12 @@ int dc_dmub_init(struct amdgpu_device *adev, struct dc_state *dc) {
     const struct dc_reg_table *r = dc->regs;
 
     u32 cntl = 0, scratch0 = 0;
-    (void)dc_reg_read(adev, 2u, r->dmcub_cntl, &cntl);
+    bool cntl_ok = dc_reg_read(adev, 2u, r->dmcub_cntl, &cntl);
     (void)dc_reg_read(adev, 2u, r->dmcub_scratch0, &scratch0);
 
-    bool already_running = ((cntl & DMUB_CNTL_ENABLE_BIT) != 0)
-        && ((cntl & DMUB_CNTL_SOFT_RESET_BIT) == 0)
-        && ((scratch0 & DMUB_SCRATCH0_FW_BOOT_COMPLETE) != 0);
+    bool already_running = cntl_ok && cntl != 0xFFFFFFFFu
+        && ((cntl & DMUB_CNTL_ENABLE_BIT) != 0)
+        && ((cntl & DMUB_CNTL_SOFT_RESET_BIT) == 0);
 
     /* Allocate 8 KiB coherent IOMMU DMA ring for Inbox1 (4 KiB) + Outbox1 (4 KiB). */
     if (adev->io.dma_alloc) {
@@ -54,16 +54,18 @@ int dc_dmub_init(struct amdgpu_device *adev, struct dc_state *dc) {
 
     if (already_running) {
         dc->dmub.fw_alive = true;
-        u32 ver = 0;
-        if (dmub_gpint_exec(adev, r, DMUB_GPINT__GET_FW_VERSION, &ver) && ver != 0) {
-            dc->dmub.fw_version = ver;
+        if ((scratch0 & DMUB_SCRATCH0_FW_BOOT_COMPLETE) != 0) {
+            u32 ver = 0;
+            if (dmub_gpint_exec(adev, r, DMUB_GPINT__GET_FW_VERSION, &ver) && ver != 0) {
+                dc->dmub.fw_version = ver;
+            }
         }
         u32 wptr = 0;
         if (dc_reg_read(adev, 2u, r->dmcub_inbox1_wptr, &wptr)) {
             dc->dmub.inbox1_wptr = wptr & 0x0FFFu;
         }
-    } else if (adev->ucodes[AMDGPU_UCODE_DMCUB].loaded && dc->dmub.ring_dma.cpu_addr) {
-        /* Cold boot / post-S3 DMCUB load: authenticate via PSP when available, else configure inbox ring. */
+    } else if (cntl_ok && cntl != 0xFFFFFFFFu && adev->ucodes[AMDGPU_UCODE_DMCUB].loaded && dc->dmub.ring_dma.cpu_addr) {
+        /* Cold boot / post-S3 DMCUB load: authenticate via PSP when available, never clobber an active UEFI DMUB. */
         const struct amdgpu_ucode_info *uc = &adev->ucodes[AMDGPU_UCODE_DMCUB];
         if (adev->psp.sos_alive && uc->payload_size > 0 && uc->payload_size <= 512u * 1024u) {
             struct dosdrm_dma_buf fw_dma;
@@ -77,15 +79,6 @@ int dc_dmub_init(struct amdgpu_device *adev, struct dc_state *dc) {
                 }
             }
         }
-        (void)dc_reg_write(adev, 2u, r->dmcub_inbox1_base, (u32)(dc->dmub.ring_dma.dma_addr & 0xFFFFFFFFULL));
-        (void)dc_reg_write(adev, 2u, r->dmcub_inbox1_size, 4096u);
-        (void)dc_reg_write(adev, 2u, r->dmcub_inbox1_rptr, 0u);
-        (void)dc_reg_write(adev, 2u, r->dmcub_inbox1_wptr, 0u);
-        (void)dc_reg_write(adev, 2u, r->dmcub_outbox1_base, (u32)((dc->dmub.ring_dma.dma_addr + 4096ULL) & 0xFFFFFFFFULL));
-        (void)dc_reg_write(adev, 2u, r->dmcub_outbox1_size, 4096u);
-        (void)dc_reg_write(adev, 2u, r->dmcub_outbox1_rptr, 0u);
-        (void)dc_reg_write(adev, 2u, r->dmcub_outbox1_wptr, 0u);
-        (void)dc_reg_write(adev, 2u, r->dmcub_cntl, DMUB_CNTL_ENABLE_BIT);
         dc->dmub.fw_version = uc->ucode_version;
         /* Poll scratch0 briefly for boot completion. */
         for (u32 i = 0; i < 40u; i++) {

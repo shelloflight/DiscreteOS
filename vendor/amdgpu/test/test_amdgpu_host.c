@@ -255,16 +255,37 @@ static void build_ip_discovery(uint8_t *buf, enum dc_dcn_version dcn_ver, bool v
     wr16(ip, 4, v4_64bit ? 4 : 2);
     wr16(ip, 12, 1); /* 1 die */
     wr16(ip, 14, 0);
-    wr16(ip, 16, 80); /* die_offset */
+    /* In real AMD IP Discovery binaries, die_offset is relative to the binary start (`buf`). */
+    wr16(ip, 16, (uint16_t)(ip_off + 80));
     if (v4_64bit) ip[78] = 1; /* base_addr_64_bit = 1 */
 
     uint8_t dce_maj = (dcn_ver == DC_DCN_4_0_1) ? 4 : 3;
     uint8_t dce_min = (dcn_ver == DC_DCN_4_0_1) ? 0 : ((dcn_ver == DC_DCN_3_1_5) ? 1 : ((dcn_ver == DC_DCN_3_2) ? 2 : 0));
 
     size_t pos = ip_off + 80;
+    /* Include 70 dummy filler IPs before DCE to verify >64-block real-GPU discovery tables never truncate DMU_HWID (271). */
+    const uint16_t filler_cnt = 70;
     wr16(buf, pos, 0);
-    wr16(buf, pos + 2, 5); /* 5 IP blocks: DCE, MMHUB, OSSSYS, MP0, MP1 */
+    wr16(buf, pos + 2, (uint16_t)(filler_cnt + 5));
     pos += 4;
+
+    for (uint16_t f = 0; f < filler_cnt; f++) {
+        wr16(buf, pos + 0, 99u); /* dummy HWID */
+        buf[pos + 2] = (uint8_t)f;
+        buf[pos + 3] = 1u;
+        buf[pos + 4] = 1u;
+        buf[pos + 5] = 0u;
+        buf[pos + 6] = 0u;
+        buf[pos + 7] = 0u;
+        pos += 8;
+        if (v4_64bit) {
+            wr64(buf, pos, 0x00001000ULL + (uint64_t)f * 0x100ULL);
+            pos += 8;
+        } else {
+            wr32(buf, pos, 0x00001000u + (uint32_t)f * 0x100u);
+            pos += 4;
+        }
+    }
 
     struct { uint16_t id; uint8_t maj; uint8_t min; uint8_t nb; uint32_t b[3]; } ips[5] = {
         { AMDGPU_HWID_DCE,    dce_maj, dce_min, 3, { 0, SIM_DCE_BASE1, SIM_DCE_BASE2 } },
@@ -331,16 +352,16 @@ static void build_atombios_rom(uint8_t *rom) {
     rom[0x250 + 0] = ATOM_CONN_DP; rom[0x250 + 1] = 1; rom[0x250 + 2] = 1; rom[0x250 + 3] = 1; rom[0x250 + 4] = 1;
 }
 
-static void sim_aux_kick(struct amdgpu_sim *s, uint8_t aux_idx) {
+static void sim_aux_kick(struct amdgpu_sim *s, uint8_t aux_idx, uint32_t wr_bytes) {
     uint32_t stride = (uint32_t)aux_idx * s->regs->aux_stride;
     uint64_t r_status = ((uint64_t)SIM_DCE_BASE2 + s->regs->aux_sw_status + stride) * 4ULL;
     if (!s->aux_connected[aux_idx]) {
-        sim_set_reg(s, r_status, 0x00000003u); /* DONE | TIMEOUT */
+        sim_set_reg(s, r_status, 0x00000081u); /* DONE | RX_TIMEOUT (bit 7) */
         return;
     }
     uint8_t cmd = (s->aux_tx[0] >> 4) & 0x0Fu;
     uint32_t addr = ((uint32_t)(s->aux_tx[0] & 0x0Fu) << 16) | ((uint32_t)s->aux_tx[1] << 8) | (uint32_t)s->aux_tx[2];
-    uint8_t len = (uint8_t)(s->aux_tx[3] + 1u);
+    uint8_t len = (wr_bytes <= 3u) ? 0u : (uint8_t)(s->aux_tx[3] + 1u);
 
     s->aux_rx[0] = 0x00u; /* AUX ACK */
     s->aux_rx_len = 1u;
@@ -378,8 +399,8 @@ static void sim_aux_kick(struct amdgpu_sim *s, uint8_t aux_idx) {
 
 static uint32_t sim_mmio_r32(void *ctx, uint64_t byte_off) {
     struct amdgpu_sim *s = (struct amdgpu_sim *)ctx;
-    if (byte_off == 0x0004u) { /* MM_DATA indirect VRAM read */
-        uint64_t va = ((uint64_t)(s->mm_index_hi & 0x7FFFFFFFu) << 32) | (uint64_t)(s->mm_index & 0x7FFFFFFFu);
+    if (byte_off == 0x0004u) { /* MM_DATA indirect VRAM read: MM_INDEX[30:0] | (MM_INDEX_HI << 31) */
+        uint64_t va = ((uint64_t)s->mm_index_hi << 31) | (uint64_t)(s->mm_index & 0x7FFFFFFCu);
         if (va + 4ULL <= SIM_VRAM_BYTES) {
             return (uint32_t)s->vram[va] | ((uint32_t)s->vram[va + 1] << 8)
                 | ((uint32_t)s->vram[va + 2] << 16) | ((uint32_t)s->vram[va + 3] << 24);
@@ -450,14 +471,30 @@ static void sim_mmio_w32(void *ctx, uint64_t byte_off, uint32_t val) {
         sim_set_reg(s, (mm_base + inv_ack_dw) * 4ULL, val);
     }
 
-    /* DP AUX data & kick handler across all AUX engines. */
+    /* HUBP primary surface latch into EARLIEST_INUSE on LOW address write. */
+    uint64_t prim_lo = ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_primary_addr) * 4ULL;
+    uint64_t prim_hi = ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_primary_addr_hi) * 4ULL;
+    if (byte_off == prim_lo) {
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_earliest_inuse) * 4ULL, val);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_earliest_inuse_hi) * 4ULL, sim_get_reg(s, prim_hi));
+    }
+
+    /* DP AUX data & kick handler across all AUX engines (real DCN bit layout). */
     for (uint8_t a = 0; a < s->regs->max_aux; a++) {
         uint32_t st = (uint32_t)a * s->regs->aux_stride;
         uint64_t arb_off = ((uint64_t)SIM_DCE_BASE2 + s->regs->aux_arb_control + st) * 4ULL;
+        uint64_t intr_off = ((uint64_t)SIM_DCE_BASE2 + s->regs->aux_interrupt_control + st) * 4ULL;
+        uint64_t status_off = ((uint64_t)SIM_DCE_BASE2 + s->regs->aux_sw_status + st) * 4ULL;
         uint64_t data_off = ((uint64_t)SIM_DCE_BASE2 + s->regs->aux_sw_data + st) * 4ULL;
         uint64_t sw_off = ((uint64_t)SIM_DCE_BASE2 + s->regs->aux_sw_control + st) * 4ULL;
-        if (byte_off == arb_off && (val & 1u) != 0) {
-            sim_set_reg(s, arb_off, val | (1u << 8));
+        if (byte_off == arb_off) {
+            if ((val & (1u << 16)) != 0) {
+                sim_set_reg(s, arb_off, (val & ~(3u << 2)) | (1u << 2)); /* SW_OWNED */
+            } else if ((val & (1u << 17)) != 0) {
+                sim_set_reg(s, arb_off, 0u);
+            }
+        } else if (byte_off == intr_off && (val & (1u << 1)) != 0) {
+            sim_set_reg(s, status_off, sim_get_reg(s, status_off) & ~1u);
         } else if (byte_off == data_off) {
             uint32_t idx = (val >> 16) & 0x1Fu;
             if ((val & 1u) != 0) {
@@ -467,7 +504,7 @@ static void sim_mmio_w32(void *ctx, uint64_t byte_off, uint32_t val) {
                 s->aux_tx[idx] = (uint8_t)((val >> 8) & 0xFFu);
             }
         } else if (byte_off == sw_off && (val & 1u) != 0) {
-            sim_aux_kick(s, a);
+            sim_aux_kick(s, a, (val >> 16) & 0x1Fu);
         }
     }
 }
@@ -794,9 +831,40 @@ static void fuzz_parsers(void) {
     printf("  amdgpu-host: 10000 fuzz rounds (ucode, IP Discovery, AtomBIOS, DSC 1.2a, PM4/SDMA/MES CS) OK\n");
 }
 
+static void test_bare_metal_regressions(void) {
+    /* 1. Verify official AMD soc15_hw_ip.h HWIDs match real hardware (RX 9070 / Ryzen iGPU). */
+    CHECK(AMDGPU_HWID_DCE == 271u && AMDGPU_HWID_DMU == 271u, "DMU/DCE HWID == 271");
+    CHECK(AMDGPU_HWID_MMHUB == 34u && AMDGPU_HWID_OSSSYS == 40u, "MMHUB=34, OSSSYS=40");
+    CHECK(AMDGPU_HWID_MP0 == 255u && AMDGPU_HWID_NBIO == 108u && AMDGPU_HWID_SDMA0 == 42u, "MP0=255, NBIO=108, SDMA0=42");
+
+    /* 2. Verify high-GOP VRAM wrap-around allocates before GOP when GOP sits near top of visible VRAM. */
+    struct amdgpu_gmc_state gmc;
+    memset(&gmc, 0, sizeof(gmc));
+    gmc.initialized = true;
+    gmc.vram_size = 256ULL << 20;
+    gmc.visible_vram_size = 256ULL << 20;
+    gmc.fb_mc_base = 0x8000000000ULL;
+    gmc.fb_mc_top = gmc.fb_mc_base + gmc.vram_size - 1ULL;
+    gmc.gop_vram_start = 240ULL << 20;
+    gmc.gop_vram_size = 12ULL << 20;
+    uint64_t vo = 0;
+    CHECK(amdgpu_gmc_alloc_vram(&gmc, 16ULL << 20, 65536u, 1u, &vo) == 0, "wrap-around alloc before high GOP");
+    CHECK(vo < gmc.gop_vram_start, "allocated below high GOP");
+
+    /* 3. Verify indirect VRAM MM_INDEX/MM_INDEX_HI bit-31 addressing at 16 GiB top-of-VRAM (non-ReBAR RX 9070). */
+    /* (16 GiB - 64 KiB) = 0x3_FFFF_0000: bit 31 = 1 -> MM_INDEX_HI = 7, MM_INDEX = 0x7FFF0000 | 0x80000000. */
+    uint64_t test_addr = (16ULL << 30) - AMDGPU_DISCOVERY_TMR_OFFSET;
+    uint32_t expected_lo = ((uint32_t)test_addr & 0x7FFFFFFCu) | 0x80000000u;
+    uint32_t expected_hi = (uint32_t)(test_addr >> 31);
+    uint64_t recon = ((uint64_t)expected_hi << 31) | (uint64_t)(expected_lo & 0x7FFFFFFCu);
+    CHECK(recon == test_addr && expected_hi == 7u, "MM_INDEX_HI 31-bit shift round-trip at 16 GiB");
+    printf("  amdgpu-host: bare-metal regression checks (HWIDs, >64-IP discovery, high-GOP wrap, 16 GiB MM_INDEX_HI) OK\n");
+}
+
 int main(int argc, char **argv) {
     const char *fw_dir = (argc > 1) ? argv[1] : "vendor/firmware/amdgpu";
     test_all_real_firmware_blobs(fw_dir);
+    test_bare_metal_regressions();
     test_family_end_to_end(fw_dir, 0x7550u, DC_DCN_4_0_1, true);  /* RX 9070 / Navi 48 (RDNA 4) */
     test_family_end_to_end(fw_dir, 0x13C0u, DC_DCN_3_1_5, false); /* Ryzen 9 9900X iGPU */
     test_family_end_to_end(fw_dir, 0x744Cu, DC_DCN_3_2,   true);  /* RX 7900 / Navi 31 (RDNA 3) */

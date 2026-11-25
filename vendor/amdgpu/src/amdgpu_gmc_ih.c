@@ -55,7 +55,8 @@ static void ih_regs(
     u32 *rb_wptr,
     u32 *wptr_addr_hi,
     u32 *wptr_addr_lo,
-    u32 *ih_cntl
+    u32 *ih_cntl,
+    u32 *ih_chicken
 ) {
     *rb_cntl      = 0x0080u;
     *wptr_addr_hi = 0x0085u;
@@ -67,6 +68,7 @@ static void ih_regs(
         *rb_base    = 0x0083u;
         *rb_base_hi = 0x0084u;
         *ih_cntl    = 0x00A8u;
+        *ih_chicken = 0x018Au;
     } else {
         /* OSSSYS 5.0.0 / 6.0.0 */
         *rb_base    = 0x0081u;
@@ -74,6 +76,7 @@ static void ih_regs(
         *rb_rptr    = 0x0083u;
         *rb_wptr    = 0x0084u;
         *ih_cntl    = 0x00C0u;
+        *ih_chicken = 0x018Du;
     }
 }
 
@@ -174,26 +177,34 @@ int amdgpu_gmc_alloc_vram(struct amdgpu_gmc_state *gmc, u64 size, u64 align, u32
     }
     u64 aligned_sz = (size + 4095ULL) & ~4095ULL;
     /* Reserve bottom 1 MiB (VBIOS/AtomBIOS) and top 2 MiB (IP Discovery + PSP TMR). */
+    u64 floor = ((1ULL << 20) + align - 1ULL) & ~(align - 1ULL);
     u64 limit = gmc->visible_vram_size > (2ULL << 20) ? (gmc->visible_vram_size - (2ULL << 20)) : 0;
-    u64 cursor = (gmc->gop_vram_size > 0)
-        ? ((gmc->gop_vram_start + gmc->gop_vram_size + align - 1ULL) & ~(align - 1ULL))
-        : ((1ULL << 20) + align - 1ULL) & ~(align - 1ULL);
+    u64 starts[2] = {
+        (gmc->gop_vram_size > 0)
+            ? ((gmc->gop_vram_start + gmc->gop_vram_size + align - 1ULL) & ~(align - 1ULL))
+            : floor,
+        floor,
+    };
 
-    while (cursor + aligned_sz <= limit) {
-        if (!vram_range_overlaps(gmc, cursor, cursor + aligned_sz)) {
-            for (u32 i = 0; i < AMDGPU_MAX_VRAM_ALLOCS; i++) {
-                if (!gmc->allocs[i].in_use) {
-                    gmc->allocs[i].in_use = true;
-                    gmc->allocs[i].vram_offset = cursor;
-                    gmc->allocs[i].size = aligned_sz;
-                    gmc->allocs[i].tag = tag;
-                    *out_vram_off = cursor;
-                    return 0;
+    for (u32 pass = 0; pass < 2u; pass++) {
+        u64 cursor = starts[pass];
+        if (cursor < floor) cursor = floor;
+        while (cursor + aligned_sz <= limit) {
+            if (!vram_range_overlaps(gmc, cursor, cursor + aligned_sz)) {
+                for (u32 i = 0; i < AMDGPU_MAX_VRAM_ALLOCS; i++) {
+                    if (!gmc->allocs[i].in_use) {
+                        gmc->allocs[i].in_use = true;
+                        gmc->allocs[i].vram_offset = cursor;
+                        gmc->allocs[i].size = aligned_sz;
+                        gmc->allocs[i].tag = tag;
+                        *out_vram_off = cursor;
+                        return 0;
+                    }
                 }
+                return -ENOMEM;
             }
-            return -ENOMEM;
+            cursor += align;
         }
-        cursor += align;
     }
     return -ENOMEM;
 }
@@ -400,10 +411,10 @@ int amdgpu_ih_init(struct amdgpu_device *adev) {
     }
     adev->ih.ring_mask = 4096u - 1u;
 
-    u32 rb_cntl = 0, rb_base = 0, rb_base_hi = 0, rb_rptr = 0, rb_wptr = 0, wptr_hi = 0, wptr_lo = 0, ih_cntl = 0;
-    ih_regs(adev, &rb_cntl, &rb_base, &rb_base_hi, &rb_rptr, &rb_wptr, &wptr_hi, &wptr_lo, &ih_cntl);
+    u32 rb_cntl = 0, rb_base = 0, rb_base_hi = 0, rb_rptr = 0, rb_wptr = 0, wptr_hi = 0, wptr_lo = 0, ih_cntl = 0, ih_chicken = 0;
+    ih_regs(adev, &rb_cntl, &rb_base, &rb_base_hi, &rb_rptr, &rb_wptr, &wptr_hi, &wptr_lo, &ih_cntl, &ih_chicken);
 
-    u64 off_cntl = 0, off_base = 0, off_base_hi = 0, off_rptr = 0, off_wptr = 0, off_whi = 0, off_wlo = 0;
+    u64 off_cntl = 0, off_base = 0, off_base_hi = 0, off_rptr = 0, off_wptr = 0, off_whi = 0, off_wlo = 0, off_chicken = 0;
     if (amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_OSSSYS, 0, 0, rb_cntl, &off_cntl)
         && amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_OSSSYS, 0, 0, rb_base, &off_base)
         && amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_OSSSYS, 0, 0, rb_base_hi, &off_base_hi)
@@ -413,15 +424,39 @@ int amdgpu_ih_init(struct amdgpu_device *adev) {
         && amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_OSSSYS, 0, 0, wptr_lo, &off_wlo)) {
         u64 ring_bus = adev->ih.ring_dma.dma_addr;
         u64 wb_bus = ring_bus + 4096ULL;
-        amdgpu_wreg32(adev, off_cntl, 0u);
+        u64 dummy_bus = ring_bus + 8192ULL;
+
+        /* Configure NBIF interrupt control for snooped system RAM IH ring (nbif_v6_3_1.c). */
+        u64 nbif_ic = 0, nbif_ic2 = 0;
+        if (amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_NBIO, 0, 2, 0x00F1u, &nbif_ic)
+            && amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_NBIO, 0, 2, 0x00F2u, &nbif_ic2)) {
+            amdgpu_wreg32(adev, nbif_ic2, (u32)(dummy_bus >> 8));
+            u32 ic = amdgpu_rreg32(adev, nbif_ic);
+            ic &= ~((1u << 0) | (1u << 3)); /* clear DUMMY_RD_OVERRIDE & REQ_NONSNOOP_EN */
+            amdgpu_wreg32(adev, nbif_ic, ic);
+        }
+
+        u32 cur_cntl = amdgpu_rreg32(adev, off_cntl);
+        amdgpu_wreg32(adev, off_cntl, cur_cntl & ~((1u << 0) | (1u << 17)));
+
+        /* Allow GPA/IOVA bus addressing when MC_SPACE = 2 (ih_v7_0.c). */
+        if (amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_OSSSYS, 0, 0, ih_chicken, &off_chicken)) {
+            u32 ch = amdgpu_rreg32(adev, off_chicken);
+            amdgpu_wreg32(adev, off_chicken, ch | (1u << 4));
+        }
+
         amdgpu_wreg32(adev, off_base, (u32)((ring_bus >> 8) & 0xFFFFFFFFULL));
-        amdgpu_wreg32(adev, off_base_hi, (u32)((ring_bus >> 40) & 0xFFFFFFFFULL));
+        amdgpu_wreg32(adev, off_base_hi, (u32)((ring_bus >> 40) & 0xFFULL));
         amdgpu_wreg32(adev, off_rptr, 0u);
         amdgpu_wreg32(adev, off_wptr, 0u);
         amdgpu_wreg32(adev, off_wlo, lower_32_bits(wb_bus));
-        amdgpu_wreg32(adev, off_whi, upper_32_bits(wb_bus));
-        /* RB_ENABLE | RB_SIZE(log2(4096/4) = 10 -> 10<<1) | WPTR_WRITEBACK_ENABLE (bit 8) */
-        amdgpu_wreg32(adev, off_cntl, 1u | (10u << 1) | (1u << 8));
+        amdgpu_wreg32(adev, off_whi, upper_32_bits(wb_bus) & 0xFFFFu);
+        /* RB_ENABLE | RB_SIZE(10) | WPTR_WB | WPTR_OVERFLOW | ENABLE_INTR | MC_SNOOP | RPTR_REARM | MC_SPACE=BUS(2) */
+        amdgpu_wreg32(
+            adev,
+            off_cntl,
+            (1u << 0) | (10u << 1) | (1u << 8) | (1u << 16) | (1u << 17) | (1u << 20) | (1u << 21) | (2u << 28)
+        );
         adev->ih.enabled = true;
     }
     return 0;
@@ -432,8 +467,8 @@ void amdgpu_ih_fini(struct amdgpu_device *adev) {
         return;
     }
     if (adev->ih.enabled) {
-        u32 rb_cntl = 0, a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0;
-        ih_regs(adev, &rb_cntl, &a, &b, &c, &d, &e, &f, &g);
+        u32 rb_cntl = 0, a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0;
+        ih_regs(adev, &rb_cntl, &a, &b, &c, &d, &e, &f, &g, &h);
         u64 off_cntl = 0;
         if (amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_OSSSYS, 0, 0, rb_cntl, &off_cntl)) {
             amdgpu_wreg32(adev, off_cntl, 0u);
@@ -453,8 +488,8 @@ u32 amdgpu_ih_drain(struct amdgpu_device *adev, struct amdgpu_ih_event *events, 
     const volatile u32 *wb = (const volatile u32 *)((const u8 *)adev->ih.ring_dma.cpu_addr + 4096u);
     u32 wptr = wb[0] & adev->ih.ring_mask;
 
-    u32 rb_rptr_reg = 0, a = 0, b = 0, c = 0, rb_wptr_reg = 0, e = 0, f = 0, g = 0;
-    ih_regs(adev, &a, &b, &c, &rb_rptr_reg, &rb_wptr_reg, &e, &f, &g);
+    u32 rb_rptr_reg = 0, a = 0, b = 0, c = 0, rb_wptr_reg = 0, e = 0, f = 0, g = 0, h = 0;
+    ih_regs(adev, &a, &b, &c, &rb_rptr_reg, &rb_wptr_reg, &e, &f, &g, &h);
     u64 off_rptr = 0, off_wptr = 0;
     if (wptr == adev->ih.rptr
         && amdgpu_discovery_reg_offset(&adev->discovery, AMDGPU_HWID_OSSSYS, 0, 0, rb_wptr_reg, &off_wptr)) {

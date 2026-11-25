@@ -95,18 +95,22 @@ int amdgpu_discovery_parse(const u8 *buf, size_t len, struct amdgpu_discovery_in
     out->ip_table_version = ip_ver;
     out->base_addr_64_bit = addr64;
 
-    size_t table_end = (size_t)ip_off + (size_t)ip_size;
+    size_t bin_end = (size_t)bin_size;
     for (u16 d = 0; d < num_dies; d++) {
         size_t di_off = 14u + (size_t)d * 4u;
-        u16 die_off = rd16(ip_hdr, di_off + 2);
-        size_t pos = (size_t)ip_off + (size_t)die_off;
-        if (pos + 4u > table_end) {
+        if (di_off + 4u > (size_t)ip_size) {
             break;
+        }
+        u16 die_off = rd16(ip_hdr, di_off + 2);
+        /* In AMD IP Discovery binaries, die_info[d].die_offset is relative to binary start (`buf`). */
+        size_t pos = (size_t)die_off;
+        if (pos + 4u > bin_end) {
+            continue;
         }
         u16 num_ips = rd16(buf, pos + 2);
         pos += 4u;
-        for (u16 i = 0; i < num_ips; i++) {
-            if (pos + 8u > table_end) {
+        for (u16 i = 0; i < num_ips && i < 256u; i++) {
+            if (pos + 8u > bin_end) {
                 break;
             }
             u16 hw_id = rd16(buf, pos + 0);
@@ -119,7 +123,7 @@ int amdgpu_discovery_parse(const u8 *buf, size_t len, struct amdgpu_discovery_in
 
             size_t elem_sz = addr64 ? 8u : 4u;
             size_t base_bytes = (size_t)nbases * elem_sz;
-            if (pos + base_bytes > table_end) {
+            if (pos + base_bytes > bin_end) {
                 break;
             }
 
@@ -134,7 +138,7 @@ int amdgpu_discovery_parse(const u8 *buf, size_t len, struct amdgpu_discovery_in
                 for (u8 b = 0; b < blk->num_bases; b++) {
                     if (addr64) {
                         u64 raw64 = rd64(buf, pos + (size_t)b * 8u);
-                        blk->base_addr[b] = (u32)(raw64 & 0xFFFFFFFFULL);
+                        blk->base_addr[b] = (u32)(raw64 & 0x3FFFFFFFULL);
                     } else {
                         blk->base_addr[b] = rd32(buf, pos + (size_t)b * 4u);
                     }
@@ -162,27 +166,25 @@ int amdgpu_discovery_parse(const u8 *buf, size_t len, struct amdgpu_discovery_in
         }
     }
 
-    /* Optional Table 6 = MEM_RESERVED_INFO. */
+    /* Optional Table 6 = MEM_RESERVED_INFO (32-byte gpu_info_header + 16-byte (offset, size) entries). */
     if (num_tables > 6u) {
         u16 mr_off = rd16(buf, tbl_list_off + 6u * 8u);
         u16 mr_csum = rd16(buf, tbl_list_off + 6u * 8u + 2u);
         u16 mr_size = rd16(buf, tbl_list_off + 6u * 8u + 4u);
-        if (mr_size >= 16u && (size_t)mr_off + (size_t)mr_size <= (size_t)bin_size
-            && byte_sum16(buf + mr_off, mr_size) == mr_csum
-            && (rd32(buf, mr_off) & 0x00FFFFFFu) == AMDGPU_MEM_RSV_SIGNATURE) {
-            u32 cnt = rd32(buf, (size_t)mr_off + 12u);
-            if (cnt > AMDGPU_MAX_MEM_RESERVED) {
-                cnt = AMDGPU_MAX_MEM_RESERVED;
-            }
-            for (u32 r = 0; r < cnt; r++) {
-                size_t roff = (size_t)mr_off + 16u + (size_t)r * 20u;
-                if (roff + 20u > (size_t)mr_off + (size_t)mr_size) {
-                    break;
+        if (mr_size >= 32u && (size_t)mr_off + (size_t)mr_size <= (size_t)bin_size
+            && byte_sum16(buf + mr_off, mr_size) == mr_csum) {
+            size_t roff = (size_t)mr_off + 32u;
+            size_t rend = (size_t)mr_off + (size_t)mr_size;
+            while (roff + 16u <= rend && out->reserved_count < AMDGPU_MAX_MEM_RESERVED) {
+                u64 r_start = rd64(buf, roff);
+                u64 r_len = rd64(buf, roff + 8u);
+                if (r_len > 0) {
+                    out->reserved[out->reserved_count].offset = r_start;
+                    out->reserved[out->reserved_count].size = r_len;
+                    out->reserved[out->reserved_count].type = 0;
+                    out->reserved_count++;
                 }
-                out->reserved[out->reserved_count].offset = rd64(buf, roff);
-                out->reserved[out->reserved_count].size = rd64(buf, roff + 8u);
-                out->reserved[out->reserved_count].type = rd32(buf, roff + 16u);
-                out->reserved_count++;
+                roff += 16u;
             }
         }
     }
@@ -194,8 +196,9 @@ int amdgpu_discovery_parse(const u8 *buf, size_t len, struct amdgpu_discovery_in
 static void read_vram_indirect(struct amdgpu_device *adev, u64 vram_off, u8 *dst, size_t len) {
     for (size_t i = 0; i + 4u <= len; i += 4u) {
         u64 addr = vram_off + (u64)i;
-        u32 lo = (u32)(addr & 0xFFFFFFFFULL) | MM_INDEX_VRAM_BIT;
-        u32 hi = (u32)((addr >> 32) & 0x7FFFFFFFULL);
+        /* MM_INDEX holds VRAM byte address bits [30:0] with bit 31 selecting VRAM space; MM_INDEX_HI holds addr >> 31. */
+        u32 lo = ((u32)addr & 0x7FFFFFFCu) | MM_INDEX_VRAM_BIT;
+        u32 hi = (u32)(addr >> 31);
         amdgpu_wreg32(adev, MM_INDEX_OFF, lo);
         amdgpu_wreg32(adev, MM_INDEX_HI_OFF, hi);
         u32 val = amdgpu_rreg32(adev, MM_DATA_OFF);
@@ -306,12 +309,18 @@ const struct amdgpu_ip_block *amdgpu_discovery_find_ip(
     if (!disc || !disc->valid) {
         return NULL;
     }
+    const struct amdgpu_ip_block *first = NULL;
     for (u32 i = 0; i < disc->block_count; i++) {
-        if (disc->blocks[i].hw_id == hw_id && disc->blocks[i].instance == instance) {
-            return &disc->blocks[i];
+        if (disc->blocks[i].hw_id == hw_id) {
+            if (disc->blocks[i].instance == instance) {
+                return &disc->blocks[i];
+            }
+            if (!first && instance == 0) {
+                first = &disc->blocks[i];
+            }
         }
     }
-    return NULL;
+    return first;
 }
 
 bool amdgpu_discovery_reg_offset(
