@@ -1,5 +1,5 @@
-//! VirtIO-GPU 2D & 3D (VirGL) protocol encoders, decoders, and strict command validators
-//! (VirtIO 1.2 specification §5.7).
+//! VirtIO-GPU 1.2 2D, EDID, Cursor, Resource UUID/Blob, and 3D (VirGL / VirGL2 / Venus Vulkan)
+//! protocol encoders, decoders, and command-stream validators (VirtIO 1.2 §5.7).
 
 use crate::{CsError, rd_u32, rd_u64, wr_u32, wr_u64};
 
@@ -8,12 +8,12 @@ pub const F_VIRGL: u64 = 1 << 0;
 pub const F_EDID: u64 = 1 << 1;
 pub const F_RESOURCE_UUID: u64 = 1 << 2;
 pub const F_RESOURCE_BLOB: u64 = 1 << 3;
+pub const F_CONTEXT_INIT: u64 = 1 << 4;
 
-// Control header size.
 pub const CTRL_HDR_SIZE: usize = 24;
 pub const MAX_SCANOUTS: usize = 16;
 
-// 2D commands.
+// 2D & Blob/UUID commands.
 pub const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 pub const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
 pub const CMD_RESOURCE_UNREF: u32 = 0x0102;
@@ -25,8 +25,11 @@ pub const CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
 pub const CMD_GET_CAPSET_INFO: u32 = 0x0108;
 pub const CMD_GET_CAPSET: u32 = 0x0109;
 pub const CMD_GET_EDID: u32 = 0x010A;
+pub const CMD_RESOURCE_ASSIGN_UUID: u32 = 0x010B;
+pub const CMD_RESOURCE_CREATE_BLOB: u32 = 0x010C;
+pub const CMD_SET_SCANOUT_BLOB: u32 = 0x010D;
 
-// 3D (VirGL) commands.
+// 3D / Venus context commands.
 pub const CMD_CTX_CREATE: u32 = 0x0200;
 pub const CMD_CTX_DESTROY: u32 = 0x0201;
 pub const CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
@@ -36,7 +39,7 @@ pub const CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
 pub const CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 pub const CMD_SUBMIT_3D: u32 = 0x0207;
 
-// Cursor commands (cursorq).
+// Cursor commands (`cursorq`).
 pub const CMD_UPDATE_CURSOR: u32 = 0x0300;
 pub const CMD_MOVE_CURSOR: u32 = 0x0301;
 
@@ -46,6 +49,7 @@ pub const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 pub const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 pub const RESP_OK_CAPSET: u32 = 0x1103;
 pub const RESP_OK_EDID: u32 = 0x1104;
+pub const RESP_OK_RESOURCE_UUID: u32 = 0x1105;
 
 // Error responses.
 pub const RESP_ERR_UNSPEC: u32 = 0x1200;
@@ -61,14 +65,20 @@ pub const FORMAT_B8G8R8X8_UNORM: u32 = 2;
 pub const FORMAT_R8G8B8A8_UNORM: u32 = 67;
 pub const FORMAT_R8G8B8X8_UNORM: u32 = 68;
 
-// Capset IDs.
+// Capset IDs (VirtIO 1.2 / Rutabaga).
 pub const CAPSET_VIRGL: u32 = 1;
 pub const CAPSET_VIRGL2: u32 = 2;
+pub const CAPSET_VENUS: u32 = 4;
 
-// Flags.
+// Blob memory & flag constants.
+pub const BLOB_MEM_GUEST: u32 = 0x0001;
+pub const BLOB_MEM_HOST3D: u32 = 0x0002;
+pub const BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
+pub const BLOB_FLAG_USE_MAPPABLE: u32 = 0x0001;
+pub const BLOB_FLAG_USE_SHAREABLE: u32 = 0x0002;
+
 pub const FLAG_FENCE: u32 = 1 << 0;
 
-/// Common 24-byte control header.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CtrlHdr {
     pub ty: u32,
@@ -116,7 +126,6 @@ impl CtrlHdr {
     }
 }
 
-/// One VirtIO-GPU scanout descriptor (`virtio_gpu_display_one`, 24 bytes).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DisplayOne {
     pub x: u32,
@@ -127,7 +136,6 @@ pub struct DisplayOne {
     pub flags: u32,
 }
 
-/// Parsed `RESP_OK_DISPLAY_INFO`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DisplayInfoResp {
     pub pmodes: [DisplayOne; MAX_SCANOUTS],
@@ -155,12 +163,10 @@ pub fn decode_display_info(b: &[u8]) -> Option<DisplayInfoResp> {
     Some(DisplayInfoResp { pmodes })
 }
 
-/// Encode `CMD_GET_DISPLAY_INFO` (24 bytes).
 pub fn encode_get_display_info(out: &mut [u8]) -> Option<usize> {
     CtrlHdr::new(CMD_GET_DISPLAY_INFO).encode(out)
 }
 
-/// Encode `CMD_GET_EDID` (32 bytes).
 pub fn encode_get_edid(out: &mut [u8], scanout: u32) -> Option<usize> {
     if out.len() < 32 {
         return None;
@@ -171,7 +177,6 @@ pub fn encode_get_edid(out: &mut [u8], scanout: u32) -> Option<usize> {
     Some(32)
 }
 
-/// Decode `RESP_OK_EDID` (24 hdr + 4 size + 4 pad + up to 1024 bytes): returns the valid EDID slice.
 pub fn decode_edid_resp(b: &[u8]) -> Option<&[u8]> {
     let hdr = CtrlHdr::decode(b)?;
     if hdr.ty != RESP_OK_EDID || b.len() < 32 {
@@ -184,7 +189,6 @@ pub fn decode_edid_resp(b: &[u8]) -> Option<&[u8]> {
     Some(&b[32..32 + size])
 }
 
-/// Encode `CMD_RESOURCE_CREATE_2D` (40 bytes).
 pub fn encode_resource_create_2d(out: &mut [u8], res_id: u32, format: u32, width: u32, height: u32) -> Option<usize> {
     if out.len() < 40 {
         return None;
@@ -197,7 +201,59 @@ pub fn encode_resource_create_2d(out: &mut [u8], res_id: u32, format: u32, width
     Some(40)
 }
 
-/// Encode `CMD_RESOURCE_UNREF` (32 bytes).
+/// Encode `CMD_RESOURCE_CREATE_BLOB` (56 bytes + `entries.len() * 16` backing runs).
+#[allow(clippy::too_many_arguments)]
+pub fn encode_resource_create_blob(
+    out: &mut [u8],
+    ctx_id: u32,
+    res_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    entries: &[(u64, u32)],
+) -> Option<usize> {
+    let need = 56usize.checked_add(entries.len().checked_mul(16)?)?;
+    if out.len() < need {
+        return None;
+    }
+    CtrlHdr::with_ctx(CMD_RESOURCE_CREATE_BLOB, ctx_id).encode(out)?;
+    wr_u32(out, 24, res_id);
+    wr_u32(out, 28, blob_mem);
+    wr_u32(out, 32, blob_flags);
+    wr_u32(out, 36, entries.len() as u32);
+    wr_u64(out, 40, blob_id);
+    wr_u64(out, 48, size);
+    for (i, &(addr, len)) in entries.iter().enumerate() {
+        let o = 56 + i * 16;
+        wr_u64(out, o, addr);
+        wr_u32(out, o + 8, len);
+        wr_u32(out, o + 12, 0);
+    }
+    Some(need)
+}
+
+/// Encode `CMD_RESOURCE_ASSIGN_UUID` (32 bytes) and decode `RESP_OK_RESOURCE_UUID` (40 bytes).
+pub fn encode_resource_assign_uuid(out: &mut [u8], res_id: u32) -> Option<usize> {
+    if out.len() < 32 {
+        return None;
+    }
+    CtrlHdr::new(CMD_RESOURCE_ASSIGN_UUID).encode(out)?;
+    wr_u32(out, 24, res_id);
+    wr_u32(out, 28, 0);
+    Some(32)
+}
+
+pub fn decode_resource_uuid(b: &[u8]) -> Option<[u8; 16]> {
+    let hdr = CtrlHdr::decode(b)?;
+    if hdr.ty != RESP_OK_RESOURCE_UUID || b.len() < 40 {
+        return None;
+    }
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&b[24..40]);
+    Some(uuid)
+}
+
 pub fn encode_resource_unref(out: &mut [u8], res_id: u32) -> Option<usize> {
     if out.len() < 32 {
         return None;
@@ -208,7 +264,6 @@ pub fn encode_resource_unref(out: &mut [u8], res_id: u32) -> Option<usize> {
     Some(32)
 }
 
-/// Encode `CMD_RESOURCE_DETACH_BACKING` (32 bytes).
 pub fn encode_resource_detach_backing(out: &mut [u8], res_id: u32) -> Option<usize> {
     if out.len() < 32 {
         return None;
@@ -219,7 +274,6 @@ pub fn encode_resource_detach_backing(out: &mut [u8], res_id: u32) -> Option<usi
     Some(32)
 }
 
-/// Encode `CMD_RESOURCE_ATTACH_BACKING` header (32 bytes) followed by `entries` of `(addr, len)`.
 pub fn encode_resource_attach_backing(out: &mut [u8], res_id: u32, entries: &[(u64, u32)]) -> Option<usize> {
     let need = 32usize.checked_add(entries.len().checked_mul(16)?)?;
     if out.len() < need {
@@ -237,7 +291,6 @@ pub fn encode_resource_attach_backing(out: &mut [u8], res_id: u32, entries: &[(u
     Some(need)
 }
 
-/// Encode `CMD_SET_SCANOUT` (48 bytes).
 pub fn encode_set_scanout(out: &mut [u8], x: u32, y: u32, w: u32, h: u32, scanout_id: u32, res_id: u32) -> Option<usize> {
     if out.len() < 48 {
         return None;
@@ -252,7 +305,6 @@ pub fn encode_set_scanout(out: &mut [u8], x: u32, y: u32, w: u32, h: u32, scanou
     Some(48)
 }
 
-/// Encode `CMD_TRANSFER_TO_HOST_2D` (56 bytes).
 pub fn encode_transfer_to_host_2d(
     out: &mut [u8],
     x: u32,
@@ -276,7 +328,6 @@ pub fn encode_transfer_to_host_2d(
     Some(56)
 }
 
-/// Encode `CMD_RESOURCE_FLUSH` (48 bytes).
 pub fn encode_resource_flush(out: &mut [u8], x: u32, y: u32, w: u32, h: u32, res_id: u32) -> Option<usize> {
     if out.len() < 48 {
         return None;
@@ -291,7 +342,6 @@ pub fn encode_resource_flush(out: &mut [u8], x: u32, y: u32, w: u32, h: u32, res
     Some(48)
 }
 
-/// Encode `CMD_UPDATE_CURSOR` or `CMD_MOVE_CURSOR` (56 bytes).
 #[allow(clippy::too_many_arguments)]
 pub fn encode_cursor(
     out: &mut [u8],
@@ -318,7 +368,6 @@ pub fn encode_cursor(
     Some(56)
 }
 
-/// Encode `CMD_GET_CAPSET_INFO` (32 bytes).
 pub fn encode_get_capset_info(out: &mut [u8], capset_index: u32) -> Option<usize> {
     if out.len() < 32 {
         return None;
@@ -329,7 +378,6 @@ pub fn encode_get_capset_info(out: &mut [u8], capset_index: u32) -> Option<usize
     Some(32)
 }
 
-/// Parsed `RESP_OK_CAPSET_INFO`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CapsetInfoResp {
     pub capset_id: u32,
@@ -349,26 +397,28 @@ pub fn decode_capset_info(b: &[u8]) -> Option<CapsetInfoResp> {
     })
 }
 
-/// Encode `CMD_CTX_CREATE` (96 bytes).
-pub fn encode_ctx_create(out: &mut [u8], ctx_id: u32, name: &[u8]) -> Option<usize> {
+/// Encode `CMD_CTX_CREATE` (96 bytes), optionally passing `context_init` (`F_CONTEXT_INIT` capset id).
+pub fn encode_ctx_create_ex(out: &mut [u8], ctx_id: u32, context_init: u32, name: &[u8]) -> Option<usize> {
     if out.len() < 96 {
         return None;
     }
     CtrlHdr::with_ctx(CMD_CTX_CREATE, ctx_id).encode(out)?;
     let nlen = name.len().min(64);
     wr_u32(out, 24, nlen as u32);
-    wr_u32(out, 28, 0); // context_init = 0
+    wr_u32(out, 28, context_init);
     out[32..96].fill(0);
     out[32..32 + nlen].copy_from_slice(&name[..nlen]);
     Some(96)
 }
 
-/// Encode `CMD_CTX_DESTROY` (24 bytes).
+pub fn encode_ctx_create(out: &mut [u8], ctx_id: u32, name: &[u8]) -> Option<usize> {
+    encode_ctx_create_ex(out, ctx_id, 0, name)
+}
+
 pub fn encode_ctx_destroy(out: &mut [u8], ctx_id: u32) -> Option<usize> {
     CtrlHdr::with_ctx(CMD_CTX_DESTROY, ctx_id).encode(out)
 }
 
-/// Encode `CMD_CTX_ATTACH_RESOURCE` / `CMD_CTX_DETACH_RESOURCE` (32 bytes).
 pub fn encode_ctx_resource(out: &mut [u8], attach: bool, ctx_id: u32, res_id: u32) -> Option<usize> {
     if out.len() < 32 {
         return None;
@@ -380,7 +430,6 @@ pub fn encode_ctx_resource(out: &mut [u8], attach: bool, ctx_id: u32, res_id: u3
     Some(32)
 }
 
-/// Encode `CMD_SUBMIT_3D` header (32 bytes) followed by `cmd_bytes` (must be 4-byte aligned).
 pub fn encode_submit_3d(out: &mut [u8], ctx_id: u32, cmd_bytes: &[u8]) -> Option<usize> {
     if !cmd_bytes.len().is_multiple_of(4) {
         return None;
@@ -396,7 +445,7 @@ pub fn encode_submit_3d(out: &mut [u8], ctx_id: u32, cmd_bytes: &[u8]) -> Option
     Some(need)
 }
 
-// ---- VirGL 3D command stream framing & strict validator -----------------------------------------
+// ---- VirGL 3D command stream framing & validator ------------------------------------------------
 
 pub const VIRGL_CCMD_NOP: u32 = 0;
 pub const VIRGL_CCMD_CREATE_OBJECT: u32 = 1;
@@ -421,13 +470,11 @@ pub const VIRGL_CCMD_CREATE_SUB_CTX: u32 = 35;
 pub const VIRGL_CCMD_DESTROY_SUB_CTX: u32 = 36;
 pub const VIRGL_MAX_CS_BYTES: usize = 64 * 1024;
 
-/// Build a VirGL packet header word: `(len_dwords << 16) | (obj_type << 8) | cmd`.
 #[inline]
 pub const fn virgl_hdr(cmd: u32, obj_type: u32, len_dwords: u32) -> u32 {
     ((len_dwords & 0xFFFF) << 16) | ((obj_type & 0xFF) << 8) | (cmd & 0xFF)
 }
 
-/// Build a VirGL `NOP` command (1 dword).
 pub fn virgl_cmd_nop(out: &mut [u32]) -> Option<usize> {
     if out.is_empty() {
         return None;
@@ -436,26 +483,6 @@ pub fn virgl_cmd_nop(out: &mut [u32]) -> Option<usize> {
     Some(1)
 }
 
-/// Build a VirGL `CLEAR` command (9 dwords: header + buffers + 4 color floats + depth_lo/hi + stencil).
-pub fn virgl_cmd_clear(out: &mut [u32], buffers: u32, rgba: [f32; 4], depth: f64, stencil: u32) -> Option<usize> {
-    if out.len() < 9 {
-        return None;
-    }
-    let d = depth.to_bits();
-    out[0] = virgl_hdr(VIRGL_CCMD_CLEAR, 0, 8);
-    out[1] = buffers;
-    out[2] = rgba[0].to_bits();
-    out[3] = rgba[1].to_bits();
-    out[4] = rgba[2].to_bits();
-    out[5] = rgba[3].to_bits();
-    out[6] = d as u32;
-    out[7] = (d >> 32) as u32;
-    out[8] = stencil;
-    Some(9)
-}
-
-/// Validate a raw VirGL command buffer before DMA submission.
-/// Checks alignment, total size cap, per-packet length bounds, and known command opcodes.
 pub fn validate_virgl_cs(bytes: &[u8]) -> Result<usize, CsError> {
     if bytes.is_empty() {
         return Err(CsError::Empty);
@@ -472,7 +499,9 @@ pub fn validate_virgl_cs(bytes: &[u8]) -> Result<usize, CsError> {
         let hdr = rd_u32(bytes, off).ok_or(CsError::Truncated)?;
         let cmd = hdr & 0xFF;
         let payload_dwords = (hdr >> 16) as usize;
-        let pkt_bytes = 4usize.checked_add(payload_dwords.checked_mul(4).ok_or(CsError::TooLarge)?).ok_or(CsError::TooLarge)?;
+        let pkt_bytes = 4usize
+            .checked_add(payload_dwords.checked_mul(4).ok_or(CsError::TooLarge)?)
+            .ok_or(CsError::TooLarge)?;
         if off.checked_add(pkt_bytes).is_none_or(|e| e > bytes.len()) {
             return Err(CsError::Truncated);
         }
@@ -499,9 +528,6 @@ pub fn validate_virgl_cs(bytes: &[u8]) -> Result<usize, CsError> {
             | VIRGL_CCMD_CREATE_SUB_CTX
             | VIRGL_CCMD_DESTROY_SUB_CTX => {}
             _ => return Err(CsError::UnknownOpcode),
-        }
-        if cmd == VIRGL_CCMD_CLEAR && payload_dwords != 8 {
-            return Err(CsError::BadArgument);
         }
         off += pkt_bytes;
         packets += 1;

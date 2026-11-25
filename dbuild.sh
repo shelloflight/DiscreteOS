@@ -15,7 +15,7 @@ fi
 NEED_BUILD=0
 if [ ! -x "$BIN" ]; then
     NEED_BUILD=1
-elif [ -n "$(find "$CRATE/src" "$CRATE/Cargo.toml" "$ROOT/user/lib/fs/src" "$ROOT/user/lib/crypto/src" "$ROOT/user/lib/net/src" "$ROOT/user/lib/font/src" "$ROOT/user/lib/app/src" "$ROOT/user/lib/identity/src" \
+elif [ -n "$(find "$CRATE/src" "$CRATE/Cargo.toml" "$ROOT/user/lib/fs/src" "$ROOT/user/lib/crypto/src" "$ROOT/user/lib/net/src" "$ROOT/user/lib/font/src" "$ROOT/user/lib/app/src" "$ROOT/user/lib/identity/src" "$ROOT/user/lib/drm/src" \
         -type f -newer "$BIN" 2>/dev/null | head -n 1)" ]; then
     NEED_BUILD=1
 fi

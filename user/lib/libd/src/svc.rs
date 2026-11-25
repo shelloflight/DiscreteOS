@@ -32,6 +32,11 @@ pub const SUSPEND: u32 = 304;
 /// Manager -> device manager (a call): restart every driver after ACPI S3 wake and wait until
 /// ready. Reply: the same op, `a` = drivers ready.
 pub const RESUME: u32 = 305;
+/// Manager -> running service (`devmgr`): grant a verified program VMO loaded from `sys:/bin/`
+/// matching `grants.programs` (`*.ddrv`); payload = program filename.
+pub const GIVE_PROGRAM: u32 = 306;
+/// Manager -> running `devmgr`: grant a read-only directory channel rooted at `sys:/firmware`.
+pub const GIVE_FIRMWARE: u32 = 307;
 
 pub const TAG_ENDPOINT_NAMES: u32 = sys::TAG_USER + 0x1FF;
 pub const TAG_ENDPOINT: u32 = sys::TAG_USER + 0x200;

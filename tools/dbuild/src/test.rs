@@ -1659,7 +1659,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "terminal|   1  virtio-gpu",
                 "1af4:1050",
                 "1024x768",
-                "gop/virtio",
+                "atomic-kms",
                 "Power: switching off",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
@@ -2937,7 +2937,7 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
         HostTest::Manifest => host_cargo_test(env, "user/lib/dman", &["--", "--nocapture"], &["test result", "FAILED", "panicked", "dman fuzz"]),
         HostTest::Audio => host_cargo_test(env, "user/lib/audio", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Net => host_cargo_test(env, "user/lib/net", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
-        HostTest::Gpu => host_cargo_test(env, "user/lib/gpu", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
+        HostTest::Gpu => host_cargo_test(env, "user/lib/drm", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Awmi => host_cargo_test(env, "user/lib/awmi", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Ui => Ok(host_cargo_test(env, "user/lib/font", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?
             && host_cargo_test(env, "user/lib/ui", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?),
@@ -3382,6 +3382,23 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
         ],
         ufiles,
     ));
+    let vfiles = collect_files(&env.root.join("vendor/dosdrm_c/src"), "c", true);
+    if !vfiles.is_empty() {
+        sets.push((
+            "vendor C (dosdrm_c)".into(),
+            vec![
+                "--target=x86_64-unknown-elf".into(),
+                "-std=c17".into(),
+                "-ffreestanding".into(),
+                "-nostdinc".into(),
+                "-isystem".into(),
+                inc.to_string_lossy().into_owned(),
+                "-I".into(),
+                env.root.join("vendor/dosdrm_c/include").to_string_lossy().into_owned(),
+            ],
+            vfiles,
+        ));
+    }
 
     let mut findings = 0usize;
     let mut total_files = 0usize;
@@ -3453,7 +3470,7 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
         ("kernel/aml", &["--all-targets"]),
         ("user/lib/audio", &["--all-targets"]),
         ("user/lib/net", &["--all-targets"]),
-        ("user/lib/gpu", &["--all-targets"]),
+        ("user/lib/drm", &["--all-targets"]),
         ("user/lib/awmi", &["--all-targets"]),
         ("user/lib/font", &["--all-targets"]),
         ("user/lib/ui", &["--all-targets"]),

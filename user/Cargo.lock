@@ -62,7 +62,7 @@ name = "devmgr"
 version = "0.1.0"
 dependencies = [
  "dosaudio",
- "dosgpu",
+ "dosdrm",
  "libd",
 ]
 
@@ -92,15 +92,18 @@ name = "doscrypt"
 version = "0.1.0"
 
 [[package]]
+name = "dosdrm"
+version = "0.1.0"
+dependencies = [
+ "libd",
+]
+
+[[package]]
 name = "dosfont"
 version = "0.1.0"
 
 [[package]]
 name = "dosfs"
-version = "0.1.0"
-
-[[package]]
-name = "dosgpu"
 version = "0.1.0"
 
 [[package]]
@@ -137,7 +140,7 @@ dependencies = [
 name = "gpu"
 version = "0.1.0"
 dependencies = [
- "dosgpu",
+ "dosdrm",
  "libd",
 ]
 
@@ -177,7 +180,7 @@ dependencies = [
  "dosapp",
  "dosaudio",
  "doscrypt",
- "dosgpu",
+ "dosdrm",
  "dosid",
  "dosnet",
  "libd",

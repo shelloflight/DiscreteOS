@@ -1,0 +1,7 @@
+# D-OS Intel Xe firmware directory manifest (sys:/firmware/xe/manifest.toml)
+# Stage 1.4 populates signed GuC, HuC, and DMC display firmware blobs here.
+vendor = "xe"
+pci_vendor = 0x8086
+driver = "xe.ddrv"
+kms_atomic = true
+families = ["xelp", "xehpg", "xe2"]

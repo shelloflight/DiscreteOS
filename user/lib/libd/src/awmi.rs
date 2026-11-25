@@ -98,16 +98,14 @@ pub const OP_SETTINGS: u32 = 934;
 pub const SET_THEME: u64 = 1;
 pub const SET_TEXT_SCALE: u64 = 2;
 pub const SET_MOTION: u64 = 4;
-/// `awmi.admin`: run the 5-second native hardware page-flip test (`a` = adapter id, `b` = duration_ms),
-/// pausing the terminal safely and reverting automatically; reply payload = `gpu::FlipTestResult`.
-pub const OP_FLIP_TEST: u32 = 935;
-/// `awmi.admin`: configure display mode, VRR, HDR, or per-output scale on an output:
+/// `awmi.admin`: configure display mode, VRR, HDR, confirmation, or per-output scale on an output:
 /// `a` = adapter_id | (subop `DISPLAY_SET_*` << 32).
 pub const OP_SET_DISPLAY: u32 = 936;
 pub const DISPLAY_SET_MODE: u8 = 0;
 pub const DISPLAY_SET_VRR: u8 = 1;
 pub const DISPLAY_SET_HDR: u8 = 2;
 pub const DISPLAY_SET_SCALE: u8 = 3;
+pub const DISPLAY_CONFIRM_MODE: u8 = 4;
 /// `awmi.admin`: engage the unforgeable compositor lock/login screen (`a` = reason 1..4, `b` = mode 1..2).
 pub const OP_LOCK: u32 = 937;
 pub const LOCK_REASON_BOOT: u64 = 1;
@@ -378,29 +376,11 @@ pub fn set_output_scale(ep: Handle, adapter_id: u32, scale_pct: u16) -> Result<(
     simple(ep, OP_SET_DISPLAY, a, u64::from(scale_pct), &[]).map(|_| ())
 }
 
-/// Run the native display flip test via `awmi.admin` (releases terminal, flips two patterns with
-/// frame counter for `duration_ms`, reverts to GOP, reclaims terminal).
-pub fn flip_test(ep: Handle, adapter_id: u32, duration_ms: u32) -> Result<crate::gpu::FlipTestResult, i64> {
-    if ep == 0 {
-        return Err(sys::ERR_BAD_HANDLE);
-    }
-    let mut req = [0u8; HEADER];
-    Header {
-        txid: 0,
-        op: OP_FLIP_TEST,
-        status: 0,
-        a: u64::from(adapter_id),
-        b: u64::from(duration_ms),
-    }
-    .put(&mut req);
-    let mut rep = [0u8; HEADER + crate::gpu::FLIP_TEST_BYTES];
-    let timeout = u64::from(duration_ms.clamp(500, 15_000)) * 1_000_000 + 10_000_000_000;
-    let n = sys::channel_call(ep, &req, &mut rep, timeout)? as usize;
-    let h = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
-    if h.status != 0 {
-        return Err(i64::from(h.status));
-    }
-    crate::gpu::FlipTestResult::decode(&rep[HEADER..n]).ok_or(sys::ERR_INVALID_ARGS)
+/// Confirm (`confirm = true`) or immediately revert (`confirm = false`) a pending 12-second
+/// modeset on `adapter_id` via `awmi.admin`.
+pub fn confirm_display_mode(ep: Handle, adapter_id: u32, confirm: bool) -> Result<(), i64> {
+    let a = u64::from(adapter_id) | (u64::from(DISPLAY_CONFIRM_MODE) << 32);
+    simple(ep, OP_SET_DISPLAY, a, u64::from(confirm), &[]).map(|_| ())
 }
 
 /// Test hook: (hash of the primary output's pixels, pixels that are not the desktop background).

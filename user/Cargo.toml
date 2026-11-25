@@ -34,7 +34,7 @@ exclude = [
     "lib/identity",
     "lib/ui",
     "lib/fs",
-    "lib/gpu",
+    "lib/drm",
     "lib/net",
 ]
 

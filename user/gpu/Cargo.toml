@@ -17,7 +17,7 @@ bench = false
 
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
-dosgpu = { path = "../lib/gpu" }
+dosdrm = { path = "../lib/drm" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

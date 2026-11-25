@@ -36,7 +36,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "net", aliases: &["ip"], usage: "net [check | dhcp | dns <ip|auto> [dns2] | static <ip> <mask> <gw> [dns1] [dns2]]", description: "network status, diagnostics, DHCP renewal, DNS and static IPv4 configuration" },
     Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
     Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
-    Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id] | display [id] | flip-test [id] [ms] | mode <w> <h> <hz> [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]", description: "GPU adapters, live display probe, refresh/mode, VRR, HDR, scale, and page-flip test" },
+    Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id] | display [id] | mode <w> <h> <hz> [id] | confirm [id] | revert [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]", description: "GPU adapters, Atomic KMS topology, refresh/mode, confirm/revert, VRR, HDR, and UI scale" },
     Builtin { name: "gui", aliases: &["awmi"], usage: "gui [demo | status | lock | theme dark|contrast | text 100-200 | motion on|off]", description: "start the desktop (D-AWMI), show its status, lock the screen, or change theme, text size and motion" },
     Builtin { name: "identity", aliases: &["id", "whoami"], usage: "identity [list | enroll <pass> | create <name> <display> [standard|operator] | switch <name> [pass] | policy [idle <sec>|sleep on|off|boot on|off]]", description: "user identities, TPM 2.0 credential sealing, and session lock policy" },
     Builtin { name: "apps", aliases: &["app"], usage: "apps [list | launch <name> | stop <name> | perms <name> | grant <name> <perm> | revoke <name> <perm> | verify <path>]", description: "signed .dapp bundles, launching, and live revocable permissions" },
@@ -1172,6 +1172,11 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
                         }
                         flags.push_str("preferred");
                     }
+                    let timing = if m.pixel_clock_khz > 0 {
+                        format!("{}.{:02} MHz ({}x{})", m.pixel_clock_khz / 1000, (m.pixel_clock_khz % 1000) / 10, m.htotal, m.vtotal)
+                    } else {
+                        String::from("-")
+                    };
                     rs.push(
                         Record::new()
                             .with("mode", Value::Text(format!("{}x{}", m.width, m.height)))
@@ -1179,6 +1184,7 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
                                 "refresh",
                                 Value::Text(format!("{}.{:02} Hz", m.refresh_mhz / 1000, (m.refresh_mhz % 1000) / 10)),
                             )
+                            .with("timing", Value::Text(timing))
                             .with("flags", Value::Text(flags)),
                     );
                 }
@@ -1186,76 +1192,58 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
             }
             "display" => {
                 let id = parse_id(args.get(1))?;
-                let p = gpu::get_display_info(sh.gpu_query, id)
-                    .map_err(|e| format!("gpu: display probe failed ({})", sys::status(e)))?;
-                let rate_label = match p.dp_rate_mbps {
-                    1_620 => "RBR",
-                    2_700 => "HBR",
-                    5_400 => "HBR2",
-                    8_100 => "HBR3",
-                    10_000 => "UHBR10",
-                    13_500 => "UHBR13.5",
-                    20_000 => "UHBR20",
-                    _ => "none",
-                };
-                let link_str = if p.dp_lanes > 0 {
+                let mut modes = [ModeEntry::default(); 16];
+                let (k, mn) = gpu::kms_get_resources(sh.gpu_query, id, &mut modes)
+                    .map_err(|e| format!("gpu: kms_get_resources failed ({})", sys::status(e)))?;
+                let link_str = if k.dp_lanes > 0 {
                     format!(
-                        "{}x {} ({} Mbps{}{})",
-                        p.dp_lanes,
-                        rate_label,
-                        p.dp_rate_mbps,
-                        if (p.flags & gpu::PROBE_DSC_SUPPORTED) != 0 {
-                            if (p.flags2 & gpu::PROBE2_DSC_ENABLED) != 0 { ", DSC on" } else { ", DSC cap" }
+                        "{}x ({} Mbps{})",
+                        k.dp_lanes,
+                        k.dp_rate_mbps,
+                        if (k.status_flags & gpu::KMS_STATUS_DSC_ENABLED) != 0 {
+                            ", DSC on"
+                        } else if (k.status_flags & gpu::KMS_STATUS_DSC_CAPABLE) != 0 {
+                            ", DSC cap"
                         } else {
                             ""
-                        },
-                        if (p.flags2 & gpu::PROBE2_IS_UHBR) != 0 { ", UHBR" } else { "" }
+                        }
                     )
                 } else {
                     String::from("none")
                 };
-                let dcn_str = if p.dcn_major > 0 {
-                    format!("DCN {}.{}.{}", p.dcn_major, p.dcn_minor, p.dcn_rev)
-                } else {
-                    String::from("gop/virtio")
-                };
                 let mode_str = format!(
                     "{}x{} (total {}x{}, pitch {})",
-                    p.width, p.height, p.h_total, p.v_total, p.pitch_bytes
+                    k.width, k.height, k.htotal, k.vtotal, k.pitch_bytes
                 );
-                let hz_str = if p.measured_mhz > 0 {
-                    format!("{}.{:02} Hz", p.measured_mhz / 1000, (p.measured_mhz % 1000) / 10)
+                let hz_str = if k.refresh_mhz > 0 {
+                    format!("{}.{:02} Hz", k.refresh_mhz / 1000, (k.refresh_mhz % 1000) / 10)
                 } else {
-                    String::from("unmeasured")
+                    String::from("inactive")
                 };
-                let scanout_str = format!(
-                    "mc={:#x} vram={:#x} gop={:#x} ({})",
-                    p.mc_addr,
-                    p.vram_off,
-                    p.gop_phys_base,
-                    if (p.flags & gpu::PROBE_GOP_MATCHED) != 0 { "GOP matched" } else { "unmatched" }
-                );
                 let mut state_parts = Vec::new();
-                if (p.flags & gpu::PROBE_FLIP_VERIFIED) != 0 {
-                    state_parts.push("flip-verified");
-                } else if (p.flags2 & gpu::PROBE2_SELF_CHECK_FAILED) != 0 {
-                    state_parts.push("self-check-failed");
-                } else {
-                    state_parts.push("probe-only");
+                state_parts.push("atomic-kms");
+                if (k.status_flags & gpu::KMS_STATUS_CRTC_ACTIVE) != 0 {
+                    state_parts.push("crtc-active");
                 }
-                if (p.flags & gpu::PROBE_IH_IRQ_ACTIVE) != 0 {
-                    state_parts.push("ih-irq");
+                if (k.status_flags & gpu::KMS_STATUS_CURSOR_PLANE) != 0 {
+                    state_parts.push("cursor-plane");
                 }
-                if (p.flags & gpu::PROBE_VRR_SUPPORTED) != 0 {
-                    state_parts.push(if (p.flags & gpu::PROBE_VRR_ENABLED) != 0 { "vrr-on" } else { "vrr-cap" });
+                if (k.status_flags & gpu::KMS_STATUS_FIRMWARE_LOADED) != 0 {
+                    state_parts.push("fw-ok");
                 }
-                if (p.flags & gpu::PROBE_HDR_SUPPORTED) != 0 {
-                    state_parts.push(if (p.flags & gpu::PROBE_HDR_ENABLED) != 0 { "hdr-on" } else { "hdr-cap" });
+                if (k.status_flags & gpu::KMS_STATUS_VENDOR_SHIM_OK) != 0 {
+                    state_parts.push("shim-ok");
+                }
+                if (k.status_flags & gpu::KMS_STATUS_VRR_CAPABLE) != 0 {
+                    state_parts.push(if (k.status_flags & gpu::KMS_STATUS_VRR_ENABLED) != 0 { "vrr-on" } else { "vrr-cap" });
+                }
+                if (k.status_flags & gpu::KMS_STATUS_HDR_CAPABLE) != 0 {
+                    state_parts.push(if (k.status_flags & gpu::KMS_STATUS_HDR_ENABLED) != 0 { "hdr-on" } else { "hdr-cap" });
+                }
+                if (k.status_flags & gpu::KMS_STATUS_REVERT_PENDING) != 0 {
+                    state_parts.push("revert-pending");
                 }
 
-                // Append concise EDID modes list & DPCD summary line to terminal output.
-                let mut modes = [ModeEntry::default(); 16];
-                let mn = gpu::get_modes(sh.gpu_query, p.adapter_id, &mut modes).unwrap_or(0);
                 let mut edid_modes = String::new();
                 for (idx, m) in modes[..mn].iter().enumerate() {
                     if idx > 0 {
@@ -1263,75 +1251,21 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
                     }
                     edid_modes.push_str(&format!("{}x{}@{}", m.width, m.height, m.refresh_mhz / 1000));
                 }
-                if p.dp_lanes > 0 {
-                    sh.write(&format!(
-                        "  dpcd: 000={:02x}{:02x}{:02x}{:02x} 060={:02x}{:02x} 100={:02x}{:02x} 202={:02x}{:02x}{:02x} (edid {} blk)\n",
-                        p.dpcd_000[0],
-                        p.dpcd_000[1],
-                        p.dpcd_000[2],
-                        p.dpcd_000[3],
-                        p.dpcd_060[0],
-                        p.dpcd_060[1],
-                        p.dpcd_100[0],
-                        p.dpcd_100[1],
-                        p.dpcd_202[0],
-                        p.dpcd_202[1],
-                        p.dpcd_202[2],
-                        p.edid_blocks,
-                    ));
-                }
-                if !p.note_str().is_empty() {
-                    sh.write(&format!("  note: {}\n", p.note_str()));
+                if !k.note_str().is_empty() {
+                    sh.write(&format!("  note: {}\n", k.note_str()));
                 }
                 return Ok(alloc::vec![
                     Record::new()
-                        .with("adapter", Value::Int(i64::from(p.adapter_id)))
-                        .with("engine", Value::Text(dcn_str))
-                        .with("pipe", Value::Text(format!("{} ({} active)", p.pipe, p.active_pipes)))
-                        .with("monitor", Value::Text(String::from(p.monitor_str())))
+                        .with("adapter", Value::Int(i64::from(k.adapter_id)))
+                        .with("connector", Value::Text(format!("{}-{}", k.connector_kind_str(), k.connector_id)))
+                        .with("crtc", Value::Text(format!("#{} (pipe {}, {} planes)", k.crtc_id, k.pipe, k.plane_count)))
+                        .with("monitor", Value::Text(String::from(k.monitor_str())))
                         .with("mode", Value::Text(mode_str))
-                        .with("measured", Value::Text(hz_str))
+                        .with("refresh", Value::Text(hz_str))
                         .with("link", Value::Text(link_str))
-                        .with("scanout", Value::Text(scanout_str))
+                        .with("vblanks", Value::Int(k.vblank_seq as i64))
                         .with("state", Value::Text(state_parts.join(",")))
-                        .with("edid_modes", Value::Text(edid_modes)),
-                ]);
-            }
-            "flip-test" => {
-                if sh.awmi_admin == 0 {
-                    return Err(String::from("gpu: flip-test requires awmi.admin grant"));
-                }
-                let id = parse_id(args.get(1))?;
-                let dur_ms = match args.get(2) {
-                    Some(s) => s.parse::<u32>().map_err(|_| format!("gpu: invalid duration '{}'", s))?,
-                    None => 5000,
-                };
-                sh.write(&format!("running native page-flip test for {} ms...\n", dur_ms));
-                let res = libd::awmi::flip_test(sh.awmi_admin, id, dur_ms)
-                    .map_err(|e| format!("gpu: flip-test failed ({})", sys::status(e)))?;
-                sh.write(&show::ok_line(&format!(
-                    "flip-test done: {} frames, {} missed, {} late, {}.{:02} Hz (pipe {}, ih={}, reverted={})",
-                    res.frames,
-                    res.missed,
-                    res.late,
-                    res.measured_mhz / 1000,
-                    (res.measured_mhz % 1000) / 10,
-                    res.pipe,
-                    res.used_ih,
-                    res.reverted,
-                )));
-                return Ok(alloc::vec![
-                    Record::new()
-                        .with("frames", Value::Int(res.frames as i64))
-                        .with("missed", Value::Int(res.missed as i64))
-                        .with("late", Value::Int(res.late as i64))
-                        .with(
-                            "measured",
-                            Value::Text(format!("{}.{:02} Hz", res.measured_mhz / 1000, (res.measured_mhz % 1000) / 10)),
-                        )
-                        .with("dcn", text(if res.used_dcn { "yes" } else { "no" }))
-                        .with("irq", text(if res.used_ih { "ih" } else { "timer" }))
-                        .with("reverted", text(if res.reverted { "yes" } else { "no" })),
+                        .with("modes", Value::Text(edid_modes)),
                 ]);
             }
             "mode" => {
@@ -1346,10 +1280,31 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
                 let raw_hz = hzs.parse::<u32>().map_err(|_| format!("gpu: invalid refresh '{}'", hzs))?;
                 let refresh_mhz = if raw_hz >= 10_000 { raw_hz } else { raw_hz.saturating_mul(1000) };
                 let id = parse_id(args.get(4))?;
-                // Allow DSC and DP link retrain (bits 0 and 1); driver verifies OTG progression and reverts on stall.
-                libd::awmi::set_display_mode(sh.awmi_admin, id, w, h, refresh_mhz, 3)
+                // Pass bit 2 (`require_confirm`) so an unconfirmed mode automatically reverts in 12s.
+                libd::awmi::set_display_mode(sh.awmi_admin, id, w, h, refresh_mhz, 7)
                     .map_err(|e| format!("gpu: mode {}x{} @ {} Hz failed ({})", w, h, refresh_mhz / 1000, sys::status(e)))?;
-                sh.write(&show::ok_line(&format!("display mode set to {}x{} @ {}.{:02} Hz", w, h, refresh_mhz / 1000, (refresh_mhz % 1000) / 10)));
+                sh.write(&show::ok_line(&format!(
+                    "display mode set to {}x{} @ {}.{:02} Hz (run 'gpu confirm' within 12s to keep, or 'gpu revert')",
+                    w,
+                    h,
+                    refresh_mhz / 1000,
+                    (refresh_mhz % 1000) / 10
+                )));
+                return Ok(Vec::new());
+            }
+            "confirm" | "revert" => {
+                if sh.awmi_admin == 0 {
+                    return Err(String::from("gpu: confirm/revert requires awmi.admin grant"));
+                }
+                let confirm = sub == "confirm";
+                let id = parse_id(args.get(1))?;
+                libd::awmi::confirm_display_mode(sh.awmi_admin, id, confirm)
+                    .map_err(|e| format!("gpu: {} failed ({})", sub, sys::status(e)))?;
+                sh.write(&show::ok_line(if confirm {
+                    "display mode confirmed"
+                } else {
+                    "display mode reverted to previous mode"
+                }));
                 return Ok(Vec::new());
             }
             "vrr" => {
@@ -1406,7 +1361,7 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
                 }
                 return Ok(Vec::new());
             }
-            _ => return Err(String::from("gpu: usage: gpu [modes [id] | display [id] | flip-test [id] [ms] | mode <w> <h> <hz> [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]")),
+            _ => return Err(String::from("gpu: usage: gpu [modes [id] | display [id] | mode <w> <h> <hz> [id] | confirm [id] | revert [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]")),
         }
     }
     let mut adapters = [AdapterInfo::empty(); 8];
@@ -1430,19 +1385,22 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
         if (a.caps & gpu::CAP_WC) != 0 {
             features.push("wc");
         }
+        if (a.caps & gpu::CAP_ATOMIC_KMS) != 0 {
+            features.push("atomic-kms");
+        }
+        if (a.caps & gpu::CAP_GEM_VM) != 0 {
+            features.push("gem-vm");
+        }
+        if (a.caps & gpu::CAP_SYNCOBJ_TIMELINE) != 0 {
+            features.push("syncobj");
+        }
         if (a.caps & gpu::CAP_EDID) != 0 {
             features.push("edid");
         }
         if (a.caps & gpu::CAP_HW_CURSOR) != 0 {
             features.push("cursor");
         }
-        if (a.caps & gpu::CAP_PAGE_FLIP) != 0 {
-            features.push("flip");
-        }
-        if (a.caps & gpu::CAP_ASYNC_FLIP) != 0 {
-            features.push("async");
-        }
-        if (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0 {
+        if (a.caps & gpu::CAP_NATIVE_KMS) != 0 {
             features.push("native");
         }
         if (a.caps & gpu::CAP_VRR) != 0 {
@@ -1456,6 +1414,12 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
         }
         if (a.caps & gpu::CAP_VIRGL_3D) != 0 {
             features.push("virgl3d");
+        }
+        if (a.caps & gpu::CAP_VENUS_VK) != 0 {
+            features.push("venus");
+        }
+        if (a.caps & gpu::CAP_SYS_FIRMWARE) != 0 {
+            features.push("fw");
         }
         if (a.caps & gpu::CAP_GSP_RPC) != 0 {
             features.push("gsp");

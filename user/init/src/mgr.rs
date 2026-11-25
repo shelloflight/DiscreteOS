@@ -518,7 +518,7 @@ impl Mgr {
                 if !m.programs.iter().any(|p| dman::program_matches(p, n)) {
                     continue;
                 }
-                if hs.len() + 2 + m.connect.len() + m.namespace.len() >= sys_spawn_max() {
+                if hs.len() + 3 + m.connect.len() + m.namespace.len() >= sys_spawn_max() {
                     left_out += 1;
                     continue;
                 }
@@ -526,6 +526,15 @@ impl Mgr {
                     give(&mut hs, d, sys::TAG_PROGRAM);
                 }
             }
+        }
+        // If `sys:` is already mounted and this service manages `.ddrv` drivers (`devmgr`),
+        // pass a read-only `sys:/firmware` directory handle directly in its startup block.
+        if m.programs.iter().any(|p| p == "*.ddrv")
+            && let Some(sys_vol) = self.volumes.iter().find(|v| v.name == "sys")
+            && let Ok((fw_dir, kind, _)) = sys_vol.root.open(b"firmware", fp::O_DIRECTORY, fp::R_READ)
+            && kind == fp::KIND_DIR
+        {
+            give(&mut hs, fw_dir.into_handle(), proto::TAG_FIRMWARE);
         }
         if left_out > 0 {
             println!("init: {}: {} devices/programs left out: a spawn passes at most {} handles", m.name, left_out, sys_spawn_max());
@@ -620,6 +629,11 @@ impl Mgr {
             println!("init: started {} with {} devices", m.name, ndev);
         } else {
             println!("init: started {}", m.name);
+        }
+        // If `sys:` is already mounted and this service spawns `.ddrv` drivers (`devmgr`),
+        // hand it a read-only directory capability rooted at `sys:/firmware`.
+        if m.programs.iter().any(|p| p == "*.ddrv") {
+            self.send_firmware_dir(i);
         }
         // A restarted provider: its volumes are announced again; its running clients get linked
         // to the new instance.
@@ -797,6 +811,15 @@ impl Mgr {
                             self.volumes_done = true;
                             let names: Vec<&str> = self.volumes.iter().map(|v| v.name.as_str()).collect();
                             println!("init: {} volume(s): {}", self.volumes.len(), names.join(" "));
+                            if self.sys_loaded {
+                                for k in 0..self.svcs.len() {
+                                    if self.svcs[k].state == State::Running
+                                        && self.svcs[k].m.programs.iter().any(|p| p == "*.ddrv")
+                                    {
+                                        self.send_firmware_dir(k);
+                                    }
+                                }
+                            }
                         }
                         _ => {
                             if handle != 0 {
@@ -1162,6 +1185,27 @@ impl Mgr {
         r
     }
 
+    /// Send a read-only `sys:/firmware` directory channel (`svc::GIVE_FIRMWARE`) to running service `i`.
+    fn send_firmware_dir(&self, i: usize) {
+        let ctl = self.svcs[i].ctl.raw();
+        if ctl == 0 {
+            return;
+        }
+        let Some(sys_vol) = self.volumes.iter().find(|v| v.name == "sys") else {
+            return;
+        };
+        let Ok((fw_dir, kind, _)) = sys_vol.root.open(b"firmware", fp::O_DIRECTORY, fp::R_READ) else {
+            return;
+        };
+        if kind != fp::KIND_DIR {
+            return;
+        }
+        let mut msg = [0u8; HEADER];
+        Header { txid: 0, op: svc::GIVE_FIRMWARE, status: 0, a: 0, b: 0 }.put(&mut msg);
+        let h = fw_dir.into_handle();
+        let _ = sys::channel_write_h(ctl, &msg, &[MsgHandle { handle: h, rights: sys::RIGHTS_SAME }]);
+    }
+
     // ---- manifests from disk --------------------------------------------------------------------
 
     /// Load signed programs (`/bin`), tools (`/tools`) and services (`/services`) from the
@@ -1174,6 +1218,13 @@ impl Mgr {
             return 0;
         };
         self.sys_loaded = true;
+        // Deliver read-only `sys:/firmware` directory capability to any already-running `.ddrv`
+        // manager (`devmgr`) before handing over late `sys:/bin/*.ddrv` driver VMOs.
+        for k in 0..self.svcs.len() {
+            if self.svcs[k].state == State::Running && self.svcs[k].m.programs.iter().any(|p| p == "*.ddrv") {
+                self.send_firmware_dir(k);
+            }
+        }
         let mut progs = 0u32;
         if let Ok((dir, _, _)) = root.open(b"bin", fp::O_DIRECTORY, fp::R_READ) {
             let mut names: Vec<Vec<u8>> = Vec::new();
@@ -1192,8 +1243,28 @@ impl Mgr {
                 sig_name.extend_from_slice(b".dsig");
                 match load_verified_program(&dir, &n, &sig_name, &file) {
                     Ok(vmo) => {
-                        self.disk_programs.push((file, vmo));
+                        let raw_vmo = vmo.raw();
+                        self.disk_programs.push((file.clone(), vmo));
                         progs += 1;
+                        // Forward newly verified `.ddrv` / matching program VMOs to running bootstrap services (`devmgr`).
+                        for s in &self.svcs {
+                            if s.state == State::Running
+                                && s.ctl.raw() != 0
+                                && s.m.programs.iter().any(|pat| dman::program_matches(pat, &file))
+                                && let Some(dup_vmo) = dup(raw_vmo)
+                            {
+                                let nb = file.as_bytes();
+                                let nl = nb.len().min(48);
+                                let mut msg = [0u8; HEADER + 48];
+                                Header { txid: 0, op: svc::GIVE_PROGRAM, status: 0, a: 0, b: 0 }.put(&mut msg);
+                                msg[HEADER..HEADER + nl].copy_from_slice(&nb[..nl]);
+                                let _ = sys::channel_write_h(
+                                    s.ctl.raw(),
+                                    &msg[..HEADER + nl],
+                                    &[MsgHandle { handle: dup_vmo, rights: sys::RIGHTS_SAME }],
+                                );
+                            }
+                        }
                     }
                     Err(why) => println!("init: sys:/bin/{} refused: {}", file, why),
                 }

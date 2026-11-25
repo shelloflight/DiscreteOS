@@ -55,6 +55,7 @@ pub struct Env {
     objcopy: OnceLock<PathBuf>,
     nm: OnceLock<PathBuf>,
     readobj: OnceLock<PathBuf>,
+    ar: OnceLock<Option<PathBuf>>,
     dlltool: OnceLock<Option<PathBuf>>,
     nasm: OnceLock<PathBuf>,
     qemu: OnceLock<PathBuf>,
@@ -84,6 +85,7 @@ impl Env {
             objcopy: OnceLock::new(),
             nm: OnceLock::new(),
             readobj: OnceLock::new(),
+            ar: OnceLock::new(),
             dlltool: OnceLock::new(),
             nasm: OnceLock::new(),
             qemu: OnceLock::new(),
@@ -184,6 +186,12 @@ impl Env {
         }
         let p = find_tool("llvm-readobj", &llvm_fallbacks())?;
         Ok(self.readobj.get_or_init(|| p))
+    }
+
+    pub fn ar(&self) -> Option<&Path> {
+        self.ar
+            .get_or_init(|| find_tool("llvm-ar", &llvm_fallbacks()).ok())
+            .as_deref()
     }
 
     pub fn dlltool(&self) -> Option<&Path> {

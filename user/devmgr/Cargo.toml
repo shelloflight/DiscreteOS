@@ -19,6 +19,7 @@ publish = false
 
 [package.metadata.dos]
 ddrv = ["ps2", "virtio-blk", "virtio-input", "ahci", "nvme", "xhci", "hda", "virtio-snd", "usbaudio", "virtio-net", "e1000e", "r8169", "virtio-gpu", "amdgpu", "xe", "nvgpu"]
+vendor_libs = ["dosdrm_c"]
 
 [lib]
 crate-type = ["staticlib"]
@@ -29,7 +30,7 @@ bench = false
 [dependencies]
 libd = { path = "../lib/libd" }
 dosaudio = { path = "../lib/audio" }
-dosgpu = { path = "../lib/gpu" }
+dosdrm = { path = "../lib/drm", features = ["shim"] }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

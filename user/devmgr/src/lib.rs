@@ -85,6 +85,8 @@ const MAX_DISKS: usize = 16;
 const MAX_AUDIO: usize = 32;
 const MAX_NET: usize = 8;
 const MAX_GPU: usize = 8;
+const MAX_LATE_PROGS: usize = 8;
+const MAX_DEFERRED_GPU: usize = 8;
 const MAX_INPUT_CLIENTS: usize = 8;
 /// Port key of the control channel from the service manager.
 const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
@@ -194,6 +196,12 @@ struct Mgr {
     /// Channel to the GPU service (`devmgr.gpu` endpoint; 0 until connected).
     gpu_svc: Handle,
     known_gpu: [Option<GpuDev>; MAX_GPU],
+    /// Read-only `sys:/firmware` directory capability handed over by `init` once `sys:` mounts.
+    firmware_dir: Handle,
+    /// Verified `.ddrv` program VMOs loaded from `sys:/bin/` after bootstrap.
+    late_progs: [Option<([u8; 24], usize, Handle)>; MAX_LATE_PROGS],
+    /// PCI GPU devices discovered at bootstrap whose `.ddrv` lives on `sys:/bin/`.
+    deferred_gpu: [Option<(&'static str, Handle, DeviceInfo)>; MAX_DEFERRED_GPU],
     /// Control channel from the service manager (0: started without one).
     mgr: Handle,
     /// SHUTDOWN received.
@@ -267,15 +275,43 @@ impl Mgr {
             println!("devmgr: out of handles starting {}", d.prog);
             return false;
         };
-        let hs = [
-            sys::SpawnHandle { handle: log, rights: sys::RIGHTS_SAME, tag: sys::TAG_LOG, reserved: 0 },
-            sys::SpawnHandle { handle: dev, rights: sys::RIGHTS_SAME, tag: sys::TAG_DEVICE, reserved: 0 },
-            sys::SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: proto::TAG_CONTROL, reserved: 0 },
-        ];
         let is_gpu = matches!(d.prog, "virtio-gpu" | "amdgpu" | "xe" | "nvgpu");
-        let limits = sys::Limits { memory: if is_gpu { 32 << 20 } else { 8 << 20 }, handles: 256, threads: 4 };
+        let mut hs = [sys::SpawnHandle::default(); 4];
+        hs[0] = sys::SpawnHandle { handle: log, rights: sys::RIGHTS_SAME, tag: sys::TAG_LOG, reserved: 0 };
+        hs[1] = sys::SpawnHandle { handle: dev, rights: sys::RIGHTS_SAME, tag: sys::TAG_DEVICE, reserved: 0 };
+        hs[2] = sys::SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: proto::TAG_CONTROL, reserved: 0 };
+        let mut nhs = 3usize;
+        if is_gpu && self.firmware_dir != 0 {
+            let vendor_sub: &[u8] = match d.prog {
+                "virtio-gpu" => b"virtio",
+                "amdgpu" => b"amdgpu",
+                "xe" => b"xe",
+                "nvgpu" => b"nvidia",
+                _ => b"",
+            };
+            if !vendor_sub.is_empty() {
+                let fw_root = fs::Node::from(self.firmware_dir);
+                if let Ok((sub, kind, _)) = fw_root.open(vendor_sub, fs::O_DIRECTORY, fs::R_READ)
+                    && kind == fs::KIND_DIR
+                {
+                    hs[3] = sys::SpawnHandle {
+                        handle: sub.into_handle(),
+                        rights: sys::RIGHTS_SAME,
+                        tag: proto::TAG_FIRMWARE,
+                        reserved: 0,
+                    };
+                    nhs = 4;
+                }
+                let _ = fw_root.into_handle();
+            }
+        }
+        let limits = sys::Limits {
+            memory: if is_gpu { 64 << 20 } else { 8 << 20 },
+            handles: if is_gpu { 512 } else { 256 },
+            threads: if is_gpu { 8 } else { 4 },
+        };
         let args: &[u8] = if self.writable { b"rw" } else { b"" };
-        match sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), d.image, &name[..n + 5], args, &hs, &limits) {
+        match sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), d.image, &name[..n + 5], args, &hs[..nhs], &limits) {
             Ok(p) => {
                 d.proc = p;
                 d.ch = mine;
@@ -508,6 +544,35 @@ impl Mgr {
                             }
                             println!("devmgr: gpu service connected: {} adapter(s) attached", attached);
                         }
+                        Some(h) if h.op == svc::GIVE_FIRMWARE && handle != 0 => {
+                            if self.firmware_dir != 0 {
+                                sys::handle_close(self.firmware_dir);
+                            }
+                            self.firmware_dir = handle;
+                        }
+                        Some(h) if h.op == svc::GIVE_PROGRAM && handle != 0 => {
+                            let pname = &buf[HEADER..n];
+                            if pname.is_empty() || pname.len() > 24 {
+                                sys::handle_close(handle);
+                            } else {
+                                let mut nb = [0u8; 24];
+                                nb[..pname.len()].copy_from_slice(pname);
+                                if let Some((_, _, old_h)) = self
+                                    .late_progs
+                                    .iter_mut()
+                                    .flatten()
+                                    .find(|(b, l, _)| &b[..*l] == pname)
+                                {
+                                    sys::handle_close(*old_h);
+                                    *old_h = handle;
+                                } else if let Some(slot) = self.late_progs.iter_mut().find(|s| s.is_none()) {
+                                    *slot = Some((nb, pname.len(), handle));
+                                } else {
+                                    sys::handle_close(handle);
+                                }
+                                self.bind_deferred_gpu(pname, handle);
+                            }
+                        }
                         Some(h) if h.op == svc::SUSPEND => {
                             if handle != 0 {
                                 sys::handle_close(handle);
@@ -545,6 +610,46 @@ impl Mgr {
                     return;
                 }
                 Err(_) => return, // the manager is gone: keep serving
+            }
+        }
+    }
+
+    /// Bind and spawn any PCI GPU devices deferred from bootstrap once `init` delivers their
+    /// verified `sys:/bin/<prog>.ddrv` VMO.
+    fn bind_deferred_gpu(&mut self, pname: &[u8], image: Handle) {
+        let Some(stem) = pname.strip_suffix(b".ddrv") else {
+            return;
+        };
+        for dslot in 0..MAX_DEFERRED_GPU {
+            let matches_stem = self.deferred_gpu[dslot]
+                .as_ref()
+                .is_some_and(|(prog, _, _)| prog.as_bytes() == stem);
+            if !matches_stem {
+                continue;
+            }
+            let Some(free_idx) = (0..MAX_DRIVERS).find(|&idx| self.drv[idx].is_none()) else {
+                println!("devmgr: no free driver slot for {}", core::str::from_utf8(pname).unwrap_or("?"));
+                return;
+            };
+            let Some((prog, dev, info)) = self.deferred_gpu[dslot].take() else {
+                continue;
+            };
+            self.drv[free_idx] = Some(Driver {
+                prog,
+                image,
+                dev,
+                info,
+                proc: 0,
+                ch: 0,
+                ready: false,
+                starts: 0,
+                gave_up: false,
+                capacity: 0,
+                disks_due: 0,
+                dynamic: false,
+            });
+            if !self.suspended {
+                self.start(free_idx);
             }
         }
     }
@@ -1163,6 +1268,9 @@ fn devmgr_main(s: *const Startup) -> i32 {
         known_net: [None; MAX_NET],
         gpu_svc: 0,
         known_gpu: [None; MAX_GPU],
+        firmware_dir: libd::startup_handle(proto::TAG_FIRMWARE),
+        late_progs: [None; MAX_LATE_PROGS],
+        deferred_gpu: [None; MAX_DEFERRED_GPU],
         mgr: libd::startup_handle(proto::TAG_CONTROL),
         stop: false,
         suspended: false,
@@ -1192,6 +1300,12 @@ fn devmgr_main(s: *const Startup) -> i32 {
         file[..prog.len()].copy_from_slice(prog.as_bytes());
         file[prog.len()..prog.len() + 5].copy_from_slice(b".ddrv");
         let Some(image) = libd::find_program(&file[..prog.len() + 5]) else {
+            if matches!(prog, "virtio-gpu" | "amdgpu" | "xe" | "nvgpu") {
+                if let Some(slot) = m.deferred_gpu.iter_mut().find(|s| s.is_none()) {
+                    *slot = Some((prog, h, info));
+                }
+                continue;
+            }
             println!("devmgr: no driver program {}.ddrv", prog);
             continue;
         };

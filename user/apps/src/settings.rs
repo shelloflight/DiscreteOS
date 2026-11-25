@@ -21,7 +21,7 @@ use dosui::{Length, Node, Tone, button, caption, column, divider, heading, input
 use libd::appmgr::{self, AppInfo, DECISION_DENIED, DECISION_GRANTED, MAX_APPS};
 use libd::audio::{self, DeviceEntry};
 use libd::awmi;
-use libd::gpu::{self, AdapterInfo, DisplayProbeInfo, ModeEntry};
+use libd::gpu::{self, AdapterInfo, KmsResourcesWire, ModeEntry};
 use libd::identity::{self, IdentityInfo, LockPolicyInfo};
 use libd::net::{self, NetConfig, NetStatus};
 use libd::sys::{self, Handle};
@@ -67,6 +67,7 @@ enum Msg {
     // Display
     SelectAdapter(usize),
     SetMode(usize),
+    ConfirmMode(bool),
     ToggleVrr,
     ToggleHdr,
     SetOutputScale(u16),
@@ -124,7 +125,7 @@ struct SettingsApp {
     sel_adapter: usize,
     adapter_picked: bool,
     modes: Vec<ModeEntry>,
-    probe: Option<DisplayProbeInfo>,
+    kms_res: Option<KmsResourcesWire>,
     vrr_on: bool,
     hdr_on: bool,
     // Appearance state
@@ -174,7 +175,7 @@ impl SettingsApp {
             sel_adapter: 0,
             adapter_picked: false,
             modes: Vec::new(),
-            probe: None,
+            kms_res: None,
             vrr_on: false,
             hdr_on: false,
             ui_settings: UiSettings::DEFAULT,
@@ -216,7 +217,7 @@ impl SettingsApp {
     fn refresh_display(&mut self) {
         self.adapters.clear();
         self.modes.clear();
-        self.probe = None;
+        self.kms_res = None;
         if self.gpu_q == 0 {
             return;
         }
@@ -228,19 +229,17 @@ impl SettingsApp {
             self.sel_adapter = self
                 .adapters
                 .iter()
-                .position(|a| a.kind != gpu::KIND_GOP && (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0)
+                .position(|a| a.kind != gpu::KIND_GOP && (a.caps & gpu::CAP_NATIVE_KMS) != 0)
                 .or_else(|| self.adapters.iter().position(|a| a.online && a.width > 0 && a.height > 0))
                 .unwrap_or(0);
         }
         if let Some(ad) = self.adapters.get(self.sel_adapter) {
             let mut m = [ModeEntry::default(); 16];
-            if let Ok(mn) = gpu::get_modes(self.gpu_q, ad.id, &mut m) {
+            if let Ok((k, mn)) = gpu::kms_get_resources(self.gpu_q, ad.id, &mut m) {
                 self.modes.extend_from_slice(&m[..mn]);
-            }
-            if let Ok(p) = gpu::get_display_info(self.gpu_q, ad.id) {
-                self.vrr_on = (p.flags & gpu::PROBE_VRR_ENABLED) != 0;
-                self.hdr_on = (p.flags & gpu::PROBE_HDR_ENABLED) != 0;
-                self.probe = Some(p);
+                self.vrr_on = (k.status_flags & gpu::KMS_STATUS_VRR_ENABLED) != 0;
+                self.hdr_on = (k.status_flags & gpu::KMS_STATUS_HDR_ENABLED) != 0;
+                self.kms_res = Some(k);
             }
         }
     }
@@ -338,35 +337,51 @@ impl SettingsApp {
         items.push(panel(ad_rows));
 
         if let Some(ad) = self.adapters.get(self.sel_adapter) {
-            if let Some(p) = self.probe {
-                let dcn_lbl = if p.dcn_major > 0 {
-                    format!("DCN {}.{}.{} pipe {}", p.dcn_major, p.dcn_minor, p.dcn_rev, p.pipe)
-                } else {
-                    String::from(ad.kind_name())
-                };
-                let link_lbl = if p.dp_lanes > 0 && p.dp_rate_mbps > 0 {
-                    format!("DP {}x {} Mbps", p.dp_lanes, p.dp_rate_mbps)
-                } else if p.edid_blocks > 0 {
-                    format!("EDID {} blk", p.edid_blocks)
+            if let Some(k) = self.kms_res {
+                let conn_lbl = format!(
+                    "Atomic KMS {}-{} (CRTC #{}, {} plane{})",
+                    k.connector_kind_str(),
+                    k.connector_id,
+                    k.crtc_id,
+                    k.plane_count,
+                    if k.plane_count == 1 { "" } else { "s" }
+                );
+                let link_lbl = if k.dp_lanes > 0 && k.dp_rate_mbps > 0 {
+                    format!("DP {}x {} Mbps", k.dp_lanes, k.dp_rate_mbps)
+                } else if k.edid_blocks > 0 {
+                    format!("EDID {} blk", k.edid_blocks)
                 } else {
                     String::from("CVT-RB modes")
                 };
-                let vrr_lbl = if p.vrr_min_hz > 0 && p.vrr_max_hz > 0 {
+                let vrr_lbl = if k.vrr_min_hz > 0 && k.vrr_max_hz > 0 {
                     if self.vrr_on {
-                        format!("VRR ON {}-{} Hz", p.vrr_min_hz, p.vrr_max_hz)
+                        format!("VRR ON {}-{} Hz", k.vrr_min_hz, k.vrr_max_hz)
                     } else {
-                        format!("VRR {}-{} Hz", p.vrr_min_hz, p.vrr_max_hz)
+                        format!("VRR {}-{} Hz", k.vrr_min_hz, k.vrr_max_hz)
                     }
                 } else {
                     String::from("VRR n/a")
                 };
-                let note = p.note_str();
+                let note = k.note_str();
                 let summary = if note.is_empty() {
-                    format!("{} • {} • {}", dcn_lbl, link_lbl, vrr_lbl)
+                    format!("{} • {} • {}", conn_lbl, link_lbl, vrr_lbl)
                 } else {
-                    format!("{} • {} • {} • {}", dcn_lbl, link_lbl, vrr_lbl, note)
+                    format!("{} • {} • {} • {}", conn_lbl, link_lbl, vrr_lbl, note)
                 };
                 items.push(caption(summary).wrap());
+                if (k.status_flags & gpu::KMS_STATUS_REVERT_PENDING) != 0 {
+                    items.push(panel([
+                        label(format!(
+                            "Confirm new display mode ({}s until automatic revert)",
+                            k.revert_secs_left.max(1)
+                        )),
+                        row([
+                            button("Keep This Mode").primary().on_press(Msg::ConfirmMode(true)),
+                            button("Revert Now").on_press(Msg::ConfirmMode(false)),
+                        ])
+                        .gap(8),
+                    ]));
+                }
             }
             items.push(label("Per-Output UI Scale"));
             items.push(
@@ -733,14 +748,20 @@ impl App for SettingsApp {
             }
             Msg::SetMode(i) => {
                 if let (Some(ad), Some(m)) = (self.adapters.get(self.sel_adapter), self.modes.get(i)) {
-                    match awmi::set_display_mode(self.awmi_admin, ad.id, m.width, m.height, m.refresh_mhz, 3) {
+                    // Pass bit 2 (`require_confirm`) so an unconfirmed mode automatically reverts in 12s.
+                    match awmi::set_display_mode(self.awmi_admin, ad.id, m.width, m.height, m.refresh_mhz, 7) {
                         Ok(()) => {
-                            self.status = format!("Mode set to {}x{} @ {} Hz", m.width, m.height, m.refresh_mhz / 1000);
+                            self.status = format!(
+                                "Mode set to {}x{} @ {} Hz (confirm within 12s to keep)",
+                                m.width,
+                                m.height,
+                                m.refresh_mhz / 1000
+                            );
                             self.refresh_display();
                         }
                         Err(e) => {
                             self.refresh_display();
-                            let note = self.probe.map(|p| String::from(p.note_str())).unwrap_or_default();
+                            let note = self.kms_res.map(|k| String::from(k.note_str())).unwrap_or_default();
                             self.status = if note.is_empty() {
                                 format!("Mode change refused: {}", sys::status(e))
                             } else {
@@ -748,6 +769,20 @@ impl App for SettingsApp {
                             };
                         }
                     }
+                }
+            }
+            Msg::ConfirmMode(confirm) => {
+                let id = self.adapters.get(self.sel_adapter).map_or(0, |a| a.id);
+                match awmi::confirm_display_mode(self.awmi_admin, id, confirm) {
+                    Ok(()) => {
+                        self.refresh_display();
+                        self.status = if confirm {
+                            String::from("Display mode confirmed")
+                        } else {
+                            String::from("Display mode reverted")
+                        };
+                    }
+                    Err(e) => self.status = format!("Mode confirmation failed: {}", sys::status(e)),
                 }
             }
             Msg::ToggleVrr => {

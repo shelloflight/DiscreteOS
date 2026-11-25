@@ -7,6 +7,7 @@ mod nettest;
 mod qemu;
 mod test;
 mod tools;
+mod vendor;
 
 use std::fs;
 use std::path::PathBuf;

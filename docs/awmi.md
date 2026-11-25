@@ -23,35 +23,35 @@ protocol), `user/init/services/awmi.dman`, `awmi-demo.dman`.
 
 ## Session lifecycle
 
-1. **Outputs** from `gpu.display`: verified native PCI outputs (`CAP_NATIVE_GOP_MATCH`, e.g. AMD
-   DCN after passing its GOP-match and 3-frame flip self-check, plus any additional page-flipping
-   outputs on that same GPU) are preferred over the firmware framebuffer for tear-free high-refresh
-   scanout; `display = firmware` in `esp:/DOS/BOOT.CFG` (passing `firmware-display` to `awmi`)
-   forces the firmware framebuffer instead. If a verified native PCI GPU finishes probing after a
-   session already started on GOP, `gpu.dsvc` emits `EVT_ADAPTERS_CHANGED` and the compositor
-   seamlessly upgrades outputs on the next frame. Without a verified native PCI output, the firmware
-   framebuffer is used when present, otherwise every online PCI GPU (`virtio-gpu`, `amdgpu`, `xe`,
-   `nvgpu`). Each output gets one offscreen backbuffer VMO, attached once and kept across sessions,
-   and an automatic per-output scale (100% / 125% / 150% by width, overridable via `OP_SET_DISPLAY`).
-   Several outputs form one desktop, left to right.
+1. **Outputs** from `gpu.display`: native Atomic KMS PCI outputs (`CAP_NATIVE_KMS`, plus any
+   additional page-flipping outputs on that same GPU) are preferred over the firmware framebuffer
+   for tear-free high-refresh scanout; `display = firmware` in `esp:/DOS/BOOT.CFG` (passing
+   `firmware-display` to `awmi`) forces the firmware framebuffer instead. If a native KMS PCI GPU
+   comes online after a session already started on GOP, `gpu.dsvc` emits `EVT_ADAPTERS_CHANGED` and
+   the compositor seamlessly upgrades outputs on the next frame. Without `CAP_NATIVE_KMS`, the
+   firmware framebuffer is used when present, otherwise every online PCI GPU (`virtio-gpu`,
+   `amdgpu`, `xe`, `nvgpu`). Each output imports one offscreen backbuffer VMO into GEM
+   (`OP_GEM_IMPORT` + `OP_KMS_CREATE_FB`), kept across sessions, with an automatic per-output scale
+   (100% / 125% / 150% by width, overridable via `OP_SET_DISPLAY`). Several outputs form one
+   desktop, left to right.
 2. **Screen and input:** `terminal.display` `DISPLAY_RELEASE` (the terminal keeps its scrollback but
    stops drawing) and `devmgr.input` `INPUT_GRAB` (keys and pointer events go to the compositor
    only: nothing typed reaches the shell).
 3. **Frames:** client commits, input, dock changes and animations add damage. Outputs supporting
-   `CAP_ASYNC_FLIP` use event-driven vsync pacing (`OP_PRESENT_MULTI` -> unsolicited
-   `EVT_FLIP_DONE` from the driver's vblank/flip interrupt, tying `EVT_FRAME_DONE` to real vertical
-   blank with zero idle CPU and stepping down cleanly on late frames); synchronous outputs use a
+   `CAP_ASYNC_FLIP` use event-driven vsync pacing (`OP_KMS_ATOMIC_COMMIT` -> unsolicited
+   `EVT_VBLANK` from the driver's vblank interrupt, tying `EVT_FRAME_DONE` to real vertical blank
+   with zero idle CPU and stepping down cleanly on late frames); synchronous outputs use a
    refresh-paced timer (supporting up to 540+ Hz). Bursts coalesce into one frame per refresh. The
    compositor selects context-aware minimal cursors (`Default`, `Pointer`, `Text`, `Move`, and
    4-axis resize arrows `ResizeEW`/`NS`/`NWSE`/`NESW`) based on what is under the pointer; a single
-   output with `CAP_HW_CURSOR` uploads the active shape and hotspot to the hardware cursor plane
-   and pushes moves immediately without recompositing, while all other outputs (including native
-   AMD DCN tear-free flips) render the cursor directly into the damaged backbuffer.
+   output with `CAP_HW_CURSOR` commits the active shape, hotspot, and coordinates to the Atomic KMS
+   cursor plane without recompositing, while all other outputs render the cursor into the damaged
+   backbuffer.
 4. **End:** `Super+Esc` (`Ctrl+Alt+Esc` inside a VM, where the host takes `Super`) or
-   `OP_SESSION_STOP`: every window closes (`EVT_SESSION` 0), native outputs call
-   `OP_RELEASE_DISPLAY` to restore the firmware GOP framebuffer, the grab is released, and the
-   terminal redraws. If the compositor exits or crashes, the device manager and the terminal see its
-   channels close and take input and screen back on their own.
+   `OP_SESSION_STOP`: every window closes (`EVT_SESSION` 0), outputs issue `ATOMIC_RESET_BOOT` on
+   `gpu.display` to restore boot scanout state, the grab is released, and the terminal redraws. If
+   the compositor exits or crashes, the device manager and the terminal see its channels close and
+   take input and screen back on their own.
 
 A GPU driver restart makes a present fail; the outputs are attached again at the next frame.
 
@@ -132,8 +132,7 @@ Requests are calls on the client's channel; events arrive on the same channel (t
 | `OP_STATUS` (932) | query, admin | session, locked state, outputs, mode, windows, workspace, indicators, frames, input counters, settings, launcher, fonts, entries |
 | `OP_INDICATOR` (933) | indicator | `IND_SECURITY_ALERT` |
 | `OP_SETTINGS` (934) | admin | `a` = settings (theme, text size << 8, reduce motion << 24), `b` = which (`SET_*`) |
-| `OP_FLIP_TEST` (935) | admin | `a` = adapter id (0 = first), `b` = duration ms; releases terminal, runs `gpu::flip_test`, restores terminal |
-| `OP_SET_DISPLAY` (936) | admin | `a` = adapter id \| subop (`DISPLAY_SET_MODE`/`VRR`/`HDR`/`SCALE`) << 32; safe display mode/refresh, VRR, HDR10, and per-output scale control |
+| `OP_SET_DISPLAY` (936) | admin | `a` = adapter id \| subop (`DISPLAY_SET_MODE`/`VRR`/`HDR`/`SCALE`/`CONFIRM_MODE`) << 32; Atomic KMS `TEST_ONLY` + modeset, 12s confirm/revert, VRR, HDR10, and per-output scale |
 | `OP_LOCK` (937) | admin | engage the unforgeable lock/login screen (`a` = reason 1..4, `b` = mode 1..2) |
 | `OP_SET_LOCK_POLICY` (938) | admin | update idle timeout seconds and lock-on-sleep policy |
 | `OP_PERM_PROMPT` (939) | launcher | display compositor-drawn permission prompt (`a` = request id, `b` = permission mask, payload = `<app>\0<title>`); answered with `EVT_PERM_RESULT` (929) |
@@ -168,10 +167,10 @@ Window programs that ship with the desktop, all ordinary `awmi.window` clients:
   to it can tear while something moves (dragging a window, the launcher opening). To keep that
   rare, the launcher's dim is drawn once and only its panel animates. Tear-free output needs a
   native display driver that flips buffers at vertical blank.
-- On a verified native AMD display (`CAP_NATIVE_GOP_MATCH`), the compositor flips dedicated VRAM
-  scanout buffers at vertical blank and restores the untouched GOP scanout on session end; on
-  unverified PCI GPUs or when `display = firmware` is configured in `BOOT.CFG`, the session falls
-  back to the firmware framebuffer when present (or PCI GPUs on GOP-less BIOS boots).
+- On native Atomic KMS PCI outputs (`CAP_NATIVE_KMS`), the compositor flips GEM-backed framebuffers
+  at vertical blank and resets boot scanout on session end; when `CAP_NATIVE_KMS` is absent or
+  `display = firmware` is configured in `BOOT.CFG`, the session uses the firmware framebuffer when
+  present (or PCI GPUs on GOP-less BIOS boots).
 
 ## Tests
 

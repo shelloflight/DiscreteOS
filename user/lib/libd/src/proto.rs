@@ -12,6 +12,8 @@
 pub const TAG_CONTROL: u32 = crate::sys::TAG_USER;
 /// Channel handed to a USB class driver (`usbaudio.ddrv`) to talk to its `xhci.ddrv` host.
 pub const TAG_USB_BUS: u32 = crate::sys::TAG_USER + 1;
+/// Read-only vendor firmware directory channel (`sys:/firmware/<vendor>/`) handed to a `.ddrv`.
+pub const TAG_FIRMWARE: u32 = crate::sys::TAG_USER + 2;
 
 /// Driver -> manager: initialised; `a` = capacity in sectors (block) or 0.
 pub const READY: u32 = 1;

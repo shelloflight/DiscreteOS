@@ -1,21 +1,18 @@
-//! `dosgpu`: pure `no_std`, `#![forbid(unsafe_code)]`, zero-dependency GPU & display core.
+//! `dosdrm`: D-OS user-space Atomic KMS, GEM/GPU-VM/Syncobj core, EDID/DisplayID parser,
+//! VirtIO-GPU 2D/3D/Blob/Venus wire codecs, and Ring-3 vendor driver compatibility shim.
 //!
-//! Provides bounds-checked hardware parsers, modesetting math, EDID decoding, dirty-rectangle
-//! blitting/format conversion, buffer-age damage tracking, and strict command-stream builders
-//! & validators for:
-//! - UEFI GOP linear framebuffer baseline
-//! - VirtIO-GPU 2D & 3D (VirGL)
-//! - AMD RDNA / AMDGPU (RDNA 2/3/4, IP Discovery, DCN 3.0/3.1.5/3.2/4.0.1, DP AUX, IH ring, PM4, SDMA)
-//! - Intel Xe / i915 (Gen9/Xe-LP/Xe-HPG/Xe2, GMD_ID, Display Pipes A-D, MI/XY Blitter)
-//! - NVIDIA Open-GSP (Turing/Ampere/Ada/Blackwell, PMC_BOOT, Open-GSP RPC framing)
+//! All pure protocol, KMS validation, GEM/VM/syncobj state machines, EDID parsing, and pixel
+//! blitters compile with `#![forbid(unsafe_code)]` and zero dependencies; the optional `shim`
+//! feature adds the Ring-3 `libd` hardware/firmware/FFI glue used by isolated `.ddrv` processes.
 
 #![no_std]
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "shim"), forbid(unsafe_code))]
 
-pub mod amd;
 pub mod edid;
-pub mod intel;
-pub mod nvidia;
+pub mod gem;
+pub mod kms;
+#[cfg(feature = "shim")]
+pub mod shim;
 pub mod virtio;
 
 #[cfg(test)]
@@ -69,64 +66,62 @@ pub mod caps {
     pub const IOMMU_CONFINED: u32 = 1 << 7;
     pub const WRITE_COMBINING: u32 = 1 << 8;
     pub const GSP_RPC: u32 = 1 << 9;
-    /// Asynchronous vsync flip completion notifications (`EVT_FLIP_DONE`).
     pub const ASYNC_FLIP: u32 = 1 << 10;
-    /// Native driver verified its active scanout matches the firmware GOP display.
     pub const NATIVE_GOP_MATCH: u32 = 1 << 11;
-    /// Variable refresh rate (FreeSync / Adaptive-Sync) supported.
     pub const VRR: u32 = 1 << 12;
-    /// 10-bit HDR10 scanout supported.
     pub const HDR: u32 = 1 << 13;
-    /// Display Stream Compression (DSC 1.2) supported.
     pub const DSC: u32 = 1 << 14;
+    pub const ATOMIC_KMS: u32 = 1 << 15;
+    pub const GEM_VM: u32 = 1 << 16;
+    pub const SYNCOBJ_TIMELINE: u32 = 1 << 17;
+    pub const VENUS_VK: u32 = 1 << 18;
+    pub const SYS_FIRMWARE: u32 = 1 << 19;
 }
 
-/// Command submission engine kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum EngineKind {
-    Virgl3d = 1,
-    AmdPm4 = 2,
-    AmdSdma = 3,
-    IntelBlit = 4,
-    NvidiaGsp = 5,
-}
-
-impl EngineKind {
-    pub const fn from_u32(v: u32) -> Option<Self> {
-        match v {
-            1 => Some(Self::Virgl3d),
-            2 => Some(Self::AmdPm4),
-            3 => Some(Self::AmdSdma),
-            4 => Some(Self::IntelBlit),
-            5 => Some(Self::NvidiaGsp),
-            _ => None,
-        }
+/// Standard DRM FourCC pixel formats (`drm/drm_fourcc.h`).
+pub mod fourcc {
+    pub const fn code(a: u8, b: u8, c: u8, d: u8) -> u32 {
+        (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
     }
+
+    pub const XRGB8888: u32 = code(b'X', b'R', b'2', b'4');
+    pub const ARGB8888: u32 = code(b'A', b'R', b'2', b'4');
+    pub const XBGR8888: u32 = code(b'X', b'B', b'2', b'4');
+    pub const ABGR8888: u32 = code(b'A', b'B', b'2', b'4');
+    pub const XRGB2101010: u32 = code(b'X', b'R', b'3', b'0');
+    pub const ARGB2101010: u32 = code(b'A', b'R', b'3', b'0');
+
+    pub const MOD_LINEAR: u64 = 0;
 }
 
-/// Pixel formats for framebuffers and scanouts.
+/// Pixel formats supported by KMS planes and WC blitters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PixelFormat {
-    /// 32-bit B, G, R, X in memory (`0x00RRGGBB` as little-endian u32, DRM_FORMAT_XRGB8888 / VirtIO B8G8R8X8).
     Xrgb8888 = 1,
-    /// 32-bit B, G, R, A in memory (`0xAARRGGBB` as little-endian u32, DRM_FORMAT_ARGB8888 / VirtIO B8G8R8A8).
     Argb8888 = 2,
-    /// 32-bit R, G, B, X in memory (`0x00BBGGRR` as little-endian u32, DRM_FORMAT_XBGR8888 / VirtIO R8G8B8X8).
     Xbgr8888 = 3,
-    /// 32-bit 10-bit per channel RGB + 2-bit alpha (`0xAARRRRRRRRRRGGGGGGGGGGBBBBBBBBBB`, HDR10).
     Argb2101010 = 4,
 }
 
 impl PixelFormat {
+    /// Accept both compact D-OS format codes (`1..=4`) and standard DRM FourCC codes.
     pub const fn from_u32(v: u32) -> Option<Self> {
         match v {
-            1 => Some(Self::Xrgb8888),
-            2 => Some(Self::Argb8888),
-            3 => Some(Self::Xbgr8888),
-            4 => Some(Self::Argb2101010),
+            1 | fourcc::XRGB8888 => Some(Self::Xrgb8888),
+            2 | fourcc::ARGB8888 => Some(Self::Argb8888),
+            3 | fourcc::XBGR8888 | fourcc::ABGR8888 => Some(Self::Xbgr8888),
+            4 | fourcc::ARGB2101010 | fourcc::XRGB2101010 => Some(Self::Argb2101010),
             _ => None,
+        }
+    }
+
+    pub const fn to_fourcc(self) -> u32 {
+        match self {
+            Self::Xrgb8888 => fourcc::XRGB8888,
+            Self::Argb8888 => fourcc::ARGB8888,
+            Self::Xbgr8888 => fourcc::XBGR8888,
+            Self::Argb2101010 => fourcc::ARGB2101010,
         }
     }
 
@@ -156,7 +151,6 @@ impl DisplayMode {
         Self { width, height, refresh_mhz, preferred }
     }
 
-    /// Checked stride in bytes for 32bpp, aligned up to `align` bytes (must be power of two >= 4).
     pub const fn stride_bytes(&self, align: u32) -> Option<u32> {
         if self.width == 0 || self.height == 0 || align < 4 || !align.is_power_of_two() {
             return None;
@@ -171,7 +165,6 @@ impl DisplayMode {
         Some(added & !mask)
     }
 
-    /// Checked total framebuffer size in bytes.
     pub const fn fb_size(&self, align: u32) -> Option<u64> {
         let Some(stride) = self.stride_bytes(align) else {
             return None;
@@ -205,7 +198,6 @@ impl DamageRect {
         self.w == 0 || self.h == 0
     }
 
-    /// Clip this rectangle to `[0, width) x [0, height)`. Returns `None` if empty after clipping.
     pub const fn clip(self, width: u32, height: u32) -> Option<Self> {
         if self.x >= width || self.y >= height || self.w == 0 || self.h == 0 {
             return None;
@@ -220,7 +212,6 @@ impl DamageRect {
         Some(Self { x: self.x, y: self.y, w, h })
     }
 
-    /// True if `self` and `other` overlap or touch along an edge.
     pub const fn intersects_or_touches(self, other: Self) -> bool {
         if self.is_empty() || other.is_empty() {
             return false;
@@ -232,7 +223,6 @@ impl DamageRect {
         self.x <= bx1 && other.x <= ax1 && self.y <= by1 && other.y <= ay1
     }
 
-    /// Bounding union of two non-empty rectangles.
     pub const fn union(self, other: Self) -> Self {
         if self.w == 0 || self.h == 0 {
             return other;
@@ -251,13 +241,11 @@ impl DamageRect {
         Self { x: x0, y: y0, w: x1.saturating_sub(x0), h: y1.saturating_sub(y0) }
     }
 
-    /// Area in pixels (saturating).
     pub const fn area(self) -> u64 {
         (self.w as u64).saturating_mul(self.h as u64)
     }
 }
 
-/// Maximum damage rectangles stored per frame in [`BufferAgeTracker`].
 pub const MAX_AGE_RECTS: usize = 16;
 const AGE_HISTORY: usize = 4;
 const MAX_AGE_BUFFERS: usize = 4;
@@ -274,11 +262,6 @@ impl FrameDamage {
 }
 
 /// Tracks per-buffer damage history across double- or triple-buffered scanout chains.
-///
-/// For any scanout buffer `buf_idx`, [`Self::collect_for_buffer`] computes the union of
-/// `current_damage` with all damage committed to newer frames since `buf_idx` was last shown.
-/// That keeps incremental updates tiny (avoiding full-frame copies over PCIe at 240/540 Hz)
-/// while guaranteeing every pixel in the flipped buffer is up to date.
 #[derive(Clone, Copy, Debug)]
 pub struct BufferAgeTracker {
     buf_count: usize,
@@ -322,7 +305,6 @@ impl BufferAgeTracker {
         self.frame
     }
 
-    /// Number of frames elapsed since `buf_idx` was last committed (`None` if never shown / dirty).
     pub const fn buffer_age(&self, buf_idx: usize) -> Option<u64> {
         if buf_idx >= self.buf_count || self.dirty_full[buf_idx] {
             return None;
@@ -330,8 +312,6 @@ impl BufferAgeTracker {
         Some(self.frame.saturating_sub(self.last_frame[buf_idx]))
     }
 
-    /// Compute the clipped, coalesced damage rectangles that must be copied into `buf_idx`
-    /// before flipping it to display the current frame (`current_damage`; empty = full frame).
     pub fn collect_for_buffer(&self, buf_idx: usize, current_damage: &[DamageRect], out: &mut [DamageRect]) -> usize {
         if out.is_empty() || self.width == 0 || self.height == 0 {
             return 0;
@@ -347,7 +327,6 @@ impl BufferAgeTracker {
             return 1;
         }
         let mut count = 0usize;
-        // Include damage from frames presented after `buf_idx` was last shown.
         let mut f = self.last_frame[buf_idx];
         while f < self.frame {
             let slot = &self.history[(f as usize) % AGE_HISTORY];
@@ -362,7 +341,6 @@ impl BufferAgeTracker {
             }
             f += 1;
         }
-        // Include current frame's damage.
         for &r in current_damage {
             if let Some(c) = r.clip(self.width, self.height) {
                 push_coalesced(out, &mut count, c);
@@ -375,8 +353,6 @@ impl BufferAgeTracker {
         count
     }
 
-    /// Record that `buf_idx` has been updated with `current_damage` (empty = full frame)
-    /// and flipped for the current frame.
     pub fn commit_buffer(&mut self, buf_idx: usize, current_damage: &[DamageRect]) {
         if buf_idx >= self.buf_count {
             return;
@@ -405,7 +381,6 @@ impl BufferAgeTracker {
 }
 
 fn push_coalesced(out: &mut [DamageRect], count: &mut usize, mut rect: DamageRect) {
-    // Merge with any existing overlapping/touching rectangle.
     let mut i = 0;
     while i < *count {
         if out[i].intersects_or_touches(rect) {
@@ -420,7 +395,6 @@ fn push_coalesced(out: &mut [DamageRect], count: &mut usize, mut rect: DamageRec
         out[*count] = rect;
         *count += 1;
     } else if !out.is_empty() {
-        // Capacity reached: merge with the rectangle that produces the smallest bounding box.
         let mut best_i = 0usize;
         let mut best_area = u64::MAX;
         for (idx, &existing) in out.iter().enumerate() {
@@ -442,22 +416,19 @@ pub enum CsError {
     Unaligned,
     Truncated,
     UnknownOpcode,
-    DisallowedRegister,
     BadArgument,
 }
 
-/// Convert one 32-bit pixel from `src_fmt` into a packed 32-bit word with the given RGB bit shifts.
 #[inline]
 pub const fn convert_pixel(px: u32, src_fmt: PixelFormat, shifts: [u8; 3]) -> u32 {
     let (r, g, b) = match src_fmt {
         PixelFormat::Xrgb8888 | PixelFormat::Argb8888 => ((px >> 16) & 0xFF, (px >> 8) & 0xFF, px & 0xFF),
         PixelFormat::Xbgr8888 => (px & 0xFF, (px >> 8) & 0xFF, (px >> 16) & 0xFF),
-        PixelFormat::Argb2101010 => (((px >> 22) & 0xFF), ((px >> 12) & 0xFF), ((px >> 2) & 0xFF)),
+        PixelFormat::Argb2101010 => ((px >> 22) & 0xFF, (px >> 12) & 0xFF, (px >> 2) & 0xFF),
     };
     (r << (shifts[0] & 31)) | (g << (shifts[1] & 31)) | (b << (shifts[2] & 31))
 }
 
-/// Convert one 8bpc pixel to packed 10bpc `ARGB2101010` (HDR10 scanout format).
 #[inline]
 pub const fn convert_pixel_to_argb2101010(px: u32, src_fmt: PixelFormat) -> u32 {
     match src_fmt {
@@ -468,7 +439,6 @@ pub const fn convert_pixel_to_argb2101010(px: u32, src_fmt: PixelFormat) -> u32 
                 PixelFormat::Xbgr8888 => (px & 0xFF, (px >> 8) & 0xFF, (px >> 16) & 0xFF),
                 PixelFormat::Argb2101010 => (0, 0, 0),
             };
-            // Expand 8-bit channel to 10-bit via `(c << 2) | (c >> 6)` for full [0, 1023] range.
             let r10 = (r << 2) | (r >> 6);
             let g10 = (g << 2) | (g >> 6);
             let b10 = (b << 2) | (b >> 6);
@@ -477,8 +447,6 @@ pub const fn convert_pixel_to_argb2101010(px: u32, src_fmt: PixelFormat) -> u32 
     }
 }
 
-/// Blit a clipped damage rectangle from `src` (pitch `src_pitch` bytes) into a destination sink
-/// `write_pixel(dst_byte_off, pixel_u32)` with zero destination readback (write-combining safe).
 #[allow(clippy::too_many_arguments)]
 pub fn blit_rect_wc<F>(
     src: &[u8],
@@ -526,7 +494,6 @@ where
     pixels
 }
 
-/// Blit a clipped damage rectangle converting pixels to 10-bit `ARGB2101010` (HDR10).
 #[allow(clippy::too_many_arguments)]
 pub fn blit_rect_wc_10bpc<F>(
     src: &[u8],
@@ -570,28 +537,24 @@ where
     pixels
 }
 
-/// Helper: read little-endian u16 from a byte slice with bounds check.
 #[inline]
 pub(crate) fn rd_u16(b: &[u8], off: usize) -> Option<u16> {
     let s = b.get(off..off + 2)?;
     Some(u16::from_le_bytes([s[0], s[1]]))
 }
 
-/// Helper: read little-endian u32 from a byte slice with bounds check.
 #[inline]
 pub(crate) fn rd_u32(b: &[u8], off: usize) -> Option<u32> {
     let s = b.get(off..off + 4)?;
     Some(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// Helper: read little-endian u64 from a byte slice with bounds check.
 #[inline]
 pub(crate) fn rd_u64(b: &[u8], off: usize) -> Option<u64> {
     let s = b.get(off..off + 8)?;
     Some(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
 }
 
-/// Helper: write little-endian u32 into a byte slice with bounds check.
 #[inline]
 pub(crate) fn wr_u32(b: &mut [u8], off: usize, v: u32) -> bool {
     if let Some(s) = b.get_mut(off..off + 4) {
@@ -602,7 +565,6 @@ pub(crate) fn wr_u32(b: &mut [u8], off: usize, v: u32) -> bool {
     }
 }
 
-/// Helper: write little-endian u64 into a byte slice with bounds check.
 #[inline]
 pub(crate) fn wr_u64(b: &mut [u8], off: usize, v: u64) -> bool {
     if let Some(s) = b.get_mut(off..off + 8) {

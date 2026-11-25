@@ -1,0 +1,25 @@
+# `dosdrm`: D-OS user-space Atomic KMS, GEM/GPU-VM/Syncobj core, EDID/DisplayID parser,
+# VirtIO-GPU 2D/3D/Venus protocol, and optional Ring-3 C/C++ vendor driver shim (`shim`).
+[package]
+name = "dosdrm"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# Ring-3 `.ddrv` hardware driver shim (PCI, MMIO/WC BARs, IOMMU SG DMA, sys:/firmware/, C/C++ ABI).
+shim = ["dep:libd"]
+
+[dependencies]
+libd = { path = "../libd", optional = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"

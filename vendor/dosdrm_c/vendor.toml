@@ -1,0 +1,10 @@
+# Scoped Ring-3 C17 + freestanding C++20 compatibility shim for vendored GPU drivers.
+name = "dosdrm_c"
+c_std = "c17"
+cxx_std = "c++20"
+includes = ["include"]
+defines = ["__DOS_DRM__=1", "__KERNEL__=1"]
+sources = [
+    "src/dosdrm_shim.c",
+    "src/dosdrm_cxx_abi.cpp",
+]

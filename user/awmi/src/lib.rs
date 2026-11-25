@@ -120,11 +120,12 @@ impl Drop for Surface {
     }
 }
 
-/// One output's backbuffer (kept across sessions: the GPU keeps it attached).
+/// One output's backbuffer (kept across sessions: the GPU keeps its GEM BO & KMS FB attached).
 struct OutBuf {
     /// `gpu.dsvc` adapter id (0: a virtual output, memory only, test mode).
     adapter: u32,
     restarts: u32,
+    gem_handle: u32,
     fb_id: u32,
     map: Mapping,
     width: u32,
@@ -132,7 +133,7 @@ struct OutBuf {
     refresh_mhz: u32,
     hw_cursor: bool,
     async_flip: bool,
-    native_match: bool,
+    native_kms: bool,
 }
 
 /// The backbuffer's pixels as `u32`s.
@@ -196,6 +197,10 @@ struct Awmi {
     /// The pointer moved since the last frame (hardware cursor position to update if software/deferred).
     cursor_moved: bool,
     cursor_map: Option<Mapping>,
+    cursor_adapter: u32,
+    cursor_restarts: u32,
+    cursor_gem: u32,
+    cursor_fb: u32,
     hw_cursor_kind: CursorKind,
     /// Indicators set over `awmi.indicator`, and the microphone state polled from the audio service.
     ext_indicators: u64,
@@ -515,9 +520,9 @@ impl Awmi {
         }
         if self.wm.pointer != before.0 {
             if let Some(o) = self.outs.iter().find(|o| o.hw_cursor) {
-                // Hardware cursor moves immediately without triggering a frame composite.
+                // Hardware cursor plane moves atomically without triggering a full frame composite.
                 let p = self.wm.pointer;
-                let _ = gpu::move_cursor(self.gpu, o.adapter, p.x.max(0) as u32, p.y.max(0) as u32);
+                let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, 0, 0);
             } else {
                 self.cursor_moved = true;
             }
@@ -742,9 +747,9 @@ impl Awmi {
     // ---- outputs & the session --------------------------------------------------------------------
 
     /// The outputs to use:
-    /// - Unless `firmware_display` (`BOOT.CFG display = firmware`), prefer a verified native PCI
-    ///   output (`CAP_NATIVE_GOP_MATCH`, plus any additional active page-flipping outputs on the
-    ///   same PCI GPU) over GOP;
+    /// - Unless `firmware_display` (`BOOT.CFG display = firmware`), prefer a native KMS PCI output
+    ///   (`CAP_NATIVE_KMS`, plus any additional active page-flipping outputs on the same PCI GPU)
+    ///   over GOP;
     /// - Otherwise prefer the firmware GOP framebuffer when present, else every online PCI GPU.
     fn choose_adapters(&self) -> Vec<(AdapterInfo, u32)> {
         let mut ads = [AdapterInfo::empty(); 8];
@@ -753,7 +758,7 @@ impl Awmi {
         let pick: Vec<AdapterInfo> = if !self.firmware_display
             && let Some(nat) = online
                 .iter()
-                .find(|a| a.kind != gpu::KIND_GOP && (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0)
+                .find(|a| a.kind != gpu::KIND_GOP && (a.caps & gpu::CAP_NATIVE_KMS) != 0)
         {
             let (vendor, device) = (nat.vendor, nat.device);
             online
@@ -761,7 +766,7 @@ impl Awmi {
                 .filter(|a| {
                     a.vendor == vendor
                         && a.device == device
-                        && (a.caps & (gpu::CAP_NATIVE_GOP_MATCH | gpu::CAP_PAGE_FLIP)) != 0
+                        && (a.caps & (gpu::CAP_NATIVE_KMS | gpu::CAP_PAGE_FLIP)) != 0
                 })
                 .collect()
         } else {
@@ -780,7 +785,7 @@ impl Awmi {
             .collect()
     }
 
-    /// Attach (or reuse) one backbuffer per chosen adapter; the layout follows.
+    /// Attach (or reuse) one GEM-backed KMS framebuffer per chosen adapter; the layout follows.
     fn attach_outputs(&mut self) -> usize {
         let chosen = self.choose_adapters();
         let (virtuals, mut old): (Vec<OutBuf>, Vec<OutBuf>) = self.outs.drain(..).partition(|o| o.adapter == 0);
@@ -790,7 +795,7 @@ impl Awmi {
             let (w, h) = (a.width, a.height);
             let hw = chosen.len() == 1 && a.caps & gpu::CAP_HW_CURSOR != 0;
             let async_flip = a.caps & gpu::CAP_ASYNC_FLIP != 0;
-            let native_match = a.caps & gpu::CAP_NATIVE_GOP_MATCH != 0;
+            let native_kms = a.caps & gpu::CAP_NATIVE_KMS != 0;
             if let Some(i) = old.iter().position(|o| {
                 o.adapter == a.id
                     && o.width == w
@@ -802,7 +807,7 @@ impl Awmi {
                 if reused.refresh_mhz != hz
                     || reused.hw_cursor != hw
                     || reused.async_flip != async_flip
-                    || reused.native_match != native_match
+                    || reused.native_kms != native_kms
                 {
                     println!(
                         "awmi: output: adapter #{} '{}' {}x{} @ {}.{:02} Hz (reused backbuffer){}{}",
@@ -812,33 +817,41 @@ impl Awmi {
                         h,
                         hz / 1000,
                         hz % 1000 / 10,
-                        if native_match { ", native" } else { "" },
+                        if native_kms { ", native kms" } else { "" },
                         if async_flip { ", async flip" } else { "" }
                     );
                 }
                 reused.refresh_mhz = hz;
                 reused.hw_cursor = hw;
                 reused.async_flip = async_flip;
-                reused.native_match = native_match;
+                reused.native_kms = native_kms;
                 kept.push(reused);
                 continue;
             }
-            to_alloc.push((a, hz, hw, async_flip, native_match));
+            to_alloc.push((a, hz, hw, async_flip, native_kms));
         }
-        // Release incompatible backbuffers before allocating new ones so peak memory stays bounded.
+        // Release incompatible KMS FBs, GEM BOs, and VMOs before allocating new ones so peak memory stays bounded.
         for o in old {
+            if o.adapter != 0 && self.gpu != 0 {
+                if o.fb_id != 0 {
+                    let _ = gpu::kms_destroy_fb(self.gpu, o.adapter, o.fb_id);
+                }
+                if o.gem_handle != 0 {
+                    let _ = gpu::gem_close(self.gpu, o.adapter, o.gem_handle);
+                }
+            }
             sys::vmar_unmap(libd::root_vmar(), o.map.addr, o.map.len);
             sys::handle_close(o.map.vmo);
         }
-        for (a, hz, hw, async_flip, native_match) in to_alloc {
+        for (a, hz, hw, async_flip, native_kms) in to_alloc {
             let (w, h) = (a.width, a.height);
             let len = u64::from(w) * u64::from(h) * 4;
             let Ok(map) = Mapping::new(len) else {
                 println!("awmi: no memory for a {}x{} backbuffer", w, h);
                 continue;
             };
-            match gpu::attach_fb(self.gpu, a.id, map.vmo, w, h, w * 4, gpu::FMT_XRGB8888) {
-                Ok(fb_id) => {
+            match gpu::kms_attach_scanout_vmo(self.gpu, a.id, map.vmo, w, h, w * 4, gpu::FMT_XRGB8888) {
+                Ok((gem_handle, fb_id)) => {
                     println!(
                         "awmi: output: adapter #{} '{}' {}x{} @ {}.{:02} Hz, {} cursor{}{}",
                         a.id,
@@ -848,12 +861,13 @@ impl Awmi {
                         hz / 1000,
                         hz % 1000 / 10,
                         if hw { "hardware" } else { "software" },
-                        if native_match { ", native" } else { "" },
+                        if native_kms { ", native kms" } else { "" },
                         if async_flip { ", async flip" } else { "" }
                     );
                     kept.push(OutBuf {
                         adapter: a.id,
                         restarts: a.restarts,
+                        gem_handle,
                         fb_id,
                         map,
                         width: w,
@@ -861,7 +875,7 @@ impl Awmi {
                         refresh_mhz: hz,
                         hw_cursor: hw,
                         async_flip,
-                        native_match,
+                        native_kms,
                     });
                 }
                 Err(e) => {
@@ -903,6 +917,7 @@ impl Awmi {
     fn upload_cursor(&mut self) {
         let Some(o) = self.outs.iter().find(|o| o.hw_cursor) else { return };
         let adapter = o.adapter;
+        let restarts = o.restarts;
         let kind = self.wm.cursor_kind;
         if self.cursor_map.is_none() {
             let Ok(m) = Mapping::new(64 * 64 * 4) else { return };
@@ -911,7 +926,55 @@ impl Awmi {
         let Some(m) = self.cursor_map.as_mut() else { return };
         let (hx, hy) = dosawmi::write_hw_cursor_64x64_kind(kind, m.bytes_mut());
         let vmo = m.vmo;
-        if let Err(e) = gpu::set_cursor(self.gpu, adapter, vmo, hx, hy) {
+
+        if self.cursor_adapter != adapter || self.cursor_restarts != restarts || self.cursor_fb == 0 {
+            if self.cursor_adapter != 0 && self.cursor_adapter == adapter && self.cursor_restarts == restarts {
+                if self.cursor_fb != 0 {
+                    let _ = gpu::kms_destroy_fb(self.gpu, self.cursor_adapter, self.cursor_fb);
+                }
+                if self.cursor_gem != 0 {
+                    let _ = gpu::gem_close(self.gpu, self.cursor_adapter, self.cursor_gem);
+                }
+            }
+            self.cursor_adapter = 0;
+            self.cursor_gem = 0;
+            self.cursor_fb = 0;
+            let size = 64 * 64 * 4;
+            match gpu::gem_import(self.gpu, adapter, vmo, size, gpu::BO_CURSOR)
+                .and_then(|(gh, _)| {
+                    gpu::kms_create_fb(self.gpu, adapter, gh, 64, 64, 64 * 4, gpu::FMT_ARGB8888, 0)
+                        .map(|fid| (gh, fid))
+                        .inspect_err(|_| {
+                            let _ = gpu::gem_close(self.gpu, adapter, gh);
+                        })
+                }) {
+                Ok((gh, fid)) => {
+                    self.cursor_adapter = adapter;
+                    self.cursor_restarts = restarts;
+                    self.cursor_gem = gh;
+                    self.cursor_fb = fid;
+                }
+                Err(e) => {
+                    println!("awmi: hardware cursor FB refused ({}): software cursor", sys::status(e));
+                    for o in &mut self.outs {
+                        o.hw_cursor = false;
+                    }
+                    self.relayout();
+                    return;
+                }
+            }
+        }
+
+        let p = self.wm.pointer;
+        if let Err(e) = gpu::kms_set_cursor_atomic(
+            self.gpu,
+            adapter,
+            self.cursor_fb,
+            p.x,
+            p.y,
+            hx as u16,
+            hy as u16,
+        ) {
             println!("awmi: hardware cursor refused ({}): software cursor", sys::status(e));
             for o in &mut self.outs {
                 o.hw_cursor = false;
@@ -927,7 +990,17 @@ impl Awmi {
             return Ok(self.wm.layout.count as u32);
         }
         *self.wm = WmState::new();
-        let n = self.attach_outputs();
+        let mut n = self.attach_outputs();
+        if n == 0 && self.gpu != 0 && self.autostart_until == 0 {
+            // PCI GPU drivers on `sys:/bin/` spawn concurrently with `awmi`; wait briefly if an
+            // explicit `OP_SESSION_START` arrives before `devmgr` finishes binding the GPU.
+            let wait_dl = sys::clock_ns() + 4 * SEC;
+            while n == 0 && sys::clock_ns() < wait_dl {
+                libd::handle::sleep(50 * MS);
+                self.on_gpu_event();
+                n = self.attach_outputs();
+            }
+        }
         if n == 0 {
             println!("awmi: no display output: the session cannot start");
             return Err(sys::ERR_NOT_SUPPORTED);
@@ -1000,16 +1073,16 @@ impl Awmi {
         self.pace_skip_until = 0;
         self.modeset_redraw_at = 0;
         self.modeset_redraw_left = 0;
-        // Hand native scanout back to the firmware GOP framebuffer before the terminal reclaims the screen.
+        // Reset native KMS outputs back to their boot mode before the terminal reclaims the screen.
         let mut released_any = false;
         for o in &self.outs {
-            if o.adapter != 0 && o.native_match {
-                let _ = gpu::release_display(self.gpu, o.adapter);
+            if o.adapter != 0 && o.native_kms {
+                let _ = gpu::kms_reset_boot_atomic(self.gpu, o.adapter);
                 released_any = true;
             }
         }
         if !released_any && self.gpu != 0 {
-            let _ = gpu::release_display(self.gpu, 0);
+            let _ = gpu::kms_reset_boot_atomic(self.gpu, 0);
         }
         self.grab(false);
         self.term_call(term::DISPLAY_RECLAIM);
@@ -1023,7 +1096,7 @@ impl Awmi {
         }
     }
 
-    /// Receive unsolicited `gpu::EVT_FLIP_DONE` and `gpu::EVT_ADAPTERS_CHANGED` events from `gpu.dsvc`.
+    /// Receive unsolicited `gpu::EVT_VBLANK` and `gpu::EVT_ADAPTERS_CHANGED` events from `gpu.dsvc`.
     fn on_gpu_event(&mut self) {
         let mut buf = [0u8; HEADER + 32];
         let mut check_adapters = false;
@@ -1035,7 +1108,7 @@ impl Awmi {
                 Ok(n) => {
                     let Some(h) = Header::get(&buf[..n as usize]) else { continue };
                     match h.op {
-                        gpu::EVT_FLIP_DONE => {
+                        gpu::EVT_VBLANK => {
                             let now = sys::clock_ns();
                             let late_flag = (h.a >> 32) != 0;
                             let interval = self.frame_interval();
@@ -1073,18 +1146,18 @@ impl Awmi {
     }
 
     /// Re-evaluate available GPU outputs when `gpu.dsvc` reports an adapter change (e.g. a native
-    /// PCI GPU driver finishing its probe/self-check after boot, or a mode change).
+    /// KMS PCI GPU driver coming online, an automatic 12s mode revert, or an explicit mode switch).
     fn check_output_upgrade(&mut self) {
         let next = self.choose_adapters();
         let cur: Vec<&OutBuf> = self.outs.iter().filter(|o| o.adapter != 0).collect();
         let changed = next.len() != cur.len()
             || next.iter().zip(cur.iter()).any(|((a, hz), o)| {
-                let nat = (a.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0;
+                let nat = (a.caps & gpu::CAP_NATIVE_KMS) != 0;
                 o.adapter != a.id
                     || o.width != a.width
                     || o.height != a.height
                     || o.refresh_mhz != *hz
-                    || o.native_match != nat
+                    || o.native_kms != nat
                     || o.restarts != a.restarts
             });
         if changed && !next.is_empty() {
@@ -1193,7 +1266,7 @@ impl Awmi {
                 for (slot, r) in rects.iter_mut().take(cnt).zip(slice.iter()) {
                     *slot = (r.x as u32, r.y as u32, r.w, r.h);
                 }
-                match gpu::present_multi(*gpu_ep, ob.adapter, ob.fb_id, &rects[..cnt]) {
+                match gpu::kms_present_atomic(*gpu_ep, ob.adapter, ob.fb_id, &rects[..cnt]) {
                     Ok((_, is_async)) => {
                         presented += cnt as u64;
                         if is_async {
@@ -1226,7 +1299,7 @@ impl Awmi {
             self.cursor_moved = false;
             if let Some(o) = self.outs.iter().find(|o| o.hw_cursor) {
                 let p = self.wm.pointer;
-                let _ = gpu::move_cursor(self.gpu, o.adapter, p.x.max(0) as u32, p.y.max(0) as u32);
+                let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, 0, 0);
             }
         }
         if any_async && !failed {
@@ -1384,31 +1457,6 @@ impl Awmi {
                 }
                 ok(self.settings.pack(), 0)
             }
-            wire::OP_FLIP_TEST if admin => {
-                if self.gpu == 0 {
-                    return err(sys::ERR_BAD_STATE);
-                }
-                let id = h.a as u32;
-                let dur_ms = if h.b == 0 { 5000 } else { (h.b as u32).clamp(500, 15_000) };
-                let was_active = self.active;
-                if !was_active {
-                    self.term_call(term::DISPLAY_RELEASE);
-                }
-                let res = gpu::flip_test(self.gpu, id, dur_ms);
-                if !was_active {
-                    self.term_call(term::DISPLAY_RECLAIM);
-                } else {
-                    self.wm.damage_all();
-                }
-                match res {
-                    Ok(r) => {
-                        let mut enc = [0u8; gpu::FLIP_TEST_BYTES];
-                        r.encode(&mut enc);
-                        (0, 0, 0, enc.to_vec())
-                    }
-                    Err(e) => err(e),
-                }
-            }
             wire::OP_SET_DISPLAY if admin => {
                 if self.gpu == 0 {
                     return err(sys::ERR_BAD_STATE);
@@ -1424,7 +1472,12 @@ impl Awmi {
                         let hh = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
                         let refresh_mhz = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
                         let flags = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-                        match gpu::set_mode_ex(self.gpu, adapter_id, w, hh, refresh_mhz, flags) {
+                        let require_confirm = (flags & 4) != 0;
+                        // Always validate via `ATOMIC_TEST_ONLY` before committing the real modeset.
+                        if let Err(e) = gpu::kms_modeset_atomic(self.gpu, adapter_id, w, hh, refresh_mhz, true, false) {
+                            return err(e);
+                        }
+                        match gpu::kms_modeset_atomic(self.gpu, adapter_id, w, hh, refresh_mhz, false, require_confirm) {
                             Ok(()) => {
                                 self.reattach = true;
                                 self.flip_pending = false;
@@ -1445,18 +1498,33 @@ impl Awmi {
                     }
                     wire::DISPLAY_SET_VRR => {
                         let enable = (h.b & 1) != 0;
-                        let min_hz = ((h.b >> 16) & 0xFFFF) as u16;
-                        let max_hz = ((h.b >> 32) & 0xFFFF) as u16;
-                        match gpu::set_vrr(self.gpu, adapter_id, enable, min_hz, max_hz) {
+                        match gpu::kms_set_vrr_atomic(self.gpu, adapter_id, enable) {
                             Ok(()) => ok(0, 0),
                             Err(e) => err(e),
                         }
                     }
                     wire::DISPLAY_SET_HDR => {
                         let enable = (h.b & 1) != 0;
-                        match gpu::set_hdr(self.gpu, adapter_id, enable) {
+                        match gpu::kms_set_hdr_atomic(self.gpu, adapter_id, enable) {
                             Ok(()) => {
                                 self.wm.damage_all();
+                                ok(0, 0)
+                            }
+                            Err(e) => err(e),
+                        }
+                    }
+                    wire::DISPLAY_CONFIRM_MODE => {
+                        let confirm = (h.b & 1) != 0;
+                        match gpu::kms_confirm_mode(self.gpu, adapter_id, confirm) {
+                            Ok(()) => {
+                                if !confirm {
+                                    self.reattach = true;
+                                    self.flip_pending = false;
+                                    self.flip_deadline = 0;
+                                    if self.active {
+                                        self.wm.damage_all();
+                                    }
+                                }
                                 ok(0, 0)
                             }
                             Err(e) => err(e),
@@ -1686,6 +1754,7 @@ impl Awmi {
                 self.outs.push(OutBuf {
                     adapter: 0,
                     restarts: 0,
+                    gem_handle: 0,
                     fb_id: 0,
                     map,
                     width: w,
@@ -1693,7 +1762,7 @@ impl Awmi {
                     refresh_mhz: 60_000,
                     hw_cursor: false,
                     async_flip: false,
-                    native_match: false,
+                    native_kms: false,
                 });
                 self.relayout();
                 println!("awmi: test: virtual output {}x{} added right of the others", w, hh);
@@ -1837,6 +1906,10 @@ fn main(s: *const Startup) -> i32 {
         pace_skip_until: 0,
         cursor_moved: false,
         cursor_map: None,
+        cursor_adapter: 0,
+        cursor_restarts: 0,
+        cursor_gem: 0,
+        cursor_fb: 0,
         hw_cursor_kind: CursorKind::Default,
         ext_indicators: 0,
         mic_live: false,

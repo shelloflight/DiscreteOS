@@ -1,0 +1,6 @@
+# D-OS VirtIO-GPU firmware & capset metadata (sys:/firmware/virtio/manifest.toml)
+vendor = "virtio"
+pci_vendor = 0x1AF4
+driver = "virtio-gpu.ddrv"
+kms_atomic = true
+capsets = ["virgl", "virgl2", "venus"]

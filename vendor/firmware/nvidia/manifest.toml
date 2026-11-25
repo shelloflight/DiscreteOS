@@ -1,0 +1,7 @@
+# D-OS NVIDIA Open-GSP firmware directory manifest (sys:/firmware/nvidia/manifest.toml)
+# Stage 1.3 populates signed GSP-RM firmware blobs (gsp_tu10x.bin, gsp_ga10x.bin) here.
+vendor = "nvidia"
+pci_vendor = 0x10DE
+driver = "nvgpu.ddrv"
+kms_atomic = true
+families = ["turing", "ampere", "ada", "blackwell"]

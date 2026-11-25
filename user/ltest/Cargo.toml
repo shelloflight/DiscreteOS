@@ -19,7 +19,7 @@ libd = { path = "../lib/libd", features = ["alloc"] }
 dosapp = { path = "../lib/app" }
 dosaudio = { path = "../lib/audio" }
 doscrypt = { path = "../lib/crypto" }
-dosgpu = { path = "../lib/gpu" }
+dosdrm = { path = "../lib/drm" }
 dosid = { path = "../lib/identity" }
 dosnet = { path = "../lib/net", features = ["tls-server"] }
 

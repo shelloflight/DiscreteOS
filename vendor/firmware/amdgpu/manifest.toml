@@ -1,0 +1,7 @@
+# D-OS AMD RDNA firmware directory manifest (sys:/firmware/amdgpu/manifest.toml)
+# Stage 1.2 populates PSP, SMU/PMFW, DMCUB, RLC, MEC, SDMA, and MES blobs here.
+vendor = "amdgpu"
+pci_vendor = 0x1002
+driver = "amdgpu.ddrv"
+kms_atomic = true
+families = ["dcn30", "dcn315", "dcn32", "dcn401"]

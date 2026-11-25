@@ -10,6 +10,7 @@ use crate::tools::{
     Env, collect_files, hash_strings, mtime_of, needs_rebuild, newest_mtime, run_capture, run_cmd,
     sha256_file, write_stamp,
 };
+use crate::vendor::build_vendor_libs;
 
 #[derive(Clone, Debug)]
 pub struct ProgramEntry {
@@ -29,6 +30,8 @@ pub struct SharedArtifacts {
 }
 
 /// Programs that stay embedded in `kernel.bin` to bootstrap storage and early input.
+/// PCI GPU `.ddrv` drivers live signed on `sys:/bin/` (with firmware on `sys:/firmware/`),
+/// keeping `kernel.bin` small while `platform:display` (UEFI GOP) serves early boot.
 const BOOTSTRAP_PROGS: &[&str] = &[
     "init.dx",
     "clock.dx",
@@ -46,17 +49,17 @@ const BOOTSTRAP_PROGS: &[&str] = &[
     "virtio-net.ddrv",
     "e1000e.ddrv",
     "r8169.ddrv",
-    "virtio-gpu.ddrv",
-    "amdgpu.ddrv",
-    "xe.ddrv",
-    "nvgpu.ddrv",
 ];
 
 /// Service manifests that stay embedded in `kernel.bin` to mount `sys:`.
 const BOOTSTRAP_MANIFESTS: &[&str] = &["clock.dman", "storaged.dman", "devmgr.dman"];
 
-/// Non-bootstrap programs placed (with `.dsig` signatures) on the immutable `sys` DFS volume.
+/// Non-bootstrap programs and PCI GPU drivers placed (with `.dsig` signatures) on `sys:/bin/`.
 const SYS_BIN_PROGS: &[&str] = &[
+    "virtio-gpu.ddrv",
+    "amdgpu.ddrv",
+    "xe.ddrv",
+    "nvgpu.ddrv",
     "audio.dsvc",
     "net.dsvc",
     "gpu.dsvc",
@@ -120,9 +123,37 @@ fn build_sys_files(
             .find(|e| e.name == name)
             .ok_or_else(|| format!("sys image: missing program '{name}'"))?;
         let sig = sig_dir.join(format!("{name}.dsig"));
-        img::sign_file(seed, "program", name, &p.path, &sig)?;
+        let sig_kind = if name.ends_with(".ddrv") { "driver" } else { "program" };
+        img::sign_file(seed, sig_kind, name, &p.path, &sig)?;
         files.push((format!("bin/{name}"), p.path.clone()));
         files.push((format!("bin/{name}.dsig"), sig));
+    }
+
+    // Vendor GPU firmware blobs & manifests (`vendor/firmware/<vendor>/*` -> `sys:/firmware/<vendor>/*`).
+    let fw_root = env.root.join("vendor").join("firmware");
+    if fw_root.is_dir() {
+        let mut vendor_dirs: Vec<PathBuf> = fs::read_dir(&fw_root)
+            .map_err(|e| format!("read {}: {e}", fw_root.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        vendor_dirs.sort();
+        for vdir in vendor_dirs {
+            let Some(vname) = vdir.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let mut entries: Vec<PathBuf> = fs::read_dir(&vdir)
+                .map_err(|e| format!("read {}: {e}", vdir.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.is_file())
+                .collect();
+            entries.sort();
+            for f in entries {
+                if let Some(fname) = f.file_name().and_then(|n| n.to_str()) {
+                    files.push((format!("firmware/{vname}/{fname}"), f));
+                }
+            }
+        }
     }
 
     let man_dir = env.root.join("user").join("init").join("services");
@@ -1119,6 +1150,12 @@ fn build_user_all(env: &Env, out_dir: &Path, quiet: bool) -> Result<(Vec<Program
         .filter(|p| p.join("Cargo.toml").is_file())
         .collect();
 
+    // Build scoped C/C++ `vendor/` archives first (cached by content hash).
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let vendor_libs = build_vendor_libs(env, out_dir, cpus, quiet)?;
+
     // Build the entire Rust user workspace in TWO fast cargo calls sharing one target dir:
     //   1) all alloc-enabled user programs in parallel (compiling libd/dosfs/doscrypt/dman once)
     //   2) devmgr (no-alloc drivers)
@@ -1164,7 +1201,16 @@ fn build_user_all(env: &Env, out_dir: &Path, quiet: bool) -> Result<(Vec<Program
             .and_then(|n| n.to_str())
             .ok_or_else(|| format!("bad user dir {}", p.display()))?;
         if p.join("Cargo.toml").is_file() {
-            out.extend(link_rust_user_crate(env, p, name, &ws_target, &out_user, lld, quiet)?);
+            out.extend(link_rust_user_crate(
+                env,
+                p,
+                name,
+                &ws_target,
+                &out_user,
+                &vendor_libs,
+                lld,
+                quiet,
+            )?);
             continue;
         }
         let csrc = collect_files(p, "c", false);
@@ -1371,12 +1417,14 @@ fn parse_toml_string_list(toml: &str, key: &str) -> Option<Vec<String>> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn link_rust_user_crate(
     _env: &Env,
     crate_dir: &Path,
     name: &str,
     ws_target: &Path,
     out_user: &Path,
+    vendor_libs: &std::collections::BTreeMap<String, PathBuf>,
     lld: &Path,
     quiet: bool,
 ) -> Result<Vec<ProgramEntry>, String> {
@@ -1389,6 +1437,15 @@ fn link_rust_user_crate(
     }
     let toml_path = crate_dir.join("Cargo.toml");
     let toml = fs::read_to_string(&toml_path).map_err(|e| e.to_string())?;
+    let mut extra_archives: Vec<PathBuf> = Vec::new();
+    if let Some(vnames) = parse_toml_string_list(&toml, "vendor_libs") {
+        for vn in vnames {
+            let vpath = vendor_libs
+                .get(&vn)
+                .ok_or_else(|| format!("{}: unknown vendor_libs entry '{vn}'", toml_path.display()))?;
+            extra_archives.push(vpath.clone());
+        }
+    }
     let mut ldflags: Vec<String> = vec![
         "-pie".into(),
         "--no-dynamic-linker".into(),
@@ -1414,12 +1471,16 @@ fn link_rust_user_crate(
         ldflags.push("-z".into());
         ldflags.push("shstk".into());
     }
-    let a_mtime = mtime_of(&a);
+    let a_mtime = extra_archives
+        .iter()
+        .filter_map(|p| mtime_of(p))
+        .chain(mtime_of(&a))
+        .max();
     let stamp = hash_strings(&ldflags);
 
     let link_one = |out_name: &str, entry: &str| -> Result<ProgramEntry, String> {
         let out_path = out_user.join(out_name);
-        let s = format!("{stamp}|{entry}");
+        let s = format!("{stamp}|{entry}|{}", extra_archives.len());
         if needs_rebuild(&out_path, a_mtime, &s) {
             log(quiet, &format!("  LD    user/{out_name}"));
             let mut args = ldflags.clone();
@@ -1430,6 +1491,7 @@ fn link_rust_user_crate(
                 out_path.to_string_lossy().into_owned(),
                 a.to_string_lossy().into_owned(),
             ]);
+            args.extend(extra_archives.iter().map(|p| p.to_string_lossy().into_owned()));
             run_cmd(lld, &args, None, &[], quiet)?;
             write_stamp(&out_path, &s);
         }

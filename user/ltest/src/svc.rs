@@ -587,12 +587,12 @@ pub fn gpu_ungranted() -> i32 {
 }
 
 pub fn gpu_queryonly() -> i32 {
-    use libd::gpu;
+    use libd::gpu::{self, ModeEntry};
     let q = gpu::query_endpoint();
     check!(q != 0, "missing gpu.query endpoint");
     check!(gpu::display_endpoint() == 0 && gpu::render_endpoint() == 0, "query-only got display/render");
     let mut adapters = [gpu::AdapterInfo::empty(); 8];
-    let dl = sys::clock_ns() + 10_000_000_000;
+    let dl = sys::clock_ns() + 15_000_000_000;
     let mut count = 0usize;
     while sys::clock_ns() < dl {
         if let Ok(n) = gpu::list_adapters(q, &mut adapters)
@@ -605,17 +605,44 @@ pub fn gpu_queryonly() -> i32 {
     }
     check!(count > 0, "no gpu adapters found");
     let id = adapters[0].id;
-    // Read-only display probe must succeed on query endpoint.
-    let probe = gpu::get_display_info(q, id);
-    check!(probe.is_ok(), "get_display_info failed on query: {:?}", probe);
-    // Query-only endpoint must be refused on display, render, and crash-driver operations.
-    check!(gpu::set_mode(q, id, 800, 600) == Err(sys::ERR_ACCESS_DENIED), "set_mode not refused on query");
-    check!(gpu::present(q, id, 1, 0, 0, 64, 64) == Err(sys::ERR_ACCESS_DENIED), "present not refused on query");
-    check!(gpu::present_multi(q, id, 1, &[(0, 0, 64, 64)]) == Err(sys::ERR_ACCESS_DENIED), "present_multi not refused on query");
-    check!(gpu::release_display(q, id) == Err(sys::ERR_ACCESS_DENIED), "release_display not refused on query");
-    check!(gpu::set_vrr(q, id, true, 48, 240) == Err(sys::ERR_ACCESS_DENIED), "set_vrr not refused on query");
-    check!(gpu::set_hdr(q, id, true) == Err(sys::ERR_ACCESS_DENIED), "set_hdr not refused on query");
-    check!(gpu::flip_test(q, id, 500) == Err(sys::ERR_ACCESS_DENIED), "flip_test not refused on query");
+    // Read-only Atomic KMS resource & mode query must succeed on `gpu.query`.
+    let mut modes = [ModeEntry::default(); 16];
+    let kres = gpu::kms_get_resources(q, id, &mut modes);
+    check!(kres.is_ok(), "kms_get_resources failed on query: {:?}", kres);
+    // Query-only endpoint must be refused on every display, GEM, VM, syncobj, render, and crash op.
+    check!(
+        gpu::kms_modeset_atomic(q, id, 800, 600, 60_000, false, false) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_modeset_atomic not refused on query"
+    );
+    check!(
+        gpu::kms_present_atomic(q, id, 1, &[(0, 0, 64, 64)]) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_present_atomic not refused on query"
+    );
+    check!(
+        gpu::kms_confirm_mode(q, id, true) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_confirm_mode not refused on query"
+    );
+    check!(
+        gpu::kms_set_vrr_atomic(q, id, true) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_set_vrr_atomic not refused on query"
+    );
+    check!(
+        gpu::kms_set_hdr_atomic(q, id, true) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_set_hdr_atomic not refused on query"
+    );
+    check!(
+        gpu::kms_reset_boot_atomic(q, id) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_reset_boot_atomic not refused on query"
+    );
+    check!(
+        gpu::gem_create(q, id, 4096, gpu::BO_RENDER) == Err(sys::ERR_ACCESS_DENIED),
+        "gem_create not refused on query"
+    );
+    check!(gpu::vm_create(q, id) == Err(sys::ERR_ACCESS_DENIED), "vm_create not refused on query");
+    check!(
+        gpu::syncobj_create(q, id, 0) == Err(sys::ERR_ACCESS_DENIED),
+        "syncobj_create not refused on query"
+    );
     check!(gpu::ctx_create(q, id) == Err(sys::ERR_ACCESS_DENIED), "ctx_create not refused on query");
     check!(gpu::crash_driver(q, id) == Err(sys::ERR_ACCESS_DENIED), "crash_driver not refused on query");
     println!("svc-gpu-queryonly: PASSED (query ok, display/render refused)");
@@ -643,7 +670,6 @@ pub fn gpu_full() -> i32 {
                 break;
             }
             if let Some(&gop) = adapters[..n].iter().find(|a| a.online && a.kind == gpu::KIND_GOP) {
-                // Give PCI drivers a short moment to settle if any are starting.
                 if chosen.is_none() {
                     chosen = Some(gop);
                 }
@@ -674,17 +700,36 @@ pub fn gpu_full() -> i32 {
 
     // 2. Role separation between display and render endpoints.
     check!(gpu::ctx_create(disp, id) == Err(sys::ERR_ACCESS_DENIED), "ctx_create on display not refused");
-    check!(gpu::set_mode(rnd, id, ad.width, ad.height) == Err(sys::ERR_ACCESS_DENIED), "set_mode on render not refused");
+    check!(gpu::vm_create(disp, id) == Err(sys::ERR_ACCESS_DENIED), "vm_create on display not refused");
+    check!(
+        gpu::gem_create(disp, id, 4096, gpu::BO_RENDER) == Err(sys::ERR_ACCESS_DENIED),
+        "gem_create on display not refused"
+    );
+    check!(
+        gpu::kms_modeset_atomic(rnd, id, ad.width, ad.height, 60_000, false, false) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_modeset_atomic on render not refused"
+    );
+    check!(
+        gpu::kms_present_atomic(rnd, id, 1, &[(0, 0, 64, 64)]) == Err(sys::ERR_ACCESS_DENIED),
+        "kms_present_atomic on render not refused"
+    );
 
-    // 3. Query modes.
+    // 3. Query Atomic KMS topology & modes.
     let mut modes = [ModeEntry::default(); 16];
-    let mcount = gpu::get_modes(q, id, &mut modes).unwrap_or(0);
+    let (kres, mcount) = match gpu::kms_get_resources(q, id, &mut modes) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("ltest: FAIL: kms_get_resources failed: {}", sys::status(e));
+            return 1;
+        }
+    };
     check!(mcount >= 1, "no display modes reported");
+    check!((kres.status_flags & gpu::KMS_STATUS_CONNECTED) != 0, "connector not marked connected");
     let (w, h) = (ad.width.max(640), ad.height.max(480));
     let pitch = w * 4;
     let fb_size = u64::from(pitch) * u64::from(h);
 
-    // 4. Allocate framebuffer VMO, draw a deterministic RGB pattern, attach & present full + partial damage.
+    // 4. Allocate framebuffer VMO, import into GEM, create KMS FB, test+commit modeset, and present.
     let Ok(mut fb) = libd::Mapping::new(fb_size) else {
         println!("ltest: FAIL: fb VMO alloc failed");
         return 1;
@@ -706,53 +751,161 @@ pub fn gpu_full() -> i32 {
             }
         }
     }
-    let fb_id = match gpu::attach_fb(disp, id, fb.vmo, w, h, pitch, gpu::FMT_XRGB8888) {
+    let (gem_h, fb_id) = match gpu::kms_attach_scanout_vmo(disp, id, fb.vmo, w, h, pitch, gpu::FMT_XRGB8888) {
         Ok(f) => f,
         Err(e) => {
-            println!("ltest: FAIL: attach_fb failed: {}", sys::status(e));
+            println!("ltest: FAIL: kms_attach_scanout_vmo failed: {}", sys::status(e));
             return 1;
         }
     };
-    check!(gpu::set_mode(disp, id, w, h).is_ok(), "set_mode failed");
-    let f1 = gpu::present(disp, id, fb_id, 0, 0, w, h);
-    check!(f1 == Ok(1), "first present failed: {:?}", f1);
-    let f2 = gpu::present(disp, id, fb_id, 32, 32, 128, 128);
-    check!(f2 == Ok(2), "partial damage present failed: {:?}", f2);
-    let f3 = gpu::present_multi(disp, id, fb_id, &[(0, 0, 64, 64), (64, 64, 64, 64)]);
-    check!(matches!(f3, Ok((3, _))), "multi-rect present failed: {:?}", f3);
+    // Render endpoint must not be allowed to close display client's GEM handle!
+    check!(
+        gpu::gem_close(rnd, id, gem_h) == Err(sys::ERR_ACCESS_DENIED),
+        "render client closed display client's GEM handle"
+    );
+    check!(
+        gpu::kms_modeset_atomic(disp, id, w, h, 60_000, true, false).is_ok(),
+        "atomic TEST_ONLY modeset failed"
+    );
+    check!(
+        gpu::kms_modeset_atomic(disp, id, w, h, 60_000, false, false).is_ok(),
+        "atomic modeset commit failed"
+    );
+    let f1 = gpu::kms_present_atomic(disp, id, fb_id, &[(0, 0, w, h)]);
+    check!(matches!(f1, Ok((1, _))), "first atomic present failed: {:?}", f1);
+    let f2 = gpu::kms_present_atomic(disp, id, fb_id, &[(32, 32, 128, 128)]);
+    check!(matches!(f2, Ok((2, _))), "partial damage atomic present failed: {:?}", f2);
+    let f3 = gpu::kms_present_atomic(disp, id, fb_id, &[(0, 0, 64, 64), (64, 64, 64, 64)]);
+    check!(matches!(f3, Ok((3, _))), "multi-rect atomic present failed: {:?}", f3);
     println!("svc-gpu-full: scanout OK ({}x{}, 3 frames presented)", w, h);
 
-    // 5. PCI VirtIO-GPU specific checks: cursor, mode switch, CS validation, and crash-recovery.
+    // 5. PCI VirtIO-GPU checks: firmware+C/C++ shim, cursor plane, 12s confirm/revert, GEM/VM/syncobj, CS, crash-recovery.
     if ad.kind == gpu::KIND_VIRTIO_GPU {
         check!((ad.caps & gpu::CAP_IOMMU) != 0, "virtio-gpu not IOMMU confined");
-        // Hardware cursor (64x64 ARGB8888)
+        check!((ad.caps & gpu::CAP_SYS_FIRMWARE) != 0, "sys:/firmware/virtio capability missing");
+        check!(
+            (kres.status_flags & gpu::KMS_STATUS_FIRMWARE_LOADED) != 0,
+            "virtio firmware manifest not loaded"
+        );
+        check!(
+            (kres.status_flags & gpu::KMS_STATUS_VENDOR_SHIM_OK) != 0 && kres.shim_abi != 0,
+            "C17/C++20 vendor shim self-test not verified"
+        );
+
+        // Hardware cursor plane (64x64 ARGB8888)
         let Ok(mut cur) = libd::Mapping::new(64 * 64 * 4) else {
             println!("ltest: FAIL: cursor VMO alloc failed");
             return 1;
         };
         cur.bytes_mut().fill(0xFF);
-        check!(gpu::set_cursor(disp, id, cur.vmo, 4, 4).is_ok(), "set_cursor failed");
-        check!(gpu::move_cursor(disp, id, 160, 120).is_ok(), "move_cursor failed");
+        let (cur_gem, _) = match gpu::gem_import(disp, id, cur.vmo, 64 * 64 * 4, gpu::BO_CURSOR) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("ltest: FAIL: cursor gem_import failed: {}", sys::status(e));
+                return 1;
+            }
+        };
+        let cur_fb = match gpu::kms_create_fb(disp, id, cur_gem, 64, 64, 64 * 4, gpu::FMT_ARGB8888, 0) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("ltest: FAIL: cursor kms_create_fb failed: {}", sys::status(e));
+                return 1;
+            }
+        };
+        check!(
+            gpu::kms_set_cursor_atomic(disp, id, cur_fb, 160, 120, 4, 4).is_ok(),
+            "kms_set_cursor_atomic upload failed"
+        );
+        check!(
+            gpu::kms_set_cursor_atomic(disp, id, 0, 220, 180, 0, 0).is_ok(),
+            "kms_set_cursor_atomic move failed"
+        );
         println!("svc-gpu-full: cursor OK");
 
-        // Dynamic mode switch: 800x600 -> back to native
+        // Atomic KMS TEST_ONLY rejection + 12-second guarded mode switch & explicit revert/confirm
+        check!(
+            gpu::kms_modeset_atomic(disp, id, 99_999, 99_999, 60_000, true, false) == Err(sys::ERR_NOT_SUPPORTED),
+            "out-of-range TEST_ONLY modeset not rejected"
+        );
         let Ok(fb2) = libd::Mapping::new(800 * 600 * 4) else {
             println!("ltest: FAIL: mode-switch fb alloc failed");
             return 1;
         };
-        let fb2_id = match gpu::attach_fb(disp, id, fb2.vmo, 800, 600, 800 * 4, gpu::FMT_XRGB8888) {
+        let (gem2, fb2_id) = match gpu::kms_attach_scanout_vmo(disp, id, fb2.vmo, 800, 600, 800 * 4, gpu::FMT_XRGB8888) {
             Ok(f) => f,
             Err(e) => {
-                println!("ltest: FAIL: attach_fb 800x600 failed: {}", sys::status(e));
+                println!("ltest: FAIL: attach_scanout 800x600 failed: {}", sys::status(e));
                 return 1;
             }
         };
-        check!(gpu::set_mode(disp, id, 800, 600).is_ok(), "set_mode 800x600 failed");
-        check!(gpu::present(disp, id, fb2_id, 0, 0, 800, 600).is_ok(), "present 800x600 failed");
-        check!(gpu::set_mode(disp, id, w, h).is_ok(), "restore mode failed");
+        check!(
+            gpu::kms_modeset_atomic(disp, id, 800, 600, 60_000, false, true).is_ok(),
+            "guarded modeset 800x600 failed"
+        );
+        check!(
+            gpu::kms_present_atomic(disp, id, fb2_id, &[(0, 0, 800, 600)]).is_ok(),
+            "present 800x600 failed"
+        );
+        let (k_pend, _) = gpu::kms_get_resources(q, id, &mut modes).unwrap_or((gpu::KmsResourcesWire::empty(), 0));
+        check!(
+            (k_pend.status_flags & gpu::KMS_STATUS_REVERT_PENDING) != 0 && k_pend.width == 800,
+            "ModeRevertGuard did not arm on guarded modeset"
+        );
+        // Trigger immediate revert (`confirm = false`) and verify restoration to boot `w x h`.
+        check!(gpu::kms_confirm_mode(disp, id, false).is_ok(), "explicit mode revert failed");
+        let (k_rev, _) = gpu::kms_get_resources(q, id, &mut modes).unwrap_or((gpu::KmsResourcesWire::empty(), 0));
+        check!(
+            (k_rev.status_flags & gpu::KMS_STATUS_REVERT_PENDING) == 0 && k_rev.width == w && k_rev.height == h,
+            "explicit mode revert did not restore {}x{} (got {}x{})",
+            w,
+            h,
+            k_rev.width,
+            k_rev.height
+        );
+        let _ = gpu::kms_destroy_fb(disp, id, fb2_id);
+        let _ = gpu::gem_close(disp, id, gem2);
         println!("svc-gpu-full: modeset OK (800x600 -> {}x{})", w, h);
 
-        // Render context + VirGL CS validator check
+        // GEM + per-context isolated GpuVm + timeline syncobj checks on `gpu.render`
+        let (r_gem, r_vmo, r_uuid) = match gpu::gem_create(rnd, id, 16_384, gpu::BO_RENDER | gpu::BO_GTT) {
+            Ok(x) => x,
+            Err(e) => {
+                println!("ltest: FAIL: gem_create failed: {}", sys::status(e));
+                return 1;
+            }
+        };
+        check!(r_vmo != 0 && sys::vmo_size(r_vmo).unwrap_or(0) >= 16_384, "gem_create returned invalid VMO");
+        sys::handle_close(r_vmo);
+        check!(r_uuid != [0u8; 16], "gem_create returned zero UUID");
+        let vm1 = gpu::vm_create(rnd, id).unwrap_or(0);
+        let vm2 = gpu::vm_create(rnd, id).unwrap_or(0);
+        check!(vm1 != 0 && vm2 != 0 && vm1 != vm2, "vm_create failed");
+        check!(
+            gpu::vm_bind(rnd, id, vm1, r_gem, 0, 0x1_0000_0000, 16_384, gpu::VM_READ | gpu::VM_WRITE).is_ok(),
+            "vm_bind vm1 failed"
+        );
+        check!(
+            gpu::vm_bind(rnd, id, vm1, r_gem, 0, 0x1_0000_2000, 8_192, gpu::VM_READ) == Err(sys::ERR_BAD_STATE),
+            "overlapping vm_bind in vm1 not rejected"
+        );
+        check!(
+            gpu::vm_bind(rnd, id, vm2, r_gem, 0, 0x1_0000_0000, 16_384, gpu::VM_READ).is_ok(),
+            "same GPU VA in isolated vm2 failed"
+        );
+        check!(gpu::vm_unbind(rnd, id, vm1, 0x1_0000_0000, 16_384).is_ok(), "vm_unbind failed");
+        check!(gpu::vm_destroy(rnd, id, vm1).is_ok() && gpu::vm_destroy(rnd, id, vm2).is_ok(), "vm_destroy failed");
+        check!(gpu::gem_close(rnd, id, r_gem).is_ok(), "gem_close render BO failed");
+
+        let sync = gpu::syncobj_create(rnd, id, 0).unwrap_or(0);
+        check!(sync != 0, "syncobj_create failed");
+        check!(
+            gpu::syncobj_wait(rnd, id, sync, 5) == Err(sys::ERR_SHOULD_WAIT),
+            "unsignaled timeline syncobj_wait did not return ERR_SHOULD_WAIT"
+        );
+        check!(gpu::syncobj_signal(rnd, id, sync, 5) == Ok(5), "syncobj_signal failed");
+        check!(gpu::syncobj_wait(rnd, id, sync, 5) == Ok(5), "signaled timeline syncobj_wait failed");
+
+        // Render context + VirGL CS validator + timeline syncobj submission check
         let ctx_id = match gpu::ctx_create(rnd, id) {
             Ok(c) => c,
             Err(e) => {
@@ -760,20 +913,30 @@ pub fn gpu_full() -> i32 {
                 return 1;
             }
         };
-        let bad_cs = [0xFE, 0x00, 0x00, 0x00]; // unknown VirGL opcode
+        let bad_cs = [0xFE, 0x00, 0x00, 0x00];
         check!(
             gpu::submit_cmd(rnd, id, ctx_id, gpu::ENGINE_VIRGL_3D, &bad_cs) == Err(sys::ERR_INVALID_ARGS),
             "malformed VirGL CS was not rejected"
         );
         let mut nop = [0u32; 1];
-        dosgpu::virtio::virgl_cmd_nop(&mut nop);
-        let r = gpu::submit_cmd(rnd, id, ctx_id, gpu::ENGINE_VIRGL_3D, &nop[0].to_le_bytes());
+        dosdrm::virtio::virgl_cmd_nop(&mut nop);
+        check!(
+            gpu::submit_ex(rnd, id, ctx_id, gpu::ENGINE_VIRGL_3D, sync, 10, sync, 20, &nop[0].to_le_bytes())
+                == Err(sys::ERR_SHOULD_WAIT),
+            "submit_ex did not gate on unsignaled wait_syncobj"
+        );
+        let _ = gpu::syncobj_signal(rnd, id, sync, 10);
+        let r = gpu::submit_ex(rnd, id, ctx_id, gpu::ENGINE_VIRGL_3D, sync, 10, sync, 20, &nop[0].to_le_bytes());
         check!(
             r.is_ok() || r == Err(sys::ERR_NOT_SUPPORTED),
             "unexpected VirGL NOP submit result: {:?}",
             r
         );
+        if r.is_ok() {
+            check!(gpu::syncobj_wait(rnd, id, sync, 20) == Ok(20), "submit_ex did not signal timeline syncobj");
+        }
         check!(gpu::ctx_destroy(rnd, id, ctx_id).is_ok(), "ctx_destroy failed");
+        check!(gpu::syncobj_destroy(rnd, id, sync).is_ok(), "syncobj_destroy failed");
         println!("svc-gpu-full: cs-validation OK");
 
         // Driver crash + automatic restart recovery
@@ -792,14 +955,17 @@ pub fn gpu_full() -> i32 {
             libd::handle::sleep(100_000_000);
         }
         check!(recovered, "virtio-gpu.ddrv did not reconnect after crash");
-        let fb3_id = match gpu::attach_fb(disp, id, fb.vmo, w, h, pitch, gpu::FMT_XRGB8888) {
+        let (_, fb3_id) = match gpu::kms_attach_scanout_vmo(disp, id, fb.vmo, w, h, pitch, gpu::FMT_XRGB8888) {
             Ok(f) => f,
             Err(e) => {
-                println!("ltest: FAIL: post-restart attach_fb failed: {}", sys::status(e));
+                println!("ltest: FAIL: post-restart kms_attach_scanout_vmo failed: {}", sys::status(e));
                 return 1;
             }
         };
-        check!(gpu::present(disp, id, fb3_id, 0, 0, w, h).is_ok(), "post-restart present failed");
+        check!(
+            gpu::kms_present_atomic(disp, id, fb3_id, &[(0, 0, w, h)]).is_ok(),
+            "post-restart atomic present failed"
+        );
         println!("svc-gpu-full: crash-recovery OK");
     }
 

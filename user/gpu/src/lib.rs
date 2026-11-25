@@ -1,18 +1,21 @@
-//! D-OS GPU & display service (`gpu.dsvc`).
+//! D-OS GPU, Atomic KMS, GEM/GPU-VM, and timeline `syncobj` service (`gpu.dsvc`).
 //!
 //! Manages:
-//! - The **GOP framebuffer baseline** (`platform:display`, `DISPLAY_RGB32`, mapped write-combining
-//!   lazily on first explicit `OP_PRESENT` so normal boots keep `terminal` undisturbed).
-//! - Isolated, IOMMU-confined PCI GPU drivers connected via `devmgr.gpu` (`virtio-gpu.ddrv`,
-//!   `amdgpu.ddrv`, `xe.ddrv`, `nvgpu.ddrv`), with transparent driver crash/restart reconnection,
-//!   firmware GOP identity hand-off (`DRV_SET_GOP_INFO`), and asynchronous vsync flip completion
-//!   forwarding (`DRV_FLIP_DONE` -> `EVT_FLIP_DONE`).
+//! - The **UEFI GOP framebuffer baseline** (`platform:display`, `DISPLAY_RGB32`), modeled natively
+//!   through `dosdrm::kms::KmsState` + `GemTable` and mapped write-combining lazily on first atomic
+//!   primary-plane commit so text-console boots remain undisturbed.
+//! - Isolated Ring-3 PCI GPU drivers connected via `devmgr.gpu` (`virtio-gpu.ddrv`,
+//!   `amdgpu.ddrv`, `xe.ddrv`, `nvgpu.ddrv`), loaded from verified `sys:/bin/` with read-only
+//!   `sys:/firmware/<vendor>/` grants, transparent crash/restart recovery, 12-second automatic
+//!   mode-revert guarding (`ModeRevertGuard`), and vblank completion forwarding (`DRV_EVENT_VBLANK`
+//!   -> `EVT_VBLANK`).
 //!
 //! Capability separation:
-//! - `gpu.query`:   read-only adapter/mode/EDID/display-probe enumeration (`OP_LIST_ADAPTERS`,
-//!   `OP_GET_MODES`, `OP_GET_DISPLAY_INFO`).
-//! - `gpu.display`: exclusive display/modesetting/scanout/cursor/flip-test authority.
-//! - `gpu.render`:  GPU context & command-buffer submission (never touches display scanout).
+//! - `gpu.query`: read-only adapter & Atomic KMS topology/EDID/mode enumeration.
+//! - `gpu.display`: exclusive Atomic KMS modeset, plane/cursor commit, mode confirm/revert, and
+//!   scanout GEM import/close authority.
+//! - `gpu.render`: per-client isolated GEM BOs, GPU-VM address spaces, timeline `syncobj`s, and
+//!   context command submission (never touches display scanout).
 
 #![no_std]
 
@@ -21,11 +24,15 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{Ordering, fence};
 
-use dosgpu::{DamageRect, MAX_DIM, MAX_FB_BYTES, PixelFormat, blit_rect_wc};
+use dosdrm::gem::{DrmMemError, GemTable};
+use dosdrm::kms::{
+    self, AtomicCommit, ConnectorKind, DEFAULT_REVERT_TIMEOUT_NS, KmsError, KmsMode, KmsState,
+    ModeRevertGuard,
+};
+use dosdrm::{DamageRect, MAX_FB_BYTES, PixelFormat, blit_rect_wc};
 use libd::gpu::{
-    self, ADAPTER_INFO_BYTES, AdapterInfo, DISPLAY_PROBE_BYTES, DisplayProbeInfo, FLIP_TEST_BYTES,
-    GOP_INFO_BYTES, GopInfoWire, MAX_PRESENT_RECTS, MODE_ENTRY_BYTES, MODE_FLAG_CURRENT,
-    MODE_FLAG_PREFERRED, ModeEntry,
+    self, ADAPTER_INFO_BYTES, ATOMIC_COMMIT_HDR_BYTES, AdapterInfo, AtomicCommitWire,
+    KMS_RESOURCES_HDR_BYTES, KmsResourcesWire, MAX_PRESENT_RECTS, MODE_ENTRY_BYTES, ModeEntry,
 };
 use libd::proto::{self, HEADER, Header};
 use libd::sys::{self, DisplayInfo, Handle, MsgHandle};
@@ -48,21 +55,18 @@ enum Role {
 }
 
 struct Client {
+    id: u32,
     ch: Handle,
     role: Role,
 }
 
-struct GopFb {
-    fb_id: u32,
+struct GopBo {
+    gem_handle: u32,
     vmo: Handle,
     map: Mapping,
-    width: u32,
-    height: u32,
-    pitch: u32,
-    format: u32,
 }
 
-impl Drop for GopFb {
+impl Drop for GopBo {
     fn drop(&mut self) {
         let _ = sys::vmar_unmap(libd::root_vmar(), self.map.addr, self.map.len);
         if self.vmo != 0 {
@@ -74,19 +78,39 @@ impl Drop for GopFb {
 struct GopState {
     dev: Handle,
     disp: DisplayInfo,
-    phys_base: u64,
     bar0: Option<Mapping>,
-    fbs: Vec<GopFb>,
-    next_fb_id: u32,
+    kms: KmsState,
+    gem: GemTable,
+    bos: Vec<GopBo>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Gop(GopState),
     Pci { drv_key: u32, ch: Handle },
 }
 
+struct OwnedGem {
+    client_id: u32,
+    adapter_id: u32,
+    gem_handle: u32,
+}
+
+struct OwnedVm {
+    client_id: u32,
+    adapter_id: u32,
+    vm_id: u32,
+}
+
+struct OwnedCtx {
+    client_id: u32,
+    adapter_id: u32,
+    ctx_id: u32,
+}
+
 struct Adapter {
     info: AdapterInfo,
+    kms_res: KmsResourcesWire,
     modes: Vec<ModeEntry>,
     backend: Backend,
 }
@@ -96,10 +120,70 @@ struct GpuSvc {
     ctl: Handle,
     devmgr: Handle,
     test_mode: bool,
-    gop_wire: Option<GopInfoWire>,
     adapters: Vec<Adapter>,
     next_adapter_id: u32,
     clients: Vec<Client>,
+    next_client_id: u32,
+    owned_gems: Vec<OwnedGem>,
+    owned_vms: Vec<OwnedVm>,
+    owned_ctxs: Vec<OwnedCtx>,
+    revert_guard: ModeRevertGuard,
+}
+
+fn kms_err_to_sys(e: KmsError) -> i64 {
+    match e {
+        KmsError::InvalidArgs => sys::ERR_INVALID_ARGS,
+        KmsError::UnknownObject | KmsError::BufferTooSmall => sys::ERR_OUT_OF_RANGE,
+        KmsError::UnsupportedFormat | KmsError::UnsupportedMode | KmsError::CapabilityUnsupported => {
+            sys::ERR_NOT_SUPPORTED
+        }
+        KmsError::ModesetRequired => sys::ERR_BAD_STATE,
+        KmsError::NoResources => sys::ERR_NO_RESOURCES,
+    }
+}
+
+fn mem_err_to_sys(e: DrmMemError) -> i64 {
+    match e {
+        DrmMemError::InvalidArgs | DrmMemError::Unaligned => sys::ERR_INVALID_ARGS,
+        DrmMemError::UnknownHandle | DrmMemError::OutOfRange => sys::ERR_OUT_OF_RANGE,
+        DrmMemError::AddressOverlap | DrmMemError::Busy => sys::ERR_BAD_STATE,
+        DrmMemError::NoResources => sys::ERR_NO_RESOURCES,
+    }
+}
+
+fn wire_to_atomic(w: &AtomicCommitWire) -> AtomicCommit {
+    let mut damage = [DamageRect::EMPTY; kms::MAX_COMMIT_DAMAGE];
+    let cnt = w.damage_count.min(kms::MAX_COMMIT_DAMAGE);
+    for (i, &(x, y, rw, rh)) in w.damage.iter().take(cnt).enumerate() {
+        damage[i] = DamageRect { x, y, w: rw, h: rh };
+    }
+    AtomicCommit {
+        flags: w.flags,
+        crtc_id: w.crtc_id,
+        connector_id: w.connector_id,
+        mode_changed: (w.change_mask & gpu::COMMIT_MODE) != 0,
+        mode_width: w.mode_width,
+        mode_height: w.mode_height,
+        mode_refresh_mhz: w.mode_refresh_mhz,
+        vrr_changed: (w.change_mask & gpu::COMMIT_VRR) != 0,
+        vrr_enable: w.vrr_enable,
+        hdr_changed: (w.change_mask & gpu::COMMIT_HDR) != 0,
+        hdr_enable: w.hdr_enable,
+        primary_changed: (w.change_mask & gpu::COMMIT_PRIMARY) != 0,
+        primary_fb_id: w.primary_fb_id,
+        damage,
+        damage_count: cnt as u8,
+        cursor_changed: (w.change_mask & gpu::COMMIT_CURSOR) != 0,
+        cursor_fb_id: w.cursor_fb_id,
+        cursor_x: w.cursor_x,
+        cursor_y: w.cursor_y,
+        cursor_hot_x: w.cursor_hot_x,
+        cursor_hot_y: w.cursor_hot_y,
+        in_syncobj: w.in_syncobj,
+        in_point: w.in_point,
+        out_syncobj: w.out_syncobj,
+        out_point: w.out_point,
+    }
 }
 
 impl GpuSvc {
@@ -114,22 +198,17 @@ impl GpuSvc {
             return;
         }
         let phys_base = sys::device_bar_addr(disp_dev, 0).unwrap_or(0);
-        self.gop_wire = Some(GopInfoWire {
-            phys_base,
-            size: di.size,
-            width: di.width,
-            height: di.height,
-            pitch: di.pitch,
-            shifts: [di.red_shift, di.green_shift, di.blue_shift],
-        });
-
         let id = self.next_adapter_id;
         self.next_adapter_id += 1;
+
+        let mut kms_state = KmsState::new();
+        kms_state.init_single_pipe(ConnectorKind::FirmwareGop, b"UEFI GOP", di.width, di.height, 60_000, false);
+
         let mut info = AdapterInfo::empty();
         info.id = id;
         info.kind = gpu::KIND_GOP;
         info.online = true;
-        info.caps = gpu::CAP_SCANOUT_2D | gpu::CAP_WC;
+        info.caps = gpu::CAP_SCANOUT_2D | gpu::CAP_WC | gpu::CAP_ATOMIC_KMS;
         info.width = di.width;
         info.height = di.height;
         info.vram_mib = ((di.size >> 20) as u32).max(1);
@@ -140,74 +219,103 @@ impl GpuSvc {
         info.monitor[..mon.len()].copy_from_slice(mon);
         info.monitor_len = mon.len() as u8;
 
+        let m0 = kms_state.modes[0];
         let mode = ModeEntry {
-            width: di.width,
-            height: di.height,
-            refresh_mhz: 60_000,
-            flags: MODE_FLAG_PREFERRED | MODE_FLAG_CURRENT,
+            width: m0.width,
+            height: m0.height,
+            refresh_mhz: m0.refresh_mhz,
+            pixel_clock_khz: m0.pixel_clock_khz,
+            htotal: m0.htotal,
+            vtotal: m0.vtotal,
+            flags: m0.flags,
         };
-        let modes = alloc::vec![mode];
+
+        let mut kres = KmsResourcesWire::empty();
+        kres.adapter_id = id;
+        kres.connector_id = 1;
+        kres.connector_kind = ConnectorKind::FirmwareGop as u8;
+        kres.crtc_id = 1;
+        kres.pipe = 0;
+        kres.plane_count = 1;
+        kres.status_flags = gpu::KMS_STATUS_CONNECTED | gpu::KMS_STATUS_CRTC_ACTIVE;
+        kres.width = di.width;
+        kres.height = di.height;
+        kres.pitch_bytes = di.pitch;
+        kres.refresh_mhz = 60_000;
+        kres.htotal = m0.htotal;
+        kres.vtotal = m0.vtotal;
+        kres.set_monitor(b"UEFI GOP");
+        kres.set_note(b"UEFI GOP Atomic KMS (WC linear baseline)");
+
         println!(
             "gpu: adapter #{} 'GOP Framebuffer' (gop, {}x{}, phys={:#x}, {} MiB WC baseline) ready",
             id, di.width, di.height, phys_base, info.vram_mib
         );
         self.adapters.push(Adapter {
             info,
-            modes,
+            kms_res: kres,
+            modes: alloc::vec![mode],
             backend: Backend::Gop(GopState {
                 dev: disp_dev,
                 disp: di,
-                phys_base,
                 bar0: None,
-                fbs: Vec::new(),
-                next_fb_id: 1,
+                kms: kms_state,
+                gem: GemTable::new(),
+                bos: Vec::new(),
             }),
         });
     }
 
-    /// Pass firmware GOP framebuffer identity to a PCI GPU driver so it can verify scanout match.
-    /// Returns updated `(caps, width, height)` if the driver refined its state.
-    fn send_gop_info(ch: Handle, gop: GopInfoWire) -> Option<(u32, u32, u32)> {
-        let mut req = [0u8; HEADER + GOP_INFO_BYTES];
-        Header { txid: 0, op: gpu::DRV_SET_GOP_INFO, status: 0, a: 0, b: 0 }.put(&mut req);
-        let mut enc = [0u8; GOP_INFO_BYTES];
-        gop.encode(&mut enc);
-        req[HEADER..HEADER + GOP_INFO_BYTES].copy_from_slice(&enc);
-        let mut rep = [0u8; HEADER];
-        let n = sys::channel_call(ch, &req, &mut rep, CALL_TIMEOUT_NS).ok()? as usize;
-        let h = Header::get(&rep[..n])?;
-        if h.status != 0 {
-            return None;
-        }
-        Some((h.a as u32, h.b as u32, (h.b >> 32) as u32))
-    }
-
-    fn query_pci_modes(ch: Handle) -> (Vec<ModeEntry>, [u8; 24], u8) {
+    fn query_pci_kms(ch: Handle, adapter_id: u32) -> (KmsResourcesWire, Vec<ModeEntry>) {
         let mut req = [0u8; HEADER];
-        Header { txid: 0, op: gpu::DRV_GET_MODES, status: 0, a: 0, b: 0 }.put(&mut req);
-        let mut rep = [0u8; HEADER + 24 + 16 * MODE_ENTRY_BYTES];
-        let mut mon = [0u8; 24];
-        let mut mon_len = 0u8;
+        Header {
+            txid: 0,
+            op: gpu::DRV_KMS_GET_RESOURCES,
+            status: 0,
+            a: 0,
+            b: 0,
+        }
+        .put(&mut req);
+        let mut rep = [0u8; HEADER + KMS_RESOURCES_HDR_BYTES + 16 * MODE_ENTRY_BYTES];
+        let mut kres = KmsResourcesWire::empty();
+        kres.adapter_id = adapter_id;
         let mut modes = Vec::new();
         if let Ok(n) = sys::channel_call(ch, &req, &mut rep, CALL_TIMEOUT_NS) {
             let n = n as usize;
             if let Some(h) = Header::get(&rep[..n])
                 && h.status == 0
-                && n >= HEADER + 24
+                && n >= HEADER + KMS_RESOURCES_HDR_BYTES
             {
-                let ml = (h.b as usize).min(24);
-                mon[..ml].copy_from_slice(&rep[HEADER..HEADER + ml]);
-                mon_len = ml as u8;
-                let body = &rep[HEADER + 24..n];
-                let cnt = (h.a as usize).min(body.len() / MODE_ENTRY_BYTES);
+                if let Some(decoded) = KmsResourcesWire::decode(&rep[HEADER..n]) {
+                    kres = decoded;
+                    kres.adapter_id = adapter_id;
+                }
+                let mslice = &rep[HEADER + KMS_RESOURCES_HDR_BYTES..n];
+                let cnt = (h.a as usize).min(mslice.len() / MODE_ENTRY_BYTES);
                 for i in 0..cnt {
-                    if let Some(m) = ModeEntry::decode(&body[i * MODE_ENTRY_BYTES..(i + 1) * MODE_ENTRY_BYTES]) {
+                    if let Some(m) = ModeEntry::decode(&mslice[i * MODE_ENTRY_BYTES..(i + 1) * MODE_ENTRY_BYTES]) {
                         modes.push(m);
                     }
                 }
             }
         }
-        (modes, mon, mon_len)
+        (kres, modes)
+    }
+
+    fn refresh_pci_adapter(ad: &mut Adapter) {
+        if let Backend::Pci { ch, .. } = ad.backend
+            && ch != 0
+        {
+            let (kres, modes) = Self::query_pci_kms(ch, ad.info.id);
+            if kres.width > 0 && kres.height > 0 {
+                ad.info.width = kres.width;
+                ad.info.height = kres.height;
+            }
+            ad.info.monitor = kres.monitor_name;
+            ad.info.monitor_len = kres.monitor_len;
+            ad.kms_res = kres;
+            ad.modes = modes;
+        }
     }
 
     fn on_devmgr_msg(&mut self) {
@@ -233,24 +341,17 @@ impl GpuSvc {
                             ]);
                             let name_bytes = &buf[HEADER + 4..n];
                             let (kind, vendor, device, vram_mib) = gpu::unpack_dev_a(h.a);
-                            let (mut width, mut height, mut caps) = gpu::unpack_dev_b(h.b);
-
-                            // Provide firmware GOP physical base & layout to PCI GPU driver so it can
-                            // verify exact scanout identity and refine caps/mode before we query modes.
-                            if let Some(gop) = self.gop_wire
-                                && let Some((new_caps, new_w, new_h)) = Self::send_gop_info(hnd, gop)
-                            {
-                                caps = new_caps;
-                                if new_w > 0 && new_h > 0 {
-                                    width = new_w;
-                                    height = new_h;
-                                }
-                            }
-                            let (modes, mon, mon_len) = Self::query_pci_modes(hnd);
+                            let (mut width, mut height, caps) = gpu::unpack_dev_b(h.b);
 
                             if let Some((idx, ad)) = self.adapters.iter_mut().enumerate().find(|(_, a)| {
                                 matches!(a.backend, Backend::Pci { drv_key: k, .. } if k == drv_key)
                             }) {
+                                let aid = ad.info.id;
+                                let (kres, modes) = Self::query_pci_kms(hnd, aid);
+                                if kres.width > 0 && kres.height > 0 {
+                                    width = kres.width;
+                                    height = kres.height;
+                                }
                                 if let Backend::Pci { ch, .. } = &mut ad.backend {
                                     if *ch != 0 {
                                         sys::handle_close(*ch);
@@ -262,22 +363,31 @@ impl GpuSvc {
                                 ad.info.height = height;
                                 ad.info.caps = caps;
                                 ad.info.restarts += 1;
-                                ad.info.monitor = mon;
-                                ad.info.monitor_len = mon_len;
+                                ad.info.monitor = kres.monitor_name;
+                                ad.info.monitor_len = kres.monitor_len;
+                                ad.kms_res = kres;
                                 ad.modes = modes;
+                                self.owned_gems.retain(|g| g.adapter_id != aid);
+                                self.owned_vms.retain(|v| v.adapter_id != aid);
+                                self.owned_ctxs.retain(|c| c.adapter_id != aid);
+                                let _ = self.revert_guard.confirm(aid);
                                 self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_BACKEND_BASE + idx as u64);
                                 println!(
                                     "gpu: adapter #{} '{}' reconnected (restart {}) caps={:#x}",
-                                    ad.info.id,
+                                    aid,
                                     ad.info.name_str(),
                                     ad.info.restarts,
                                     caps
                                 );
-                                let changed_id = ad.info.id;
-                                self.broadcast_adapters_changed(changed_id);
+                                self.broadcast_adapters_changed(aid);
                             } else {
                                 let id = self.next_adapter_id;
                                 self.next_adapter_id += 1;
+                                let (kres, modes) = Self::query_pci_kms(hnd, id);
+                                if kres.width > 0 && kres.height > 0 {
+                                    width = kres.width;
+                                    height = kres.height;
+                                }
                                 let mut info = AdapterInfo::empty();
                                 info.id = id;
                                 info.kind = kind;
@@ -288,8 +398,8 @@ impl GpuSvc {
                                 info.width = width;
                                 info.height = height;
                                 info.vram_mib = vram_mib;
-                                info.monitor = mon;
-                                info.monitor_len = mon_len;
+                                info.monitor = kres.monitor_name;
+                                info.monitor_len = kres.monitor_len;
                                 let nl = name_bytes.len().min(40);
                                 info.name[..nl].copy_from_slice(&name_bytes[..nl]);
                                 info.name_len = nl as u8;
@@ -308,6 +418,7 @@ impl GpuSvc {
                                 );
                                 self.adapters.push(Adapter {
                                     info,
+                                    kms_res: kres,
                                     modes,
                                     backend: Backend::Pci { drv_key, ch: hnd },
                                 });
@@ -334,6 +445,10 @@ impl GpuSvc {
                                 }
                             }
                             if gone_id != 0 {
+                                self.owned_gems.retain(|g| g.adapter_id != gone_id);
+                                self.owned_vms.retain(|v| v.adapter_id != gone_id);
+                                self.owned_ctxs.retain(|c| c.adapter_id != gone_id);
+                                let _ = self.revert_guard.confirm(gone_id);
                                 self.broadcast_adapters_changed(gone_id);
                             }
                         }
@@ -353,8 +468,6 @@ impl GpuSvc {
         }
     }
 
-    /// Forward unsolicited `DRV_FLIP_DONE` events from a PCI GPU driver to `gpu.display` clients,
-    /// or mark the backend offline on `PEER_CLOSED`.
     fn on_backend_event(&mut self, idx: usize) {
         let mut buf = [0u8; HEADER + 64];
         loop {
@@ -370,14 +483,24 @@ impl GpuSvc {
                     let Some(h) = Header::get(&buf[..n as usize]) else {
                         continue;
                     };
-                    if h.op == gpu::DRV_FLIP_DONE {
-                        let frames = h.a & !(1u64 << 63);
-                        let late = (h.a >> 63) != 0;
-                        let ts_ns = h.b;
-                        if let Some(ad) = self.adapters.get_mut(idx) {
-                            ad.info.frames = frames;
+                    match h.op {
+                        gpu::DRV_EVENT_VBLANK => {
+                            let seq = h.a & !(1u64 << 63);
+                            let late = (h.a >> 63) != 0;
+                            let ts_ns = h.b;
+                            if let Some(ad) = self.adapters.get_mut(idx) {
+                                ad.info.frames = seq;
+                                ad.kms_res.vblank_seq = seq;
+                            }
+                            self.broadcast_vblank(adapter_id, seq, ts_ns, late);
                         }
-                        self.broadcast_flip_done(adapter_id, frames, ts_ns, late);
+                        gpu::DRV_EVENT_HOTPLUG => {
+                            if let Some(ad) = self.adapters.get_mut(idx) {
+                                Self::refresh_pci_adapter(ad);
+                            }
+                            self.broadcast_adapters_changed(adapter_id);
+                        }
+                        _ => {}
                     }
                 }
                 Err(sys::ERR_SHOULD_WAIT) => {
@@ -392,14 +515,14 @@ impl GpuSvc {
         }
     }
 
-    fn broadcast_flip_done(&self, adapter_id: u32, frames: u64, ts_ns: u64, late: bool) {
+    fn broadcast_vblank(&self, adapter_id: u32, seq: u64, ts_ns: u64, late: bool) {
         let mut msg = [0u8; HEADER + 8];
         Header {
             txid: 0,
-            op: gpu::EVT_FLIP_DONE,
+            op: gpu::EVT_VBLANK,
             status: 0,
             a: u64::from(adapter_id) | (u64::from(late) << 32),
-            b: frames,
+            b: seq,
         }
         .put(&mut msg);
         msg[HEADER..HEADER + 8].copy_from_slice(&ts_ns.to_le_bytes());
@@ -441,7 +564,119 @@ impl GpuSvc {
             println!("gpu: adapter #{} '{}' offline (driver exited)", ad.info.id, ad.info.name_str());
         }
         if closed_id != 0 {
+            self.owned_gems.retain(|g| g.adapter_id != closed_id);
+            self.owned_vms.retain(|v| v.adapter_id != closed_id);
+            self.owned_ctxs.retain(|c| c.adapter_id != closed_id);
+            let _ = self.revert_guard.confirm(closed_id);
             self.broadcast_adapters_changed(closed_id);
+        }
+    }
+
+    fn apply_mode_revert(&mut self, adapter_id: u32, mode: KmsMode) {
+        let Some(ad) = self.find_adapter_mut(adapter_id) else {
+            return;
+        };
+        let aid = ad.info.id;
+        if let Backend::Pci { ch: dch, .. } = ad.backend
+            && dch != 0
+        {
+            let wire = AtomicCommitWire {
+                flags: gpu::ATOMIC_ALLOW_MODESET,
+                change_mask: gpu::COMMIT_MODE,
+                mode_width: mode.width,
+                mode_height: mode.height,
+                mode_refresh_mhz: mode.refresh_mhz,
+                ..AtomicCommitWire::default()
+            };
+            let mut body = [0u8; ATOMIC_COMMIT_HDR_BYTES + MAX_PRESENT_RECTS * 16];
+            let blen = wire.encode(&mut body);
+            let mut req = [0u8; HEADER + ATOMIC_COMMIT_HDR_BYTES + MAX_PRESENT_RECTS * 16];
+            Header {
+                txid: 0,
+                op: gpu::DRV_KMS_ATOMIC_COMMIT,
+                status: 0,
+                a: 0,
+                b: blen as u64,
+            }
+            .put(&mut req);
+            req[HEADER..HEADER + blen].copy_from_slice(&body[..blen]);
+            let mut rep = [0u8; HEADER];
+            let _ = sys::channel_call(dch, &req[..HEADER + blen], &mut rep, CALL_TIMEOUT_NS);
+            Self::refresh_pci_adapter(ad);
+            println!(
+                "gpu: adapter #{} reverted unconfirmed mode back to {}x{} @ {} Hz",
+                aid,
+                mode.width,
+                mode.height,
+                mode.refresh_mhz / 1000
+            );
+            self.broadcast_adapters_changed(aid);
+        }
+    }
+
+    fn cleanup_client_resources(&mut self, client_id: u32) {
+        let ctxs: Vec<(u32, u32)> = self
+            .owned_ctxs
+            .iter()
+            .filter(|c| c.client_id == client_id)
+            .map(|c| (c.adapter_id, c.ctx_id))
+            .collect();
+        self.owned_ctxs.retain(|c| c.client_id != client_id);
+        for (aid, ctx_id) in ctxs {
+            if let Some(ad) = self.adapters.iter().find(|a| a.info.id == aid)
+                && let Backend::Pci { ch: dch, .. } = ad.backend
+                && dch != 0
+            {
+                let mut req = [0u8; HEADER];
+                Header { txid: 0, op: gpu::DRV_CTX_DESTROY, status: 0, a: 0, b: u64::from(ctx_id) }.put(&mut req);
+                let mut rep = [0u8; HEADER];
+                let _ = sys::channel_call(dch, &req, &mut rep, 2_000_000_000);
+            }
+        }
+
+        let vms: Vec<(u32, u32)> = self
+            .owned_vms
+            .iter()
+            .filter(|v| v.client_id == client_id)
+            .map(|v| (v.adapter_id, v.vm_id))
+            .collect();
+        self.owned_vms.retain(|v| v.client_id != client_id);
+        for (aid, vm_id) in vms {
+            if let Some(ad) = self.adapters.iter().find(|a| a.info.id == aid)
+                && let Backend::Pci { ch: dch, .. } = ad.backend
+                && dch != 0
+            {
+                let mut req = [0u8; HEADER];
+                Header { txid: 0, op: gpu::DRV_VM_DESTROY, status: 0, a: 0, b: u64::from(vm_id) }.put(&mut req);
+                let mut rep = [0u8; HEADER];
+                let _ = sys::channel_call(dch, &req, &mut rep, 2_000_000_000);
+            }
+        }
+
+        let gems: Vec<(u32, u32)> = self
+            .owned_gems
+            .iter()
+            .filter(|g| g.client_id == client_id)
+            .map(|g| (g.adapter_id, g.gem_handle))
+            .collect();
+        self.owned_gems.retain(|g| g.client_id != client_id);
+        for (aid, gem_h) in gems {
+            if let Some(ad) = self.adapters.iter_mut().find(|a| a.info.id == aid) {
+                match &mut ad.backend {
+                    Backend::Gop(g) => {
+                        if let Ok(Some(_)) = g.gem.release(gem_h) {
+                            g.bos.retain(|b| b.gem_handle != gem_h);
+                        }
+                    }
+                    Backend::Pci { ch: dch, .. } if *dch != 0 => {
+                        let mut req = [0u8; HEADER];
+                        Header { txid: 0, op: gpu::DRV_GEM_CLOSE, status: 0, a: 0, b: u64::from(gem_h) }.put(&mut req);
+                        let mut rep = [0u8; HEADER];
+                        let _ = sys::channel_call(*dch, &req, &mut rep, 2_000_000_000);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 
@@ -471,8 +706,10 @@ impl GpuSvc {
                                         continue;
                                     }
                                 };
+                                let cid = self.next_client_id;
+                                self.next_client_id = self.next_client_id.wrapping_add(1).max(1);
                                 let idx = self.clients.len();
-                                self.clients.push(Client { ch: hnd, role });
+                                self.clients.push(Client { id: cid, ch: hnd, role });
                                 self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_CLIENT_BASE + idx as u64);
                             }
                         }
@@ -480,13 +717,27 @@ impl GpuSvc {
                             if hnd != 0 {
                                 sys::handle_close(hnd);
                             }
-                            // Ask every active PCI GPU driver to hand display back to firmware GOP.
                             for ad in &self.adapters {
                                 if let Backend::Pci { ch: dch, .. } = ad.backend
                                     && dch != 0
                                 {
-                                    let mut req = [0u8; HEADER];
-                                    Header { txid: 0, op: gpu::DRV_RELEASE_DISPLAY, status: 0, a: 0, b: 0 }.put(&mut req);
+                                    let wire = AtomicCommitWire {
+                                        flags: gpu::ATOMIC_ALLOW_MODESET | gpu::ATOMIC_RESET_BOOT,
+                                        ..AtomicCommitWire::default()
+                                    };
+                                    let mut body = [0u8; ATOMIC_COMMIT_HDR_BYTES + MAX_PRESENT_RECTS * 16];
+                                    let blen = wire.encode(&mut body);
+                                    let mut req = [0u8; HEADER + ATOMIC_COMMIT_HDR_BYTES];
+                                    Header {
+                                        txid: 0,
+                                        op: gpu::DRV_KMS_ATOMIC_COMMIT,
+                                        status: 0,
+                                        a: 0,
+                                        b: blen as u64,
+                                    }
+                                    .put(&mut req);
+                                    req[HEADER..HEADER + ATOMIC_COMMIT_HDR_BYTES]
+                                        .copy_from_slice(&body[..ATOMIC_COMMIT_HDR_BYTES]);
                                     let mut rep = [0u8; HEADER];
                                     let _ = sys::channel_call(dch, &req, &mut rep, 2_000_000_000);
                                 }
@@ -509,26 +760,27 @@ impl GpuSvc {
         }
     }
 
-    fn find_adapter_mut(&mut self, id: u32) -> Option<&mut Adapter> {
+    fn resolve_adapter_id(&self, id: u32) -> Option<u32> {
         if id == 0 {
-            let idx = self
-                .adapters
+            self.adapters
                 .iter()
-                .position(|a| {
-                    a.info.online
-                        && a.info.kind != gpu::KIND_GOP
-                        && (a.info.caps & gpu::CAP_NATIVE_GOP_MATCH) != 0
-                })
+                .find(|a| a.info.online && a.info.kind != gpu::KIND_GOP && (a.info.caps & gpu::CAP_NATIVE_KMS) != 0)
                 .or_else(|| {
                     self.adapters
                         .iter()
-                        .position(|a| a.info.online && a.info.kind != gpu::KIND_GOP && a.info.width > 0 && a.info.height > 0)
+                        .find(|a| a.info.online && a.info.kind != gpu::KIND_GOP && a.info.width > 0 && a.info.height > 0)
                 })
-                .or_else(|| self.adapters.iter().position(|a| a.info.online && a.info.kind != gpu::KIND_GOP))
-                .or_else(|| self.adapters.iter().position(|a| a.info.online))?;
-            return self.adapters.get_mut(idx);
+                .or_else(|| self.adapters.iter().find(|a| a.info.online && a.info.kind != gpu::KIND_GOP))
+                .or_else(|| self.adapters.iter().find(|a| a.info.online))
+                .map(|a| a.info.id)
+        } else {
+            self.adapters.iter().find(|a| a.info.id == id).map(|a| a.info.id)
         }
-        self.adapters.iter_mut().find(|a| a.info.id == id)
+    }
+
+    fn find_adapter_mut(&mut self, id: u32) -> Option<&mut Adapter> {
+        let resolved = self.resolve_adapter_id(id)?;
+        self.adapters.iter_mut().find(|a| a.info.id == resolved)
     }
 
     fn reply(ch: Handle, txid: u32, op: u32, status: i32, a: u64, b: u64, payload: &[u8]) {
@@ -538,6 +790,18 @@ impl GpuSvc {
         let _ = sys::channel_write(ch, &out);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn reply_with_handle(ch: Handle, txid: u32, op: u32, status: i32, a: u64, b: u64, payload: &[u8], hnd: Handle) {
+        let mut out = alloc::vec![0u8; HEADER + payload.len()];
+        Header { txid, op, status, a, b }.put(&mut out);
+        out[HEADER..].copy_from_slice(payload);
+        let _ = sys::channel_write_h(
+            ch,
+            &out,
+            &[MsgHandle { handle: hnd, rights: sys::RIGHTS_SAME }],
+        );
+    }
+
     fn on_client_msg(&mut self, idx: usize) {
         let mut buf = alloc::vec![0u8; HEADER + 4096];
         loop {
@@ -545,7 +809,7 @@ impl GpuSvc {
             if c.ch == 0 {
                 return;
             }
-            let (ch, role) = (c.ch, c.role);
+            let (cid, ch, role) = (c.id, c.ch, c.role);
             let mut hs = [0 as Handle; 1];
             match sys::channel_read_h(ch, &mut buf, &mut hs, 0) {
                 Ok((n, nh)) => {
@@ -556,7 +820,7 @@ impl GpuSvc {
                         }
                         continue;
                     };
-                    self.dispatch_client(ch, role, h, &buf[HEADER..n], hnd);
+                    self.dispatch_client(cid, ch, role, h, &buf[HEADER..n], hnd);
                 }
                 Err(sys::ERR_SHOULD_WAIT) => {
                     self.port.arm(ch, sys::READABLE | sys::PEER_CLOSED, KEY_CLIENT_BASE + idx as u64);
@@ -567,6 +831,7 @@ impl GpuSvc {
                     if let Some(c) = self.clients.get_mut(idx) {
                         c.ch = 0;
                     }
+                    self.cleanup_client_resources(cid);
                     return;
                 }
             }
@@ -584,8 +849,11 @@ impl GpuSvc {
             };
             g.bar0 = Some(m);
         }
-        let Some(fb) = g.fbs.iter().find(|f| f.fb_id == fb_id) else {
-            return Err(sys::ERR_INVALID_ARGS);
+        let Some(fb) = g.kms.get_fb(fb_id) else {
+            return Err(sys::ERR_OUT_OF_RANGE);
+        };
+        let Some(bo) = g.bos.iter().find(|b| b.gem_handle == fb.gem_handle) else {
+            return Err(sys::ERR_OUT_OF_RANGE);
         };
         let Some(bar0) = g.bar0.as_ref() else {
             return Err(sys::ERR_BAD_STATE);
@@ -599,7 +867,7 @@ impl GpuSvc {
         for &r in list {
             let rect = if r.w == 0 || r.h == 0 { DamageRect::full(bw, bh) } else { r };
             blit_rect_wc(
-                fb.map.bytes(),
+                bo.map.bytes(),
                 fb.pitch,
                 fmt,
                 g.disp.pitch,
@@ -618,7 +886,25 @@ impl GpuSvc {
         Ok(())
     }
 
-    fn dispatch_client(&mut self, ch: Handle, role: Role, h: Header, payload: &[u8], hnd: Handle) {
+    fn client_owns_gem(&self, client_id: u32, adapter_id: u32, gem_handle: u32) -> bool {
+        self.owned_gems
+            .iter()
+            .any(|g| g.client_id == client_id && g.adapter_id == adapter_id && g.gem_handle == gem_handle)
+    }
+
+    fn client_owns_vm(&self, client_id: u32, adapter_id: u32, vm_id: u32) -> bool {
+        self.owned_vms
+            .iter()
+            .any(|v| v.client_id == client_id && v.adapter_id == adapter_id && v.vm_id == vm_id)
+    }
+
+    fn client_owns_ctx(&self, client_id: u32, adapter_id: u32, ctx_id: u32) -> bool {
+        self.owned_ctxs
+            .iter()
+            .any(|c| c.client_id == client_id && c.adapter_id == adapter_id && c.ctx_id == ctx_id)
+    }
+
+    fn dispatch_client(&mut self, client_id: u32, ch: Handle, role: Role, h: Header, payload: &[u8], hnd: Handle) {
         let close_h = |hnd: Handle| {
             if hnd != 0 {
                 sys::handle_close(hnd);
@@ -635,14 +921,33 @@ impl GpuSvc {
                 }
                 Self::reply(ch, h.txid, h.op, 0, self.adapters.len() as u64, 0, &body);
             }
-            gpu::OP_GET_MODES => {
+            gpu::OP_KMS_GET_RESOURCES => {
                 close_h(hnd);
-                let id = h.a as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
+                let req_id = h.a as u32;
+                let Some(aid) = self.resolve_adapter_id(req_id) else {
                     Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
                     return;
                 };
-                let mut body = Vec::with_capacity(ad.modes.len() * MODE_ENTRY_BYTES);
+                let secs_left = self.revert_guard.secs_left(aid, sys::clock_ns());
+                let Some(ad) = self.adapters.iter_mut().find(|a| a.info.id == aid) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                if matches!(ad.backend, Backend::Pci { ch: dch, .. } if dch != 0) {
+                    Self::refresh_pci_adapter(ad);
+                } else if let Backend::Gop(g) = &ad.backend {
+                    ad.kms_res.vblank_seq = g.kms.crtcs[0].map_or(ad.info.frames, |c| c.vblank_seq);
+                }
+                let mut res = ad.kms_res;
+                res.adapter_id = aid;
+                res.revert_secs_left = secs_left;
+                if secs_left > 0 {
+                    res.status_flags |= gpu::KMS_STATUS_REVERT_PENDING;
+                }
+                let mut body = Vec::with_capacity(KMS_RESOURCES_HDR_BYTES + ad.modes.len() * MODE_ENTRY_BYTES);
+                let mut hdr = [0u8; KMS_RESOURCES_HDR_BYTES];
+                res.encode(&mut hdr);
+                body.extend_from_slice(&hdr);
                 for m in &ad.modes {
                     let mut enc = [0u8; MODE_ENTRY_BYTES];
                     m.encode(&mut enc);
@@ -650,477 +955,8 @@ impl GpuSvc {
                 }
                 Self::reply(ch, h.txid, h.op, 0, ad.modes.len() as u64, 0, &body);
             }
-            gpu::OP_GET_DISPLAY_INFO => {
-                close_h(hnd);
-                let id = h.a as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                let adapter_id = ad.info.id;
-                match &ad.backend {
-                    Backend::Gop(g) => {
-                        let mut p = DisplayProbeInfo::empty();
-                        p.adapter_id = adapter_id;
-                        p.active_pipes = 1;
-                        p.width = g.disp.width;
-                        p.height = g.disp.height;
-                        p.pitch_bytes = g.disp.pitch;
-                        p.measured_mhz = 60_000;
-                        p.gop_phys_base = g.phys_base;
-                        p.flags = gpu::PROBE_GOP_MATCHED;
-                        let mon = b"UEFI GOP";
-                        p.monitor_name[..mon.len()].copy_from_slice(mon);
-                        p.monitor_len = mon.len() as u8;
-                        p.set_note(b"UEFI GOP linear framebuffer");
-                        let mut enc = [0u8; DISPLAY_PROBE_BYTES];
-                        p.encode(&mut enc);
-                        Self::reply(ch, h.txid, h.op, 0, 0, 0, &enc);
-                    }
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let mut req = [0u8; HEADER];
-                        Header { txid: 0, op: gpu::DRV_GET_DISPLAY_INFO, status: 0, a: 0, b: 0 }.put(&mut req);
-                        let mut rep = [0u8; HEADER + DISPLAY_PROBE_BYTES];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
-                            Ok(rn) => {
-                                let rn = rn as usize;
-                                let dh = Header::get(&rep[..rn]).unwrap_or_default();
-                                if dh.status == 0 && rn >= HEADER + DISPLAY_PROBE_BYTES {
-                                    let mut p = DisplayProbeInfo::decode(&rep[HEADER..rn]).unwrap_or_else(DisplayProbeInfo::empty);
-                                    p.adapter_id = adapter_id;
-                                    let mut enc = [0u8; DISPLAY_PROBE_BYTES];
-                                    p.encode(&mut enc);
-                                    Self::reply(ch, h.txid, h.op, 0, 0, 0, &enc);
-                                } else {
-                                    // Synthesize basic probe for drivers without DCN (e.g. virtio-gpu).
-                                    let mut p = DisplayProbeInfo::empty();
-                                    p.adapter_id = adapter_id;
-                                    p.active_pipes = 1;
-                                    p.width = ad.info.width;
-                                    p.height = ad.info.height;
-                                    p.pitch_bytes = ad.info.width.saturating_mul(4);
-                                    p.measured_mhz = ad.modes.first().map_or(60_000, |m| m.refresh_mhz);
-                                    p.monitor_name = ad.info.monitor;
-                                    p.monitor_len = ad.info.monitor_len;
-                                    p.set_note(b"non-DCN PCI adapter");
-                                    let mut enc = [0u8; DISPLAY_PROBE_BYTES];
-                                    p.encode(&mut enc);
-                                    Self::reply(ch, h.txid, h.op, 0, 0, 0, &enc);
-                                }
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                }
-            }
-            gpu::OP_ATTACH_FB => {
-                if role != Role::Display {
-                    close_h(hnd);
-                    println!("gpu: refused OP_ATTACH_FB on non-display endpoint");
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                if hnd == 0 || payload.len() < 4 {
-                    close_h(hnd);
-                    Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let format = (h.a >> 32) as u32;
-                let width = h.b as u32;
-                let height = (h.b >> 32) as u32;
-                let pitch = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    close_h(hnd);
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                match &mut ad.backend {
-                    Backend::Gop(g) => {
-                        if width == 0 || height == 0 || width > MAX_DIM || height > MAX_DIM || pitch < width.saturating_mul(4) {
-                            close_h(hnd);
-                            Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let need = u64::from(pitch).saturating_mul(u64::from(height));
-                        if need == 0 || need > MAX_FB_BYTES || sys::vmo_size(hnd).is_err_and(|_| true) || sys::vmo_size(hnd).unwrap_or(0) < need {
-                            close_h(hnd);
-                            Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let Ok(map) = Mapping::of_ro(hnd, need) else {
-                            close_h(hnd);
-                            Self::reply(ch, h.txid, h.op, sys::ERR_NO_MEMORY as i32, 0, 0, &[]);
-                            return;
-                        };
-                        if g.fbs.len() >= 4 {
-                            g.fbs.remove(0);
-                        }
-                        let fb_id = g.next_fb_id;
-                        g.next_fb_id += 1;
-                        g.fbs.push(GopFb { fb_id, vmo: hnd, map, width, height, pitch, format });
-                        Self::reply(ch, h.txid, h.op, 0, u64::from(fb_id), 0, &[]);
-                    }
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            close_h(hnd);
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let mut req = [0u8; HEADER + 4];
-                        Header { txid: 0, op: gpu::DRV_ATTACH_FB, status: 0, a: h.a, b: h.b }.put(&mut req);
-                        req[HEADER..HEADER + 4].copy_from_slice(&payload[..4]);
-                        let mut rep = [0u8; HEADER];
-                        let mut rh = [0 as Handle; 1];
-                        match sys::channel_call_h(
-                            *dch,
-                            &req,
-                            &[MsgHandle { handle: hnd, rights: sys::RIGHTS_SAME }],
-                            &mut rep,
-                            &mut rh,
-                            CALL_TIMEOUT_NS,
-                        ) {
-                            Ok((rn, _)) if Header::get(&rep[..rn]).is_some() => {
-                                let dh = Header::get(&rep[..rn]).unwrap_or_default();
-                                Self::reply(ch, h.txid, h.op, dh.status, dh.a, dh.b, &[]);
-                            }
-                            Ok(_) => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                }
-            }
-            gpu::OP_SET_MODE => {
-                close_h(hnd);
-                if role != Role::Display {
-                    println!("gpu: refused OP_SET_MODE on non-display endpoint");
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let width = h.b as u32;
-                let height = (h.b >> 32) as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                match &mut ad.backend {
-                    Backend::Gop(g) => {
-                        if width == g.disp.width && height == g.disp.height {
-                            Self::reply(ch, h.txid, h.op, 0, 0, 0, &[]);
-                        } else {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]);
-                        }
-                    }
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let mut req = [0u8; HEADER];
-                        Header { txid: 0, op: gpu::DRV_SET_MODE, status: 0, a: 0, b: h.b }.put(&mut req);
-                        let mut rep = [0u8; HEADER];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
-                            Ok(rn) => {
-                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                let changed_id = if dh.status == 0 {
-                                    ad.info.width = width;
-                                    ad.info.height = height;
-                                    Some(ad.info.id)
-                                } else {
-                                    None
-                                };
-                                Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
-                                if let Some(cid) = changed_id {
-                                    self.broadcast_adapters_changed(cid);
-                                }
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                }
-            }
-            gpu::OP_SET_MODE_EX => {
-                close_h(hnd);
-                if role != Role::Display {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                if payload.len() < 4 {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let width = h.b as u32;
-                let height = (h.b >> 32) as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                match &mut ad.backend {
-                    Backend::Gop(_) => Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]),
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let mut req = [0u8; HEADER + 4];
-                        Header { txid: 0, op: gpu::DRV_SET_MODE_EX, status: 0, a: h.a, b: h.b }.put(&mut req);
-                        req[HEADER..HEADER + 4].copy_from_slice(&payload[..4]);
-                        let mut rep = [0u8; HEADER];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
-                            Ok(rn) => {
-                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                let changed_id = if dh.status == 0 {
-                                    ad.info.width = width;
-                                    ad.info.height = height;
-                                    let (modes, mon, mon_len) = Self::query_pci_modes(*dch);
-                                    ad.modes = modes;
-                                    ad.info.monitor = mon;
-                                    ad.info.monitor_len = mon_len;
-                                    Some(ad.info.id)
-                                } else {
-                                    None
-                                };
-                                Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
-                                if let Some(cid) = changed_id {
-                                    self.broadcast_adapters_changed(cid);
-                                }
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                }
-            }
-            gpu::OP_PRESENT => {
-                close_h(hnd);
-                if role != Role::Display {
-                    println!("gpu: refused OP_PRESENT on non-display endpoint");
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                if payload.len() < 8 {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let fb_id = (h.a >> 32) as u32;
-                let x = h.b as u32;
-                let y = (h.b >> 32) as u32;
-                let w = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let hh = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                match &mut ad.backend {
-                    Backend::Gop(g) => match Self::gop_present_rects(g, fb_id, &[DamageRect { x, y, w, h: hh }]) {
-                        Ok(()) => {
-                            ad.info.frames += 1;
-                            Self::reply(ch, h.txid, h.op, 0, ad.info.frames, 0, &[]);
-                        }
-                        Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                    },
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let mut req = [0u8; HEADER + 8];
-                        Header { txid: 0, op: gpu::DRV_PRESENT, status: 0, a: h.a, b: h.b }.put(&mut req);
-                        req[HEADER..HEADER + 8].copy_from_slice(&payload[..8]);
-                        let mut rep = [0u8; HEADER];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
-                            Ok(rn) => {
-                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                if dh.status == 0 {
-                                    ad.info.frames = dh.a;
-                                }
-                                Self::reply(ch, h.txid, h.op, dh.status, dh.a, 0, &[]);
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                }
-            }
-            gpu::OP_PRESENT_MULTI => {
-                close_h(hnd);
-                if role != Role::Display {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let fb_id = (h.a >> 32) as u32;
-                let cnt = (h.b as usize).min(MAX_PRESENT_RECTS).min(payload.len() / 16);
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                match &mut ad.backend {
-                    Backend::Gop(g) => {
-                        let mut rects = [DamageRect::EMPTY; MAX_PRESENT_RECTS];
-                        for (i, slot) in rects.iter_mut().take(cnt).enumerate() {
-                            let o = i * 16;
-                            *slot = DamageRect {
-                                x: u32::from_le_bytes([payload[o], payload[o + 1], payload[o + 2], payload[o + 3]]),
-                                y: u32::from_le_bytes([payload[o + 4], payload[o + 5], payload[o + 6], payload[o + 7]]),
-                                w: u32::from_le_bytes([payload[o + 8], payload[o + 9], payload[o + 10], payload[o + 11]]),
-                                h: u32::from_le_bytes([payload[o + 12], payload[o + 13], payload[o + 14], payload[o + 15]]),
-                            };
-                        }
-                        match Self::gop_present_rects(g, fb_id, &rects[..cnt]) {
-                            Ok(()) => {
-                                ad.info.frames += 1;
-                                Self::reply(ch, h.txid, h.op, 0, ad.info.frames, 0, &[]);
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
-                            return;
-                        }
-                        let plen = cnt * 16;
-                        let mut req = alloc::vec![0u8; HEADER + plen];
-                        Header { txid: 0, op: gpu::DRV_PRESENT_MULTI, status: 0, a: h.a, b: cnt as u64 }.put(&mut req);
-                        req[HEADER..HEADER + plen].copy_from_slice(&payload[..plen]);
-                        let mut rep = [0u8; HEADER];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
-                            Ok(rn) => {
-                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                if dh.status == 0 {
-                                    ad.info.frames = dh.a;
-                                }
-                                Self::reply(ch, h.txid, h.op, dh.status, dh.a, dh.b, &[]);
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                }
-            }
-            gpu::OP_RELEASE_DISPLAY => {
-                close_h(hnd);
-                if role != Role::Display {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                match &ad.backend {
-                    Backend::Gop(_) => Self::reply(ch, h.txid, h.op, 0, 0, 0, &[]),
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, 0, 0, 0, &[]);
-                            return;
-                        }
-                        let mut req = [0u8; HEADER];
-                        Header { txid: 0, op: gpu::DRV_RELEASE_DISPLAY, status: 0, a: 0, b: 0 }.put(&mut req);
-                        let mut rep = [0u8; HEADER];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
-                            Ok(rn) => {
-                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                let mut changed_id = None;
-                                if dh.status == 0 {
-                                    let old_w = ad.info.width;
-                                    let old_h = ad.info.height;
-                                    let (modes, mon, mon_len) = Self::query_pci_modes(*dch);
-                                    if let Some(cur) = modes.iter().find(|m| (m.flags & gpu::MODE_FLAG_CURRENT) != 0)
-                                        && cur.width > 0
-                                        && cur.height > 0
-                                    {
-                                        ad.info.width = cur.width;
-                                        ad.info.height = cur.height;
-                                    }
-                                    let modes_changed = ad.modes != modes || ad.info.width != old_w || ad.info.height != old_h;
-                                    ad.modes = modes;
-                                    ad.info.monitor = mon;
-                                    ad.info.monitor_len = mon_len;
-                                    if modes_changed {
-                                        changed_id = Some(ad.info.id);
-                                    }
-                                }
-                                Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
-                                if let Some(cid) = changed_id {
-                                    self.broadcast_adapters_changed(cid);
-                                }
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                }
-            }
-            gpu::OP_SET_VRR | gpu::OP_SET_HDR => {
-                close_h(hnd);
-                if role != Role::Display {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                let drv_op = if h.op == gpu::OP_SET_VRR { gpu::DRV_SET_VRR } else { gpu::DRV_SET_HDR };
-                match &ad.backend {
-                    Backend::Gop(_) => Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]),
-                    Backend::Pci { ch: dch, .. } if *dch != 0 => {
-                        let mut req = [0u8; HEADER];
-                        Header { txid: 0, op: drv_op, status: 0, a: 0, b: h.b }.put(&mut req);
-                        let mut rep = [0u8; HEADER];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
-                            Ok(rn) => {
-                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
-                                Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                    _ => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
-                }
-            }
-            gpu::OP_FLIP_TEST => {
-                close_h(hnd);
-                if role != Role::Display {
-                    println!("gpu: refused OP_FLIP_TEST on non-display endpoint");
-                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
-                    return;
-                }
-                let id = h.a as u32;
-                let dur = (h.b as u32).clamp(500, 15_000);
-                let Some(ad) = self.find_adapter_mut(id) else {
-                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
-                    return;
-                };
-                match &ad.backend {
-                    Backend::Gop(_) => Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]),
-                    Backend::Pci { ch: dch, .. } if *dch != 0 => {
-                        let mut req = [0u8; HEADER];
-                        Header { txid: 0, op: gpu::DRV_FLIP_TEST, status: 0, a: 0, b: u64::from(dur) }.put(&mut req);
-                        let mut rep = [0u8; HEADER + FLIP_TEST_BYTES];
-                        let timeout = u64::from(dur) * 1_000_000 + CALL_TIMEOUT_NS;
-                        match sys::channel_call(*dch, &req, &mut rep, timeout) {
-                            Ok(rn) => {
-                                let rn = rn as usize;
-                                let dh = Header::get(&rep[..rn]).unwrap_or_default();
-                                let body = if rn > HEADER { &rep[HEADER..rn] } else { &[] };
-                                Self::reply(ch, h.txid, h.op, dh.status, dh.a, dh.b, body);
-                            }
-                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
-                        }
-                    }
-                    _ => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
-                }
-            }
-            gpu::OP_SET_CURSOR => {
-                if role != Role::Display {
+            gpu::OP_GEM_IMPORT => {
+                if role == Role::Query {
                     close_h(hnd);
                     Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
                     return;
@@ -1129,16 +965,66 @@ impl GpuSvc {
                     Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
                     return;
                 }
-                let id = h.a as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
+                let req_id = h.a as u32;
+                let bo_flags = (h.a >> 32) as u32;
+                let size = h.b;
+                // Display clients may only import scanout/cursor BOs; render clients may only import render BOs.
+                if role == Role::Display && (bo_flags & gpu::BO_RENDER) != 0 {
+                    close_h(hnd);
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                if role == Role::Render && (bo_flags & (gpu::BO_SCANOUT | gpu::BO_CURSOR)) != 0 {
+                    close_h(hnd);
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                let Some(aid) = self.resolve_adapter_id(req_id) else {
                     close_h(hnd);
                     Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
                     return;
                 };
-                match &ad.backend {
-                    Backend::Gop(_) => {
-                        close_h(hnd);
-                        Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]);
+                let Some(ad) = self.adapters.iter_mut().find(|a| a.info.id == aid) else {
+                    close_h(hnd);
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                match &mut ad.backend {
+                    Backend::Gop(g) => {
+                        if role != Role::Display {
+                            close_h(hnd);
+                            Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]);
+                            return;
+                        }
+                        if size == 0 || size > MAX_FB_BYTES || sys::vmo_size(hnd).unwrap_or(0) < size {
+                            close_h(hnd);
+                            Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                            return;
+                        }
+                        let map_len = size.div_ceil(sys::PAGE) * sys::PAGE;
+                        let Ok(map) = Mapping::of_ro(hnd, map_len) else {
+                            close_h(hnd);
+                            Self::reply(ch, h.txid, h.op, sys::ERR_NO_MEMORY as i32, 0, 0, &[]);
+                            return;
+                        };
+                        let mut uuid = [0u8; 16];
+                        uuid[0..4].copy_from_slice(b"GOPB");
+                        match g.gem.insert(size, bo_flags, 0, uuid) {
+                            Ok(gem_h) => {
+                                uuid[4..8].copy_from_slice(&gem_h.to_le_bytes());
+                                g.bos.push(GopBo { gem_handle: gem_h, vmo: hnd, map });
+                                self.owned_gems.push(OwnedGem {
+                                    client_id,
+                                    adapter_id: aid,
+                                    gem_handle: gem_h,
+                                });
+                                Self::reply(ch, h.txid, h.op, 0, u64::from(gem_h), 0, &uuid);
+                            }
+                            Err(e) => {
+                                drop(GopBo { gem_handle: 0, vmo: hnd, map });
+                                Self::reply(ch, h.txid, h.op, mem_err_to_sys(e) as i32, 0, 0, &[]);
+                            }
+                        }
                     }
                     Backend::Pci { ch: dch, .. } => {
                         if *dch == 0 {
@@ -1147,8 +1033,8 @@ impl GpuSvc {
                             return;
                         }
                         let mut req = [0u8; HEADER];
-                        Header { txid: 0, op: gpu::DRV_SET_CURSOR, status: 0, a: 0, b: h.b }.put(&mut req);
-                        let mut rep = [0u8; HEADER];
+                        Header { txid: 0, op: gpu::DRV_GEM_IMPORT, status: 0, a: h.a, b: size }.put(&mut req);
+                        let mut rep = [0u8; HEADER + 16];
                         let mut rh = [0 as Handle; 1];
                         match sys::channel_call_h(
                             *dch,
@@ -1160,33 +1046,111 @@ impl GpuSvc {
                         ) {
                             Ok((rn, _)) => {
                                 let dh = Header::get(&rep[..rn]).unwrap_or_default();
-                                Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
+                                if dh.status == 0 {
+                                    self.owned_gems.push(OwnedGem {
+                                        client_id,
+                                        adapter_id: aid,
+                                        gem_handle: dh.a as u32,
+                                    });
+                                }
+                                let body = if rn > HEADER { &rep[HEADER..rn] } else { &[] };
+                                Self::reply(ch, h.txid, h.op, dh.status, dh.a, dh.b, body);
                             }
                             Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
                         }
                     }
                 }
             }
-            gpu::OP_MOVE_CURSOR => {
+            gpu::OP_GEM_CREATE => {
                 close_h(hnd);
-                if role != Role::Display {
+                if role != Role::Render {
                     Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
                     return;
                 }
-                let id = h.a as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
+                let req_id = h.a as u32;
+                let Some(aid) = self.resolve_adapter_id(req_id) else {
                     Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
                     return;
                 };
-                match &ad.backend {
+                let Some(ad) = self.adapters.iter().find(|a| a.info.id == aid) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                match ad.backend {
                     Backend::Gop(_) => Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]),
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
-                            return;
-                        }
+                    Backend::Pci { ch: dch, .. } if dch != 0 => {
                         let mut req = [0u8; HEADER];
-                        Header { txid: 0, op: gpu::DRV_MOVE_CURSOR, status: 0, a: 0, b: h.b }.put(&mut req);
+                        Header { txid: 0, op: gpu::DRV_GEM_CREATE, status: 0, a: h.a, b: h.b }.put(&mut req);
+                        let mut rep = [0u8; HEADER + 16];
+                        let mut rh = [0 as Handle; 1];
+                        match sys::channel_call_h(dch, &req, &[], &mut rep, &mut rh, CALL_TIMEOUT_NS) {
+                            Ok((rn, rnh)) => {
+                                let dh = Header::get(&rep[..rn]).unwrap_or_default();
+                                let got_vmo = if rnh > 0 { rh[0] } else { 0 };
+                                let body = if rn > HEADER { &rep[HEADER..rn] } else { &[] };
+                                if dh.status == 0 && got_vmo != 0 {
+                                    self.owned_gems.push(OwnedGem {
+                                        client_id,
+                                        adapter_id: aid,
+                                        gem_handle: dh.a as u32,
+                                    });
+                                    Self::reply_with_handle(ch, h.txid, h.op, 0, dh.a, 0, body, got_vmo);
+                                } else {
+                                    if got_vmo != 0 {
+                                        sys::handle_close(got_vmo);
+                                    }
+                                    Self::reply(
+                                        ch,
+                                        h.txid,
+                                        h.op,
+                                        if dh.status != 0 { dh.status } else { sys::ERR_BAD_STATE as i32 },
+                                        0,
+                                        0,
+                                        &[],
+                                    );
+                                }
+                            }
+                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
+                        }
+                    }
+                    _ => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
+                }
+            }
+            gpu::OP_GEM_CLOSE => {
+                close_h(hnd);
+                if role == Role::Query {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                let req_id = h.a as u32;
+                let gem_h = h.b as u32;
+                let Some(aid) = self.resolve_adapter_id(req_id) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                if !self.client_owns_gem(client_id, aid, gem_h) {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                self.owned_gems
+                    .retain(|g| !(g.client_id == client_id && g.adapter_id == aid && g.gem_handle == gem_h));
+                let Some(ad) = self.adapters.iter_mut().find(|a| a.info.id == aid) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                match &mut ad.backend {
+                    Backend::Gop(g) => match g.gem.release(gem_h) {
+                        Ok(released) => {
+                            if released.is_some() {
+                                g.bos.retain(|b| b.gem_handle != gem_h);
+                            }
+                            Self::reply(ch, h.txid, h.op, 0, 0, 0, &[]);
+                        }
+                        Err(e) => Self::reply(ch, h.txid, h.op, mem_err_to_sys(e) as i32, 0, 0, &[]),
+                    },
+                    Backend::Pci { ch: dch, .. } if *dch != 0 => {
+                        let mut req = [0u8; HEADER];
+                        Header { txid: 0, op: gpu::DRV_GEM_CLOSE, status: 0, a: 0, b: u64::from(gem_h) }.put(&mut req);
                         let mut rep = [0u8; HEADER];
                         match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
                             Ok(rn) => {
@@ -1196,44 +1160,387 @@ impl GpuSvc {
                             Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
                         }
                     }
+                    _ => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
                 }
             }
-            gpu::OP_CTX_CREATE | gpu::OP_CTX_DESTROY | gpu::OP_SUBMIT_CMD => {
+            gpu::OP_KMS_CREATE_FB => {
+                close_h(hnd);
+                if role != Role::Display {
+                    println!("gpu: refused OP_KMS_CREATE_FB on non-display endpoint");
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                if payload.len() < 16 {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
+                    return;
+                }
+                let req_id = h.a as u32;
+                let gem_h = (h.a >> 32) as u32;
+                let width = h.b as u32;
+                let height = (h.b >> 32) as u32;
+                let pitch = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let format = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                let modifier = u64::from_le_bytes([
+                    payload[8],
+                    payload[9],
+                    payload[10],
+                    payload[11],
+                    payload[12],
+                    payload[13],
+                    payload[14],
+                    payload[15],
+                ]);
+                let Some(aid) = self.resolve_adapter_id(req_id) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                if !self.client_owns_gem(client_id, aid, gem_h) {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                let Some(ad) = self.adapters.iter_mut().find(|a| a.info.id == aid) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                match &mut ad.backend {
+                    Backend::Gop(g) => {
+                        let Some(bo) = g.gem.get(gem_h) else {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                            return;
+                        };
+                        let _ = g.gem.add_ref(gem_h);
+                        match g.kms.add_fb(gem_h, width, height, pitch, format, modifier, bo.size) {
+                            Ok(fb_id) => Self::reply(ch, h.txid, h.op, 0, u64::from(fb_id), 0, &[]),
+                            Err(e) => {
+                                let _ = g.gem.release(gem_h);
+                                Self::reply(ch, h.txid, h.op, kms_err_to_sys(e) as i32, 0, 0, &[]);
+                            }
+                        }
+                    }
+                    Backend::Pci { ch: dch, .. } if *dch != 0 => {
+                        let mut req = [0u8; HEADER + 16];
+                        Header { txid: 0, op: gpu::DRV_KMS_CREATE_FB, status: 0, a: h.a, b: h.b }.put(&mut req);
+                        req[HEADER..HEADER + 16].copy_from_slice(&payload[..16]);
+                        let mut rep = [0u8; HEADER];
+                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
+                            Ok(rn) => {
+                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
+                                Self::reply(ch, h.txid, h.op, dh.status, dh.a, 0, &[]);
+                            }
+                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
+                        }
+                    }
+                    _ => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
+                }
+            }
+            gpu::OP_KMS_DESTROY_FB => {
+                close_h(hnd);
+                if role != Role::Display {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                let req_id = h.a as u32;
+                let fb_id = h.b as u32;
+                let Some(ad) = self.find_adapter_mut(req_id) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                match &mut ad.backend {
+                    Backend::Gop(g) => match g.kms.remove_fb(fb_id) {
+                        Some(fb) => {
+                            if let Ok(Some(_)) = g.gem.release(fb.gem_handle) {
+                                g.bos.retain(|b| b.gem_handle != fb.gem_handle);
+                            }
+                            Self::reply(ch, h.txid, h.op, 0, 0, 0, &[]);
+                        }
+                        None => Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]),
+                    },
+                    Backend::Pci { ch: dch, .. } if *dch != 0 => {
+                        let mut req = [0u8; HEADER];
+                        Header { txid: 0, op: gpu::DRV_KMS_DESTROY_FB, status: 0, a: 0, b: u64::from(fb_id) }
+                            .put(&mut req);
+                        let mut rep = [0u8; HEADER];
+                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
+                            Ok(rn) => {
+                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
+                                Self::reply(ch, h.txid, h.op, dh.status, 0, 0, &[]);
+                            }
+                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
+                        }
+                    }
+                    _ => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
+                }
+            }
+            gpu::OP_KMS_ATOMIC_COMMIT => {
+                close_h(hnd);
+                if role != Role::Display {
+                    println!("gpu: refused OP_KMS_ATOMIC_COMMIT on non-display endpoint");
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                let max_len = ATOMIC_COMMIT_HDR_BYTES + MAX_PRESENT_RECTS * 16;
+                let Some(wire) = AtomicCommitWire::decode(&payload[..payload.len().min(max_len)]) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
+                    return;
+                };
+                let commit = wire_to_atomic(&wire);
+                let req_id = h.a as u32;
+                let Some(aid) = self.resolve_adapter_id(req_id) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                let Some(ad) = self.adapters.iter_mut().find(|a| a.info.id == aid) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                let prev_mode = ad
+                    .modes
+                    .iter()
+                    .find(|m| (m.flags & gpu::MODE_FLAG_CURRENT) != 0)
+                    .map(|m| KmsMode {
+                        width: m.width,
+                        height: m.height,
+                        refresh_mhz: m.refresh_mhz,
+                        pixel_clock_khz: m.pixel_clock_khz,
+                        htotal: m.htotal,
+                        vtotal: m.vtotal,
+                        flags: m.flags,
+                    })
+                    .unwrap_or_else(|| KmsMode::simple(ad.info.width, ad.info.height, 60_000, 0));
+
+                match &mut ad.backend {
+                    Backend::Gop(g) => {
+                        if (commit.flags & kms::ATOMIC_RESET_BOOT) != 0 {
+                            Self::reply(ch, h.txid, h.op, 0, ad.info.frames, 0, &[]);
+                            return;
+                        }
+                        let resolved = match g.kms.validate_commit(&commit) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                Self::reply(ch, h.txid, h.op, kms_err_to_sys(e) as i32, 0, 0, &[]);
+                                return;
+                            }
+                        };
+                        if (commit.flags & kms::ATOMIC_TEST_ONLY) != 0 {
+                            Self::reply(ch, h.txid, h.op, 0, ad.info.frames, 0, &[]);
+                            return;
+                        }
+                        if commit.primary_changed && commit.primary_fb_id != 0 {
+                            let cnt = usize::from(commit.damage_count).min(kms::MAX_COMMIT_DAMAGE);
+                            if let Err(e) = Self::gop_present_rects(g, commit.primary_fb_id, &commit.damage[..cnt]) {
+                                Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]);
+                                return;
+                            }
+                        }
+                        g.kms.apply_commit(&commit, resolved);
+                        if commit.primary_changed && commit.primary_fb_id != 0 {
+                            ad.info.frames = g.kms.crtcs[0].map_or(ad.info.frames + 1, |c| c.vblank_seq);
+                            ad.kms_res.vblank_seq = ad.info.frames;
+                        }
+                        Self::reply(ch, h.txid, h.op, 0, ad.info.frames, 0, &[]);
+                    }
+                    Backend::Pci { ch: dch, .. } => {
+                        if *dch == 0 {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
+                            return;
+                        }
+                        let plen = payload.len().min(max_len);
+                        let mut req = [0u8; HEADER + ATOMIC_COMMIT_HDR_BYTES + MAX_PRESENT_RECTS * 16];
+                        Header {
+                            txid: 0,
+                            op: gpu::DRV_KMS_ATOMIC_COMMIT,
+                            status: 0,
+                            a: 0,
+                            b: plen as u64,
+                        }
+                        .put(&mut req);
+                        req[HEADER..HEADER + plen].copy_from_slice(&payload[..plen]);
+                        let mut rep = [0u8; HEADER];
+                        match sys::channel_call(*dch, &req[..HEADER + plen], &mut rep, CALL_TIMEOUT_NS) {
+                            Ok(rn) => {
+                                let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
+                                let mut broadcast = false;
+                                if dh.status == 0 && (commit.flags & kms::ATOMIC_TEST_ONLY) == 0 {
+                                    if commit.primary_changed && commit.primary_fb_id != 0 {
+                                        ad.info.frames = dh.a;
+                                        ad.kms_res.vblank_seq = dh.a;
+                                    }
+                                    if commit.mode_changed
+                                        || commit.vrr_changed
+                                        || commit.hdr_changed
+                                        || (commit.flags & kms::ATOMIC_RESET_BOOT) != 0
+                                    {
+                                        Self::refresh_pci_adapter(ad);
+                                        broadcast = true;
+                                        if commit.mode_changed && (commit.flags & kms::ATOMIC_REQUIRE_CONFIRM) != 0 {
+                                            self.revert_guard.arm(
+                                                aid,
+                                                prev_mode,
+                                                sys::clock_ns(),
+                                                DEFAULT_REVERT_TIMEOUT_NS,
+                                            );
+                                        } else if (commit.flags & kms::ATOMIC_RESET_BOOT) != 0 {
+                                            let _ = self.revert_guard.confirm(aid);
+                                        }
+                                    }
+                                }
+                                Self::reply(ch, h.txid, h.op, dh.status, dh.a, dh.b, &[]);
+                                if broadcast {
+                                    self.broadcast_adapters_changed(aid);
+                                }
+                            }
+                            Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
+                        }
+                    }
+                }
+            }
+            gpu::OP_KMS_CONFIRM_MODE => {
+                close_h(hnd);
+                if role != Role::Display {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                    return;
+                }
+                let req_id = h.a as u32;
+                let confirm = (h.b & 1) != 0;
+                let aid = self.resolve_adapter_id(req_id).unwrap_or(req_id);
+                if confirm {
+                    let _ = self.revert_guard.confirm(aid);
+                    Self::reply(ch, h.txid, h.op, 0, 0, 0, &[]);
+                } else if let Some((rev_id, rev_mode)) = self.revert_guard.take_pending(aid) {
+                    self.apply_mode_revert(rev_id, rev_mode);
+                    Self::reply(ch, h.txid, h.op, 0, 0, 0, &[]);
+                } else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
+                }
+            }
+            gpu::OP_VM_CREATE
+            | gpu::OP_VM_DESTROY
+            | gpu::OP_VM_BIND
+            | gpu::OP_VM_UNBIND
+            | gpu::OP_SYNCOBJ_CREATE
+            | gpu::OP_SYNCOBJ_DESTROY
+            | gpu::OP_SYNCOBJ_SIGNAL
+            | gpu::OP_SYNCOBJ_WAIT
+            | gpu::OP_CTX_CREATE
+            | gpu::OP_CTX_DESTROY
+            | gpu::OP_SUBMIT => {
                 close_h(hnd);
                 if role != Role::Render {
                     println!("gpu: refused render op {} on non-render endpoint", h.op);
                     Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
                     return;
                 }
-                let id = h.a as u32;
-                let Some(ad) = self.find_adapter_mut(id) else {
+                let req_id = h.a as u32;
+                let Some(aid) = self.resolve_adapter_id(req_id) else {
                     Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
                     return;
                 };
-                let drv_op = match h.op {
-                    gpu::OP_CTX_CREATE => gpu::DRV_CTX_CREATE,
-                    gpu::OP_CTX_DESTROY => gpu::DRV_CTX_DESTROY,
-                    _ => gpu::DRV_SUBMIT_CMD,
-                };
-                match &ad.backend {
-                    Backend::Gop(_) => Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]),
-                    Backend::Pci { ch: dch, .. } => {
-                        if *dch == 0 {
-                            Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]);
+                // Enforce per-client ownership on VM, GEM, and Context handles!
+                match h.op {
+                    gpu::OP_VM_DESTROY => {
+                        let vm_id = h.b as u32;
+                        if !self.client_owns_vm(client_id, aid, vm_id) {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
                             return;
                         }
+                    }
+                    gpu::OP_VM_BIND => {
+                        let vm_id = (h.a >> 32) as u32;
+                        let gem_h = h.b as u32;
+                        if !self.client_owns_vm(client_id, aid, vm_id)
+                            || !self.client_owns_gem(client_id, aid, gem_h)
+                        {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                            return;
+                        }
+                    }
+                    gpu::OP_VM_UNBIND => {
+                        let vm_id = (h.a >> 32) as u32;
+                        if !self.client_owns_vm(client_id, aid, vm_id) {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                            return;
+                        }
+                    }
+                    gpu::OP_CTX_CREATE => {
+                        let vm_id = h.b as u32;
+                        if vm_id != 0 && !self.client_owns_vm(client_id, aid, vm_id) {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                            return;
+                        }
+                    }
+                    gpu::OP_CTX_DESTROY => {
+                        let ctx_id = h.b as u32;
+                        if !self.client_owns_ctx(client_id, aid, ctx_id) {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                            return;
+                        }
+                    }
+                    gpu::OP_SUBMIT => {
+                        let ctx_id = (h.a >> 32) as u32;
+                        if !self.client_owns_ctx(client_id, aid, ctx_id) {
+                            Self::reply(ch, h.txid, h.op, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+
+                let drv_op = match h.op {
+                    gpu::OP_VM_CREATE => gpu::DRV_VM_CREATE,
+                    gpu::OP_VM_DESTROY => gpu::DRV_VM_DESTROY,
+                    gpu::OP_VM_BIND => gpu::DRV_VM_BIND,
+                    gpu::OP_VM_UNBIND => gpu::DRV_VM_UNBIND,
+                    gpu::OP_SYNCOBJ_CREATE => gpu::DRV_SYNCOBJ_CREATE,
+                    gpu::OP_SYNCOBJ_DESTROY => gpu::DRV_SYNCOBJ_DESTROY,
+                    gpu::OP_SYNCOBJ_SIGNAL => gpu::DRV_SYNCOBJ_SIGNAL,
+                    gpu::OP_SYNCOBJ_WAIT => gpu::DRV_SYNCOBJ_WAIT,
+                    gpu::OP_CTX_CREATE => gpu::DRV_CTX_CREATE,
+                    gpu::OP_CTX_DESTROY => gpu::DRV_CTX_DESTROY,
+                    _ => gpu::DRV_SUBMIT,
+                };
+                let Some(ad) = self.adapters.iter().find(|a| a.info.id == aid) else {
+                    Self::reply(ch, h.txid, h.op, sys::ERR_OUT_OF_RANGE as i32, 0, 0, &[]);
+                    return;
+                };
+                match ad.backend {
+                    Backend::Gop(_) => Self::reply(ch, h.txid, h.op, sys::ERR_NOT_SUPPORTED as i32, 0, 0, &[]),
+                    Backend::Pci { ch: dch, .. } if dch != 0 => {
                         let mut req = alloc::vec![0u8; HEADER + payload.len()];
                         Header { txid: 0, op: drv_op, status: 0, a: h.a, b: h.b }.put(&mut req);
                         req[HEADER..].copy_from_slice(payload);
                         let mut rep = [0u8; HEADER];
-                        match sys::channel_call(*dch, &req, &mut rep, CALL_TIMEOUT_NS) {
+                        match sys::channel_call(dch, &req, &mut rep, CALL_TIMEOUT_NS) {
                             Ok(rn) => {
                                 let dh = Header::get(&rep[..rn as usize]).unwrap_or_default();
+                                if dh.status == 0 {
+                                    match h.op {
+                                        gpu::OP_VM_CREATE => self.owned_vms.push(OwnedVm {
+                                            client_id,
+                                            adapter_id: aid,
+                                            vm_id: dh.a as u32,
+                                        }),
+                                        gpu::OP_VM_DESTROY => {
+                                            let vm_id = h.b as u32;
+                                            self.owned_vms.retain(|v| !(v.adapter_id == aid && v.vm_id == vm_id));
+                                        }
+                                        gpu::OP_CTX_CREATE => self.owned_ctxs.push(OwnedCtx {
+                                            client_id,
+                                            adapter_id: aid,
+                                            ctx_id: dh.a as u32,
+                                        }),
+                                        gpu::OP_CTX_DESTROY => {
+                                            let ctx_id = h.b as u32;
+                                            self.owned_ctxs.retain(|c| !(c.adapter_id == aid && c.ctx_id == ctx_id));
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 Self::reply(ch, h.txid, h.op, dh.status, dh.a, dh.b, &[]);
                             }
                             Err(e) => Self::reply(ch, h.txid, h.op, e as i32, 0, 0, &[]),
                         }
                     }
+                    _ => Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0, &[]),
                 }
             }
             gpu::OP_CRASH_DRIVER => {
@@ -1279,10 +1586,14 @@ fn main(s: *const Startup) -> i32 {
         ctl,
         devmgr,
         test_mode,
-        gop_wire: None,
         adapters: Vec::new(),
         next_adapter_id: 1,
         clients: Vec::new(),
+        next_client_id: 1,
+        owned_gems: Vec::new(),
+        owned_vms: Vec::new(),
+        owned_ctxs: Vec::new(),
+        revert_guard: ModeRevertGuard::new(),
     };
     svc.init_gop(disp_dev);
 
@@ -1299,7 +1610,16 @@ fn main(s: *const Startup) -> i32 {
     );
 
     loop {
-        let Some((key, _)) = svc.port.wait(sys::WAIT_FOREVER) else { continue };
+        if let Some((rev_id, rev_mode)) = svc.revert_guard.poll_expired(sys::clock_ns()) {
+            svc.apply_mode_revert(rev_id, rev_mode);
+        }
+        let timeout = match svc.revert_guard.deadline_ns() {
+            Some(dl) => dl.saturating_sub(sys::clock_ns()),
+            None => sys::WAIT_FOREVER,
+        };
+        let Some((key, _)) = svc.port.wait(timeout) else {
+            continue;
+        };
         match key {
             KEY_CTL => {
                 if !svc.on_ctl_msg() {
