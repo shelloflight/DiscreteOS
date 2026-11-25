@@ -33,7 +33,9 @@ typedef uint64_t __be64;
 typedef uint64_t dma_addr_t;
 typedef uint64_t phys_addr_t;
 typedef uint64_t resource_size_t;
+#if !defined(__DOSDRM_HOST_TEST__)
 typedef int64_t ssize_t;
+#endif
 typedef uint32_t gfp_t;
 
 #define GFP_KERNEL 0u

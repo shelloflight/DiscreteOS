@@ -5,6 +5,7 @@ build/
 *.o
 *.obj
 *.bin
+!vendor/firmware/**/*.bin
 *.elf
 *.img
 *.iso

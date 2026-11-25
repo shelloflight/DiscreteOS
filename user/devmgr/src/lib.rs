@@ -306,7 +306,7 @@ impl Mgr {
             }
         }
         let limits = sys::Limits {
-            memory: if is_gpu { 64 << 20 } else { 8 << 20 },
+            memory: if is_gpu { 96 << 20 } else { 8 << 20 },
             handles: if is_gpu { 512 } else { 256 },
             threads: if is_gpu { 8 } else { 4 },
         };
@@ -1095,6 +1095,13 @@ impl Mgr {
         let mut n = 0u64;
         for i in 0..MAX_DRIVERS {
             let Some(d) = self.drv[i].as_mut() else { continue };
+            // Allow PCI GPU drivers to quiesce Display Core / SMU / IH cleanly before S3 sleep.
+            if d.proc != 0 && d.ch != 0 && matches!(d.prog, "virtio-gpu" | "amdgpu" | "xe" | "nvgpu") {
+                let mut req = [0u8; HEADER];
+                Header { txid: 0, op: svc::SUSPEND, status: 0, a: 0, b: 0 }.put(&mut req);
+                let mut rep = [0u8; HEADER];
+                let _ = sys::channel_call(d.ch, &req, &mut rep, SEC);
+            }
             // Quiesce PCI bus mastering before killing the driver so no DMA races with unpinning.
             if d.dev != 0 && d.info.kind == sys::DEV_KIND_PCI {
                 let _ = sys::config_write(d.dev, 0x04, 2, 0);

@@ -14,7 +14,7 @@ use dosfs::{FileSystem, Ino, Kind};
 use crate::tools::{random_seed_32, to_hex};
 
 pub const SECTOR_SIZE: u64 = 512;
-pub const BOOT_IMAGE_MIB: u64 = 64;
+pub const BOOT_IMAGE_MIB: u64 = 80;
 pub const BIOS_PART_SECTORS: u64 = 8 * 2048;
 pub const ESP_PART_SECTORS: u64 = 36 * 2048;
 pub const STAGE2_LBA: u64 = 2048;

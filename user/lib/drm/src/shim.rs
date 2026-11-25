@@ -9,7 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use libd::fs::{self as fp, Node};
 use libd::proto;
 use libd::sys::{self, DeviceInfo, Handle};
-use libd::{Mapping, println};
+use libd::{Dma, Mapping, println};
 
 use crate::MAX_FB_BYTES;
 
@@ -240,7 +240,7 @@ static SHIM_DEV: AtomicU32 = AtomicU32::new(0);
 static SHIM_FW: AtomicU32 = AtomicU32::new(0);
 static ALLOC_LOCK: AtomicBool = AtomicBool::new(false);
 
-const MAX_C_ALLOCS: usize = 256;
+const MAX_C_ALLOCS: usize = 1024;
 
 #[derive(Clone, Copy)]
 struct AllocRec {
@@ -299,6 +299,142 @@ pub extern "C" fn dosdrm_host_log(msg: *const u8, len: usize) {
 pub extern "C" fn dosdrm_host_udelay(us: u32) {
     if us > 0 {
         libd::handle::sleep(u64::from(us).saturating_mul(1_000));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dosdrm_host_clock_ns() -> u64 {
+    sys::clock_ns()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dosdrm_host_pci_info(
+    dev_handle: u32,
+    out_vendor: *mut u16,
+    out_device: *mut u16,
+    out_rev: *mut u8,
+    out_bar_sizes: *mut u64,
+) -> i32 {
+    let dev = if dev_handle != 0 { dev_handle } else { SHIM_DEV.load(Ordering::Acquire) };
+    let Ok(info) = sys::device_info(dev) else {
+        return -5;
+    };
+    if !out_vendor.is_null() {
+        // SAFETY: Checked non-null immediately above.
+        unsafe { *out_vendor = info.vendor; }
+    }
+    if !out_device.is_null() {
+        // SAFETY: Checked non-null immediately above.
+        unsafe { *out_device = info.device; }
+    }
+    if !out_rev.is_null() {
+        // SAFETY: Checked non-null immediately above.
+        unsafe { *out_rev = info.revision; }
+    }
+    if !out_bar_sizes.is_null() {
+        // SAFETY: Caller passes a 6-element `uint64_t[6]` array per `dosdrm_pci_get_info` contract.
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(out_bar_sizes, 6);
+            dst.copy_from_slice(&info.bar_size);
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dosdrm_host_map_bar(
+    dev_handle: u32,
+    bar: u8,
+    off: u64,
+    len: u64,
+    out_vmo: *mut u32,
+    out_addr: *mut u64,
+    out_len: *mut u64,
+) -> i32 {
+    if bar >= 6 || len == 0 || out_vmo.is_null() || out_addr.is_null() || out_len.is_null() {
+        return -22;
+    }
+    let dev = if dev_handle != 0 { dev_handle } else { SHIM_DEV.load(Ordering::Acquire) };
+    let Ok(vmo) = sys::device_map_bar(dev, u64::from(bar)) else {
+        return -5;
+    };
+    let Ok(map) = Mapping::of_range(vmo, off, len) else {
+        sys::handle_close(vmo);
+        return -12;
+    };
+    // SAFETY: All output pointers were checked non-null above.
+    unsafe {
+        *out_vmo = map.vmo;
+        *out_addr = map.addr;
+        *out_len = map.len;
+    }
+    core::mem::forget(map);
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dosdrm_host_unmap_bar(vmo: u32, addr: u64, len: u64) {
+    if addr != 0 && len != 0 {
+        let _ = sys::vmar_unmap(libd::root_vmar(), addr, len);
+    }
+    if vmo != 0 {
+        sys::handle_close(vmo);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dosdrm_host_dma_alloc(
+    dev_handle: u32,
+    size: u64,
+    out_cpu_addr: *mut u64,
+    out_dma_addr: *mut u64,
+    out_vmo: *mut u32,
+    out_pin: *mut u32,
+    out_map_len: *mut u64,
+) -> i32 {
+    if size == 0
+        || size > MAX_FB_BYTES
+        || out_cpu_addr.is_null()
+        || out_dma_addr.is_null()
+        || out_vmo.is_null()
+        || out_pin.is_null()
+        || out_map_len.is_null()
+    {
+        return -22;
+    }
+    let dev = if dev_handle != 0 { dev_handle } else { SHIM_DEV.load(Ordering::Acquire) };
+    let aligned = size.div_ceil(sys::PAGE) * sys::PAGE;
+    let Ok(mut dma) = Dma::new(dev, aligned, sys::DMA_DEVICE_READ | sys::DMA_DEVICE_WRITE) else {
+        return -12;
+    };
+    dma.map.bytes_mut().fill(0);
+    let cpu_addr = dma.map.addr;
+    let map_len = dma.map.len;
+    let vmo = dma.map.vmo;
+    let pin = dma.pin;
+    let dma_addr = dma.dev_addr(0);
+    core::mem::forget(dma);
+    // SAFETY: All output pointers were checked non-null above.
+    unsafe {
+        *out_cpu_addr = cpu_addr;
+        *out_dma_addr = dma_addr;
+        *out_vmo = vmo;
+        *out_pin = pin;
+        *out_map_len = map_len;
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dosdrm_host_dma_free(cpu_addr: u64, map_len: u64, vmo: u32, pin: u32) {
+    if pin != 0 {
+        sys::handle_close(pin);
+    }
+    if cpu_addr != 0 && map_len != 0 {
+        let _ = sys::vmar_unmap(libd::root_vmar(), cpu_addr, map_len);
+    }
+    if vmo != 0 {
+        sys::handle_close(vmo);
     }
 }
 

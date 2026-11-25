@@ -1,0 +1,21 @@
+# Scoped Ring-3 C17 AMD RDNA / AMDGPU + Display Core (DC / DML2 / DMCUB) static library.
+name = "amdgpu"
+c_std = "c17"
+includes = ["include", "../dosdrm_c/include"]
+defines = ["__DOS_DRM__=1", "__KERNEL__=1"]
+sources = [
+    "src/amdgpu_ucode.c",
+    "src/amdgpu_discovery.c",
+    "src/amdgpu_atom.c",
+    "src/amdgpu_psp_smu.c",
+    "src/amdgpu_gmc_ih.c",
+    "src/amdgpu_ring.c",
+    "src/dc_regs.c",
+    "src/dc_dmub.c",
+    "src/dc_dml2.c",
+    "src/dc_dsc.c",
+    "src/dc_link.c",
+    "src/dc_core.c",
+    "src/amdgpu_device.c",
+    "src/amdgpu_capi.c",
+]

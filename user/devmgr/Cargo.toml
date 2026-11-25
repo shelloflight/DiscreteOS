@@ -19,7 +19,7 @@ publish = false
 
 [package.metadata.dos]
 ddrv = ["ps2", "virtio-blk", "virtio-input", "ahci", "nvme", "xhci", "hda", "virtio-snd", "usbaudio", "virtio-net", "e1000e", "r8169", "virtio-gpu", "amdgpu", "xe", "nvgpu"]
-vendor_libs = ["dosdrm_c"]
+vendor_libs = ["dosdrm_c", "amdgpu"]
 
 [lib]
 crate-type = ["staticlib"]

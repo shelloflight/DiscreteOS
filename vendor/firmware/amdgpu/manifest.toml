@@ -1,7 +1,52 @@
 # D-OS AMD RDNA firmware directory manifest (sys:/firmware/amdgpu/manifest.toml)
-# Stage 1.2 populates PSP, SMU/PMFW, DMCUB, RLC, MEC, SDMA, and MES blobs here.
+# Official signed AMD microcode blobs redistributed under AMD's firmware license (linux-firmware).
 vendor = "amdgpu"
 pci_vendor = 0x1002
 driver = "amdgpu.ddrv"
 kms_atomic = true
 families = ["dcn30", "dcn315", "dcn32", "dcn401"]
+blobs = [
+    "dcn_4_0_1_dmcub.bin",
+    "psp_14_0_3_sos.bin",
+    "psp_14_0_3_ta.bin",
+    "smu_14_0_3.bin",
+    "gc_12_0_1_toc.bin",
+    "gc_12_0_1_pfp.bin",
+    "gc_12_0_1_me.bin",
+    "gc_12_0_1_mec.bin",
+    "gc_12_0_1_rlc.bin",
+    "gc_12_0_1_imu.bin",
+    "gc_12_0_1_uni_mes.bin",
+    "sdma_7_0_1.bin",
+    "dcn_3_1_5_dmcub.bin",
+    "psp_13_0_5_asd.bin",
+    "psp_13_0_5_ta.bin",
+    "psp_13_0_5_toc.bin",
+    "gc_10_3_6_pfp.bin",
+    "gc_10_3_6_me.bin",
+    "gc_10_3_6_mec.bin",
+    "gc_10_3_6_rlc.bin",
+    "sdma_5_2_6.bin",
+    "dcn_3_2_0_dmcub.bin",
+    "dcn_3_2_1_dmcub.bin",
+    "psp_13_0_0_sos.bin",
+    "psp_13_0_0_ta.bin",
+    "smu_13_0_0.bin",
+    "gc_11_0_0_pfp.bin",
+    "gc_11_0_0_me.bin",
+    "gc_11_0_0_mec.bin",
+    "gc_11_0_0_rlc.bin",
+    "gc_11_0_0_imu.bin",
+    "gc_11_0_0_mes_2.bin",
+    "gc_11_0_0_mes1.bin",
+    "sdma_6_0_0.bin",
+    "sienna_cichlid_dmcub.bin",
+    "sienna_cichlid_sos.bin",
+    "sienna_cichlid_ta.bin",
+    "sienna_cichlid_smc.bin",
+    "sienna_cichlid_pfp.bin",
+    "sienna_cichlid_me.bin",
+    "sienna_cichlid_mec.bin",
+    "sienna_cichlid_rlc.bin",
+    "sienna_cichlid_sdma.bin",
+]

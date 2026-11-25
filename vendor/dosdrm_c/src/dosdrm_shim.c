@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include <linux/firmware.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
 #define DOSDRM_ALLOC_MAGIC 0x4444524Du /* "DDRM" */
 
@@ -14,7 +15,65 @@ struct dosdrm_alloc_hdr {
     size_t total_bytes;
 };
 
-static size_t cstr_len(const char *s, size_t max_len) {
+void *dosdrm_memcpy(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+    return dst;
+}
+
+void *dosdrm_memmove(void *dst, const void *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    const uint8_t *s = (const uint8_t *)src;
+    if (d == s || n == 0) {
+        return dst;
+    }
+    if (d < s) {
+        for (size_t i = 0; i < n; i++) {
+            d[i] = s[i];
+        }
+    } else {
+        for (size_t i = n; i > 0; i--) {
+            d[i - 1] = s[i - 1];
+        }
+    }
+    return dst;
+}
+
+void *dosdrm_memset(void *dst, int c, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    uint8_t v = (uint8_t)c;
+    for (size_t i = 0; i < n; i++) {
+        d[i] = v;
+    }
+    return dst;
+}
+
+int dosdrm_memcmp(const void *a, const void *b, size_t n) {
+    const uint8_t *pa = (const uint8_t *)a;
+    const uint8_t *pb = (const uint8_t *)b;
+    for (size_t i = 0; i < n; i++) {
+        if (pa[i] != pb[i]) {
+            return (int)pa[i] - (int)pb[i];
+        }
+    }
+    return 0;
+}
+
+size_t dosdrm_strlen(const char *s) {
+    size_t n = 0;
+    if (!s) {
+        return 0;
+    }
+    while (s[n] != '\0') {
+        n++;
+    }
+    return n;
+}
+
+size_t dosdrm_strnlen(const char *s, size_t max_len) {
     size_t n = 0;
     if (!s) {
         return 0;
@@ -25,11 +84,27 @@ static size_t cstr_len(const char *s, size_t max_len) {
     return n;
 }
 
-static void mem_zero(void *dst, size_t n) {
-    uint8_t *p = (uint8_t *)dst;
-    for (size_t i = 0; i < n; i++) {
-        p[i] = 0;
+int dosdrm_strcmp(const char *a, const char *b) {
+    if (!a || !b) {
+        return (a == b) ? 0 : (a ? 1 : -1);
     }
+    while (*a && (*a == *b)) {
+        a++;
+        b++;
+    }
+    return (int)(uint8_t)*a - (int)(uint8_t)*b;
+}
+
+int dosdrm_strncmp(const char *a, const char *b, size_t n) {
+    if (!a || !b) {
+        return (a == b) ? 0 : (a ? 1 : -1);
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] != b[i] || a[i] == '\0') {
+            return (int)(uint8_t)a[i] - (int)(uint8_t)b[i];
+        }
+    }
+    return 0;
 }
 
 uint32_t dosdrm_shim_version(void) {
@@ -37,7 +112,7 @@ uint32_t dosdrm_shim_version(void) {
 }
 
 void dosdrm_log_cstr(const char *msg) {
-    size_t len = cstr_len(msg, 256);
+    size_t len = dosdrm_strnlen(msg, 256);
     if (len > 0) {
         dosdrm_host_log(msg, len);
     }
@@ -45,6 +120,10 @@ void dosdrm_log_cstr(const char *msg) {
 
 void dosdrm_udelay(uint32_t us) {
     dosdrm_host_udelay(us);
+}
+
+uint64_t dosdrm_clock_ns(void) {
+    return dosdrm_host_clock_ns();
 }
 
 void *dosdrm_kzalloc(size_t size) {
@@ -59,7 +138,7 @@ void *dosdrm_kzalloc(size_t size) {
     if (!hdr) {
         return NULL;
     }
-    mem_zero(hdr, total);
+    dosdrm_memset(hdr, 0, total);
     hdr->magic = DOSDRM_ALLOC_MAGIC;
     hdr->reserved = 0;
     hdr->total_bytes = total;
@@ -104,12 +183,54 @@ int dosdrm_pci_write_config(uint32_t dev_handle, uint16_t where, uint8_t width, 
     return dosdrm_host_pci_cfg_write(dev_handle, where, width, val);
 }
 
+int dosdrm_pci_get_info(
+    uint32_t dev_handle,
+    uint16_t *out_vendor,
+    uint16_t *out_device,
+    uint8_t *out_rev,
+    uint64_t *out_bar_sizes
+) {
+    return dosdrm_host_pci_info(dev_handle, out_vendor, out_device, out_rev, out_bar_sizes);
+}
+
+int dosdrm_map_bar(
+    uint32_t dev_handle,
+    uint8_t bar,
+    uint64_t off,
+    uint64_t len,
+    uint32_t *out_vmo,
+    uint64_t *out_addr,
+    uint64_t *out_len
+) {
+    return dosdrm_host_map_bar(dev_handle, bar, off, len, out_vmo, out_addr, out_len);
+}
+
+void dosdrm_unmap_bar(uint32_t vmo, uint64_t addr, uint64_t len) {
+    dosdrm_host_unmap_bar(vmo, addr, len);
+}
+
+int dosdrm_dma_alloc(
+    uint32_t dev_handle,
+    uint64_t size,
+    uint64_t *out_cpu_addr,
+    uint64_t *out_dma_addr,
+    uint32_t *out_vmo,
+    uint32_t *out_pin,
+    uint64_t *out_map_len
+) {
+    return dosdrm_host_dma_alloc(dev_handle, size, out_cpu_addr, out_dma_addr, out_vmo, out_pin, out_map_len);
+}
+
+void dosdrm_dma_free(uint64_t cpu_addr, uint64_t map_len, uint32_t vmo, uint32_t pin) {
+    dosdrm_host_dma_free(cpu_addr, map_len, vmo, pin);
+}
+
 int dosdrm_request_firmware(const struct firmware **fw_out, const char *name) {
     if (!fw_out || !name) {
         return -EINVAL;
     }
     *fw_out = NULL;
-    size_t nlen = cstr_len(name, 255);
+    size_t nlen = dosdrm_strnlen(name, 255);
     if (nlen == 0) {
         return -EINVAL;
     }

@@ -192,6 +192,14 @@ pub trait DrmDriver {
         None
     }
 
+    /// Poll connector hotplug state changes; returns `true` when `gpu.dsvc` should refresh connectors.
+    fn poll_hotplug(&mut self) -> bool {
+        false
+    }
+
+    /// Quiesce GPU hardware cleanly prior to ACPI S3 suspend.
+    fn on_suspend(&mut self) {}
+
     fn on_shutdown(&mut self) {}
     fn irqs(&self) -> u64 {
         0
@@ -234,6 +242,13 @@ pub fn serve_loop<D: DrmDriver>(ctl: Handle, port: &Port, drv: &mut D) -> i32 {
             {
                 let a = (seq & !(1u64 << 63)) | (u64::from(late) << 63);
                 proto::send(ch, gpu::DRV_EVENT_VBLANK, a, ts_ns);
+            }
+        }
+        if drv.poll_hotplug() {
+            for &ch in &svc_ch {
+                if ch != 0 {
+                    proto::send(ch, gpu::DRV_EVENT_HOTPLUG, 0, 0);
+                }
             }
         }
 
@@ -285,6 +300,22 @@ pub fn serve_loop<D: DrmDriver>(ctl: Handle, port: &Port, drv: &mut D) -> i32 {
                                     sys::handle_close(hnd);
                                 }
                                 panic!("intentional test crash");
+                            }
+                            libd::svc::SUSPEND => {
+                                if hnd != 0 {
+                                    sys::handle_close(hnd);
+                                }
+                                drv.on_suspend();
+                                let mut rep = [0u8; HEADER];
+                                Header {
+                                    txid: h.txid,
+                                    op: libd::svc::SUSPEND,
+                                    status: 0,
+                                    a: 0,
+                                    b: 0,
+                                }
+                                .put(&mut rep);
+                                let _ = sys::channel_write(ctl, &rep);
                             }
                             _ => {
                                 if hnd != 0 {

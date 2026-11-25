@@ -15,8 +15,12 @@ once `sys:` mounts, and `devmgr` grants each GPU driver a read-only vendor-scope
   scatter-gather IOMMU DMA `SgPin`, `FirmwareDir` VMO loading, and `vendor/dosdrm_c` FFI callbacks).
 - `vendor/dosdrm_c` (scoped C17 + freestanding C++20 compatibility headers & runtime compiled by
   `dbuild` with `-fcf-protection=return` and content-hashed object/archive caches in `build/vendor/`).
-- `vendor/firmware/{virtio,amdgpu,nvidia,xe}` (read-only firmware manifests/blobs packaged into
-  `sys:/firmware/<vendor>/`).
+- `vendor/amdgpu` (upstream-aligned C17 AMD `amdgpu` core + Display Core `dc`/`dml2`/`dmub`/`dsc`
+  static library `libvendor_amdgpu.a` linked into `amdgpu.ddrv`, plus host hardware simulator &
+  fuzz suite in `vendor/amdgpu/test/test_amdgpu_host.c`).
+- `vendor/firmware/{virtio,amdgpu,nvidia,xe}` (read-only firmware manifests and official signed
+  firmware blobs packaged into `sys:/firmware/<vendor>/`, including 43 signed AMD blobs covering
+  RDNA 2, RDNA 3, Ryzen 7000/9000 DCN 3.1.5 iGPUs, and RDNA 4 / RX 9070 DCN 4.0.1).
 - `user/devmgr/src/{gpu_drv,virtio_gpu,amdgpu,xe,nvgpu}.rs`, `user/gpu` (`gpu.dsvc`),
   `user/lib/libd/src/gpu.rs`, `user/init/services/gpu.dman`.
 
@@ -29,7 +33,7 @@ The compositor and window manager built on `gpu.display` is D-AWMI ([awmi.md](aw
 |---|---|
 | GOP framebuffer baseline (`gpu.dsvc`) | Models `platform:display` (`DISPLAY_RGB32`, write-combining BAR 0) natively through `dosdrm::kms::KmsState` + `GemTable`; maps BAR 0 lazily on first atomic primary-plane commit so text-console boots remain undisturbed. |
 | `virtio-gpu.ddrv` | Modern VirtIO 1.2 GPU (PCI `1AF4:1050`, `sys:/bin/virtio-gpu.ddrv`): negotiates `F_VIRGL`, `F_EDID`, `F_RESOURCE_UUID`, `F_RESOURCE_BLOB`, and `F_CONTEXT_INIT`; verifies `sys:/firmware/virtio/` and `libvendor_dosdrm_c.a` at startup; serves full Atomic KMS (`ATOMIC_TEST_ONLY` + `ATOMIC_ALLOW_MODESET`, `CMD_SET_SCANOUT`, multi-rect primary damage, 64x64 cursor plane), IOMMU-pinned `GemTable` (`DRV_GEM_IMPORT` & `DRV_GEM_CREATE`), isolated `GpuVmTable`, timeline `SyncobjTable`, and validated VirGL/Venus command submission. |
-| `amdgpu.ddrv` | AMD Radeon RDNA / GCN user-space DRM driver (`sys:/bin/amdgpu.ddrv`, PCI `1002:*` class `03.*`): loads with read-only `sys:/firmware/amdgpu/`, verifies the `dosdrm` C17/C++20 vendor shim, initializes GEM/GPU-VM/timeline `syncobj` tables, and keeps display scanout safely on UEFI GOP when native KMS pipes are not yet active. |
+| `amdgpu.ddrv` | AMD Radeon RDNA 2 / RDNA 3 / Ryzen 7000 & 9000 DCN 3.1.5 iGPU / RDNA 4 (RX 9070, DCN 4.0.1) user-space DRM driver (`sys:/bin/amdgpu.ddrv`, PCI `1002:*` class `03.*`): loads official signed `sys:/firmware/amdgpu/` blobs (PSP, SMU/PMFW, DMCUB, GC/MES, SDMA), parses IP Discovery v2/v4 and AtomBIOS v2.2 ROM/bytecode, runs Display Core (`dc`, `dml2`, `dmub`, VESA DSC 1.2a, DP 1.4/2.1 UHBR & HDMI 2.1 FRL link training, E-DDC EDID/DisplayID 2.0 up to 540+ Hz), supports arbitrary resolution scaling (HUBP/DSCL), 60/120/240/540+ Hz modesetting with live OTG verification and auto-rollback, FreeSync VRR, 10-bit HDR10, 64x64–256x256 hardware cursors, triple-buffered vsync flips over OSSSYS IH interrupts, multi-monitor HPD hotplug, GMC/MMHUB per-client 4-level GPU VM & GFX/SDMA/MES rings, clean GOP hand-back, and S3 suspend/resume. |
 | `nvgpu.ddrv` | NVIDIA Open-GSP / `nvkms` user-space DRM driver (`sys:/bin/nvgpu.ddrv`, PCI `10DE:*` class `03.*`): loads with read-only `sys:/firmware/nvidia/`, verifies the freestanding C++20 `dosdrm` vendor runtime, initializes GEM/GPU-VM/timeline `syncobj` tables, and keeps display scanout safely on UEFI GOP until GSP-RM + `nvkms` attach native KMS pipes. |
 | `xe.ddrv` | Intel Xe / Iris / Arc user-space DRM driver (`sys:/bin/xe.ddrv`, PCI `8086:*` class `03.*`): loads with read-only `sys:/firmware/xe/`, verifies the `dosdrm` C17/C++20 vendor shim, initializes GEM/GPU-VM/timeline `syncobj` tables, and keeps display scanout safely on UEFI GOP until Xe display + GuC attach native KMS pipes. |
 | `gpu.dsvc` | Exposes capability-separated `gpu.query`, `gpu.display`, and `gpu.render` endpoints, enforces per-client GEM/VM/context ownership isolation, guards interactive mode switches with a 12-second `ModeRevertGuard`, and transparently reconnects adapters across driver restarts. |
@@ -94,7 +98,11 @@ The shell holds `gpu = ["query"]` and `awmi = ["admin"]` and provides:
 - `gpu-host`: `dosdrm` unit tests (EDID 1.4 / CTA-861 / DisplayID 2.0 240–540 Hz / CVT-RB v2,
   Atomic KMS validation & `ModeRevertGuard`, `GemTable` refcounting, `GpuVmSpace` 47-bit VA range
   isolation, timeline `SyncobjTable`, 8/10-bit WC blitters & `BufferAgeTracker`, VirtIO-GPU 2D/3D
-  Blob/UUID/Venus codecs & VirGL validator) plus 16,000 fuzz rounds over untrusted inputs.
+  Blob/UUID/Venus codecs & VirGL validator, 16,000 fuzz rounds) plus the `vendor/amdgpu` C17 host
+  simulator (validating all 43 signed AMD firmware blobs, simulating DCN 4.0.1 / 3.1.5 / 3.2 / 3.0
+  end-to-end across IP Discovery, AtomBIOS, PSP/SMU/DMCUB, DML2, DSC 1.2a, DP 1.4/2.1 UHBR,
+  HDMI 2.1 FRL, 240/540 Hz modeset & OTG stall rollback, VRR, HDR10, HW cursor, OSSSYS IH, HPD
+  hotplug, GMC VM, GFX/SDMA/MES CS, S3 suspend/resume, and 10,000 additional fuzz rounds).
 - `gpu-virtio` / `gpu-virtio-amd`: QEMU tests under Intel VT-d and AMD-Vi verifying late
   `sys:/bin/virtio-gpu.ddrv` loading, `sys:/firmware/virtio/` & C17/C++20 vendor shim self-test,
   Atomic KMS scanout & cursor plane, 12-second mode-revert guard, per-client GEM/GPU-VM/timeline

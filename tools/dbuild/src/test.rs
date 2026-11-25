@@ -2937,7 +2937,7 @@ fn run_host_test(env: &Env, test: HostTest) -> Result<bool, String> {
         HostTest::Manifest => host_cargo_test(env, "user/lib/dman", &["--", "--nocapture"], &["test result", "FAILED", "panicked", "dman fuzz"]),
         HostTest::Audio => host_cargo_test(env, "user/lib/audio", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Net => host_cargo_test(env, "user/lib/net", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
-        HostTest::Gpu => host_cargo_test(env, "user/lib/drm", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
+        HostTest::Gpu => host_gpu_test(env),
         HostTest::Awmi => host_cargo_test(env, "user/lib/awmi", &["--", "--nocapture"], &["test result", "FAILED", "panicked"]),
         HostTest::Ui => Ok(host_cargo_test(env, "user/lib/font", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?
             && host_cargo_test(env, "user/lib/ui", &["--", "--nocapture"], &["test result", "FAILED", "panicked"])?),
@@ -3029,6 +3029,63 @@ fn export_acpi_tables(env: &Env) -> usize {
         }
         n
     }
+}
+
+fn host_gpu_test(env: &Env) -> Result<bool, String> {
+    let mut ok = host_cargo_test(
+        env,
+        "user/lib/drm",
+        &["--", "--nocapture"],
+        &["test result", "FAILED", "panicked"],
+    )?;
+
+    let Some(cc) = env.host_cc() else {
+        println!("  host: no host C compiler: vendor/amdgpu simulator checks skipped");
+        return Ok(ok);
+    };
+    let amd_root = env.root.join("vendor/amdgpu");
+    let test_src = amd_root.join("test/test_amdgpu_host.c");
+    if !test_src.is_file() {
+        return Ok(ok);
+    }
+
+    let dir = env.build.join("host/ctest");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let exe = dir.join(exe_name("test_amdgpu_host"));
+
+    let mut args = vec![
+        "-O2".to_string(),
+        "-std=c17".to_string(),
+        "-Wall".to_string(),
+        "-Wextra".to_string(),
+        "-Werror".to_string(),
+        "-D__DOSDRM_HOST_TEST__=1".to_string(),
+        "-I".to_string(),
+        amd_root.join("include").to_string_lossy().into_owned(),
+        "-I".to_string(),
+        env.root.join("vendor/dosdrm_c/include").to_string_lossy().into_owned(),
+        "-o".to_string(),
+        exe.to_string_lossy().into_owned(),
+        test_src.to_string_lossy().into_owned(),
+    ];
+    for cfile in collect_files(&amd_root.join("src"), "c", true) {
+        args.push(cfile.to_string_lossy().into_owned());
+    }
+    run_cmd(cc, &args, None, &[], true)?;
+
+    let cc_env = host_cc_runtime_env(cc);
+    let fw_dir = env.root.join("vendor/firmware/amdgpu");
+    let (sim_ok, sim_out) = run_capture_all(
+        &exe,
+        &[fw_dir.to_string_lossy().into_owned()],
+        None,
+        &cc_env,
+    )?;
+    for line in sim_out.lines() {
+        println!("  {}", line.trim());
+    }
+    ok &= sim_ok;
+    Ok(ok)
 }
 
 fn host_aml_test(env: &Env) -> Result<bool, String> {
@@ -3397,6 +3454,25 @@ fn host_static_analysis(env: &Env) -> Result<bool, String> {
                 env.root.join("vendor/dosdrm_c/include").to_string_lossy().into_owned(),
             ],
             vfiles,
+        ));
+    }
+    let amdf = collect_files(&env.root.join("vendor/amdgpu/src"), "c", true);
+    if !amdf.is_empty() {
+        sets.push((
+            "vendor C (amdgpu)".into(),
+            vec![
+                "--target=x86_64-unknown-elf".into(),
+                "-std=c17".into(),
+                "-ffreestanding".into(),
+                "-nostdinc".into(),
+                "-isystem".into(),
+                inc.to_string_lossy().into_owned(),
+                "-I".into(),
+                env.root.join("vendor/amdgpu/include").to_string_lossy().into_owned(),
+                "-I".into(),
+                env.root.join("vendor/dosdrm_c/include").to_string_lossy().into_owned(),
+            ],
+            amdf,
         ));
     }
 
