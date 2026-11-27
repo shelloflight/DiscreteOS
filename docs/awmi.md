@@ -60,10 +60,17 @@ A GPU driver restart makes a present fail; the outputs are attached again at the
 Floating by default, with snapping: drag a title bar to move (an edge or corner of an output shows a
 snap preview: halves, quarters, maximize), drag an edge or corner to resize, title bar buttons to
 minimize, maximize/restore and close. Click to focus. Four workspaces. The dock is a floating island at the bottom of the primary output: pinned quick-launch apps on the
-left (with a running dot; clicking focuses/restores an open window or sends `EVT_LAUNCH` when
-closed), followed by the windows of the current workspace (each workspace has its own; click: focus,
-or minimize the focused one), workspaces `1`-`4`, network, audio, `MIC LIVE` (green) and security
-alert (red) indicators, and the UTC clock.
+left (up to 8 entries with a running dot; left-clicking focuses/restores an open window or sends
+`EVT_LAUNCH` when closed, and right-clicking a pinned dock pill unpins it; right-clicking an app row
+in the launcher toggles pinning), followed by the windows of the current workspace (each workspace
+has its own; click: focus, or minimize the focused one), workspaces `1`-`4`, network, audio,
+`MIC LIVE` (green) and security alert (red) indicators, and the UTC clock.
+
+Desktop, display, and taskbar settings (theme, text scale, reduce motion, per-output UI scale,
+confirmed display mode, VRR, HDR10, and customized taskbar pins) are persisted on installed disks in
+`/home/.dos/settings.toml` (`dosid::DesktopSettings`) and restored on subsequent boots. Confirmed
+display modes are only written after explicit user confirmation (`DISPLAY_CONFIRM_MODE`), preventing
+an incompatible mode from persisting across reboots.
 
 | Keys | Action |
 |---|---|
@@ -113,8 +120,8 @@ awmi = ["launcher"]    # register up to 16 .dapp launcher/dock entries and trigg
 
 `awmi.dsvc` itself holds `gpu = ["display"]`, `audio = ["control"]` (microphone and mute state),
 `net = ["status"]` (read-only link state), `identity = ["session"]` (exclusively for lock/login
-authentication), `devmgr.input`, `terminal.display`, `clock.time`, and read-only `sys:/` (fonts and
-themes).
+authentication), `devmgr.input`, `terminal.display`, `clock.time`, and `namespace = ["*"]` (read-only
+`/sys` for fonts/themes and writable `/home/.dos/settings.toml` on installed systems).
 
 ## Client protocol (`libd::awmi`)
 

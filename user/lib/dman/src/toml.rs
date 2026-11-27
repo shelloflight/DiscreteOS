@@ -67,6 +67,7 @@ struct P<'a> {
     s: &'a [u8],
     i: usize,
     line: u32,
+    max_string: usize,
 }
 
 fn bare_key_char(c: u8) -> bool {
@@ -166,8 +167,8 @@ impl P<'_> {
                 c if c < 0x20 || c == 0x7F => return Err(self.e("control character in a string")),
                 c => out.push(c),
             }
-            if out.len() > MAX_STRING {
-                return Err(self.e("string longer than 256 bytes"));
+            if out.len() > self.max_string {
+                return Err(self.e(alloc::format!("string longer than {} bytes", self.max_string)));
             }
         }
         String::from_utf8(out).map_err(|_| self.e("string is not valid UTF-8"))
@@ -251,12 +252,18 @@ pub struct Doc {
     pub tables: Vec<(String, u32)>,
 }
 
-/// Parse a whole document.
+/// Parse a whole document with the default manifest limits (`MAX_SIZE`, `MAX_STRING`).
 pub fn parse(s: &[u8]) -> Result<Doc, Error> {
-    if s.len() > MAX_SIZE {
+    parse_with_limits(s, MAX_SIZE, MAX_STRING)
+}
+
+/// Parse a whole document with explicit upper bounds on total byte size and string length
+/// (used by stores that persist hex-encoded hardware-sealed blobs such as TPM 2.0 credentials).
+pub fn parse_with_limits(s: &[u8], max_size: usize, max_string: usize) -> Result<Doc, Error> {
+    if s.len() > max_size {
         return Err(err(0, "manifest larger than 16 KiB"));
     }
-    let mut p = P { s, i: 0, line: 1 };
+    let mut p = P { s, i: 0, line: 1, max_string };
     // A UTF-8 byte-order mark is tolerated (editors add one).
     if s.starts_with(&[0xEF, 0xBB, 0xBF]) {
         p.i = 3;

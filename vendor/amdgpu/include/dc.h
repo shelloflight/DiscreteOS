@@ -75,6 +75,15 @@ struct dc_reg_table {
     u32 hubp_earliest_inuse_hi;
     u32 hubp_cursor_settings;
     u32 hubp_ret_control;
+    u32 hubp_blank_offset_0;
+    u32 hubp_blank_offset_1;
+    u32 hubp_dst_dimensions;
+    u32 hubp_ref_freq_to_pix_freq;
+    u32 hubp_per_line_delivery_pre;
+    u32 hubp_per_line_delivery;
+    u32 hubp_ttu_global_cntl;
+    u32 hubp_surf0_ttu_cntl0;
+    u32 hubp_surf0_ttu_cntl1;
 
     /* Cursor (base 2) */
     u32 cursor_control;
@@ -115,14 +124,21 @@ struct dc_reg_table {
     u32 otg_double_buffer_control;
     u32 otg_vert_int0_pos;
     u32 otg_vert_int0_ctrl;
+    u32 otg_vstartup_param;
     u32 otg_master_update_lock;
+    u32 vtg_control;
+    u32 optc_input_global_ctrl;
+    u32 optc_input_stride;
 
     /* DCCG (base 1) */
     bool has_otg_pixel_rate_div;
+    u32 dccg_dentist_dispclk_cntl;
     u32 dccg_otg_pixel_rate_div;
     u32 dccg_otg_pixel_rate_cntl;
     u32 dccg_dp_dto_phase;
     u32 dccg_dp_dto_modulo;
+    u32 dccg_dppclk_dto_param;
+    u32 dccg_dppclk_ctrl;
 
     /* DP AUX (base 2) */
     u32 aux_control;
@@ -133,10 +149,13 @@ struct dc_reg_table {
     u32 aux_sw_data;
 
     /* DIG / DP (base 2) */
+    bool has_dig_fifo_ctrl;
     u32 dig_fe_cntl;
     u32 dig_be_en_cntl;
+    u32 dig_fifo_ctrl0;
     u32 dp_pixel_format;
     u32 dp_msa_colorimetry;
+    u32 dp_vid_stream_cntl;
     u32 dp_steer_fifo;
     u32 dp_msa_misc;
     u32 dp_vid_timing;
@@ -229,6 +248,7 @@ struct dc_dsc_pps {
 struct dc_dmub_state {
     bool initialized;
     bool fw_alive;
+    bool ring_owned;
     u32 fw_version;
     u32 inbox1_wptr;
     u32 cmds_submitted;
@@ -280,10 +300,26 @@ struct dc_pipe_reg_snapshot {
     u32 otg_v_total_min;
     u32 otg_v_total_max;
     u32 otg_v_total_control;
+    u32 otg_double_buffer_control;
+    u32 otg_vstartup_param;
+    u32 vtg_control;
+    u32 dccg_dentist_dispclk_cntl;
     u32 dccg_pixel_rate_div;
     u32 dccg_pixel_rate_cntl;
     u32 dccg_dto_phase;
     u32 dccg_dto_modulo;
+    u32 dccg_dppclk_dto_param;
+    u32 dccg_dppclk_ctrl;
+    u32 hubp_cntl;
+    u32 hubp_blank_offset_0;
+    u32 hubp_blank_offset_1;
+    u32 hubp_dst_dimensions;
+    u32 hubp_ref_freq_to_pix_freq;
+    u32 hubp_per_line_delivery_pre;
+    u32 hubp_per_line_delivery;
+    u32 hubp_ttu_global_cntl;
+    u32 hubp_surf0_ttu_cntl0;
+    u32 hubp_surf0_ttu_cntl1;
     u32 hubp_viewport_start;
     u32 hubp_viewport_dim;
     u32 hubp_surface_pitch;
@@ -298,8 +334,15 @@ struct dc_pipe_reg_snapshot {
     u32 dp_msa_param2;
     u32 dp_msa_param3;
     u32 dp_msa_param4;
+    u32 dp_pixel_format;
+    u32 dp_msa_colorimetry;
     u32 dp_msa_misc;
     u32 dp_vid_timing;
+    u32 dp_vid_m;
+    u32 dp_vid_n;
+    u32 dp_vid_stream_cntl;
+    u32 dp_steer_fifo;
+    u32 dig_fifo_ctrl0;
     u32 cnvc_pixel_format;
     u32 cm_hdr_mult;
     u32 dsc_top_control;
@@ -309,7 +352,19 @@ struct dc_pipe_reg_snapshot {
     u32 dst_width;
     u32 dst_height;
     u32 refresh_mhz;
+    u32 boot_pclk_khz;
+    u32 boot_h_total;
+    u32 boot_h_blank_end;
+    u32 boot_v_blank;
+    u32 boot_v_blank_end;
     u32 dto_src_clk_khz;
+    bool msa_h_low;
+    bool msa_misc0_high;
+    bool dto_src_calibrated;
+    bool dscl_static_valid;
+    u8 dpp_size_reg_count;
+    u32 dpp_size_regs[4];
+    u32 dpp_size_saved[4];
 };
 
 /* Active Display Core pipe state (scanout buffers, flip engine, HW cursor, modeset state). */

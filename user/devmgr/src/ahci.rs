@@ -35,13 +35,21 @@ const CMD_ST: u32 = 1 << 0;
 const CMD_FRE: u32 = 1 << 4;
 const CMD_FR: u32 = 1 << 14;
 const CMD_CR: u32 = 1 << 15;
+const CMD_P_ATAPI: u32 = 1 << 24;
+const HDR_ATAPI: u32 = 1 << 5;
 const IS_TFES: u32 = 1 << 30;
 const SIG_ATA: u32 = 0x0000_0101;
+const SIG_ATAPI: u32 = 0xEB14_0101;
 
 const ATA_READ_DMA_EXT: u8 = 0x25;
 const ATA_WRITE_DMA_EXT: u8 = 0x35;
 const ATA_FLUSH_EXT: u8 = 0xEA;
 const ATA_IDENTIFY: u8 = 0xEC;
+const ATA_IDENTIFY_PACKET: u8 = 0xA1;
+const ATA_PACKET: u8 = 0xA0;
+
+const ATAPI_SECTOR: usize = 2048;
+const MAX_ATAPI_BLOCKS: u64 = (MAX_SECTORS * SECTOR as u64) / ATAPI_SECTOR as u64; // 16 blocks = 32 KiB
 
 const DATA_PAGES: usize = (MAX_SECTORS as usize * SECTOR).div_ceil(4096);
 const MS: u64 = 1_000_000;
@@ -50,6 +58,7 @@ struct Port {
     index: u32,
     mem: Dma, // command list at 0, received FIS at 1024, command table at 2048
     sectors: u64,
+    atapi: bool,
     model: [u8; 40],
     model_len: usize,
 }
@@ -171,6 +180,77 @@ impl Ahci {
         Ok(())
     }
 
+    /// Issue an ATAPI PACKET (`0xA0`) DMA read command with 12-byte SCSI CDB.
+    fn packet_command(&mut self, unit: usize, cdb: &[u8; 12], bytes: usize) -> Result<(), i32> {
+        let port = self.ports[unit].as_ref().ok_or(sys::ERR_INVALID_ARGS as i32)?;
+        let p = port.index;
+        let m = &port.mem.map;
+        let prds = bytes.div_ceil(4096);
+        m.w32(0, 5 | HDR_ATAPI | (prds as u32) << 16);
+        m.w32(4, 0);
+        let table = port.mem.dev_addr(2048);
+        m.w32(8, table as u32);
+        m.w32(12, (table >> 32) as u32);
+        for i in 0..32 {
+            m.w32(2048 + 4 * i, 0);
+        }
+        m.w8(2048, 0x27);
+        m.w8(2049, 0x80);
+        m.w8(2050, ATA_PACKET);
+        m.w8(2051, if bytes > 0 { 0x01 } else { 0x00 }); // DMA transfer bit
+        let bcl = bytes.min(0xFFFE) as u16;
+        m.w8(2053, (bcl & 0xFF) as u8);
+        m.w8(2054, (bcl >> 8) as u8);
+        // ATAPI CDB at Command Table + 0x40.
+        for (i, &b) in cdb.iter().enumerate() {
+            m.w8(2048 + 0x40 + i as u64, b);
+        }
+        for i in 0..prds {
+            let o = 2048 + 0x80 + 16 * i as u64;
+            let a = self.data.dev_addr(i as u64 * 4096);
+            let len = (bytes - i * 4096).min(4096);
+            m.w32(o, a as u32);
+            m.w32(o + 4, (a >> 32) as u32);
+            m.w32(o + 8, 0);
+            m.w32(o + 12, (len as u32 - 1) | if i + 1 == prds { 1 << 31 } else { 0 });
+        }
+        self.w(port_reg(p, P_IS), !0);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        self.w(port_reg(p, P_CI), 1);
+        let deadline = sys::clock_ns() + 5000 * MS;
+        loop {
+            let is = self.r(port_reg(p, P_IS));
+            if is & IS_TFES != 0 {
+                self.w(port_reg(p, P_IS), is);
+                self.recover(p);
+                return Err(proto::ERR_IO);
+            }
+            if self.r(port_reg(p, P_CI)) & 1 == 0 {
+                break;
+            }
+            let now = sys::clock_ns();
+            if now >= deadline {
+                println!("ahci: port {}: ATAPI command {:#x} timed out", p, cdb[0]);
+                self.recover(p);
+                return Err(sys::ERR_TIMED_OUT as i32);
+            }
+            let _ = sys::object_wait(self.irq, sys::SIGNALED, (deadline - now).min(10 * MS));
+            if let Ok(n) = sys::interrupt_ack(self.irq) {
+                self.irqs = n;
+            }
+            let is = self.r(port_reg(p, P_IS));
+            self.w(port_reg(p, P_IS), is & !IS_TFES);
+            self.w(IS, 1 << p);
+        }
+        self.w(port_reg(p, P_IS), !0);
+        self.w(IS, 1 << p);
+        if self.r(port_reg(p, P_TFD)) & 0x01 != 0 {
+            return Err(proto::ERR_IO);
+        }
+        self.done += 1;
+        Ok(())
+    }
+
     /// After an error: restart the port's command engine.
     fn recover(&self, p: u32) {
         self.stop(p);
@@ -192,16 +272,52 @@ impl Disk for Ahci {
     fn model(&self, unit: usize) -> &[u8] {
         self.ports[unit].as_ref().map_or(&[], |p| &p.model[..p.model_len])
     }
+    fn read_only(&self, unit: usize) -> bool {
+        self.ports[unit].as_ref().is_some_and(|p| p.atapi)
+    }
     fn read(&mut self, unit: usize, lba: u64, count: u64, out: &mut [u8]) -> Result<(), i32> {
-        self.command(unit, ATA_READ_DMA_EXT, lba, count, false, out.len())?;
-        out.copy_from_slice(&self.data.map.bytes()[..out.len()]);
+        let is_atapi = self.ports[unit].as_ref().is_some_and(|p| p.atapi);
+        if !is_atapi {
+            self.command(unit, ATA_READ_DMA_EXT, lba, count, false, out.len())?;
+            out.copy_from_slice(&self.data.map.bytes()[..out.len()]);
+            return Ok(());
+        }
+        // Translate 512-byte logical sectors to 2048-byte ATAPI CD blocks via SCSI READ (10).
+        let mut cur_lba = lba;
+        let mut rem = count;
+        let mut dst_off = 0usize;
+        while rem > 0 {
+            let cd_lba = cur_lba / 4;
+            let lead = (cur_lba % 4) as usize;
+            let need_cd = (lead as u64 + rem).div_ceil(4).min(MAX_ATAPI_BLOCKS);
+            let cd_lba32 = u32::try_from(cd_lba).map_err(|_| sys::ERR_INVALID_ARGS as i32)?;
+            let cnt16 = need_cd as u16;
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x28; // SCSI READ (10)
+            cdb[2..6].copy_from_slice(&cd_lba32.to_be_bytes());
+            cdb[7..9].copy_from_slice(&cnt16.to_be_bytes());
+            self.packet_command(unit, &cdb, need_cd as usize * ATAPI_SECTOR)?;
+            let take_sectors = rem.min(need_cd * 4 - lead as u64) as usize;
+            let src_start = lead * SECTOR;
+            let nbytes = take_sectors * SECTOR;
+            out[dst_off..dst_off + nbytes].copy_from_slice(&self.data.map.bytes()[src_start..src_start + nbytes]);
+            cur_lba += take_sectors as u64;
+            rem -= take_sectors as u64;
+            dst_off += nbytes;
+        }
         Ok(())
     }
     fn write(&mut self, unit: usize, lba: u64, count: u64, data: &[u8]) -> Result<(), i32> {
+        if self.ports[unit].as_ref().is_some_and(|p| p.atapi) {
+            return Err(sys::ERR_ACCESS_DENIED as i32);
+        }
         self.data.map.bytes_mut()[..data.len()].copy_from_slice(data);
         self.command(unit, ATA_WRITE_DMA_EXT, lba, count, true, data.len())
     }
     fn flush(&mut self, unit: usize) -> Result<(), i32> {
+        if self.ports[unit].as_ref().is_some_and(|p| p.atapi) {
+            return Err(sys::ERR_ACCESS_DENIED as i32);
+        }
         self.command(unit, ATA_FLUSH_EXT, 0, 0, false, 0)
     }
     fn stats(&self) -> (u64, u64) {
@@ -259,31 +375,32 @@ fn open(dev: Handle) -> Result<Ahci, &'static str> {
             println!("ahci: port {}: device stays busy", p);
             continue;
         }
-        if a.r(port_reg(p, P_SIG)) != SIG_ATA {
-            continue; // ATAPI, port multiplier, ...: not a disk we drive
-        }
-        a.w(port_reg(p, P_CMD), c | CMD_FRE | CMD_ST);
+        let sig = a.r(port_reg(p, P_SIG));
+        let atapi = match sig {
+            SIG_ATA => false,
+            SIG_ATAPI => true,
+            _ => continue, // port multiplier or unknown: not a disk we drive
+        };
+        let extra = if atapi { CMD_P_ATAPI } else { 0 };
+        a.w(port_reg(p, P_CMD), c | CMD_FRE | CMD_ST | extra);
         a.w(port_reg(p, P_IE), 1 | IS_TFES); // D2H register FIS, task file error
         let u = a.n;
-        a.ports[u] = Some(Port { index: p, mem, sectors: 0, model: [0; 40], model_len: 0 });
+        a.ports[u] = Some(Port { index: p, mem, sectors: 0, atapi, model: [0; 40], model_len: 0 });
         a.n += 1;
     }
     a.w(IS, !0);
     a.w(GHC, GHC_AE | GHC_IE);
-    // Identify each disk.
+    // Identify each disk (ATA or ATAPI optical drive).
     let mut keep = 0;
     for u in 0..a.n {
-        if a.command(u, ATA_IDENTIFY, 0, 0, false, SECTOR).is_err() {
+        let is_atapi = a.ports[u].as_ref().is_some_and(|p| p.atapi);
+        let id_cmd = if is_atapi { ATA_IDENTIFY_PACKET } else { ATA_IDENTIFY };
+        if a.command(u, id_cmd, 0, 0, false, SECTOR).is_err() {
             a.ports[u] = None;
             continue;
         }
         let id = a.data.map.bytes();
         let w = |i: usize| u16::from_le_bytes([id[2 * i], id[2 * i + 1]]);
-        let sectors = if w(83) & 1 << 10 != 0 {
-            u64::from(w(100)) | u64::from(w(101)) << 16 | u64::from(w(102)) << 32 | u64::from(w(103)) << 48
-        } else {
-            u64::from(w(60)) | u64::from(w(61)) << 16
-        };
         let mut model = [0u8; 40];
         for i in 0..20 {
             let x = w(27 + i);
@@ -291,6 +408,33 @@ fn open(dev: Handle) -> Result<Ahci, &'static str> {
             model[2 * i + 1] = x as u8;
         }
         let len = model.iter().rposition(|&c| c != b' ' && c != 0).map_or(0, |i| i + 1);
+        let sectors = if is_atapi {
+            // Query ATAPI optical medium capacity via SCSI READ CAPACITY (10); retry past initial
+            // power-on UNIT ATTENTION. Empty trays fail cleanly and are skipped.
+            let mut cap_sectors = 0u64;
+            let mut cdb = [0u8; 12];
+            cdb[0] = 0x25; // SCSI READ CAPACITY (10)
+            for _ in 0..3 {
+                if a.packet_command(u, &cdb, 8).is_ok() {
+                    let b = a.data.map.bytes();
+                    let last_lba = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                    let blk_len = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
+                    if blk_len == ATAPI_SECTOR as u32 && last_lba > 0 {
+                        cap_sectors = (u64::from(last_lba) + 1) * 4;
+                    }
+                    break;
+                }
+            }
+            if cap_sectors == 0 {
+                a.ports[u] = None;
+                continue;
+            }
+            cap_sectors
+        } else if w(83) & 1 << 10 != 0 {
+            u64::from(w(100)) | u64::from(w(101)) << 16 | u64::from(w(102)) << 32 | u64::from(w(103)) << 48
+        } else {
+            u64::from(w(60)) | u64::from(w(61)) << 16
+        };
         if let Some(mut port) = a.ports[u].take() {
             port.sectors = sectors.min(1 << 48);
             port.model = model;
@@ -326,10 +470,11 @@ pub fn main(s: *const Startup) -> i32 {
     for p in a.ports.iter().take(a.n).flatten() {
         {
             println!(
-                "ahci: port {}: {} sectors ({} MiB), \"{}\"",
+                "ahci: port {}: {} sectors ({} MiB){}, \"{}\"",
                 p.index,
                 p.sectors,
                 p.sectors / 2048,
+                if p.atapi { " [ATAPI CD-ROM, read-only]" } else { "" },
                 core::str::from_utf8(&p.model[..p.model_len]).unwrap_or("?")
             );
         }

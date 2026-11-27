@@ -15,6 +15,7 @@ use crate::tools::Env;
 #[derive(Clone, Debug)]
 pub struct QemuOpts<'a> {
     pub image: &'a Path,
+    pub cdrom: bool,
     pub cpus: u32,
     pub cpu_model: &'a str,
     pub devices: bool,
@@ -144,9 +145,20 @@ pub fn build_qemu_args(env: &Env, opts: &QemuOpts<'_>) -> Result<Vec<String>, St
     if !has_net {
         a.extend(["-nic".into(), "none".into()]);
     }
+    if opts.cdrom {
+        a.extend([
+            "-drive".into(),
+            format!("if=none,id=cd0,format=raw,readonly=on,file={}", opts.image.display()),
+            "-device".into(),
+            "ide-cd,drive=cd0,bus=ide.0".into(),
+        ]);
+    } else {
+        a.extend([
+            "-drive".into(),
+            format!("format=raw,file={},index=0,media=disk", opts.image.display()),
+        ]);
+    }
     a.extend([
-        "-drive".into(),
-        format!("format=raw,file={},index=0,media=disk", opts.image.display()),
         "-cpu".into(),
         opts.cpu_model.into(),
         "-smp".into(),
@@ -530,6 +542,7 @@ pub fn run_interactive(
     }
     let opts = QemuOpts {
         image,
+        cdrom: false,
         cpus: smp,
         cpu_model: "max",
         devices: !debug,
@@ -573,6 +586,7 @@ pub fn run_soak(env: &Env, image: &Path, smp: u32, minutes: u64) -> Result<(), S
 
     let opts = QemuOpts {
         image,
+        cdrom: false,
         cpus: smp,
         cpu_model: "max",
         devices: false,

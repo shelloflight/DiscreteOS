@@ -33,6 +33,14 @@ enum PostCheck {
     ServicesOrder,
     KaslrReboots,
     AudioWav(u32),
+    InstallDualBoot,
+    InstallE2e,
+}
+
+#[derive(Clone, Copy)]
+enum InstallSetup {
+    Dual,
+    E2e,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +90,10 @@ struct TestCase {
     /// Boot the release image as shipped (to the desktop). Other release-image boots use a copy
     /// whose boot volume says `desktop = off`, so they test the text console as before.
     desktop: bool,
+    /// Boot `build/discrete.iso` attached as a read-only SATA AHCI CD-ROM (no hard disk).
+    iso: bool,
+    /// Prepare synthetic target disk(s) for disk installer tests.
+    install_setup: Option<InstallSetup>,
 }
 
 impl TestCase {
@@ -114,11 +126,23 @@ impl TestCase {
             post: None,
             host: None,
             desktop: false,
+            iso: false,
+            install_setup: None,
         }
     }
 
     fn desktop(mut self) -> Self {
         self.desktop = true;
+        self
+    }
+
+    fn iso(mut self) -> Self {
+        self.iso = true;
+        self
+    }
+
+    fn install_setup(mut self, s: InstallSetup) -> Self {
+        self.install_setup = Some(s);
         self
     }
 
@@ -1779,7 +1803,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             .timeout(150)
             .must_exit()
             .expect(&[
-                "appmgr: ready, 5 verified .dapp bundle(s)",
+                "appmgr: ready, 7 verified .dapp bundle(s)",
                 "svc-app-ungranted: PASSED (no appmgr or awmi.launcher endpoints)",
                 "svc-app-full: 5 core .dapp bundles verified",
                 "svc-app-full: .dapp signature enforcement OK",
@@ -1899,6 +1923,107 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "KTEST objects: PASSED",
             ])
             .forbid(&["KERNEL PANIC", "FAIL"]),
+
+        // Hybrid ISO 9660 + El Torito CD-ROM boots (BIOS No-Emulation & UEFI Platform 0xEF,
+        // attached strictly as a read-only SATA AHCI ATAPI CD-ROM with no hard disk).
+        TestCase::boot("iso-bios")
+            .iso()
+            .timeout(90)
+            .expect(&[
+                "D-OS: stage1 OK",
+                "D-OS: stage2 OK",
+                "D-OS: stage3: kernel signature valid (Ed25519",
+                "boot drive 0xe0",
+                "D-KRNL 1.",
+                "ATAPI CD-ROM, read-only",
+                "init: sys volume:",
+                "shell: ready:",
+                "appmgr: ready, 7 verified .dapp bundle(s)",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]),
+
+        TestCase::boot("iso-uefi")
+            .iso()
+            .uefi()
+            .timeout(90)
+            .expect(&[
+                "D-OS: UEFI loader",
+                "D-OS: kernel signature valid (Ed25519",
+                "D-KRNL 1.",
+                "ATAPI CD-ROM, read-only",
+                "init: sys volume:",
+                "shell: ready:",
+                "appmgr: ready, 7 verified .dapp bundle(s)",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]),
+
+        // Dual-boot safe disk installer: installs into unallocated GPT free space on an NVMe
+        // drive with an existing Windows ESP + NTFS partition, then proves on the host that
+        // zero bytes of the Windows partition or existing EFI loaders were modified.
+        TestCase::boot("install-dual")
+            .install_setup(InstallSetup::Dual)
+            .timeout(240)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(
+                    &[
+                        "install disks",
+                        "install parts nvme0",
+                        "install plan nvme0 dual",
+                        "install run nvme0 dual",
+                        "@~25000",
+                        "power off",
+                    ],
+                    1000,
+                ),
+                "shell: ready:",
+            )
+            .expect(&[
+                "shell: ready:",
+                "shell: install ok: Installed D-OS (dual-boot)",
+                "existing \\EFI\\BOOT preserved",
+                "fsck 0 errors",
+                "preserved partitions: 2",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"])
+            .post(PostCheck::InstallDualBoot),
+
+        // Whole-disk install, confirmed wipe & repartition, partition deletion, real UEFI reboot
+        // directly from the installed disk (no live media), OOBE auto-launch + completion +
+        // reboot bypass, and persistent isolated multi-user `/home/<user>` directories.
+        TestCase::boot("install-e2e")
+            .install_setup(InstallSetup::E2e)
+            .timeout(300)
+            .must_exit()
+            .keys_vec(
+                convert_to_qemu_keys(
+                    &[
+                        "install run nvme1 whole",
+                        "install run nvme1 wipe",
+                        "install delete-part nvme1 1 --confirm",
+                        "install run nvme1 wipe --confirm",
+                        "@~25000",
+                        "install run nvme0 whole",
+                        "@~25000",
+                        "power off",
+                    ],
+                    1000,
+                ),
+                "shell: ready:",
+            )
+            .expect(&[
+                "shell: ready:",
+                "disk already has partitions",
+                "requires explicit wipe confirmation",
+                "Deleted partition #1 on nvme1",
+                "Installed D-OS (wipe-disk) on nvme1",
+                "Installed D-OS (whole-disk) on nvme0",
+                "fsck 0 errors",
+                "Power: switching off",
+            ])
+            .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"])
+            .post(PostCheck::InstallE2e),
     ]
 }
 
@@ -1974,9 +2099,13 @@ pub fn run_test_suite(
         )?;
         let h1 = sha256_file(&r1.image)?;
         let h2 = sha256_file(&r2.image)?;
-        let same = h1 == h2;
+        let iso_same = match (&r1.iso, &r2.iso) {
+            (Some(i1), Some(i2)) => sha256_file(i1)? == sha256_file(i2)?,
+            _ => false,
+        };
+        let same = h1 == h2 && iso_same;
         println!(
-            "--- [repro] {} vs {}: {} ---",
+            "--- [repro] {} vs {} (img+iso): {} ---",
             &h1[..16],
             &h2[..16],
             if same { "identical" } else { "DIFFERENT" }
@@ -2119,17 +2248,55 @@ pub fn run_test_suite(
             (env.build.clone(), img)
         };
 
-        if tc.tamper {
+        if tc.iso {
+            let iso_path = env.build.join("discrete.iso");
+            if !iso_path.is_file() {
+                return Err(format!("missing ISO image {}", iso_path.display()));
+            }
+            image = iso_path;
+        } else if tc.tamper {
             image = make_tampered_image(env, &image)?;
         } else if tc.define.is_none() && !tc.desktop {
             image = make_text_console_image(env, &image)?;
         }
 
         let disk_dir = env.build.join("disks").join(tc.name);
-        if (tc.devices || tc.usb_disk.is_some()) && disk_dir.exists() {
+        if (tc.devices || tc.usb_disk.is_some() || tc.install_setup.is_some()) && disk_dir.exists() {
             let _ = fs::remove_dir_all(&disk_dir);
         }
         let mut extra = tc.qemu_extra.clone();
+        if let Some(setup) = tc.install_setup {
+            fs::create_dir_all(&disk_dir).map_err(|e| e.to_string())?;
+            match setup {
+                InstallSetup::Dual => {
+                    let tgt = disk_dir.join("target-dual.img");
+                    let win_sha = img::make_dualboot_target(&tgt)?;
+                    fs::write(disk_dir.join("target-dual.sha256"), &win_sha).map_err(|e| e.to_string())?;
+                    extra.extend([
+                        "-drive".into(),
+                        format!("if=none,id=tgt0,format=raw,file={}", tgt.display()),
+                        "-device".into(),
+                        "nvme,drive=tgt0,serial=DOSTGT01".into(),
+                    ]);
+                }
+                InstallSetup::E2e => {
+                    let blank = disk_dir.join("target-blank.img");
+                    let wipe = disk_dir.join("target-wipe.img");
+                    img::make_blank_target(&blank, 128)?;
+                    img::make_wipe_target(&wipe)?;
+                    extra.extend([
+                        "-drive".into(),
+                        format!("if=none,id=tgt0,format=raw,file={}", blank.display()),
+                        "-device".into(),
+                        "nvme,drive=tgt0,serial=DOSBLK01".into(),
+                        "-drive".into(),
+                        format!("if=none,id=tgt1,format=raw,file={}", wipe.display()),
+                        "-device".into(),
+                        "nvme,drive=tgt1,serial=DOSWIP02".into(),
+                    ]);
+                }
+            }
+        }
         if let Some(usb_suffix) = tc.usb_disk {
             fs::create_dir_all(&disk_dir).map_err(|e| e.to_string())?;
             let usb = disk_dir.join("usb.img");
@@ -2189,6 +2356,7 @@ pub fn run_test_suite(
             let log_p = out_dir.join(format!("serial-{}.log", tc.name));
             let qopts = QemuOpts {
                 image: &image,
+                cdrom: tc.iso,
                 cpus: tc.smp,
                 cpu_model: tc.cpu,
                 devices: tc.devices,
@@ -2317,7 +2485,197 @@ fn run_post_check(
         PostCheck::ServicesOrder => Ok(post_services_order(log)),
         PostCheck::KaslrReboots => post_kaslr_reboots(env, image, log),
         PostCheck::AudioWav(hz) => post_audio_wav(disk_dir, hz),
+        PostCheck::InstallDualBoot => post_install_dualboot(env, disk_dir, image),
+        PostCheck::InstallE2e => post_install_e2e(env, disk_dir),
     }
+}
+
+fn post_install_dualboot(env: &Env, disk_dir: &Path, image: &Path) -> Result<bool, String> {
+    let tgt = disk_dir.join("target-dual.img");
+    let orig_sha = fs::read_to_string(disk_dir.join("target-dual.sha256")).map_err(|e| e.to_string())?;
+    if !img::verify_dualboot_target(&tgt, orig_sha.trim())? {
+        return Ok(false);
+    }
+
+    // Boot live media under UEFI with the dual-boot target attached and verify that the UEFI
+    // loader scans attached filesystems and registers `Boot00D0` from the target's ESP.
+    let extra = vec![
+        "-drive".to_string(),
+        format!("file={},format=raw,if=none,id=dualtgt", tgt.display()),
+        "-device".to_string(),
+        "nvme,drive=dualtgt,serial=DUALTGT0".to_string(),
+    ];
+    let expect: Vec<String> = [
+        "D-OS: UEFI loader",
+        "D-OS: registered UEFI NVRAM boot entry Boot00D0",
+        "D-KRNL 1.",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let forbid: Vec<String> = ["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let log_path = disk_dir.join("serial-dual-nvram.log");
+    let qopts = QemuOpts {
+        image,
+        cdrom: false,
+        cpus: 2,
+        cpu_model: "max",
+        devices: false,
+        disk_dir,
+        uefi: true,
+        iommu: "intel",
+        extra: &extra,
+        must_exit: false,
+    };
+    let r = qemu_capture(env, &qopts, &log_path, &expect, &forbid, 60, &[], "", &[], "")?;
+    let miss: Vec<&String> = expect.iter().filter(|e| !r.log.contains(e.as_str())).collect();
+    let bad: Vec<&String> = forbid.iter().filter(|f| r.log.contains(f.as_str())).collect();
+    if !miss.is_empty() || !bad.is_empty() {
+        eprintln!("  dualboot NVRAM check FAILED: missing={miss:?} forbidden={bad:?}");
+        return Ok(false);
+    }
+    println!("  host: dualboot: live UEFI loader scanned target ESP and registered Boot00D0 in NVRAM");
+    Ok(true)
+}
+
+fn post_install_e2e(env: &Env, disk_dir: &Path) -> Result<bool, String> {
+    let wipe = disk_dir.join("target-wipe.img");
+    let blank = disk_dir.join("target-blank.img");
+    if !img::verify_installed_dfs(&wipe)? {
+        println!("  e2e: target-wipe.img DFS verification failed");
+        return Ok(false);
+    }
+    if !img::verify_installed_dfs(&blank)? {
+        println!("  e2e: target-blank.img DFS verification failed");
+        return Ok(false);
+    }
+
+    let gpu_extra = vec![
+        "-device".to_string(),
+        "virtio-gpu-pci,disable-legacy=on,iommu_platform=on,edid=on,xres=1024,yres=768".to_string(),
+    ];
+
+    // Boot #1 directly from the newly installed disk (UEFI, NO live media attached):
+    // verifies UEFI boot entry registration, automatic /home read-write unlock, OOBE auto-launch,
+    // OOBE completion persistence, and multi-user identity + /home directory creation.
+    let mut keys1 = vec!["~1500".to_string(), "ctrl-alt-esc".to_string(), "~2000".to_string()];
+    keys1.extend(convert_to_qemu_keys(
+        &[
+            "setup status",
+            "setup complete en-US us UTC skip",
+            "gui theme contrast",
+            "go /sys",
+            "go",
+            "identity create alice Alice operator",
+            "identity create bob Bob standard",
+            "identity switch alice",
+            "create /home/alice_secret.txt",
+            "identity switch bob",
+            "create /home/bob_note.txt",
+            "power off",
+        ],
+        1000,
+    ));
+    let expect1: Vec<String> = [
+        "D-OS: UEFI loader",
+        "D-OS: registered UEFI NVRAM boot entry Boot00D0",
+        "init: installed system detected: /home unlocked read-write",
+        "appmgr: first-boot setup pending, launching oobe",
+        "oobe: window",
+        "setup: first-boot setup completed (lang=en-US, kbd=us, tz=UTC, net=skip)",
+        "identity: created operator identity 'alice'",
+        "identity: created standard identity 'bob'",
+        "identity: switched active identity to 'alice'",
+        "identity: switched active identity to 'bob'",
+        "Power: switching off",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let forbid1: Vec<String> = ["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let log1 = disk_dir.join("serial-installed-boot1.log");
+    let qopts1 = QemuOpts {
+        image: &blank,
+        cdrom: false,
+        cpus: 4,
+        cpu_model: "max",
+        devices: false,
+        disk_dir,
+        uefi: true,
+        iommu: "intel",
+        extra: &gpu_extra,
+        must_exit: true,
+    };
+    let r1 = qemu_capture(env, &qopts1, &log1, &expect1, &forbid1, 180, &keys1, "oobe: window", &[], "")?;
+    println!("--- [install-e2e boot1] serial ({:.1}s) ---", r1.seconds);
+    println!("{}", r1.log.trim_end());
+    let miss1: Vec<&String> = expect1.iter().filter(|e| !r1.log.contains(e.as_str())).collect();
+    let bad1: Vec<&String> = forbid1.iter().filter(|f| r1.log.contains(f.as_str())).collect();
+    if !r1.exited || !miss1.is_empty() || !bad1.is_empty() {
+        eprintln!("  e2e boot1 FAILED: exited={} missing={miss1:?} forbidden={bad1:?}", r1.exited);
+        return Ok(false);
+    }
+
+    // Boot #2 directly from the SAME installed disk:
+    // verifies OOBE is bypassed once completed, identities and /home files persist across reboots,
+    // per-identity /home/<user> isolation blocks cross-user copy, and /sys stays read-only.
+    let mut keys2 = vec!["~1500".to_string(), "ctrl-alt-esc".to_string(), "~2000".to_string()];
+    keys2.extend(convert_to_qemu_keys(
+        &[
+            "copy /home/alice_secret.txt /home/leaked.txt",
+            "copy /home/bob_note.txt /home/bob_copy.txt",
+            "identity switch alice",
+            "copy /home/bob_note.txt /home/leaked.txt",
+            "copy /home/alice_secret.txt /home/alice_copy.txt",
+            "create /sys/ro_check.txt",
+            "power off",
+        ],
+        1000,
+    ));
+    let expect2: Vec<String> = [
+        "init: installed system detected: /home unlocked read-write",
+        "awmi: loaded saved settings (theme=High Contrast",
+        "appmgr: OOBE completed, bypassing first-boot setup",
+        "identity: ready, active 'bob', 3 identity(s)",
+        "identity: switched active identity to 'alice'",
+        "Power: switching off",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let forbid2: Vec<String> = [
+        "KERNEL PANIC",
+        "FAIL",
+        "blocked DMA",
+        "user fault",
+        "PANIC",
+        "launching oobe",
+        "oobe: window",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let log2 = disk_dir.join("serial-installed-boot2.log");
+    let r2 = qemu_capture(env, &qopts1, &log2, &expect2, &forbid2, 180, &keys2, "appmgr: OOBE completed, bypassing first-boot setup", &[], "")?;
+    println!("--- [install-e2e boot2] serial ({:.1}s) ---", r2.seconds);
+    println!("{}", r2.log.trim_end());
+    let miss2: Vec<&String> = expect2.iter().filter(|e| !r2.log.contains(e.as_str())).collect();
+    let bad2: Vec<&String> = forbid2.iter().filter(|f| r2.log.contains(f.as_str())).collect();
+    if !r2.exited || !miss2.is_empty() || !bad2.is_empty() {
+        eprintln!("  e2e boot2 FAILED: exited={} missing={miss2:?} forbidden={bad2:?}", r2.exited);
+        return Ok(false);
+    }
+    if !img::verify_home_multiuser(&blank)? {
+        return Ok(false);
+    }
+    println!("  host: install-e2e: UEFI installed boot + Boot00D0 + OOBE launch/bypass + multi-user /home isolation PASSED");
+    Ok(true)
 }
 
 /// Verify a QEMU `-audiodev wav` capture file: valid RIFF/WAVE PCM header, audible RMS & peak
@@ -2649,6 +3007,7 @@ fn post_time_reboot(
     std::thread::sleep(Duration::from_millis(1100));
     let qopts = QemuOpts {
         image,
+        cdrom: false,
         cpus: 4,
         cpu_model: "max",
         devices: true,
@@ -2813,6 +3172,7 @@ fn post_kaslr_reboots(env: &Env, image: &Path, first_log: &str) -> Result<bool, 
         let log_p = dir.join(format!("serial-kaslr-{}.log", if uefi { "uefi" } else { "bios2" }));
         let qopts = QemuOpts {
             image,
+            cdrom: false,
             cpus: 4,
             cpu_model: "max",
             devices: false,

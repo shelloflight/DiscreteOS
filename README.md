@@ -15,7 +15,7 @@ measured**. Where standards cost nothing, D-OS uses them: ELF, UEFI, ACPI, GPT, 
 |---|---|---|
 | **D-KRNL** | the kernel | working, hardened, extensively tested |
 | **D-CMPL** | compatibility layer for Windows and Linux programs | console programs run |
-| **D-AWMI** | compositor, window manager, UI toolkit & core apps | desktop, lock screen, `.dapp` apps (Terminal, Files, Text Editor, Settings, System Monitor), native AMD display |
+| **D-AWMI** | compositor, window manager, UI toolkit & core apps | desktop, lock screen, `.dapp` apps (Terminal, Files, Text Editor, Settings, System Monitor, Installer, First-Boot Setup), native AMD display |
 | **D-PACK** | signed packages and updates | planned |
 
 ## Where it stands
@@ -24,16 +24,21 @@ measured**. Where standards cost nothing, D-OS uses them: ELF, UEFI, ACPI, GPT, 
 test, fuzzers and sanitizers clean). It boots in QEMU and on real PCs (BIOS and UEFI) to a desktop with a terminal window, or to
 the text console when there is no display.
 
-- Own BIOS and UEFI loaders with verified boot (Ed25519) and KASLR; one GPT image for both
+- Own BIOS and UEFI loaders with verified boot (Ed25519) and KASLR; builds both a GPT disk image
+  (`build/discrete.img`) and a hybrid ISO 9660 + El Torito CD-ROM image (`build/discrete.iso`) for
+  VMs (VirtualBox, VMware, QEMU) and USB sticks
 - SMP kernel (x2APIC), W^X everywhere, SMEP/SMAP/UMIP, KPTI, retpolines and other speculation
   mitigations chosen per CPU
 - Capability objects, quotas, ring-3 processes, IPC (channels, shared-memory rings, fast
   call/reply, zero-copy memory), a versioned ABI
 - User-space drivers: PCI/PCIe, MSI-X, Intel VT-d and AMD-Vi IOMMUs (DMA and interrupt
-  remapping), virtio, AHCI, NVMe, PS/2,
+  remapping), virtio, AHCI (SATA disks & ATAPI CD-ROMs), NVMe, PS/2,
   USB (xHCI): keyboards, mice, mass storage, USB 2 and USB 3 hubs
-- Storage: GPT, FAT32, and DFS (copy-on-write B+tree with BLAKE3 checksums and snapshots); files
-  are handles; per-app namespaces; disks are read-only by default
+- Storage & disk installer: GPT, FAT32, and DFS (copy-on-write B+tree with BLAKE3 checksums and
+  snapshots); files are handles; per-app namespaces; live media is read-only by default; dual-boot
+  safe disk installer (`installer.dapp` & `install` CLI) supporting unallocated GPT free space,
+  whole-disk installs on blank drives, and explicitly confirmed wipe/repartition + partition deletion,
+  plus skippable first-boot setup (`oobe.dapp`) and persistent multi-user `/home` isolation
 - A service manager: each service gets exactly the capabilities its signed manifest lists, and is
   restarted with backoff when it fails; core services for a structured system log, wall-clock time
   and keyboard input
@@ -53,7 +58,7 @@ the text console when there is no display.
 - Windows console programs built with MSVC's static C runtime (threads, TLS, SEH, C++
   exceptions, files) and static Linux programs (threads, `mmap`, files, signals, `futex`) run
   unchanged, started from the shell with `run` and given only the current directory
-- Over 115 automated test cases: protections firing, fuzzers, sanitizers, static analysis,
+- Over 120 automated test cases: protections firing, fuzzers, sanitizers, static analysis,
   multi-core stress, reproducible builds
 
 ## Quick start

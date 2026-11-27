@@ -17,6 +17,7 @@ bench = false
 libd = { path = "../lib/libd", features = ["alloc"] }
 dman = { path = "../lib/dman" }
 dosapp = { path = "../lib/app" }
+dosid = { path = "../lib/identity" }
 dosaudio = { path = "../lib/audio" }
 dosnet = { path = "../lib/net" }
 

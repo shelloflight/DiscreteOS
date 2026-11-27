@@ -445,6 +445,8 @@ pub enum WmAction {
     UnlockAttempt { identity_id: u32 },
     /// User answered the compositor modal permission prompt.
     PermPromptResult { request_id: u32, choice: u8 },
+    /// User pinned or unpinned a launcher app on the taskbar (e.g. right-click on dock or launcher).
+    SetAppPinned { owner: u32, app: u8, pinned: bool },
 }
 
 /// Client surface pixel provider callback for compositing.
@@ -786,11 +788,21 @@ impl WmState {
             if self.launcher.open {
                 self.damage_launcher_output();
             }
-            if pinned {
-                self.damage_dock();
-            }
+            self.damage_dock();
         }
         ok
+    }
+
+    /// Pin or unpin an existing registered app on the floating dock.
+    pub fn set_app_pinned(&mut self, owner: u32, app: u8, pinned: bool) -> bool {
+        let changed = self.launcher.set_pinned(owner, app, pinned);
+        if changed {
+            self.damage_dock();
+            if self.launcher.open {
+                self.damage_launcher_output();
+            }
+        }
+        changed
     }
 
     pub fn damage_all(&mut self) {
@@ -1336,6 +1348,7 @@ impl WmState {
         self.buttons = buttons;
         let left_pressed = (buttons & 1) != 0 && (prev_buttons & 1) == 0;
         let left_released = (buttons & 1) == 0 && (prev_buttons & 1) != 0;
+        let right_pressed = (buttons & 2) != 0 && (prev_buttons & 2) == 0;
 
         // 1. Lock screen: traps all pointer input; zero delivery to dock or clients.
         if self.lock.active {
@@ -1392,6 +1405,13 @@ impl WmState {
                         LaunchTarget::App { owner, app } => WmAction::Launch { owner, app },
                         LaunchTarget::Setting(s) => WmAction::Setting(s),
                     };
+                } else if right_pressed
+                    && let LaunchTarget::App { owner, app } = target
+                    && let Some(pinned) = self.launcher.toggle_pinned(owner, app)
+                {
+                    self.damage_dock();
+                    self.damage_launcher_output();
+                    return WmAction::SetAppPinned { owner, app, pinned };
                 }
             } else if left_pressed && !inside {
                 self.launcher.hide();
@@ -1496,6 +1516,12 @@ impl WmState {
             let dhit = dl.hit_test(local);
             if dhit != DockHit::None {
                 self.hovered = None;
+                if right_pressed
+                    && let DockHit::Pinned(owner, app) = dhit
+                    && self.set_app_pinned(owner, app, false)
+                {
+                    return WmAction::SetAppPinned { owner, app, pinned: false };
+                }
                 if left_pressed {
                     match dhit {
                         DockHit::Pinned(owner, app) => {

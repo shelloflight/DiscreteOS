@@ -18,6 +18,7 @@ pub const OP_SET_PERM: u32 = 1203;
 pub const OP_INSTALL_CHECK: u32 = 1204;
 pub const OP_PERMS: u32 = 1205;
 pub const OP_RUNNING: u32 = 1206;
+pub const OP_SET_PIN: u32 = 1207;
 
 pub const DECISION_ASK: u8 = 0;
 pub const DECISION_GRANTED: u8 = 1;
@@ -171,4 +172,10 @@ pub fn perms(ep: Handle, app: &str) -> Result<(u32, u32), i64> {
 pub fn running_count(ep: Handle, app: &str) -> Result<u64, i64> {
     let mut rep = [0u8; HEADER];
     call(ep, OP_RUNNING, 0, 0, app.as_bytes(), &mut rep).map(|(h, _)| h.a)
+}
+
+/// Pin or unpin an application on the floating taskbar (`appmgr.admin`).
+pub fn set_pin(ep: Handle, app: &str, pinned: bool) -> Result<(), i64> {
+    let mut rep = [0u8; HEADER];
+    call(ep, OP_SET_PIN, u64::from(pinned), 0, app.as_bytes(), &mut rep).map(|_| ())
 }

@@ -34,6 +34,7 @@ pub mod handle;
 #[cfg(feature = "alloc")]
 pub mod heap;
 pub mod identity;
+pub mod install;
 pub mod log;
 pub mod net;
 pub mod proto;

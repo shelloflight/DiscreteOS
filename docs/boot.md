@@ -1,31 +1,36 @@
-# Boot: BIOS and UEFI
+# Boot: BIOS, UEFI, and hybrid ISO
 
-One image, `build\discrete.img`, boots on BIOS and UEFI machines. Both loaders verify the kernel,
-relocate it to a random base (KASLR) and hand it the same machine state and the same BootInfo, so
-the kernel has a single entry contract.
+Every release build produces two 80 MiB images: `build\discrete.img` (GPT disk image for USB sticks
+and virtual hard disks) and `build\discrete.iso` (hybrid ISO 9660 + El Torito + GPT optical image
+for VirtualBox, VMware, QEMU CD-ROM drives, and USB sticks). Both BIOS and UEFI loaders verify the
+kernel, relocate it to a random base (KASLR) and hand it the same machine state and the same
+BootInfo, so the kernel has a single entry contract.
 
-**Code:** `boot/stage1.asm`, `boot/stage2.asm`, `boot/stage3/` (BIOS); `boot/uefi/` (UEFI);
-`boot/common/` (signature verifier and KASLR, shared by both); `kernel/include/bootinfo.h` (the
-contract); `kernel/bootinfo.c` (validation); `kernel/mm/kaslr.c`; `kernel/drivers/fbcon.c`;
-`tools/dbuild` (`dbuild img boot` builds the image).
+**Code:** `boot/stage1.asm`, `boot/isoboot.asm` (El Torito BIOS Stage 1), `boot/stage2.asm`,
+`boot/stage3/` (BIOS); `boot/uefi/` (UEFI); `boot/common/` (signature verifier and KASLR, shared by
+both); `kernel/include/bootinfo.h` (the contract); `kernel/bootinfo.c` (validation);
+`kernel/mm/kaslr.c`; `kernel/drivers/fbcon.c`; `tools/dbuild/src/{img,iso}.rs` (`dbuild img boot`
+and `dbuild img iso`).
 
-## Disk image (64 MiB, GPT)
+## Disk and ISO images (80 MiB, GPT + hybrid ISO 9660)
 
 | Where | What |
 |---|---|
 | LBA 0 | protective MBR; its boot code area is stage 1 |
 | LBA 1-33 | GPT (backup at the end of the disk) |
+| LBA 64-127 *(ISO only)* | ISO 9660 Primary/Boot/Terminator Volume Descriptors, El Torito Boot Catalog (BIOS No-Emulation + UEFI Platform `0xEF`), and 2 KiB `isoboot.bin` |
 | Partition 1 (LBA 2048) | BIOS boot partition: stage 2, stage 3, the kernel's `.dsig`, then `kernel.bin` |
-| Partition 2 `esp` | FAT32 EFI System Partition: `\EFI\BOOT\BOOTX64.EFI`, `\DOS\KERNEL.BIN` |
-| Partition 3 `sys` | Immutable DFS system volume: signed `/bin/*.dx` + `.dsig`, `/services/*.dman` + `.dsig`, `/tools/*.dman` + `.dsig` |
+| Partition 2 `esp` | FAT32 EFI System Partition: `\EFI\BOOT\BOOTX64.EFI`, `\DOS\KERNEL.BIN`, `\DOS\KERNEL.DSIG`, `\DOS\BOOT.CFG` (also referenced directly by the El Torito UEFI catalog entry) |
+| Partition 3 `sys` | Immutable DFS system volume: signed `/bin/*.dx` + `.dsig`, `/services/*.dman` + `.dsig`, `/tools/*.dman` + `.dsig`, `/apps/*.dapp`, `/fonts/`, `/themes/`, `/certs/`, `/firmware/` |
 
 `kernel.bin` embeds only the minimal bootstrap chain (`init.dx`, `clock.dx`, `storaged.dx`,
 `devmgr.dx`, `*.ddrv`, and the bootstrap manifests) needed to mount the `sys` volume. Once `sys` is
 mounted read-only, `init` loads and Ed25519-verifies all remaining services, tools, and programs
 from it (`vmo_verify`).
 
-The image is deterministic (fixed GUIDs and timestamps), so the reproducible-build check covers it.
-The LBA constants live in `tools/dbuild/src/img.rs` and are passed to stage 1 and stage 2 as NASM defines.
+Both images are deterministic (fixed GUIDs and timestamps), so the reproducible-build check covers
+both `discrete.img` and `discrete.iso`. The LBA constants live in `tools/dbuild/src/img.rs` and are
+passed to stage 1, `isoboot.asm`, and stage 2 as NASM defines.
 
 ## Kernel image header
 
@@ -36,21 +41,27 @@ check every field (`kaslr_check_header`) after the signature and before using an
 
 ## BIOS path
 
-Stage 1 (MBR) loads stage 2. Stage 2 reads the E820 map, loads stage 3, the `.dsig` and the kernel
-(to 1 MiB), builds page tables and enters long mode. Stage 3 (C) verifies the kernel signature,
-applies KASLR, and returns the entry point; it halts on any failure. Screen: VGA text mode.
+Stage 1 (`stage1.asm` on hard disks/USB, or `isoboot.asm` via El Torito No-Emulation on CD-ROM)
+loads stage 2. Stage 2 queries INT 13h `AH=48h` to detect 512-byte disk vs. 2048-byte CD-ROM
+sectors, reads the E820 map, loads stage 3, the `.dsig` and the kernel (to 1 MiB), builds page
+tables and enters long mode. Stage 3 (C) verifies the kernel signature, applies KASLR, and returns
+the entry point; it halts on any failure. Screen: VGA text mode.
 
 ## UEFI path (`BOOTX64.EFI`)
 
 A small PE32+ application (C + a NASM hand-off stub, built with clang and lld-link `/Brepro`):
 
-1. read `\DOS\KERNEL.BIN`, verify its signature, check the header;
-2. allocate the kernel's physical range, copy it, zero `.bss`, relocate to a random base;
-3. take the GOP framebuffer and the ACPI RSDP;
-4. put BootInfo, page tables and the hand-off stub in low memory (below 512 KiB);
-5. identity-map all RAM plus the first GiB at the kernel's random base;
-6. `ExitBootServices`, convert the UEFI memory map to E820 types;
-7. the stub loads the D-OS GDT, switches CR3 and jumps to the kernel (RDI = BootInfo).
+1. on installed disks (when `\EFI\DOS\BOOTENTRY.BIN` is present alongside `\EFI\DOS\BOOTX64.EFI`),
+   or when live media scans other attached UEFI filesystems and finds `\EFI\DOS\BOOTENTRY.BIN` on
+   an installed disk's ESP, register a UEFI NVRAM `Boot00D0` entry and prepend `0x00D0` to
+   `BootOrder` via `SetVariable` without overwriting other OS boot entries;
+2. read `\DOS\KERNEL.BIN`, verify its signature, check the header;
+3. allocate the kernel's physical range, copy it, zero `.bss`, relocate to a random base;
+4. take the GOP framebuffer and the ACPI RSDP;
+5. put BootInfo, page tables and the hand-off stub in low memory (below 512 KiB);
+6. identity-map all RAM plus the first GiB at the kernel's random base;
+7. `ExitBootServices`, convert the UEFI memory map to E820 types;
+8. the stub loads the D-OS GDT, switches CR3 and jumps to the kernel (RDI = BootInfo).
 
 Errors before `ExitBootServices` go to the firmware console (and the loader returns to the
 firmware); after it, to COM1. The loader also stamps the TSC per step; the kernel prints the
@@ -93,13 +104,14 @@ buffer with the 8x16 VGA font, glyphs doubled at 2560 px and wider.
 
 ## Tests
 
-`boot`, `uefi`, `uefi-uniproc`, `uefi-selftest` (BootInfo validation), `bios-badsig` and
-`uefi-badsig` (a tampered kernel never runs), `kaslr` (three boots, every region base must differ),
-`kaslr-host` (loader relocation code on the host), `roinit`.
+`boot`, `uefi`, `uefi-uniproc`, `uefi-selftest` (BootInfo validation), `iso-bios` and `iso-uefi`
+(booting `discrete.iso` attached as a read-only SATA AHCI CD-ROM with no hard disk), `bios-badsig`
+and `uefi-badsig` (a tampered kernel never runs), `kaslr` (three boots, every region base must
+differ), `kaslr-host` (loader relocation code on the host), `roinit`.
 
 ## Limitations
 
 - The kernel is stored twice (BIOS partition and ESP) so stage 2 needs no FAT32 reader.
 - The UEFI loader is not signed for UEFI Secure Boot; the D-OS chain of trust starts at the loader.
 - KASLR randomizes the kernel's virtual address only; its physical address stays at 1 MiB.
-- UEFI runtime services are not used.
+- UEFI runtime services are used only before `ExitBootServices` (`GetTime`, `GetVariable`, `SetVariable`).

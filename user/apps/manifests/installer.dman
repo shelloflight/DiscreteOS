@@ -1,0 +1,19 @@
+kind = "app"
+name = "installer"
+title = "Install D-OS"
+version = "1.0.0"
+binary = "installer.dx"
+description = "Dual-boot safe disk installer, whole-disk setup, and partition manager"
+pinned = true
+autostart = false
+
+[permissions]
+required = [
+    "window",
+    "storage:admin",
+]
+
+[quota]
+memory = "48M"
+handles = 256
+threads = 4

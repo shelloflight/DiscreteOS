@@ -22,7 +22,7 @@ pub struct Builtin {
 
 pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "help", aliases: &["?"], usage: "help [command]", description: "the commands, or how to use one" },
-    Builtin { name: "go", aliases: &["cd"], usage: "go [place]", description: "change the current place (no place: the list of places)" },
+    Builtin { name: "go", aliases: &["cd"], usage: "go [place]", description: "change the current place (no place: /home, or /)" },
     Builtin { name: "places", aliases: &[], usage: "places", description: "what this session may reach, and with which rights" },
     Builtin { name: "tasks", aliases: &["ps"], usage: "tasks", description: "the services and this session's jobs" },
     Builtin { name: "objects", aliases: &["objs"], usage: "objects [job | service]", description: "the handles held (by the shell if none named)" },
@@ -40,6 +40,8 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "gui", aliases: &["awmi"], usage: "gui [demo | status | lock | theme dark|contrast | text 100-200 | motion on|off]", description: "start the desktop (D-AWMI), show its status, lock the screen, or change theme, text size and motion" },
     Builtin { name: "identity", aliases: &["id", "whoami"], usage: "identity [list | enroll <pass> | create <name> <display> [standard|operator] | switch <name> [pass] | policy [idle <sec>|sleep on|off|boot on|off]]", description: "user identities, TPM 2.0 credential sealing, and session lock policy" },
     Builtin { name: "apps", aliases: &["app"], usage: "apps [list | launch <name> | stop <name> | perms <name> | grant <name> <perm> | revoke <name> <perm> | verify <path>]", description: "signed .dapp bundles, launching, and live revocable permissions" },
+    Builtin { name: "install", aliases: &[], usage: "install [disks | parts <disk> | plan <disk> [dual|whole|wipe [--confirm]] | delete-part <disk> <index> --confirm | run <disk> [dual|whole|wipe [--confirm]]]", description: "dual-boot safe disk installer, whole-disk install, and partition management" },
+    Builtin { name: "setup", aliases: &["oobe"], usage: "setup [status | skip | complete [lang] [keyboard] [timezone] [skip|dhcp]]", description: "first-boot setup status, skip, or complete configuration on an installed disk" },
     Builtin { name: "power", aliases: &[], usage: "power off | restart | sleep", description: "switch off, restart, or sleep after every service stopped cleanly" },
     Builtin { name: "clear", aliases: &["cls"], usage: "clear", description: "clear the screen" },
 ];
@@ -62,7 +64,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "end" | "restart" | "wait" | "power" => 1,
         "ping" | "tls" | "gui" => 2,
         "audio" | "apps" => 3,
-        "gpu" | "identity" => 5,
+        "gpu" | "identity" | "install" | "setup" => 5,
         "net" => 6,
         _ => 0,
     };
@@ -72,7 +74,14 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
     let arg = args.first().map(String::as_str);
     Some(match b.name {
         "help" => help(sh, arg),
-        "go" => go(sh, arg.unwrap_or("/")),
+        "go" => {
+            let home_avail = sh.places.iter().any(|p| p.path == "/home");
+            let target = match arg {
+                None | Some("~") => if home_avail { "/home" } else { "/" },
+                Some(p) => p,
+            };
+            go(sh, target)
+        }
         "places" => places(sh),
         "tasks" => tasks(sh),
         "objects" => objects(sh, arg),
@@ -100,6 +109,8 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "gui" => gui_cmd(sh, args),
         "identity" => identity_cmd(sh, args),
         "apps" => apps_cmd(sh, args),
+        "install" => install_cmd(sh, args),
+        "setup" => setup_cmd(sh, args),
         "power" => power(sh, arg),
         _ => {
             sh.clear();
@@ -1439,7 +1450,7 @@ fn gpu_cmd(sh: &Shell, args: &[String]) -> Res {
     Ok(rs)
 }
 
-fn identity_cmd(sh: &Shell, args: &[String]) -> Res {
+fn identity_cmd(sh: &mut Shell, args: &[String]) -> Res {
     use libd::identity::{self, IdentityInfo};
     let q = if sh.identity_query != 0 { sh.identity_query } else { sh.identity_admin };
     let admin = || {
@@ -1524,6 +1535,7 @@ fn identity_cmd(sh: &Shell, args: &[String]) -> Res {
             let pass = args.get(2).map_or(&[][..], |s| s.as_bytes());
             identity::switch_user(admin()?, name, pass)
                 .map_err(|e| format!("identity: switch failed ({})", sys::status(e)))?;
+            sh.refresh_home_scope();
             sh.write(&show::ok_line(&format!("active identity switched to '{}'", name)));
             Ok(Vec::new())
         }
@@ -1651,5 +1663,242 @@ fn apps_cmd(sh: &Shell, args: &[String]) -> Res {
             Ok(Vec::new())
         }
         Some(other) => Err(format!("apps: unknown subcommand '{}'", other)),
+    }
+}
+
+fn parse_install_mode(args: &[String]) -> Result<(u8, bool), String> {
+    use libd::install::{MODE_DUAL_BOOT, MODE_WHOLE_DISK, MODE_WIPE_DISK};
+    let mut mode = MODE_DUAL_BOOT;
+    let mut confirm = false;
+    for a in args {
+        match a.as_str() {
+            "dual" | "dual-boot" => mode = MODE_DUAL_BOOT,
+            "whole" | "blank" => mode = MODE_WHOLE_DISK,
+            "wipe" | "repartition" => mode = MODE_WIPE_DISK,
+            "--confirm" => confirm = true,
+            other => {
+                return Err(format!(
+                    "install: unknown option '{}' (expected dual, whole, wipe, or --confirm)",
+                    other
+                ));
+            }
+        }
+    }
+    Ok((mode, confirm))
+}
+
+fn install_cmd(sh: &Shell, args: &[String]) -> Res {
+    use libd::install::{self, DiskSummary, MAX_DISKS};
+    if sh.storaged_admin == 0 {
+        return Err(String::from("install: no storaged.admin grant in this session"));
+    }
+    match args.first().map(String::as_str) {
+        None | Some("disks" | "list") => {
+            let mut disks = [DiskSummary::default(); MAX_DISKS];
+            let n = install::list_disks(sh.storaged_admin, &mut disks)
+                .map_err(|e| format!("install: list disks failed ({})", sys::status(e)))?;
+            let mut rs = Vec::new();
+            for d in &disks[..n] {
+                let table = if d.is_blank() {
+                    "blank"
+                } else if d.has_gpt() {
+                    "gpt"
+                } else if d.has_mbr() {
+                    "mbr"
+                } else {
+                    "unknown"
+                };
+                let mut flags = Vec::new();
+                if d.is_live_boot() {
+                    flags.push("live");
+                }
+                if d.is_optical() {
+                    flags.push("optical");
+                }
+                if d.has_esp() {
+                    flags.push("esp");
+                }
+                rs.push(
+                    Record::new()
+                        .with("disk", Value::Text(String::from(d.name_str())))
+                        .with("model", Value::Text(String::from(d.model_str())))
+                        .with("size", Value::Size(d.sectors * 512))
+                        .with("table", text(table))
+                        .with("parts", Value::Int(i64::from(d.part_count)))
+                        .with("free_mib", Value::Int(i64::from(d.largest_free_mib)))
+                        .with("flags", Value::Text(flags.join(","))),
+                );
+            }
+            Ok(rs)
+        }
+        Some("parts") => {
+            let Some(target) = args.get(1) else {
+                return Err(String::from("install: usage: install parts <disk>"));
+            };
+            let mut disks = [DiskSummary::default(); MAX_DISKS];
+            let n = install::list_disks(sh.storaged_admin, &mut disks)
+                .map_err(|e| format!("install: list disks failed ({})", sys::status(e)))?;
+            let Some(d) = disks[..n].iter().find(|d| d.name_str() == target) else {
+                return Err(format!("install: disk '{}' not found", target));
+            };
+            let mut rs = Vec::new();
+            for p in d.parts_slice() {
+                rs.push(
+                    Record::new()
+                        .with("index", Value::Int(i64::from(p.index)))
+                        .with("name", Value::Text(String::from(p.name_str())))
+                        .with("fs", Value::Text(String::from(p.fs_str())))
+                        .with("size_mib", Value::Int(i64::from(p.size_mib)))
+                        .with("first", Value::Int(p.first as i64))
+                        .with("last", Value::Int(p.last as i64)),
+                );
+            }
+            Ok(rs)
+        }
+        Some("plan") => {
+            let Some(target) = args.get(1) else {
+                return Err(String::from("install: usage: install plan <disk> [dual|whole|wipe [--confirm]]"));
+            };
+            let (mode, confirm) = parse_install_mode(&args[2..])?;
+            let mut out = alloc::vec![0u8; 4096];
+            match install::plan(sh.storaged_admin, target, mode, confirm, &mut out) {
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&out[..n]).into_owned();
+                    sh.write(&format!("{}\n", s));
+                    Ok(Vec::new())
+                }
+                Err((e, n)) => {
+                    if n > 0 {
+                        Err(format!("install: {}", String::from_utf8_lossy(&out[..n])))
+                    } else {
+                        Err(format!("install: plan failed ({})", sys::status(e)))
+                    }
+                }
+            }
+        }
+        Some("delete-part") => {
+            let (Some(target), Some(idx_s)) = (args.get(1), args.get(2)) else {
+                return Err(String::from("install: usage: install delete-part <disk> <index> --confirm"));
+            };
+            let idx = idx_s
+                .parse::<u32>()
+                .map_err(|_| format!("install: invalid partition index '{}'", idx_s))?;
+            let confirm = args.get(3).is_some_and(|a| a == "--confirm");
+            let mut out = alloc::vec![0u8; 4096];
+            match install::delete_part(sh.storaged_admin, target, idx, confirm, &mut out) {
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&out[..n]).into_owned();
+                    libd::println!("shell: install delete-part: {}", s);
+                    sh.write(&show::ok_line(&s));
+                    Ok(Vec::new())
+                }
+                Err((e, n)) => {
+                    if n > 0 {
+                        let s = String::from_utf8_lossy(&out[..n]).into_owned();
+                        libd::println!("shell: install delete-part refused: {}", s);
+                        Err(format!("install: {}", s))
+                    } else {
+                        Err(format!("install: delete-part failed ({})", sys::status(e)))
+                    }
+                }
+            }
+        }
+        Some("run") => {
+            let Some(target) = args.get(1) else {
+                return Err(String::from("install: usage: install run <disk> [dual|whole|wipe [--confirm]]"));
+            };
+            let (mode, confirm) = parse_install_mode(&args[2..])?;
+            let mut out = alloc::vec![0u8; 4096];
+            match install::execute(sh.storaged_admin, target, mode, confirm, &mut out) {
+                Ok(n) => {
+                    let s = String::from_utf8_lossy(&out[..n]).into_owned();
+                    libd::println!("shell: install ok: {}", s);
+                    sh.write(&show::ok_line(&s));
+                    Ok(Vec::new())
+                }
+                Err((e, n)) => {
+                    if n > 0 {
+                        let s = String::from_utf8_lossy(&out[..n]).into_owned();
+                        libd::println!("shell: install refused: {}", s);
+                        Err(format!("install: {}", s))
+                    } else {
+                        Err(format!("install: failed ({})", sys::status(e)))
+                    }
+                }
+            }
+        }
+        Some(other) => Err(format!("install: unknown subcommand '{}'", other)),
+    }
+}
+
+fn setup_cmd(sh: &Shell, args: &[String]) -> Res {
+    use dosid::{KEYBOARDS, LANGUAGES, OobeConfig, TIMEZONES};
+    match args.first().map(String::as_str) {
+        None | Some("status") => {
+            if !sh.has_home_volume() {
+                sh.write(&show::ok_line("live media (no dedicated /home volume; first-boot setup runs on installed disks)"));
+                return Ok(Vec::new());
+            }
+            let cfg = sh
+                .home_dot_dos_read(b"oobe.toml")
+                .and_then(|b| OobeConfig::from_toml(&b).ok())
+                .unwrap_or_default();
+            Ok(alloc::vec![
+                Record::new()
+                    .with("completed", text(if cfg.completed { "yes" } else { "no" }))
+                    .with("skipped", text(if cfg.skipped { "yes" } else { "no" }))
+                    .with("language", Value::Text(cfg.language))
+                    .with("keyboard", Value::Text(cfg.keyboard))
+                    .with("timezone", Value::Text(cfg.timezone))
+                    .with("network", Value::Text(cfg.net_mode)),
+            ])
+        }
+        Some("skip") => {
+            let mut cfg = sh
+                .home_dot_dos_read(b"oobe.toml")
+                .and_then(|b| OobeConfig::from_toml(&b).ok())
+                .unwrap_or_default();
+            cfg.completed = true;
+            cfg.skipped = true;
+            sh.home_dot_dos_write(b"oobe.toml", cfg.to_toml().as_bytes())?;
+            libd::println!("setup: first-boot setup skipped and persisted");
+            sh.write(&show::ok_line("first-boot setup skipped and persisted to /home/.dos/oobe.toml"));
+            Ok(Vec::new())
+        }
+        Some("complete") => {
+            let lang = args.get(1).map_or("en-US", String::as_str);
+            let kbd = args.get(2).map_or("us", String::as_str);
+            let tz = args.get(3).map_or("UTC", String::as_str);
+            let net_mode = args.get(4).map_or("skip", String::as_str);
+            if !LANGUAGES.iter().any(|(c, _)| *c == lang) {
+                return Err(format!("setup: unsupported language '{}'", lang));
+            }
+            if !KEYBOARDS.iter().any(|(c, _)| *c == kbd) {
+                return Err(format!("setup: unsupported keyboard '{}'", kbd));
+            }
+            if !TIMEZONES.iter().any(|(z, _)| *z == tz) {
+                return Err(format!("setup: unsupported timezone '{}'", tz));
+            }
+            if !matches!(net_mode, "skip" | "dhcp" | "static") {
+                return Err(format!("setup: unsupported network mode '{}' (skip|dhcp|static)", net_mode));
+            }
+            let cfg = OobeConfig {
+                completed: true,
+                skipped: false,
+                language: String::from(lang),
+                keyboard: String::from(kbd),
+                timezone: String::from(tz),
+                net_mode: String::from(net_mode),
+                ..OobeConfig::default()
+            };
+            sh.home_dot_dos_write(b"oobe.toml", cfg.to_toml().as_bytes())?;
+            libd::println!("setup: first-boot setup completed (lang={}, kbd={}, tz={}, net={})", lang, kbd, tz, net_mode);
+            sh.write(&show::ok_line(&format!(
+                "first-boot setup completed (lang={}, kbd={}, tz={}, net={})",
+                lang, kbd, tz, net_mode
+            )));
+            Ok(Vec::new())
+        }
+        Some(other) => Err(format!("setup: unknown subcommand '{}' (expected status, skip, or complete)", other)),
     }
 }

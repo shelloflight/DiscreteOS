@@ -106,6 +106,14 @@ pub struct Shell {
     pub identity_query: Handle,
     pub appmgr_admin: Handle,
     pub appmgr_query: Handle,
+    pub storaged_admin: Handle,
+    /// Raw `/home` volume root (private; used only to re-scope `/home` per active identity and
+    /// read/write `.dos/oobe.toml` for Operator sessions).
+    home_vol: Handle,
+    home_rights: u64,
+    scoped_home_handle: Handle,
+    data_vol: Handle,
+    data_rights: u64,
     pub jobs: Vec<Job>,
     next_job: u32,
     /// The job whose output the terminal is waiting for.
@@ -833,6 +841,100 @@ impl Shell {
     pub fn self_process() -> Handle {
         libd::startup_handle(sys::TAG_PROC_SELF)
     }
+
+    /// Re-scope the shell's `/home` place to the active identity's private directory (`home:/<name>`)
+    /// when a dedicated `/home` volume is mounted, and restrict `/data` to Operator identities.
+    pub fn refresh_home_scope(&mut self) {
+        if self.home_vol == 0 {
+            return;
+        }
+        let ep = if self.identity_query != 0 { self.identity_query } else { self.identity_admin };
+        let (name, role) = if ep != 0
+            && let Ok(a) = libd::identity::active(ep)
+        {
+            (String::from(a.name_str()), a.role)
+        } else {
+            (String::from("user"), libd::identity::ROLE_OPERATOR)
+        };
+        let d = borrow(self.home_vol);
+        let opened = if (self.home_rights & fp::R_WRITE) != 0 {
+            d.open(name.as_bytes(), fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE).ok()
+        } else {
+            d.open(name.as_bytes(), fp::O_DIRECTORY, fp::R_READ).ok()
+        };
+        if let Some((node, _, _)) = opened {
+            let new_h = node.into_handle();
+            if self.scoped_home_handle != 0 {
+                sys::handle_close(self.scoped_home_handle);
+            }
+            self.scoped_home_handle = new_h;
+            if let Some(p) = self.places.iter_mut().find(|p| p.path == "/home") {
+                p.h = new_h;
+                p.rights = self.home_rights;
+            }
+        }
+        if role == libd::identity::ROLE_STANDARD {
+            self.places.retain(|p| p.path != "/data");
+            if self.place == "/data" || self.place.starts_with("/data/") {
+                self.place = String::from("/home");
+            }
+        } else if self.data_vol != 0 && !self.places.iter().any(|p| p.path == "/data") {
+            self.places.push(Place { path: String::from("/data"), h: self.data_vol, rights: self.data_rights });
+            self.places.sort_by(|a, b| a.path.cmp(&b.path));
+        }
+        if self.place.starts_with("/home/") {
+            self.place = String::from("/home");
+        }
+    }
+
+    pub fn has_home_volume(&self) -> bool {
+        self.home_vol != 0
+    }
+
+    pub fn home_dot_dos_read(&self, leaf: &[u8]) -> Option<Vec<u8>> {
+        if self.home_vol == 0 {
+            return None;
+        }
+        let d = borrow(self.home_vol);
+        let (cfg_dir, _, _) = d.open(b".dos", fp::O_DIRECTORY, fp::R_READ).ok()?;
+        let (f, _, size) = cfg_dir.open(leaf, 0, fp::R_READ).ok()?;
+        let size = usize::try_from(size).ok()?;
+        if size == 0 || size > 64 * 1024 {
+            return None;
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let n = f.read(0, &mut buf).ok()?;
+        buf.truncate(n);
+        Some(buf)
+    }
+
+    pub fn home_dot_dos_write(&self, leaf: &[u8], data: &[u8]) -> Result<(), String> {
+        if self.home_vol == 0 {
+            return Err(String::from("setup: no dedicated /home volume is mounted (running on live media?)"));
+        }
+        if (self.home_rights & fp::R_WRITE) == 0 {
+            return Err(String::from("setup: /home is read-only in this session"));
+        }
+        let ep = if self.identity_query != 0 { self.identity_query } else { self.identity_admin };
+        if ep != 0
+            && let Ok(a) = libd::identity::active(ep)
+            && a.role != libd::identity::ROLE_OPERATOR
+        {
+            return Err(String::from("setup: only an Operator identity may modify system setup configuration"));
+        }
+        let d = borrow(self.home_vol);
+        let (cfg_dir, _, _) = d
+            .open(b".dos", fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE)
+            .map_err(|e| format!("setup: cannot open /home/.dos ({})", fp::message(e)))?;
+        let (f, _, _) = cfg_dir
+            .open(leaf, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            .map_err(|e| format!("setup: cannot open config file ({})", fp::message(e)))?;
+        f.write(0, data).map_err(|e| format!("setup: write failed ({})", fp::message(e)))?;
+        drop(f);
+        let _ = cfg_dir.sync();
+        let _ = d.sync();
+        Ok(())
+    }
 }
 
 pub fn rights_word(r: u64) -> &'static str {
@@ -852,6 +954,10 @@ fn main(s: *const Startup) -> i32 {
         .map(|(p, h)| Place { path: String::from_utf8_lossy(p).into_owned(), h, rights: borrow(h).stat().map_or(fp::R_READ, |st| st.rights) })
         .collect();
     places.sort_by(|a, b| a.path.cmp(&b.path));
+    let home_vol = places.iter().find(|p| p.path == "/home").map_or(0, |p| p.h);
+    let home_rights = places.iter().find(|p| p.path == "/home").map_or(0, |p| p.rights);
+    let data_vol = places.iter().find(|p| p.path == "/data").map_or(0, |p| p.h);
+    let data_rights = places.iter().find(|p| p.path == "/data").map_or(0, |p| p.rights);
     // The tools: their manifests (handed over by the service manager).
     let mut tools: Vec<Tool> = Vec::new();
     for (h, t) in libd::startup_handles() {
@@ -894,6 +1000,12 @@ fn main(s: *const Startup) -> i32 {
         identity_query: svc::endpoint(b"identity.query"),
         appmgr_admin: svc::endpoint(b"appmgr.admin"),
         appmgr_query: svc::endpoint(b"appmgr.query"),
+        storaged_admin: svc::endpoint(b"storaged.admin"),
+        home_vol,
+        home_rights,
+        scoped_home_handle: 0,
+        data_vol,
+        data_rights,
         jobs: Vec::new(),
         next_job: 1,
         fg: None,
@@ -906,6 +1018,10 @@ fn main(s: *const Startup) -> i32 {
         && let Some(b) = libd::time::query(sh.clock)
     {
         libd::time::set_base(&b);
+    }
+    sh.refresh_home_scope();
+    if sh.places.iter().any(|p| p.path == "/home") {
+        sh.place = String::from("/home");
     }
     let names: Vec<String> = sh.places.iter().map(|p| format!("{} ({})", p.path, rights_word(p.rights))).collect();
     println!("shell: ready: {} place(s): {}; {} tool(s)", sh.places.len(), names.join(", "), sh.tools.len());
@@ -967,6 +1083,7 @@ fn main(s: *const Startup) -> i32 {
                                     b"identity.query" => &mut sh.identity_query,
                                     b"appmgr.admin" => &mut sh.appmgr_admin,
                                     b"appmgr.query" => &mut sh.appmgr_query,
+                                    b"storaged.admin" => &mut sh.storaged_admin,
                                     _ => {
                                         sys::handle_close(handle);
                                         continue;

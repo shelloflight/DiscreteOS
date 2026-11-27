@@ -29,10 +29,11 @@ pub enum Permission {
     IdentityAdmin = 12,
     AppsQuery = 13,
     AppsAdmin = 14,
+    StorageAdmin = 15,
 }
 
 impl Permission {
-    pub const ALL: [Permission; 15] = [
+    pub const ALL: [Permission; 16] = [
         Self::Window,
         Self::FilesRead,
         Self::FilesWrite,
@@ -48,9 +49,10 @@ impl Permission {
         Self::IdentityAdmin,
         Self::AppsQuery,
         Self::AppsAdmin,
+        Self::StorageAdmin,
     ];
 
-    pub const ALL_MASK: u32 = (1u32 << 15) - 1;
+    pub const ALL_MASK: u32 = (1u32 << 16) - 1;
 
     pub const fn bit(self) -> u32 {
         1u32 << (self as u32)
@@ -73,6 +75,7 @@ impl Permission {
             12 => Some(Self::IdentityAdmin),
             13 => Some(Self::AppsQuery),
             14 => Some(Self::AppsAdmin),
+            15 => Some(Self::StorageAdmin),
             _ => None,
         }
     }
@@ -94,6 +97,7 @@ impl Permission {
             Self::IdentityAdmin => "identity:admin",
             Self::AppsQuery => "apps:query",
             Self::AppsAdmin => "apps:admin",
+            Self::StorageAdmin => "storage:admin",
         }
     }
 
@@ -119,6 +123,7 @@ impl Permission {
             Self::IdentityAdmin => "Manage identities & lock",
             Self::AppsQuery => "List installed apps",
             Self::AppsAdmin => "Manage app permissions",
+            Self::StorageAdmin => "Partition & install disks",
         }
     }
 
@@ -140,6 +145,7 @@ impl Permission {
             Self::IdentityAdmin => "Enroll passphrases, create users, and lock the session",
             Self::AppsQuery => "View installed applications and their permission states",
             Self::AppsAdmin => "Grant or revoke permissions for installed applications",
+            Self::StorageAdmin => "Inspect disks, partition free space, and install D-OS to storage",
         }
     }
 
@@ -157,6 +163,7 @@ impl Permission {
             Self::SystemQuery => caps::SYSTEM_QUERY,
             Self::IdentityAdmin => caps::IDENTITY_ADMIN,
             Self::AppsAdmin => caps::APP_ADMIN,
+            Self::StorageAdmin => caps::SYSTEM_ADMIN,
         }
     }
 }

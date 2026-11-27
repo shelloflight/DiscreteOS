@@ -28,6 +28,12 @@ pub const VOLUME: u32 = 102;
 pub const VOLUMES_DONE: u32 = 103;
 /// init -> storaged: a new disks channel (devmgr was restarted); carries it.
 pub const DISKS_LINK: u32 = 104;
+/// storaged -> devmgr (on `storaged.disks`, call): enable (`b = 1`) or disable (`b = 0`) writes on
+/// disk key `a`. Refused on optical media or read-only locked boots.
+pub const DISK_ENABLE_RW: u32 = 105;
+/// init -> storaged (on `TAG_CONTROL`, call): unlock the `home` DFS volume for read-write on an
+/// installed system (`BOOT.CFG installed = true`). `sys` and all other partitions stay read-only.
+pub const UNLOCK_HOME: u32 = 106;
 
 /// Startup tags.
 pub const TAG_DISKS: u32 = sys::TAG_USER + 0x10; // storaged: disks from devmgr

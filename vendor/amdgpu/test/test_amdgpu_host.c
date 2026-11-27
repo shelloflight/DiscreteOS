@@ -206,6 +206,7 @@ static uint32_t sim_get_reg(struct amdgpu_sim *s, uint64_t byte_off) {
 #define SIM_OSS_BASE0   0x00050000u
 #define SIM_MP0_BASE0   0x00060000u
 #define SIM_MP1_BASE0   0x00070000u
+#define SIM_MP1_BASE1   0x00074000u
 
 static void build_sample_edid_240_540hz(uint8_t raw[256]) {
     memset(raw, 0, 256);
@@ -292,7 +293,7 @@ static void build_ip_discovery(uint8_t *buf, enum dc_dcn_version dcn_ver, bool v
         { AMDGPU_HWID_MMHUB,  4,       1,       2, { SIM_MMHUB_BASE0, SIM_MMHUB_BASE1, 0 } },
         { AMDGPU_HWID_OSSSYS, 7,       0,       1, { SIM_OSS_BASE0, 0, 0 } },
         { AMDGPU_HWID_MP0,    14,      0,       1, { SIM_MP0_BASE0, 0, 0 } },
-        { AMDGPU_HWID_MP1,    14,      0,       1, { SIM_MP1_BASE0, 0, 0 } },
+        { AMDGPU_HWID_MP1,    14,      0,       2, { SIM_MP1_BASE0, SIM_MP1_BASE1, 0 } },
     };
     for (int i = 0; i < 5; i++) {
         wr16(buf, pos + 0, ips[i].id);
@@ -431,16 +432,23 @@ static void sim_mmio_w32(void *ctx, uint64_t byte_off, uint32_t val) {
     if (byte_off == 0x0018u) { s->mm_index_hi = val; return; }
     sim_set_reg(s, byte_off, val);
 
-    /* SMU mailbox response handler (MP1_SMN_C2PMSG_66 / 82 / 90). */
-    uint32_t smu_msg_dw = (s->dcn_ver == DC_DCN_4_0_1) ? 0x0082u : 0x0282u;
-    uint32_t smu_par_dw = (s->dcn_ver == DC_DCN_4_0_1) ? 0x0092u : 0x0292u;
-    uint32_t smu_rsp_dw = (s->dcn_ver == DC_DCN_4_0_1) ? 0x009Au : 0x029Au;
-    if (byte_off == ((uint64_t)SIM_MP1_BASE0 + smu_msg_dw) * 4ULL) {
+    /* SMU mailbox response handler (RDNA 4 DAL mailbox at MP1 BASE_IDX 1: C2PMSG_74/51/52;
+     * DCN 3.x standard MP1 BASE_IDX 0: C2PMSG_66/82/90). */
+    uint64_t smu_base = (s->dcn_ver == DC_DCN_4_0_1) ? SIM_MP1_BASE1 : SIM_MP1_BASE0;
+    uint32_t smu_msg_dw = (s->dcn_ver == DC_DCN_4_0_1) ? 0x008Au : 0x0282u;
+    uint32_t smu_par_dw = (s->dcn_ver == DC_DCN_4_0_1) ? 0x0073u : 0x0292u;
+    uint32_t smu_rsp_dw = (s->dcn_ver == DC_DCN_4_0_1) ? 0x0074u : 0x029Au;
+    if (byte_off == (smu_base + smu_msg_dw) * 4ULL) {
         s->smu_msg_count++;
         if (val == PPSMC_MSG_GetSmuVersion) {
-            sim_set_reg(s, ((uint64_t)SIM_MP1_BASE0 + smu_par_dw) * 4ULL, 0x00501200u);
+            sim_set_reg(s, (smu_base + smu_par_dw) * 4ULL, 0x00501200u);
+        } else if (s->dcn_ver == DC_DCN_4_0_1 && val == 0x15u) { /* DALSMC_MSG_ReturnHardMinStatus */
+            sim_set_reg(s, (smu_base + smu_par_dw) * 4ULL, 0x0000FFFFu);
+        } else if (s->dcn_ver == DC_DCN_4_0_1 && val == 0x09u) { /* DALSMC_MSG_SetHardMinByFreq */
+            uint32_t arg = sim_get_reg(s, (smu_base + smu_par_dw) * 4ULL);
+            sim_set_reg(s, (smu_base + smu_par_dw) * 4ULL, (arg & 0xFFFFu) * 1000u);
         }
-        sim_set_reg(s, ((uint64_t)SIM_MP1_BASE0 + smu_rsp_dw) * 4ULL, PPSMC_Result_OK);
+        sim_set_reg(s, (smu_base + smu_rsp_dw) * 4ULL, PPSMC_Result_OK);
     }
 
     /* PSP command completion handler (MP0_SMN_C2PMSG_64). */
@@ -477,6 +485,30 @@ static void sim_mmio_w32(void *ctx, uint64_t byte_off, uint32_t val) {
     if (byte_off == prim_lo) {
         sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_earliest_inuse) * 4ULL, val);
         sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_earliest_inuse_hi) * 4ULL, sim_get_reg(s, prim_hi));
+    }
+
+    /* DP_VID_STREAM_CNTL: mirror bit 0 (ENABLE) into bit 16 (STATUS) across all DIG stream encoders. */
+    if (s->regs->dp_vid_stream_cntl != 0) {
+        for (uint8_t enc = 0; enc < 5u; enc++) {
+            uint64_t vs_off = ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_vid_stream_cntl + (uint32_t)enc * s->regs->dig_stride) * 4ULL;
+            if (byte_off == vs_off) {
+                uint32_t status_bit = ((val & 1u) != 0) ? (1u << 16) : 0u;
+                sim_set_reg(s, vs_off, (val & ~(1u << 16)) | status_bit);
+                break;
+            }
+        }
+    }
+
+    /* DCN 4.0.1 DIG_FIFO_CTRL0: mirror bit 1 (DIG_FIFO_RESET) into bit 20 (DIG_FIFO_RESET_DONE). */
+    if (s->regs->dig_fifo_ctrl0 != 0) {
+        for (uint8_t enc = 0; enc < 5u; enc++) {
+            uint64_t df_off = ((uint64_t)SIM_DCE_BASE2 + s->regs->dig_fifo_ctrl0 + (uint32_t)enc * s->regs->dig_stride) * 4ULL;
+            if (byte_off == df_off) {
+                uint32_t done_bit = ((val & (1u << 1)) != 0) ? (1u << 20) : 0u;
+                sim_set_reg(s, df_off, (val & ~(1u << 20)) | done_bit);
+                break;
+            }
+        }
     }
 
     /* DP AUX data & kick handler across all AUX engines (real DCN bit layout). */
@@ -592,10 +624,11 @@ static void init_sim_gpu(struct amdgpu_sim *s, const char *fw_dir, enum dc_dcn_v
     sim_set_reg(s, (mm_base + fb_b) * 4ULL, 0x008000u); /* 0x80_0000_0000 >> 24 */
     sim_set_reg(s, (mm_base + fb_t) * 4ULL, 0x008003u); /* 4 * 16 MiB = 64 MiB */
 
-    /* Configure PSP SOS alive, SMU ready, DMCUB running. */
+    /* Configure PSP SOS alive, SMU ready (DCN 4.0.1 DAL_RESP_REG starts at 0 on cold UEFI boot!), DMCUB running. */
     sim_set_reg(s, ((uint64_t)SIM_MP0_BASE0 + 0x0063u) * 4ULL, 0x80000001u);
-    uint32_t smu_rsp_dw = (ver == DC_DCN_4_0_1) ? 0x009Au : 0x029Au;
-    sim_set_reg(s, ((uint64_t)SIM_MP1_BASE0 + smu_rsp_dw) * 4ULL, PPSMC_Result_OK);
+    uint64_t smu_base = (ver == DC_DCN_4_0_1) ? SIM_MP1_BASE1 : SIM_MP1_BASE0;
+    uint32_t smu_rsp_dw = (ver == DC_DCN_4_0_1) ? 0x0074u : 0x029Au;
+    sim_set_reg(s, (smu_base + smu_rsp_dw) * 4ULL, (ver == DC_DCN_4_0_1) ? 0u : PPSMC_Result_OK);
     sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dmcub_cntl) * 4ULL, 1u);
     sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dmcub_scratch0) * 4ULL, 1u);
 
@@ -609,10 +642,50 @@ static void init_sim_gpu(struct amdgpu_sim *s, const char *fw_dir, enum dc_dcn_v
     sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_surface_pitch) * 4ULL, 1919u);
     sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_primary_addr_hi) * 4ULL, 0x0080u);
     sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_primary_addr) * 4ULL, 0x00100000u);
+    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dscl_recout_size) * 4ULL, (1080u << 16) | 1920u);
+    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dscl_mpc_size) * 4ULL, (1080u << 16) | 1920u);
     sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dig_be_en_cntl) * 4ULL, 1u);
     sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dig_fe_cntl) * 4ULL, 0u);
-    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dp_dto_modulo) * 4ULL, 1000000u);
-    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dp_dto_phase) * 4ULL, 148500u);
+    /* Official DCN 4.0.1 (`dcn_4_1_0_sh_mask.h`): H in [31:16], V in [15:0], MISC0 in [31:24]. */
+    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_msa_timing_param1) * 4ULL, (2200u << 16) | 1125u);
+    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_msa_timing_param4) * 4ULL, (1920u << 16) | 1080u);
+    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_pixel_format) * 4ULL, (1u << 8));
+    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_msa_colorimetry) * 4ULL, 0x21u << 24);
+    sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_vid_timing) * 4ULL, (1u << 8));
+    if (s->regs->dp_vid_stream_cntl != 0) {
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_vid_stream_cntl) * 4ULL, (1u << 0) | (2u << 8) | (1u << 16));
+    }
+    if (s->regs->has_dig_fifo_ctrl) {
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_steer_fifo) * 4ULL, 1u); /* DP_STEER_FIFO_ENABLE = 1 */
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dig_fifo_ctrl0) * 4ULL, (7u << 2) | 1u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->otg_vstartup_param) * 4ULL, 35u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->vtg_control) * 4ULL, (1u << 31) | ((36u + 1080u) << 16));
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dppclk_dto_param) * 4ULL, (0xFFu << 16) | 0x40u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dppclk_ctrl) * 4ULL, 1u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dentist_dispclk_cntl) * 4ULL, (45u << 24) | (1u << 20) | (1u << 19) | 45u);
+        /* Seed realistic 60 Hz HUBP DLG/TTU boot values (v_blank_end = 36, refclk = 100 MHz, pclk = 148.5 MHz). */
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_blank_offset_0) * 4ULL, (36u << 16) | 129u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_dst_dimensions) * 4ULL, 379264u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_ref_freq_to_pix_freq) * 4ULL, 353056u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_per_line_delivery) * 4ULL, 1293u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_per_line_delivery_pre) * 4ULL, 646u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_surf0_ttu_cntl0) * 4ULL, 24000u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_surf0_ttu_cntl1) * 4ULL, 12000u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->hubp_ttu_global_cntl) * 4ULL, 60000u);
+    } else {
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE2 + s->regs->dp_steer_fifo) * 4ULL, 0u);
+    }
+    if (s->regs->has_otg_pixel_rate_div) {
+        /* 100 MHz REFCLK in Hz units (`dccg401_set_dp_dto`): 148.5 MHz = 1 * 100M + 48.5M. */
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_otg_pixel_rate_div) * 4ULL, (1u << 1));
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_otg_pixel_rate_cntl) * 4ULL, (1u << 4) | (1u << 12));
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dp_dto_modulo) * 4ULL, 100000000u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dp_dto_phase) * 4ULL, 48500000u);
+    } else {
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_otg_pixel_rate_cntl) * 4ULL, (1u << 4));
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dp_dto_modulo) * 4ULL, 1000000000u);
+        sim_set_reg(s, ((uint64_t)SIM_DCE_BASE1 + s->regs->dccg_dp_dto_phase) * 4ULL, 148500000u);
+    }
 
     /* DP 2.1 UHBR13.5 + DSC 1.2a + VRR + HDR10 monitor on AUX 0. */
     s->aux_connected[0] = true;
@@ -703,10 +776,69 @@ static void test_family_end_to_end(const char *fw_dir, uint16_t pci_dev, enum dc
     CHECK(amdgpu_atom_execute_table(&adev, atom_code, sizeof(atom_code), aparams, 2) == 0, "AtomBIOS exec");
     CHECK(aparams[0] == 0x00AB1234u, "AtomBIOS register result");
 
-    /* DML2 + DSC 1.2a + Atomic KMS TEST_ONLY & COMMIT: 2560x1440 @ 240 Hz & 3840x2160 @ 240 Hz! */
+    /* UEFI-owned DMCUB must refuse link-rate increases without corrupting live DPCD 0x0100/0x0102! */
     struct dc_atomic_req req;
     uint64_t seq = 0;
     bool is_async = false;
+    memset(&req, 0, sizeof(req));
+    req.test_only = true;
+    req.allow_modeset = true;
+    req.mode_changed = true;
+    req.mode_width = 2560; req.mode_height = 1440; req.mode_refresh_mhz = 240000;
+    CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == -95, "UEFI DMUB refuses link retrain");
+    CHECK(sim.dpcd[0x00100] == 0x14u && sim.dpcd[0x00102] == 0x00u, "DPCD untouched on refused retrain");
+
+    /* Within current HBR2 4-lane link (1080p @ 240 Hz), modeset succeeds cleanly under UEFI DMUB! */
+    uint32_t smu_before = sim.smu_msg_count;
+    req.test_only = false;
+    req.mode_width = 1920; req.mode_height = 1080; req.mode_refresh_mhz = 240000;
+    CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "COMMIT 1080p240 on UEFI HBR2");
+    if (ver == DC_DCN_4_0_1) {
+        CHECK(sim.smu_msg_count > smu_before, "RDNA 4 raises display clocks via DAL SMU mailbox (0x09/0x15)");
+        /* Verify 4-bit DPDTO0_INT >= 5 for 1080p@240Hz (~580 MHz / 100 MHz REFCLK),
+         * PIPE0_DTO_SRC_SEL (bit 12), DPPCLK0_DTO_PARAM unthrottled to 255/255,
+         * VTG0_CONTROL enabled & synced to v_blank_start, DP_STEER_FIFO_ENABLE (bit 0) kept 1 & RESET (bit 1) 0,
+         * DIG_FIFO_CTRL0 ENABLE (bit 0) = 1 & RESET (bit 1) = 0, DP_VID_STREAM_ENABLE = 1! */
+        uint32_t pdiv_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_otg_pixel_rate_div) * 4ULL);
+        CHECK(((pdiv_240 >> 1) & 0xFu) >= 5u, "DCN 4.0.1 4-bit DPDTO0_INT >= 5 for 1080p@240Hz");
+        uint32_t dto_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_otg_pixel_rate_cntl) * 4ULL);
+        CHECK((dto_240 & ((1u << 4) | (1u << 12))) == ((1u << 4) | (1u << 12)), "DCN 4.0.1 DP_DTO_ENABLE + PIPE_DTO_SRC_SEL");
+        uint32_t dpp_dto = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_dppclk_dto_param) * 4ULL);
+        CHECK(dpp_dto == ((0xFFu << 16) | 0xFFu), "DCN 4.0.1 DPPCLK0_DTO_PARAM unthrottled to 255/255");
+        uint32_t vtg_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->vtg_control) * 4ULL);
+        uint32_t vblank_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->otg_v_blank) * 4ULL);
+        CHECK((vtg_240 & (1u << 31)) != 0 && ((vtg_240 >> 16) & 0x7FFFu) == (vblank_240 & 0x7FFFu), "DCN 4.0.1 VTG0_CONTROL synced to v_blank_start");
+        uint32_t steer_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_steer_fifo) * 4ULL);
+        CHECK((steer_240 & 0x3u) == 0x1u, "DCN 4.0.1 DP_STEER_FIFO_ENABLE=1, RESET=0");
+        uint32_t df_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dig_fifo_ctrl0) * 4ULL);
+        CHECK((df_240 & 0x3u) == 0x1u, "DCN 4.0.1 DIG_FIFO_ENABLE=1, RESET=0");
+        uint32_t vs_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_vid_stream_cntl) * 4ULL);
+        CHECK((vs_240 & 1u) == 1u, "DCN 4.0.1 DP_VID_STREAM_ENABLE=1");
+        /* Verify HUBP DLG/TTU timers scaled proportionally from 60 Hz (~148.5 MHz) to 240 Hz (~580 MHz)
+         * and DLG_V_BLANK_END synced exactly to OTG_V_BLANK_END! */
+        uint32_t bo0_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->hubp_blank_offset_0) * 4ULL);
+        CHECK(((bo0_240 >> 16) & 0x7FFFu) == ((vblank_240 >> 16) & 0x7FFFu), "DCN 4.0.1 HUBP DLG_V_BLANK_END synced to OTG_V_BLANK_END");
+        uint32_t r2p_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->hubp_ref_freq_to_pix_freq) * 4ULL);
+        CHECK(r2p_240 > 40000u && r2p_240 < 120000u, "DCN 4.0.1 HUBP REF_FREQ_TO_PIX_FREQ scaled ~4x smaller for 240 Hz");
+        uint32_t dst_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->hubp_dst_dimensions) * 4ULL);
+        CHECK(dst_240 > 40000u && dst_240 < 130000u, "DCN 4.0.1 HUBP REFCYC_PER_HTOTAL scaled ~4x smaller for 240 Hz");
+        /* Also verify DENTIST fallback raises DISPCLK/DPPCLK dividers when SMU is unavailable. */
+        adev.smu.pmfw_alive = false;
+        CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "COMMIT 1080p240 with DENTIST fallback");
+        uint32_t dent_240 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_dentist_dispclk_cntl) * 4ULL);
+        CHECK((dent_240 & 0x7Fu) < 45u && ((dent_240 >> 24) & 0x7Fu) < 45u, "DCN 4.0.1 DENTIST raised DISPCLK & DPPCLK DIDs");
+        adev.smu.pmfw_alive = true;
+    }
+    /* Verify official AMD DCN MSA H-high layout, preserved 8bpc colorimetry [31:24], and DP_VID_M_N_GEN_EN bit 8! */
+    uint32_t msa4_1080 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_msa_timing_param4) * 4ULL);
+    CHECK((msa4_1080 >> 16) == 1920u && (msa4_1080 & 0xFFFFu) == 1080u, "DP MSA4 packs (h_active<<16)|v_active");
+    uint32_t msa_col = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_msa_colorimetry) * 4ULL);
+    CHECK(((msa_col >> 24) & 0xFFu) == 0x21u, "DP MSA MISC0 preserved in [31:24]");
+    uint32_t vid_t = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_vid_timing) * 4ULL);
+    CHECK((vid_t & (1u << 8)) != 0, "DP_VID_M_N_GEN_EN bit 8 set");
+
+    /* Grant driver-owned DMCUB ring for full link retraining tests (1440p@240 + 4K@240 DSC/UHBR). */
+    adev.dc->dmub.ring_owned = true;
     memset(&req, 0, sizeof(req));
     req.test_only = true;
     req.allow_modeset = true;
@@ -720,6 +852,14 @@ static void test_family_end_to_end(const char *fw_dir, uint16_t pci_dev, enum dc
     CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "COMMIT 1440p240 + VRR");
     CHECK(adev.dc->pipes[0].current_mode.h_active == 2560 && adev.dc->pipes[0].vrr_enabled, "1440p240 + VRR active");
     CHECK(sim.dpcd[0x00107] == 0x80u, "DPCD VRR enabled");
+    uint32_t msa4 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_msa_timing_param4) * 4ULL);
+    CHECK((msa4 >> 16) == 2560u && (msa4 & 0xFFFFu) == 1440u, "DP MSA4 packs (h_active<<16)|v_active");
+    uint32_t msa1 = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_msa_timing_param1) * 4ULL);
+    CHECK((msa1 >> 16) > 2560u && (msa1 & 0xFFFFu) > 1440u, "DP MSA1 packs (h_total<<16)|v_total");
+    uint32_t dto_ctl = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_otg_pixel_rate_cntl) * 4ULL);
+    CHECK((dto_ctl & (1u << 4)) != 0, "DCCG DP_DTO_ENABLE bit 4 set");
+    uint32_t dp_pf = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_pixel_format) * 4ULL);
+    CHECK(((dp_pf >> 8) & 0x7u) == 1u, "DP pixel format 8bpc");
 
     /* 4K @ 240 Hz triggers VESA DSC 1.2a + 2:1 ODM/MPC pipe split + DP 2.1 UHBR link training! */
     memset(&req, 0, sizeof(req));
@@ -741,6 +881,10 @@ static void test_family_end_to_end(const char *fw_dir, uint16_t pci_dev, enum dc
     /* 1080p @ 540 Hz succeeds cleanly when OTG runs! */
     CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "COMMIT 1080p540");
     CHECK(adev.dc->pipes[0].current_mode.h_active == 1920, "1080p540 active");
+    if (sim.regs->has_otg_pixel_rate_div) {
+        uint32_t pdiv = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_otg_pixel_rate_div) * 4ULL);
+        CHECK(((pdiv >> 1) & 0xFu) >= 12u, "DCCG 4-bit DPDTO0_INT >= 12 for 1080p@540Hz (1296 MHz / 100 MHz)");
+    }
 
     /* Arbitrary resolution scaling (1280x720 source scaled to 1920x1080 output) + 64x64 HW cursor + vsync flip! */
     static uint8_t fb_buf[1280 * 720 * 4];
@@ -796,11 +940,29 @@ static void test_family_end_to_end(const char *fw_dir, uint16_t pci_dev, enum dc
     CHECK(amdgpu_device_suspend(&adev) == 0 && adev.suspended, "S3 suspend");
     CHECK(amdgpu_device_resume(&adev) == 0 && !adev.suspended && adev.smu.pmfw_alive, "S3 resume");
 
-    /* Clean UEFI GOP `reset_boot` hand-back! */
+    /* Clean UEFI GOP `reset_boot` hand-back (Super+Esc recovery)! */
     memset(&req, 0, sizeof(req));
     req.reset_boot = true;
     CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "reset_boot GOP hand-back");
     CHECK(adev.dc->pipes[0].current_mode.h_active == 1920 && !adev.dc->pipes[0].dsc_enabled, "restored 1080p boot GOP");
+    if (ver == DC_DCN_4_0_1) {
+        uint32_t steer_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_steer_fifo) * 4ULL);
+        CHECK((steer_rst & 0x3u) == 0x1u, "reset_boot preserves DCN 4.0.1 DP_STEER_FIFO_ENABLE=1");
+        uint32_t df_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dig_fifo_ctrl0) * 4ULL);
+        CHECK((df_rst & 0x3u) == 0x1u, "reset_boot preserves DCN 4.0.1 DIG_FIFO_ENABLE=1");
+        uint32_t vs_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->dp_vid_stream_cntl) * 4ULL);
+        CHECK((vs_rst & 1u) == 1u, "reset_boot preserves DCN 4.0.1 DP_VID_STREAM_ENABLE=1");
+        uint32_t vtg_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->vtg_control) * 4ULL);
+        CHECK(vtg_rst == ((1u << 31) | ((36u + 1080u) << 16)), "reset_boot restores DCN 4.0.1 VTG0_CONTROL");
+        uint32_t dpp_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_dppclk_dto_param) * 4ULL);
+        CHECK(dpp_rst == ((0xFFu << 16) | 0x40u), "reset_boot restores DCN 4.0.1 DPPCLK0_DTO_PARAM");
+        uint32_t bo0_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->hubp_blank_offset_0) * 4ULL);
+        CHECK(bo0_rst == ((36u << 16) | 129u), "reset_boot restores DCN 4.0.1 HUBP BLANK_OFFSET_0");
+        uint32_t r2p_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE2 + sim.regs->hubp_ref_freq_to_pix_freq) * 4ULL);
+        CHECK(r2p_rst == 353056u, "reset_boot restores DCN 4.0.1 HUBP REF_FREQ_TO_PIX_FREQ");
+        uint32_t dent_rst = sim_get_reg(&sim, ((uint64_t)SIM_DCE_BASE1 + sim.regs->dccg_dentist_dispclk_cntl) * 4ULL);
+        CHECK(dent_rst == ((45u << 24) | (1u << 20) | (1u << 19) | 45u), "reset_boot restores DCN 4.0.1 DENTIST_DISPCLK_CNTL");
+    }
 
     amdgpu_device_fini(&adev);
     free(sim.vram);

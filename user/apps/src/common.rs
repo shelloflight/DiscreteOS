@@ -23,6 +23,9 @@ pub trait App {
     fn tick(&mut self) -> bool {
         false
     }
+    fn should_exit(&self) -> bool {
+        false
+    }
 }
 
 /// Read an embedded resource file from the app's read-only `DRES` VMO (`TAG_APP_RESOURCES`).
@@ -182,6 +185,9 @@ pub fn run_app<A: App>(name: &str, mut app: A, tick_ms: u64) -> i32 {
                     let msgs = ui.key(key, &text);
                     for m in msgs {
                         app.update(m);
+                        if app.should_exit() {
+                            return 0;
+                        }
                     }
                     ui.set_view(app.view(), &text);
                     dirty = true;
@@ -190,6 +196,9 @@ pub fn run_app<A: App>(name: &str, mut app: A, tick_ms: u64) -> i32 {
                     let msgs = ui.pointer(x, y, buttons, wheel, &text);
                     for m in msgs {
                         app.update(m);
+                        if app.should_exit() {
+                            return 0;
+                        }
                     }
                     ui.set_view(app.view(), &text);
                     dirty = true;

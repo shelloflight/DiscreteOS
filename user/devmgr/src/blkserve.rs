@@ -22,6 +22,10 @@ pub trait Disk {
     fn capacity(&self, unit: usize) -> u64;
     /// A short model name for the DISK message.
     fn model(&self, unit: usize) -> &[u8];
+    /// True if `unit` is inherently read-only (e.g. ATAPI optical disc).
+    fn read_only(&self, _unit: usize) -> bool {
+        false
+    }
     /// Read `count` sectors at `lba` into `out` (exactly count * 512 bytes).
     fn read(&mut self, unit: usize, lba: u64, count: u64, out: &mut [u8]) -> Result<(), i32>;
     fn write(&mut self, unit: usize, lba: u64, count: u64, data: &[u8]) -> Result<(), i32>;
@@ -118,13 +122,19 @@ fn ring_op(d: &mut impl Disk, unit: usize, sqe: &Sqe, ring: &mut IoRing, writabl
 /// driver must end (`control` returned an exit code).
 pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
     let units = d.units().min(MAX_UNITS);
-    let writable = libd::args() == b"rw";
+    let ro_locked = libd::args() == b"ro";
+    let init_rw = libd::args() == b"rw";
+    let mut unit_rw = [false; MAX_UNITS];
+    for (u, rw) in unit_rw.iter_mut().enumerate().take(units) {
+        *rw = init_rw && !d.read_only(u);
+    }
     // b: how many DISK messages follow (the device manager waits for them before it tells the
     // storage service the disks present at boot are all known).
     proto::send(ctl, proto::READY, if units > 0 { d.capacity(0) } else { 0 }, units as u64);
     for u in 0..units {
         let mut m = [0u8; HEADER + 40];
-        Header { txid: 0, op: proto::DISK, status: 0, a: u as u64, b: d.capacity(u) }.put(&mut m);
+        let u_val = (u as u64) | if d.read_only(u) { 1u64 << 63 } else { 0 };
+        Header { txid: 0, op: proto::DISK, status: 0, a: u_val, b: d.capacity(u) }.put(&mut m);
         let model = d.model(u);
         let n = model.len().min(40);
         m[HEADER..HEADER + n].copy_from_slice(&model[..n]);
@@ -202,11 +212,21 @@ pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
             if nh > 0 {
                 sys::handle_close(hs[0]); // other requests carry no handles
             }
+            if key == 0 && h.op == proto::BLK_SET_RW {
+                let u = h.a as usize;
+                if ro_locked || u >= units || d.read_only(u) {
+                    reply(ch, &h, sys::ERR_ACCESS_DENIED as i32, 0, 0, &[]);
+                } else {
+                    unit_rw[u] = h.b != 0;
+                    reply(ch, &h, 0, 0, 0, &[]);
+                }
+                continue;
+            }
             if key != 0 && h.op == proto::BLK_RING_DOORBELL {
                 if let Some(ring) = rings[unit].as_mut() {
                     let mut done = 0u64;
                     while let Some(sqe) = ring.pop_sq() {
-                        let st = ring_op(d, unit, &sqe, ring, writable);
+                        let st = ring_op(d, unit, &sqe, ring, unit_rw[unit]);
                         if !ring.push_cq(Cqe { id: sqe.id, status: st, a: sqe.b }) {
                             break;
                         }
@@ -228,7 +248,7 @@ pub fn serve(name: &str, d: &mut impl Disk, ctl: Handle) -> i32 {
                 reply(ch, &h, sys::ERR_INVALID_ARGS as i32, 0, 0, &[]);
                 continue;
             }
-            block_op(d, ch, unit, &h, &msg[..n], &mut data, writable);
+            block_op(d, ch, unit, &h, &msg[..n], &mut data, unit_rw[unit]);
         }
     }
 }

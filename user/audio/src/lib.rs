@@ -26,10 +26,12 @@ use dosaudio::pcm::{
 use dosaudio::route::{
     DeviceKind, FLAG_PLAYBACK, FLAG_PLUGGED, RouteDevice, select_input, select_output,
 };
+use dosid::AudioSettings;
 use libd::audio::{
     self, DEVICE_ENTRY_BYTES, DeviceEntry, FMT_F32_LE, FMT_S16_LE, FMT_S24_LE, FMT_S32_LE, FMT_U8,
     RING_READ, RING_WRITE,
 };
+use libd::fs as fp;
 use libd::proto::{self, HEADER, Header};
 use libd::ring::{Cqe, IoRing, Sqe};
 use libd::sys::{self, Handle, MsgHandle};
@@ -47,6 +49,51 @@ const KEY_CLIENT_BASE: u64 = 100;
 const HW_RING_SLOTS: u32 = 8;
 const HW_RING_SLOT_BYTES: u32 = 4096;
 const HW_MAX_IN_FLIGHT: u32 = 4;
+const HOME_CFG_DIR: &[u8] = b".dos";
+const HOME_AUDIO_FILE: &[u8] = b".dos/audio.toml";
+const HOME_AUDIO_TMP: &[u8] = b".dos/audio.tmp";
+
+fn load_audio_settings() -> Option<AudioSettings> {
+    let ns = fp::Namespace::get();
+    let (dir, _) = ns.resolve(b"/home")?;
+    let d = fp::Node::from(dir);
+    let parsed = (|| {
+        let (f, _, size) = d.open(HOME_AUDIO_FILE, 0, fp::R_READ).ok()?;
+        let size = usize::try_from(size).ok()?;
+        if size == 0 || size > 16 * 1024 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        let n = f.read(0, &mut buf).ok()?;
+        AudioSettings::from_toml(&buf[..n]).ok()
+    })();
+    let _ = d.into_handle();
+    parsed
+}
+
+fn save_audio_settings(cfg: &AudioSettings) {
+    let ns = fp::Namespace::get();
+    let Some((dir, _)) = ns.resolve(b"/home") else {
+        return;
+    };
+    let d = fp::Node::from(dir);
+    if d.stat().is_ok_and(|st| st.rights & fp::R_WRITE != 0) {
+        let text = cfg.to_toml();
+        let _ = d.open(HOME_CFG_DIR, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
+        if let Ok((f, _, _)) = d.open(HOME_AUDIO_TMP, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            && f.write(0, text.as_bytes()).is_ok()
+        {
+            drop(f);
+            if d.rename(HOME_AUDIO_TMP, HOME_AUDIO_FILE, true).is_err()
+                && let Ok((f2, _, _)) = d.open(HOME_AUDIO_FILE, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            {
+                let _ = f2.write(0, text.as_bytes());
+            }
+            let _ = d.sync();
+        }
+    }
+    let _ = d.into_handle();
+}
 
 fn wire_to_fmt(v: u8) -> Option<SampleFormat> {
     match v {
@@ -213,9 +260,15 @@ struct AudioSvc {
     mic_ind_on: bool,
     driver_restarts: u32,
     last_silent_pace_ns: u64,
+    saved: AudioSettings,
 }
 
 impl AudioSvc {
+    fn persist_settings(&self) {
+        if !self.test_mode {
+            save_audio_settings(&self.saved);
+        }
+    }
     fn route_snapshot(&self) -> Vec<RouteDevice> {
         self.backends
             .iter()
@@ -491,6 +544,11 @@ impl AudioSvc {
                                     params.channels,
                                     flags
                                 );
+                                let init_vol = self.saved.volume.min(100);
+                                let init_muted = self.saved.muted;
+                                let match_default = !self.saved.default_output.is_empty()
+                                    && self.saved.default_output == name
+                                    && (flags & FLAG_PLAYBACK) != 0;
                                 self.backends.push(Backend {
                                     id,
                                     dev_key,
@@ -500,10 +558,13 @@ impl AudioSvc {
                                     name,
                                     ch: hnd,
                                     online: true,
-                                    volume: 100,
-                                    saved_volume: 100,
-                                    muted: false,
+                                    volume: init_vol,
+                                    saved_volume: init_vol,
+                                    muted: init_muted,
                                 });
+                                if match_default && self.manual_out.is_none() {
+                                    self.manual_out = Some(id);
+                                }
                             }
                             self.reconcile_routing();
                         }
@@ -978,6 +1039,9 @@ impl AudioSvc {
                         let mut drep = [0u8; HEADER];
                         let _ = sys::channel_call(bch, &dreq, &mut drep, 500_000_000);
                     }
+                    self.saved.volume = out_vol;
+                    self.saved.muted = out_muted;
+                    self.persist_settings();
                     Self::reply(ch, h, 0, u64::from(id), u64::from(out_vol));
                 } else {
                     Self::reply(ch, h, sys::ERR_BAD_STATE as i32, 0, 0);
@@ -991,13 +1055,22 @@ impl AudioSvc {
                 }
                 if h.a == 0 {
                     self.manual_out = None;
+                    self.saved.default_output.clear();
+                    self.persist_settings();
                     println!("audio: output routing set to automatic");
                     self.reconcile_routing();
                     Self::reply(ch, h, 0, u64::from(self.active_out_id.unwrap_or(0)), 0);
                 } else {
                     let id = h.a as u32;
-                    if self.backends.iter().any(|b| b.id == id && (b.flags & FLAG_PLAYBACK) != 0) {
+                    if let Some(bname) = self
+                        .backends
+                        .iter()
+                        .find(|b| b.id == id && (b.flags & FLAG_PLAYBACK) != 0)
+                        .map(|b| b.name.clone())
+                    {
                         self.manual_out = Some(id);
+                        self.saved.default_output = bname;
+                        self.persist_settings();
                         self.reconcile_routing();
                         Self::reply(ch, h, 0, u64::from(id), 0);
                     } else {
@@ -1013,6 +1086,8 @@ impl AudioSvc {
                 }
                 let allow = h.a != 0;
                 self.mic_allowed = allow;
+                self.saved.mic_allowed = allow;
+                self.persist_settings();
                 println!("audio: microphone policy set to {}", if allow { "allowed" } else { "revoked" });
                 if !allow {
                     // Immediately revoke all active capture streams and clear `[MIC LIVE]`.
@@ -1254,6 +1329,8 @@ fn main(s: *const Startup) -> i32 {
         port.arm(devmgr, sys::READABLE | sys::PEER_CLOSED, KEY_DEVMGR);
     }
 
+    let saved = if test_mode { AudioSettings::default() } else { load_audio_settings().unwrap_or_default() };
+    let init_mic = saved.mic_allowed;
     let mut svc_state = AudioSvc {
         port,
         ctl,
@@ -1272,10 +1349,11 @@ fn main(s: *const Startup) -> i32 {
         next_client_id: 1,
         streams: Vec::new(),
         next_stream_id: 1,
-        mic_allowed: true,
+        mic_allowed: init_mic,
         mic_ind_on: false,
         driver_restarts: 0,
         last_silent_pace_ns: 0,
+        saved,
     };
 
     println!("audio: ready (mixer, routing, capability-gated playback & capture)");

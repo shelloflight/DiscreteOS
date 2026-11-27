@@ -19,9 +19,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use dosid::NetworkSettings;
 use dosnet::stack::{DhcpState, NetStack};
 use dosnet::tcp::TcpState;
 use dosnet::{fmt_ipv4, fmt_mac};
+use libd::fs as fp;
 use libd::net::{self, NET_STATUS_BYTES, NetStatus};
 use libd::proto::{self, HEADER, Header};
 use libd::ring::{Cqe, IoRing, Sqe};
@@ -38,6 +40,51 @@ const KEY_CLIENT_BASE: u64 = 100;
 
 const NIC_SLOTS: u32 = 32;
 const NIC_SLOT_BYTES: u32 = 2048;
+const HOME_CFG_DIR: &[u8] = b".dos";
+const HOME_NET_FILE: &[u8] = b".dos/network.toml";
+const HOME_NET_TMP: &[u8] = b".dos/network.tmp";
+
+fn load_net_settings() -> Option<NetworkSettings> {
+    let ns = fp::Namespace::get();
+    let (dir, _) = ns.resolve(b"/home")?;
+    let d = fp::Node::from(dir);
+    let parsed = (|| {
+        let (f, _, size) = d.open(HOME_NET_FILE, 0, fp::R_READ).ok()?;
+        let size = usize::try_from(size).ok()?;
+        if size == 0 || size > 16 * 1024 {
+            return None;
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let n = f.read(0, &mut buf).ok()?;
+        NetworkSettings::from_toml(&buf[..n]).ok()
+    })();
+    let _ = d.into_handle();
+    parsed
+}
+
+fn save_net_settings(cfg: &NetworkSettings) {
+    let ns = fp::Namespace::get();
+    let Some((dir, _)) = ns.resolve(b"/home") else {
+        return;
+    };
+    let d = fp::Node::from(dir);
+    if d.stat().is_ok_and(|st| st.rights & fp::R_WRITE != 0) {
+        let text = cfg.to_toml();
+        let _ = d.open(HOME_CFG_DIR, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
+        if let Ok((f, _, _)) = d.open(HOME_NET_TMP, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            && f.write(0, text.as_bytes()).is_ok()
+        {
+            drop(f);
+            if d.rename(HOME_NET_TMP, HOME_NET_FILE, true).is_err()
+                && let Ok((f2, _, _)) = d.open(HOME_NET_FILE, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            {
+                let _ = f2.write(0, text.as_bytes());
+            }
+            let _ = d.sync();
+        }
+    }
+    let _ = d.into_handle();
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -254,6 +301,7 @@ struct NetSvc {
     pending_dns: Vec<PendingDnsCall>,
     pending_connects: Vec<PendingConnect>,
     sockets: Vec<ClientSock>,
+    saved_cfg: Option<NetworkSettings>,
 }
 
 fn now_ms() -> u64 {
@@ -362,6 +410,22 @@ impl NetSvc {
                                 Ok(mut nic) => {
                                     self.port.arm(nic.ch, sys::READABLE | sys::PEER_CLOSED, KEY_NIC);
                                     println!("net: interface '{}' attached (MAC {})", name, fmt_mac(mac));
+                                    if let Some(cfg) = self.saved_cfg {
+                                        if cfg.dhcp {
+                                            nic.stack.enable_dhcp(cfg.dns1, cfg.dns2, cfg.dns_port, cfg.dns_fallback, now_ms());
+                                        } else {
+                                            nic.stack.set_static_full(
+                                                cfg.ip,
+                                                cfg.netmask,
+                                                cfg.gateway,
+                                                cfg.dns1,
+                                                cfg.dns2,
+                                                cfg.dns_port,
+                                                cfg.dns_fallback,
+                                            );
+                                        }
+                                        println!("net: restored saved network configuration on '{}'", name);
+                                    }
                                     nic.flush_tx();
                                     self.nic = Some(nic);
                                 }
@@ -543,7 +607,13 @@ impl NetSvc {
                 let ip = net::unpack_ipv4(h.a);
                 let port = ((h.a >> 32) & 0xFFFF) as u16;
                 if let Some(nic) = self.nic.as_mut() {
-                    nic.stack.set_dns(ip, if port == 0 { 53 } else { port });
+                    let eff_port = if port == 0 { 53 } else { port };
+                    nic.stack.set_dns(ip, eff_port);
+                    let mut cfg = self.saved_cfg.unwrap_or_default();
+                    cfg.dns1 = ip;
+                    cfg.dns_port = eff_port;
+                    self.saved_cfg = Some(cfg);
+                    save_net_settings(&cfg);
                     Self::reply(ch, h.txid, h.op, 0, 0, 0);
                 } else {
                     Self::reply(ch, h.txid, h.op, sys::ERR_BAD_STATE as i32, 0, 0);
@@ -600,6 +670,18 @@ impl NetSvc {
                         nic.stack.dns_fallback
                     );
                 }
+                let persisted = NetworkSettings {
+                    dhcp: cfg.dhcp,
+                    ip: cfg.ip,
+                    netmask: cfg.netmask,
+                    gateway: cfg.gateway,
+                    dns1: cfg.dns1,
+                    dns2: cfg.dns2,
+                    dns_port: cfg.dns_port,
+                    dns_fallback: cfg.dns_fallback,
+                };
+                self.saved_cfg = Some(persisted);
+                save_net_settings(&persisted);
                 Self::reply(ch, h.txid, h.op, 0, 0, 0);
             }
             net::OP_DNS_RESOLVE => {
@@ -999,6 +1081,7 @@ fn main(s: *const Startup) -> i32 {
         port.arm(devmgr, sys::READABLE | sys::PEER_CLOSED, KEY_DEVMGR);
     }
 
+    let saved_cfg = load_net_settings();
     let mut svc_state = NetSvc {
         port,
         ctl,
@@ -1012,6 +1095,7 @@ fn main(s: *const Startup) -> i32 {
         pending_dns: Vec::new(),
         pending_connects: Vec::new(),
         sockets: Vec::new(),
+        saved_cfg,
     };
 
     println!("net: ready (in-tree TCP/IP, DHCP, DNS, capability-gated endpoints)");

@@ -22,7 +22,7 @@ audio = ["control"]   # the dock: microphone live, output muted
 net = ["status"]      # the dock: network up (read-only)
 identity = ["session"]
 connect = ["devmgr.input", "terminal.display", "clock.time"]
-namespace = ["/sys=sys:r"]   # fonts and themes
+namespace = ["*"]   # fonts/themes from /sys and persistent settings under /home/.dos
 
 [quota]
 memory = "192M"

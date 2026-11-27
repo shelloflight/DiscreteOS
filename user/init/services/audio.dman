@@ -3,7 +3,7 @@
 name = "audio"
 image = "audio.dsvc"
 group = "system"
-after = ["devmgr", "terminal"]
+after = ["devmgr", "storaged", "terminal"]
 description = "audio mixer, routing, and microphone policy"
 
 [provides]
@@ -12,6 +12,7 @@ endpoints = ["playback", "capture", "control"]
 [grants]
 log = true
 connect = ["devmgr.audio", "terminal.indicator"]
+namespace = ["*"]
 
 [quota]
 memory = "32M"

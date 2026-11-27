@@ -11,7 +11,7 @@ use crate::text::{TextRender, TextRole};
 use crate::theme::{DockConfig, Theme};
 
 pub const MAX_DOCK_WINDOWS: usize = 12;
-pub const MAX_DOCK_PINNED: usize = 4;
+pub const MAX_DOCK_PINNED: usize = 8;
 
 /// A pinned quick-launch application shown on the left side of the floating dock.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

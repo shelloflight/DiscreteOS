@@ -40,6 +40,10 @@ const CALL_NS: u64 = 10_000_000_000;
 const LEDGER_DIR: &[u8] = b"apps";
 const LEDGER_FILE: &[u8] = b"apps/permissions.toml";
 const LEDGER_TMP: &[u8] = b"apps/permissions.tmp";
+const HOME_CFG_DIR: &[u8] = b".dos";
+const HOME_LEDGER_FILE: &[u8] = b".dos/permissions.toml";
+const HOME_LEDGER_TMP: &[u8] = b".dos/permissions.tmp";
+const HOME_OOBE_FILE: &[u8] = b".dos/oobe.toml";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -58,6 +62,7 @@ struct InstalledApp {
     prog_vmo: Owned,
     res_vmo: Owned,
     entry_idx: u8,
+    pinned: bool,
 }
 
 struct RunningApp {
@@ -199,11 +204,12 @@ fn discover_apps() -> Vec<InstalledApp> {
             match read_ns_file(full.as_bytes(), MAX_BUNDLE_BYTES).and_then(|b| verify_bundle_bytes(&b)) {
                 Ok((manifest, prog_vmo, res_vmo)) => {
                     let entry_idx = out.len() as u8;
+                    let pinned = manifest.pinned;
                     println!(
                         "appmgr: verified {} ({} v{}, binary {})",
                         manifest.name, manifest.title, manifest.version, manifest.binary
                     );
-                    out.push(InstalledApp { manifest, prog_vmo, res_vmo, entry_idx });
+                    out.push(InstalledApp { manifest, prog_vmo, res_vmo, entry_idx, pinned });
                 }
                 Err(e) => {
                     println!("appmgr: {} rejected ({})", full, sys::status(e));
@@ -217,44 +223,84 @@ fn discover_apps() -> Vec<InstalledApp> {
 
 fn load_ledger() -> PermissionLedger {
     let ns = fp::Namespace::get();
-    let Some((dir, _)) = ns.resolve(b"/data") else {
-        return PermissionLedger::new();
-    };
-    let d = fp::Node::from(dir);
-    let parsed = (|| {
-        let (f, _, size) = d.open(LEDGER_FILE, 0, fp::R_READ).ok()?;
-        let size = usize::try_from(size).ok()?;
-        if size == 0 || size > 64 * 1024 {
-            return None;
+    for (vol, path) in [(b"/home" as &[u8], HOME_LEDGER_FILE), (b"/data" as &[u8], LEDGER_FILE)] {
+        let Some((dir, _)) = ns.resolve(vol) else { continue };
+        let d = fp::Node::from(dir);
+        let parsed = (|| {
+            let (f, _, size) = d.open(path, 0, fp::R_READ).ok()?;
+            let size = usize::try_from(size).ok()?;
+            if size == 0 || size > 64 * 1024 {
+                return None;
+            }
+            let mut buf = alloc::vec![0u8; size];
+            let n = f.read(0, &mut buf).ok()?;
+            PermissionLedger::from_toml(&buf[..n]).ok()
+        })();
+        let _ = d.into_handle();
+        if let Some(l) = parsed {
+            return l;
         }
-        let mut buf = alloc::vec![0u8; size];
-        let n = f.read(0, &mut buf).ok()?;
-        PermissionLedger::from_toml(&buf[..n]).ok()
-    })();
-    let _ = d.into_handle();
-    parsed.unwrap_or_default()
+    }
+    PermissionLedger::new()
 }
 
-fn save_ledger(ledger: &PermissionLedger) {
-    let ns = fp::Namespace::get();
-    let Some((dir, _)) = ns.resolve(b"/data") else { return };
-    let d = fp::Node::from(dir);
+fn write_ledger_at(dir_h: Handle, dir_name: &[u8], tmp_path: &[u8], dst_path: &[u8], text: &str) -> bool {
+    let d = fp::Node::from(dir_h);
+    let mut wrote = false;
     if d.stat().is_ok_and(|st| st.rights & fp::R_WRITE != 0) {
-        let _ = d.open(LEDGER_DIR, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
-        let text = ledger.to_toml();
-        if let Ok((f, _, _)) = d.open(LEDGER_TMP, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+        let _ = d.open(dir_name, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
+        if let Ok((f, _, _)) = d.open(tmp_path, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
             && f.write(0, text.as_bytes()).is_ok()
         {
             drop(f);
-            if d.rename(LEDGER_TMP, LEDGER_FILE, true).is_err()
-                && let Ok((f2, _, _)) = d.open(LEDGER_FILE, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            if d.rename(tmp_path, dst_path, true).is_err()
+                && let Ok((f2, _, _)) = d.open(dst_path, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
             {
                 let _ = f2.write(0, text.as_bytes());
             }
             let _ = d.sync();
+            wrote = true;
         }
     }
     let _ = d.into_handle();
+    wrote
+}
+
+fn save_ledger(ledger: &PermissionLedger) {
+    let ns = fp::Namespace::get();
+    let text = ledger.to_toml();
+    if let Some((dir, _)) = ns.resolve(b"/home")
+        && write_ledger_at(dir, HOME_CFG_DIR, HOME_LEDGER_TMP, HOME_LEDGER_FILE, &text)
+    {
+        return;
+    }
+    if let Some((dir, _)) = ns.resolve(b"/data") {
+        let _ = write_ledger_at(dir, LEDGER_DIR, LEDGER_TMP, LEDGER_FILE, &text);
+    }
+}
+
+/// Returns `Some(true)` if `/home` is writable and OOBE is completed, `Some(false)` if OOBE is
+/// pending on a newly installed disk, or `None` on live media / read-only `/home`.
+fn oobe_status() -> Option<bool> {
+    let ns = fp::Namespace::get();
+    let (dir, _) = ns.resolve(b"/home")?;
+    let d = fp::Node::from(dir);
+    let res = (|| {
+        let st = d.stat().ok()?;
+        if st.rights & fp::R_WRITE == 0 {
+            return None;
+        }
+        let (f, _, size) = d.open(HOME_OOBE_FILE, 0, fp::R_READ).ok()?;
+        let size = usize::try_from(size).ok()?;
+        if size == 0 || size > 16 * 1024 {
+            return None;
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let n = f.read(0, &mut buf).ok()?;
+        dosid::OobeConfig::from_toml(&buf[..n]).ok().map(|c| c.completed)
+    })();
+    let _ = d.into_handle();
+    res
 }
 
 impl AppMgr {
@@ -268,7 +314,7 @@ impl AppMgr {
                 app.entry_idx,
                 app.manifest.title.as_bytes(),
                 app.manifest.name.as_bytes(),
-                app.manifest.pinned,
+                app.pinned,
             );
         }
     }
@@ -403,6 +449,9 @@ impl AppMgr {
         if has(Permission::AppsAdmin) {
             ep_specs.push("appmgr.admin");
         }
+        if has(Permission::StorageAdmin) {
+            ep_specs.push("storaged.admin");
+        }
 
         let mut ep_names = Vec::new();
         let mut ep_k = 0u32;
@@ -427,53 +476,101 @@ impl AppMgr {
             }
         }
 
-        // 3. Per-identity isolated namespace (ONLY if files:read or files:write is granted).
-        if has(Permission::FilesRead) || has(Permission::FilesWrite) {
+        // 3. Per-identity isolated namespace (files:read / files:write, or `/config` for OOBE).
+        let need_files = has(Permission::FilesRead) || has(Permission::FilesWrite);
+        let is_oobe = app_name == "oobe";
+        if need_files || is_oobe {
             let want = fp::R_READ | if has(Permission::FilesWrite) { fp::R_WRITE } else { 0 };
             let ns = fp::Namespace::get();
             let mut nsb = NsBuilder::new();
             let mut added = 0usize;
 
-            // `/home` -> `/data/home/<active_identity_name>` (isolated per identity!)
-            if let Some((data_h, _)) = ns.resolve(b"/data") {
-                let d = fp::Node::from(data_h);
-                let have = d.stat().map_or(fp::R_READ, |st| st.rights);
-                let eff_r = want & have;
-                let home_node = if (have & fp::R_WRITE) != 0 {
-                    d.open(b"home", fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE)
+            if is_oobe
+                && let Some((home_h, _)) = ns.resolve(b"/home")
+            {
+                let h = fp::Node::from(home_h);
+                let have = h.stat().map_or(fp::R_READ, |st| st.rights);
+                let cfg_node = if (have & fp::R_WRITE) != 0 {
+                    h.open(HOME_CFG_DIR, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE)
                         .ok()
-                        .and_then(|(hd, _, _)| {
-                            hd.open(active.name_str().as_bytes(), fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE)
-                                .ok()
-                                .and_then(|(uh, _, _)| uh.clone_with(eff_r).ok())
-                        })
+                        .map(|(cd, _, _)| cd)
                 } else {
-                    let sub = format!("home/{}", active.name_str());
-                    d.open(sub.as_bytes(), fp::O_DIRECTORY, fp::R_READ).ok().map(|(uh, _, _)| uh)
+                    h.open(HOME_CFG_DIR, fp::O_DIRECTORY, fp::R_READ).ok().map(|(cd, _, _)| cd)
                 };
-                if let Some(hn) = home_node {
-                    nsb.add(b"/home", hn);
+                if let Some(cn) = cfg_node {
+                    nsb.add(b"/config", cn);
                     added += 1;
                 }
-                // Only Operator identities receive `/data`.
-                if active.role == idwire::ROLE_OPERATOR
-                    && let Ok(dn) = d.clone_with(eff_r)
-                {
-                    nsb.add(b"/data", dn);
-                    added += 1;
-                }
-                let _ = d.into_handle();
+                let _ = h.into_handle();
             }
 
-            // Read-only `/system` and `/sys` when present.
-            for vol in [b"/system" as &[u8], b"/sys"] {
-                if let Some((vh, _)) = ns.resolve(vol) {
-                    let v = fp::Node::from(vh);
-                    if let Ok(vn) = v.clone_with(fp::R_READ) {
-                        nsb.add(vol, vn);
+            if need_files {
+                // `/home` -> dedicated `/home/<active_identity_name>` volume when installed,
+                // otherwise `/data/home/<active_identity_name>` fallback (always isolated per identity!).
+                let mut home_added = false;
+                if let Some((home_h, _)) = ns.resolve(b"/home") {
+                    let h = fp::Node::from(home_h);
+                    let have = h.stat().map_or(fp::R_READ, |st| st.rights);
+                    let eff_r = want & have;
+                    let home_node = if (have & fp::R_WRITE) != 0 {
+                        h.open(active.name_str().as_bytes(), fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE)
+                            .ok()
+                            .and_then(|(uh, _, _)| uh.clone_with(eff_r).ok())
+                    } else {
+                        h.open(active.name_str().as_bytes(), fp::O_DIRECTORY, fp::R_READ)
+                            .ok()
+                            .map(|(uh, _, _)| uh)
+                    };
+                    if let Some(hn) = home_node {
+                        nsb.add(b"/home", hn);
+                        added += 1;
+                        home_added = true;
+                    }
+                    let _ = h.into_handle();
+                }
+
+                if let Some((data_h, _)) = ns.resolve(b"/data") {
+                    let d = fp::Node::from(data_h);
+                    let have = d.stat().map_or(fp::R_READ, |st| st.rights);
+                    let eff_r = want & have;
+                    if !home_added {
+                        let home_node = if (have & fp::R_WRITE) != 0 {
+                            d.open(b"home", fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE)
+                                .ok()
+                                .and_then(|(hd, _, _)| {
+                                    hd.open(active.name_str().as_bytes(), fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE)
+                                        .ok()
+                                        .and_then(|(uh, _, _)| uh.clone_with(eff_r).ok())
+                                })
+                        } else {
+                            let sub = format!("home/{}", active.name_str());
+                            d.open(sub.as_bytes(), fp::O_DIRECTORY, fp::R_READ).ok().map(|(uh, _, _)| uh)
+                        };
+                        if let Some(hn) = home_node {
+                            nsb.add(b"/home", hn);
+                            added += 1;
+                        }
+                    }
+                    // Only Operator identities receive `/data`.
+                    if active.role == idwire::ROLE_OPERATOR
+                        && let Ok(dn) = d.clone_with(eff_r)
+                    {
+                        nsb.add(b"/data", dn);
                         added += 1;
                     }
-                    let _ = v.into_handle();
+                    let _ = d.into_handle();
+                }
+
+                // Read-only `/system` and `/sys` when present.
+                for vol in [b"/system" as &[u8], b"/sys"] {
+                    if let Some((vh, _)) = ns.resolve(vol) {
+                        let v = fp::Node::from(vh);
+                        if let Ok(vn) = v.clone_with(fp::R_READ) {
+                            nsb.add(vol, vn);
+                            added += 1;
+                        }
+                        let _ = v.into_handle();
+                    }
                 }
             }
 
@@ -639,10 +736,29 @@ impl AppMgr {
                                 }
                             }
                         }
+                        match oobe_status() {
+                            Some(false) => {
+                                if let Some(idx) = self.apps.iter().position(|a| a.manifest.name == "oobe")
+                                    && !self.running.iter().any(|r| r.app_name == "oobe")
+                                {
+                                    println!("appmgr: first-boot setup pending, launching oobe");
+                                    let _ = self.launch_app(idx, false);
+                                }
+                            }
+                            Some(true) => {
+                                println!("appmgr: OOBE completed, bypassing first-boot setup");
+                            }
+                            None => {}
+                        }
                     }
                     Event::Launch { app } => {
                         if let Some(idx) = self.apps.iter().position(|a| a.entry_idx == app) {
                             let _ = self.launch_app(idx, true);
+                        }
+                    }
+                    Event::AppPin { app, pinned } => {
+                        if let Some(entry) = self.apps.iter_mut().find(|a| a.entry_idx == app) {
+                            entry.pinned = pinned;
                         }
                     }
                     Event::PermResult { request_id, choice } => {
@@ -738,7 +854,7 @@ impl AppMgr {
                         effective_perms: eff,
                         denied_perms: denied,
                         running: run,
-                        pinned: app.manifest.pinned,
+                        pinned: app.pinned,
                         autostart: app.manifest.autostart,
                         verified: true,
                         ..AppInfo::default()
@@ -849,7 +965,26 @@ impl AppMgr {
                     }
                 }
             }
-            wire::OP_LAUNCH | wire::OP_STOP | wire::OP_SET_PERM | wire::OP_INSTALL_CHECK => {
+            wire::OP_SET_PIN if role == Role::Admin => {
+                let pinned = h.a != 0;
+                let Some(app) = self.apps.iter_mut().find(|a| a.manifest.name == name) else {
+                    return (fp::ERR_NOT_FOUND, 0, 0, Vec::new());
+                };
+                app.pinned = pinned;
+                if self.awmi != 0 {
+                    let _ = awmi::register_launcher_app_ex(
+                        self.awmi,
+                        app.entry_idx,
+                        app.manifest.title.as_bytes(),
+                        app.manifest.name.as_bytes(),
+                        pinned,
+                        true,
+                    );
+                }
+                println!("appmgr: {} {} taskbar", if pinned { "pinned" } else { "unpinned" }, name);
+                (0, 0, 0, Vec::new())
+            }
+            wire::OP_LAUNCH | wire::OP_STOP | wire::OP_SET_PERM | wire::OP_INSTALL_CHECK | wire::OP_SET_PIN => {
                 (sys::ERR_ACCESS_DENIED, 0, 0, Vec::new())
             }
             _ => (sys::ERR_NOT_SUPPORTED, 0, 0, Vec::new()),
@@ -867,7 +1002,15 @@ fn main(s: *const Startup) -> i32 {
     let mgr = libd::startup_handle(tool::TAG_MANAGER);
     let awmi = awmi::launcher_endpoint();
     let identity = idwire::query_endpoint();
-    let apps = discover_apps();
+    let mut apps = discover_apps();
+    // On an installed system (writable /home with OOBE state), do not pin the disk installer by default.
+    if oobe_status().is_some() {
+        for app in &mut apps {
+            if app.manifest.name == "installer" {
+                app.pinned = false;
+            }
+        }
+    }
     let ledger = load_ledger();
     let mut state = AppMgr {
         port,

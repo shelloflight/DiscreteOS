@@ -16,6 +16,7 @@ pub mod dev;
 pub mod dfs;
 pub mod fat;
 pub mod gpt;
+pub mod install;
 pub mod time;
 
 #[cfg(test)]

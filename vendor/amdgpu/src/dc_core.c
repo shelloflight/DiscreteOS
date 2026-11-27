@@ -18,15 +18,39 @@
 
 #define OTG_MASTER_EN_MASK                 ((1u << 0) | (1u << 16))
 #define HUBP_BLANK_EN_BIT                  (1u << 0)
+#define HUBP_VREADY_AT_OR_AFTER_VSYNC_BIT  (1u << 8)
+#define HUBP_UNDERFLOW_CLEAR_BIT           (1u << 31)
+#define OPTC_UNDERFLOW_CLEAR_BIT           (1u << 12)
+#define DENTIST_DISPCLK_CHG_DONE_BIT       (1u << 19)
+#define DENTIST_DPPCLK_CHG_DONE_BIT        (1u << 20)
+/* Navi 48 / DCN 4.0.1 CLK01 DFS PLL & slices (`dcn401_clk_mgr.c`, byte offsets inside BAR5). */
+#define DCN401_CLK0_PLL_REQ_BYTE           (0x16E37ULL * 4ULL)
+#define DCN401_CLK0_DISP_DFS_BYTE          (0x16E69ULL * 4ULL)
+#define DCN401_CLK0_DPP_DFS_BYTE           (0x16E6CULL * 4ULL)
+#define DCN401_CLK0_DCF_DFS_BYTE           (0x16E72ULL * 4ULL)
+#define DCN401_CLK0_DTB_DFS_BYTE           (0x16E75ULL * 4ULL)
 #define FLIP_TYPE_IMMEDIATE_BIT            (1u << 1)
 #define FLIP_PENDING_BIT                   (1u << 8)
-#define DP_VID_M_N_GEN_EN_BIT              (1u << 0)
-#define DP_STEER_FIFO_RESET_BIT            (1u << 0)
+#define DP_DTO_ENABLE_BIT                  (1u << 4)
+#define PIPE_DTO_SRC_SEL_BIT               (1u << 12)
+#define DP_VID_M_N_GEN_EN_BIT              (1u << 8)  /* dcn_4_1_0_sh_mask.h: DP_VID_M_N_GEN_EN__SHIFT = 0x8 */
+#define DP_VID_STREAM_ENABLE_BIT           (1u << 0)
+#define DP_VID_STREAM_DIS_DEFER_MASK       (0x3u << 8)
+#define DP_VID_STREAM_STATUS_BIT           (1u << 16)
+#define DP_STEER_FIFO_ENABLE_BIT_401       (1u << 0)  /* dcn_4_1_0_sh_mask.h: bit 0 = ENABLE, bit 1 = RESET */
+#define DP_STEER_FIFO_RESET_BIT_401        (1u << 1)
+#define DP_STEER_FIFO_RESET_BIT_3X         (1u << 0)  /* DCN 3.0/3.1.5/3.2: bit 0 = RESET */
+#define DIG_FIFO_ENABLE_BIT                (1u << 0)
+#define DIG_FIFO_RESET_BIT                 (1u << 1)
+#define DIG_FIFO_READ_START_LEVEL_MASK     (0x1Fu << 2)
+#define DIG_FIFO_READ_START_LEVEL_7        (0x7u << 2)
+#define DIG_FIFO_RESET_DONE_BIT            (1u << 20)
 #define CURSOR_EN_BIT                      (1u << 0)
 #define CURSOR_MODE_ARGB_UNPREMUL          3u
 #define OTG_V_TOTAL_MIN_SEL_BIT            (1u << 0)
 #define OTG_V_TOTAL_MAX_SEL_BIT            (1u << 1)
-#define OTG_SET_V_TOTAL_MIN_MASK_EN_BIT    (1u << 2)
+#define OTG_SET_V_TOTAL_MIN_MASK_EN_BIT    (1u << 3)
+#define OTG_SET_V_TOTAL_MIN_MASK_FLIP      ((1u << 1) << 16)
 
 static u64 decode_mc_addr(u32 lo, u32 hi) {
     return ((u64)(hi & 0xFFFFu) << 32) | (u64)(lo & 0xFFFFFF00u);
@@ -47,7 +71,134 @@ static u32 frame_count_delta(u32 after, u32 before) {
     return (after - before) & 0x00FFFFFFu;
 }
 
-static u32 find_dig_for_pipe(const struct amdgpu_device *adev, const struct dc_reg_table *r, u8 pipe) {
+/* Lightweight freestanding log builder for bare-metal diagnostics (`log amdgpu`). */
+struct dc_log_buf {
+    char data[256];
+    size_t len;
+};
+
+static void dlog_str(struct dc_log_buf *b, const char *s) {
+    if (!b || !s) return;
+    while (*s && b->len + 1u < sizeof(b->data)) {
+        b->data[b->len++] = *s++;
+    }
+    b->data[b->len] = '\0';
+}
+
+static void dlog_u32(struct dc_log_buf *b, u32 v) {
+    char tmp[12];
+    size_t n = 0;
+    if (v == 0) {
+        tmp[n++] = '0';
+    } else {
+        while (v > 0 && n < sizeof(tmp)) {
+            tmp[n++] = (char)('0' + (v % 10u));
+            v /= 10u;
+        }
+    }
+    while (n > 0 && b->len + 1u < sizeof(b->data)) {
+        b->data[b->len++] = tmp[--n];
+    }
+    b->data[b->len] = '\0';
+}
+
+static void dlog_hex(struct dc_log_buf *b, u32 v) {
+    static const char hex[] = "0123456789abcdef";
+    dlog_str(b, "0x");
+    bool started = false;
+    for (int sh = 28; sh >= 0; sh -= 4) {
+        u32 nib = (v >> (u32)sh) & 0xFu;
+        if (nib != 0 || started || sh == 0) {
+            started = true;
+            if (b->len + 1u < sizeof(b->data)) {
+                b->data[b->len++] = hex[nib];
+            }
+        }
+    }
+    b->data[b->len] = '\0';
+}
+
+static void dlog_emit(const struct amdgpu_device *adev, const struct dc_log_buf *b) {
+    if (adev && adev->io.log && b && b->len > 0) {
+        adev->io.log(adev->io.ctx, b->data);
+    }
+}
+
+/* Measure live OTG refresh rate in mHz over ~15-55 ms using OTG_STATUS_FRAME_COUNT. */
+static u32 measure_otg_refresh_mhz(
+    const struct amdgpu_device *adev,
+    const struct dc_reg_table *r,
+    u8 pipe,
+    u32 *out_total_df
+) {
+    u32 fc0 = read_otg_frame_count(adev, r, pipe);
+    u32 fc_start = fc0;
+    u64 t_start = amdgpu_now_ns(adev);
+    for (u32 step = 0; step < 25u; step++) {
+        amdgpu_udelay(adev, 1000u);
+        u32 cur = read_otg_frame_count(adev, r, pipe);
+        if (cur != fc0) {
+            fc_start = cur;
+            t_start = amdgpu_now_ns(adev);
+            break;
+        }
+    }
+    u32 fc_last = fc_start;
+    u64 t_last = t_start;
+    for (u32 step = 0; step < 50u; step++) {
+        amdgpu_udelay(adev, 1000u);
+        u32 cur = read_otg_frame_count(adev, r, pipe);
+        if (cur != fc_last) {
+            fc_last = cur;
+            t_last = amdgpu_now_ns(adev);
+            if (frame_count_delta(fc_last, fc_start) >= 3u && (t_last - t_start) >= 12000000ULL) {
+                break;
+            }
+        }
+    }
+    u32 df = frame_count_delta(fc_last, fc_start);
+    if (out_total_df) {
+        *out_total_df = frame_count_delta(fc_last, fc0);
+    }
+    if (df > 0 && t_last > t_start) {
+        u64 dt_ns = t_last - t_start;
+        u64 mhz = ((u64)df * 1000000000000ULL) / dt_ns;
+        if (mhz >= 20000ULL && mhz <= 1000000ULL) {
+            return (u32)mhz;
+        }
+    }
+    return 0u;
+}
+
+/* Locate the live DIG stream encoder driving `pipe`.
+ * On DCN 3.2/4.0.1 DIG_FE (stream encoder) and DIG_BE (link encoder) are decoupled, so matching
+ * live DP_MSA_TIMING_PARAM4/PARAM1 against the active OTG geometry finds the exact stream encoder
+ * even when physical port index != stream encoder index. */
+static u32 find_dig_for_pipe(
+    const struct amdgpu_device *adev,
+    const struct dc_reg_table *r,
+    u8 pipe,
+    u32 w,
+    u32 h,
+    u32 h_total,
+    u32 v_total
+) {
+    for (u8 enc = 0; enc < 5u; enc++) {
+        u32 p4 = 0, p1 = 0;
+        if (!dc_reg_read(adev, 2u, r->dp_msa_timing_param4 + (u32)enc * r->dig_stride, &p4)) continue;
+        if (p4 == 0 || p4 == 0xFFFFFFFFu) continue;
+        bool h_low = ((p4 & 0xFFFFu) == w && ((p4 >> 16) & 0xFFFFu) == h);
+        bool h_high = (((p4 >> 16) & 0xFFFFu) == w && (p4 & 0xFFFFu) == h);
+        if (!h_low && !h_high) continue;
+        (void)dc_reg_read(adev, 2u, r->dp_msa_timing_param1 + (u32)enc * r->dig_stride, &p1);
+        if (p1 != 0 && p1 != 0xFFFFFFFFu) {
+            bool p1_ok = h_low
+                ? ((p1 & 0xFFFFu) == h_total && ((p1 >> 16) & 0xFFFFu) == v_total)
+                : (((p1 >> 16) & 0xFFFFu) == h_total && (p1 & 0xFFFFu) == v_total);
+            if (!p1_ok) continue;
+        }
+        return enc;
+    }
     for (u8 enc = 0; enc < 5u; enc++) {
         u32 fe = 0, be = 0;
         if (!dc_reg_read(adev, 2u, r->dig_fe_cntl + (u32)enc * r->dig_stride, &fe)) continue;
@@ -57,6 +208,131 @@ static u32 find_dig_for_pipe(const struct amdgpu_device *adev, const struct dc_r
         }
     }
     return pipe;
+}
+
+/* Read-only probe of DPP geometry registers (`DSCL_RECOUT_SIZE`, `DSCL_MPC_SIZE`) holding
+ * `(height << 16) | width`, used when static DSCL offsets do not match live hardware. */
+static void probe_dpp_size_regs(
+    const struct amdgpu_device *adev,
+    const struct dc_reg_table *r,
+    u8 pipe,
+    u32 w,
+    u32 h,
+    struct dc_pipe_reg_snapshot *snap
+) {
+    snap->dpp_size_reg_count = 0;
+    if (w < 320u || h < 200u || w > 0x3FFFu || h > 0x3FFFu) return;
+    u32 target = (w & 0x3FFFu) | ((h & 0x3FFFu) << 16);
+    u32 dpp = (u32)pipe * r->dpp_stride;
+    u32 start = r->cnvc_pixel_format + dpp + 1u;
+    u32 end = r->cm_hdr_mult + dpp;
+    if (end <= start || (end - start) > 512u) return;
+    u8 found = 0;
+    for (u32 off = start; off < end; off++) {
+        u32 v = 0;
+        if (dc_reg_read(adev, 2u, off, &v) && v == target) {
+            if (found >= 4u) {
+                snap->dpp_size_reg_count = 0;
+                return;
+            }
+            snap->dpp_size_regs[found] = off;
+            snap->dpp_size_saved[found] = v;
+            found++;
+        }
+    }
+    snap->dpp_size_reg_count = found;
+}
+
+/* Blank DP video stream cleanly before modifying OTG timing/clocks or resetting FIFOs
+ * (matches `enc1_stream_encoder_dp_blank` + `enc35_disable_fifo`). */
+static void dp_stream_blank(struct amdgpu_device *adev, const struct dc_reg_table *r, u32 dig_o) {
+    if (r->dp_vid_stream_cntl != 0) {
+        u32 cntl = 0;
+        if (dc_reg_read(adev, 2u, r->dp_vid_stream_cntl + dig_o, &cntl) && cntl != 0xFFFFFFFFu) {
+            if ((cntl & DP_VID_STREAM_ENABLE_BIT) != 0) {
+                (void)dc_reg_write(adev, 2u, r->dp_vid_stream_cntl + dig_o, cntl & ~DP_VID_STREAM_ENABLE_BIT);
+                for (u32 i = 0; i < 500u; i++) {
+                    u32 st = 0;
+                    if (!dc_reg_read(adev, 2u, r->dp_vid_stream_cntl + dig_o, &st)) break;
+                    if ((st & DP_VID_STREAM_STATUS_BIT) == 0) break;
+                    amdgpu_udelay(adev, 100u);
+                }
+            }
+        }
+    }
+    if (r->has_dig_fifo_ctrl && r->dig_fifo_ctrl0 != 0) {
+        u32 df = 0;
+        if (dc_reg_read(adev, 2u, r->dig_fifo_ctrl0 + dig_o, &df) && df != 0xFFFFFFFFu) {
+            (void)dc_reg_write(adev, 2u, r->dig_fifo_ctrl0 + dig_o, df & ~DIG_FIFO_ENABLE_BIT);
+        }
+    }
+}
+
+/* Reset & re-enable DP_STEER_FIFO, DIG_FIFO_CTRL0 (DCN 4.0.1), and DP_VID_STREAM_CNTL after
+ * OTG latches the new timing/pixel clock (`enc401_stream_encoder_dp_unblank`). */
+static void dp_stream_resync_and_unblank(
+    struct amdgpu_device *adev,
+    const struct dc_reg_table *r,
+    u32 dig_o,
+    u32 saved_steer,
+    u32 saved_vid_stream,
+    u32 saved_dig_fifo
+) {
+    if (r->has_dig_fifo_ctrl) {
+        /* DCN 4.0.1 (`dcn_4_1_0_sh_mask.h`): DP_STEER_FIFO bit 0 = ENABLE, bit 1 = RESET! */
+        u32 steer_base = saved_steer & ~DP_STEER_FIFO_RESET_BIT_401;
+        (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, steer_base | DP_STEER_FIFO_RESET_BIT_401);
+        amdgpu_udelay(adev, 10u);
+        (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, steer_base);
+        (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, steer_base | DP_STEER_FIFO_ENABLE_BIT_401);
+
+        if (r->dp_vid_stream_cntl != 0) {
+            u32 vs = (saved_vid_stream & ~DP_VID_STREAM_DIS_DEFER_MASK)
+                | DP_VID_STREAM_ENABLE_BIT
+                | (2u << 8);
+            (void)dc_reg_write(adev, 2u, r->dp_vid_stream_cntl + dig_o, vs);
+            amdgpu_udelay(adev, 200u);
+        }
+
+        /* DCN 4.0.1 DIG resync FIFO (`DIG_FIFO_CTRL0`, 0x209B): ensure ENABLE=0 during reset,
+         * set start level = 7, pulse RESET (bit 1), wait for RESET_DONE (bit 20), then set ENABLE=1. */
+        if (r->dig_fifo_ctrl0 != 0) {
+            u32 df = (saved_dig_fifo & ~(DIG_FIFO_ENABLE_BIT | DIG_FIFO_READ_START_LEVEL_MASK | DIG_FIFO_RESET_BIT))
+                | DIG_FIFO_READ_START_LEVEL_7;
+            (void)dc_reg_write(adev, 2u, r->dig_fifo_ctrl0 + dig_o, df);
+            (void)dc_reg_write(adev, 2u, r->dig_fifo_ctrl0 + dig_o, df | DIG_FIFO_RESET_BIT);
+            for (u32 i = 0; i < 500u; i++) {
+                u32 st = 0;
+                if (!dc_reg_read(adev, 2u, r->dig_fifo_ctrl0 + dig_o, &st)) break;
+                if ((st & DIG_FIFO_RESET_DONE_BIT) != 0) break;
+                amdgpu_udelay(adev, 10u);
+            }
+            (void)dc_reg_write(adev, 2u, r->dig_fifo_ctrl0 + dig_o, df);
+            for (u32 i = 0; i < 500u; i++) {
+                u32 st = 0;
+                if (!dc_reg_read(adev, 2u, r->dig_fifo_ctrl0 + dig_o, &st)) break;
+                if ((st & DIG_FIFO_RESET_DONE_BIT) == 0) break;
+                amdgpu_udelay(adev, 10u);
+            }
+            (void)dc_reg_write(adev, 2u, r->dig_fifo_ctrl0 + dig_o, df | DIG_FIFO_ENABLE_BIT);
+            amdgpu_udelay(adev, 100u);
+        }
+
+        if (r->dp_vid_stream_cntl != 0) {
+            u32 vs = (saved_vid_stream & ~DP_VID_STREAM_DIS_DEFER_MASK)
+                | DP_VID_STREAM_ENABLE_BIT
+                | (2u << 8);
+            (void)dc_reg_write(adev, 2u, r->dp_vid_stream_cntl + dig_o, vs);
+        }
+    } else {
+        /* DCN 3.0 / 3.1.5 / 3.2: DP_STEER_FIFO bit 0 = RESET. */
+        (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, saved_steer | DP_STEER_FIFO_RESET_BIT_3X);
+        amdgpu_udelay(adev, 10u);
+        (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, saved_steer & ~DP_STEER_FIFO_RESET_BIT_3X);
+        if (r->dp_vid_stream_cntl != 0) {
+            (void)dc_reg_write(adev, 2u, r->dp_vid_stream_cntl + dig_o, saved_vid_stream | DP_VID_STREAM_ENABLE_BIT);
+        }
+    }
 }
 
 static void capture_pipe_snapshot(
@@ -87,14 +363,42 @@ static void capture_pipe_snapshot(
     (void)dc_reg_read(adev, 2u, r->otg_v_total_min + otg, &snap->otg_v_total_min);
     (void)dc_reg_read(adev, 2u, r->otg_v_total_max + otg, &snap->otg_v_total_max);
     (void)dc_reg_read(adev, 2u, r->otg_v_total_control + otg, &snap->otg_v_total_control);
+    (void)dc_reg_read(adev, 2u, r->otg_double_buffer_control + otg, &snap->otg_double_buffer_control);
+    if (r->otg_vstartup_param != 0) {
+        (void)dc_reg_read(adev, 2u, r->otg_vstartup_param + otg, &snap->otg_vstartup_param);
+    }
+    if (r->vtg_control != 0) {
+        (void)dc_reg_read(adev, 2u, r->vtg_control + (u32)pipe, &snap->vtg_control);
+    }
 
+    if (r->dccg_dentist_dispclk_cntl != 0) {
+        (void)dc_reg_read(adev, 1u, r->dccg_dentist_dispclk_cntl, &snap->dccg_dentist_dispclk_cntl);
+    }
     if (r->has_otg_pixel_rate_div) {
         (void)dc_reg_read(adev, 1u, r->dccg_otg_pixel_rate_div, &snap->dccg_pixel_rate_div);
     }
     (void)dc_reg_read(adev, 1u, r->dccg_otg_pixel_rate_cntl + dccg, &snap->dccg_pixel_rate_cntl);
     (void)dc_reg_read(adev, 1u, r->dccg_dp_dto_phase + dccg, &snap->dccg_dto_phase);
     (void)dc_reg_read(adev, 1u, r->dccg_dp_dto_modulo + dccg, &snap->dccg_dto_modulo);
+    if (r->dccg_dppclk_dto_param != 0) {
+        (void)dc_reg_read(adev, 1u, r->dccg_dppclk_dto_param + (u32)pipe, &snap->dccg_dppclk_dto_param);
+    }
+    if (r->dccg_dppclk_ctrl != 0) {
+        (void)dc_reg_read(adev, 1u, r->dccg_dppclk_ctrl, &snap->dccg_dppclk_ctrl);
+    }
 
+    (void)dc_reg_read(adev, 2u, r->hubp_cntl + hubp, &snap->hubp_cntl);
+    if (r->hubp_blank_offset_0 != 0) {
+        (void)dc_reg_read(adev, 2u, r->hubp_blank_offset_0 + hubp, &snap->hubp_blank_offset_0);
+        (void)dc_reg_read(adev, 2u, r->hubp_blank_offset_1 + hubp, &snap->hubp_blank_offset_1);
+        (void)dc_reg_read(adev, 2u, r->hubp_dst_dimensions + hubp, &snap->hubp_dst_dimensions);
+        (void)dc_reg_read(adev, 2u, r->hubp_ref_freq_to_pix_freq + hubp, &snap->hubp_ref_freq_to_pix_freq);
+        (void)dc_reg_read(adev, 2u, r->hubp_per_line_delivery_pre + hubp, &snap->hubp_per_line_delivery_pre);
+        (void)dc_reg_read(adev, 2u, r->hubp_per_line_delivery + hubp, &snap->hubp_per_line_delivery);
+        (void)dc_reg_read(adev, 2u, r->hubp_ttu_global_cntl + hubp, &snap->hubp_ttu_global_cntl);
+        (void)dc_reg_read(adev, 2u, r->hubp_surf0_ttu_cntl0 + hubp, &snap->hubp_surf0_ttu_cntl0);
+        (void)dc_reg_read(adev, 2u, r->hubp_surf0_ttu_cntl1 + hubp, &snap->hubp_surf0_ttu_cntl1);
+    }
     (void)dc_reg_read(adev, 2u, r->hubp_viewport_start + hubp, &snap->hubp_viewport_start);
     (void)dc_reg_read(adev, 2u, r->hubp_viewport_dim + hubp, &snap->hubp_viewport_dim);
     (void)dc_reg_read(adev, 2u, r->hubp_surface_pitch + hubp, &snap->hubp_surface_pitch);
@@ -113,8 +417,19 @@ static void capture_pipe_snapshot(
     (void)dc_reg_read(adev, 2u, r->dp_msa_timing_param2 + dig_o, &snap->dp_msa_param2);
     (void)dc_reg_read(adev, 2u, r->dp_msa_timing_param3 + dig_o, &snap->dp_msa_param3);
     (void)dc_reg_read(adev, 2u, r->dp_msa_timing_param4 + dig_o, &snap->dp_msa_param4);
+    (void)dc_reg_read(adev, 2u, r->dp_pixel_format + dig_o, &snap->dp_pixel_format);
+    (void)dc_reg_read(adev, 2u, r->dp_msa_colorimetry + dig_o, &snap->dp_msa_colorimetry);
     (void)dc_reg_read(adev, 2u, r->dp_msa_misc + dig_o, &snap->dp_msa_misc);
     (void)dc_reg_read(adev, 2u, r->dp_vid_timing + dig_o, &snap->dp_vid_timing);
+    (void)dc_reg_read(adev, 2u, r->dp_vid_m + dig_o, &snap->dp_vid_m);
+    (void)dc_reg_read(adev, 2u, r->dp_vid_n + dig_o, &snap->dp_vid_n);
+    if (r->dp_vid_stream_cntl != 0) {
+        (void)dc_reg_read(adev, 2u, r->dp_vid_stream_cntl + dig_o, &snap->dp_vid_stream_cntl);
+    }
+    (void)dc_reg_read(adev, 2u, r->dp_steer_fifo + dig_o, &snap->dp_steer_fifo);
+    if (r->dig_fifo_ctrl0 != 0) {
+        (void)dc_reg_read(adev, 2u, r->dig_fifo_ctrl0 + dig_o, &snap->dig_fifo_ctrl0);
+    }
     (void)dc_reg_read(adev, 2u, r->dsc_top_control + (u32)pipe * r->dsc_stride, &snap->dsc_top_control);
 
     u32 e_lo = snap->hubp_primary_addr, e_hi = snap->hubp_primary_addr_hi;
@@ -138,6 +453,7 @@ static void restore_pipe_snapshot(
     u32 dig_o = (u32)snap->dig * r->dig_stride;
     u32 dccg = (u32)snap->pipe * 4u;
 
+    dp_stream_blank(adev, r, dig_o);
     (void)dc_reg_write(adev, 2u, r->otg_master_update_lock + otg, 1u);
 
     (void)dc_reg_write(adev, 2u, r->otg_h_total + otg, snap->otg_h_total);
@@ -151,14 +467,45 @@ static void restore_pipe_snapshot(
     (void)dc_reg_write(adev, 2u, r->otg_v_total_min + otg, snap->otg_v_total_min);
     (void)dc_reg_write(adev, 2u, r->otg_v_total_max + otg, snap->otg_v_total_max);
     (void)dc_reg_write(adev, 2u, r->otg_v_total_control + otg, snap->otg_v_total_control);
+    (void)dc_reg_write(adev, 2u, r->otg_double_buffer_control + otg, snap->otg_double_buffer_control);
+    if (r->otg_vstartup_param != 0) {
+        (void)dc_reg_write(adev, 2u, r->otg_vstartup_param + otg, snap->otg_vstartup_param);
+    }
+    if (r->vtg_control != 0) {
+        (void)dc_reg_write(adev, 2u, r->vtg_control + (u32)snap->pipe, snap->vtg_control);
+    }
 
+    if (r->dccg_dentist_dispclk_cntl != 0 && snap->dccg_dentist_dispclk_cntl != 0
+        && snap->dccg_dentist_dispclk_cntl != 0xFFFFFFFFu) {
+        (void)dc_reg_write(adev, 1u, r->dccg_dentist_dispclk_cntl, snap->dccg_dentist_dispclk_cntl);
+    }
     if (r->has_otg_pixel_rate_div) {
         (void)dc_reg_write(adev, 1u, r->dccg_otg_pixel_rate_div, snap->dccg_pixel_rate_div);
     }
     (void)dc_reg_write(adev, 1u, r->dccg_dp_dto_modulo + dccg, snap->dccg_dto_modulo);
     (void)dc_reg_write(adev, 1u, r->dccg_dp_dto_phase + dccg, snap->dccg_dto_phase);
     (void)dc_reg_write(adev, 1u, r->dccg_otg_pixel_rate_cntl + dccg, snap->dccg_pixel_rate_cntl);
+    if (r->dccg_dppclk_dto_param != 0) {
+        (void)dc_reg_write(adev, 1u, r->dccg_dppclk_dto_param + (u32)snap->pipe, snap->dccg_dppclk_dto_param);
+    }
+    if (r->dccg_dppclk_ctrl != 0) {
+        (void)dc_reg_write(adev, 1u, r->dccg_dppclk_ctrl, snap->dccg_dppclk_ctrl);
+    }
 
+    if (r->hubp_blank_offset_0 != 0 && snap->hubp_blank_offset_0 != 0 && snap->hubp_blank_offset_0 != 0xFFFFFFFFu) {
+        (void)dc_reg_write(adev, 2u, r->hubp_blank_offset_0 + hubp, snap->hubp_blank_offset_0);
+        (void)dc_reg_write(adev, 2u, r->hubp_blank_offset_1 + hubp, snap->hubp_blank_offset_1);
+        (void)dc_reg_write(adev, 2u, r->hubp_dst_dimensions + hubp, snap->hubp_dst_dimensions);
+        (void)dc_reg_write(adev, 2u, r->hubp_ref_freq_to_pix_freq + hubp, snap->hubp_ref_freq_to_pix_freq);
+        (void)dc_reg_write(adev, 2u, r->hubp_per_line_delivery_pre + hubp, snap->hubp_per_line_delivery_pre);
+        (void)dc_reg_write(adev, 2u, r->hubp_per_line_delivery + hubp, snap->hubp_per_line_delivery);
+        (void)dc_reg_write(adev, 2u, r->hubp_ttu_global_cntl + hubp, snap->hubp_ttu_global_cntl);
+        (void)dc_reg_write(adev, 2u, r->hubp_surf0_ttu_cntl0 + hubp, snap->hubp_surf0_ttu_cntl0);
+        (void)dc_reg_write(adev, 2u, r->hubp_surf0_ttu_cntl1 + hubp, snap->hubp_surf0_ttu_cntl1);
+    }
+    if (snap->hubp_cntl != 0 && snap->hubp_cntl != 0xFFFFFFFFu) {
+        (void)dc_reg_write(adev, 2u, r->hubp_cntl + hubp, snap->hubp_cntl | HUBP_UNDERFLOW_CLEAR_BIT);
+    }
     (void)dc_reg_write(adev, 2u, r->hubp_viewport_start + hubp, snap->hubp_viewport_start);
     (void)dc_reg_write(adev, 2u, r->hubp_viewport_dim + hubp, snap->hubp_viewport_dim);
     (void)dc_reg_write(adev, 2u, r->hubp_surface_pitch + hubp, snap->hubp_surface_pitch);
@@ -166,10 +513,16 @@ static void restore_pipe_snapshot(
     (void)dc_reg_write(adev, 2u, r->hubp_primary_addr_hi + hubp, snap->hubp_primary_addr_hi);
     (void)dc_reg_write(adev, 2u, r->hubp_primary_addr + hubp, snap->hubp_primary_addr);
 
-    (void)dc_reg_write(adev, 2u, r->dscl_scl_mode + dpp, snap->dscl_scl_mode);
-    (void)dc_reg_write(adev, 2u, r->dscl_recout_start + dpp, snap->dscl_recout_start);
-    (void)dc_reg_write(adev, 2u, r->dscl_recout_size + dpp, snap->dscl_recout_size);
-    (void)dc_reg_write(adev, 2u, r->dscl_mpc_size + dpp, snap->dscl_mpc_size);
+    if (snap->dscl_static_valid) {
+        (void)dc_reg_write(adev, 2u, r->dscl_scl_mode + dpp, snap->dscl_scl_mode);
+        (void)dc_reg_write(adev, 2u, r->dscl_recout_start + dpp, snap->dscl_recout_start);
+        (void)dc_reg_write(adev, 2u, r->dscl_recout_size + dpp, snap->dscl_recout_size);
+        (void)dc_reg_write(adev, 2u, r->dscl_mpc_size + dpp, snap->dscl_mpc_size);
+    } else {
+        for (u8 i = 0; i < snap->dpp_size_reg_count && i < 4u; i++) {
+            (void)dc_reg_write(adev, 2u, snap->dpp_size_regs[i], snap->dpp_size_saved[i]);
+        }
+    }
     (void)dc_reg_write(adev, 2u, r->cnvc_pixel_format + dpp, snap->cnvc_pixel_format);
     (void)dc_reg_write(adev, 2u, r->cm_hdr_mult + dpp, snap->cm_hdr_mult);
 
@@ -177,17 +530,27 @@ static void restore_pipe_snapshot(
     (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param2 + dig_o, snap->dp_msa_param2);
     (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param3 + dig_o, snap->dp_msa_param3);
     (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param4 + dig_o, snap->dp_msa_param4);
+    (void)dc_reg_write(adev, 2u, r->dp_pixel_format + dig_o, snap->dp_pixel_format);
+    (void)dc_reg_write(adev, 2u, r->dp_msa_colorimetry + dig_o, snap->dp_msa_colorimetry);
     (void)dc_reg_write(adev, 2u, r->dp_msa_misc + dig_o, snap->dp_msa_misc);
     (void)dc_reg_write(adev, 2u, r->dp_vid_timing + dig_o, snap->dp_vid_timing);
+    (void)dc_reg_write(adev, 2u, r->dp_vid_n + dig_o, snap->dp_vid_n);
+    (void)dc_reg_write(adev, 2u, r->dp_vid_m + dig_o, snap->dp_vid_m);
     (void)dc_reg_write(adev, 2u, r->dsc_top_control + (u32)snap->pipe * r->dsc_stride, snap->dsc_top_control);
-    (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, DP_STEER_FIFO_RESET_BIT);
-    (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, 0u);
 
     /* Disable hardware cursor cleanly on boot restore. */
     (void)dc_reg_write(adev, 2u, r->cursor_control + hubp, 0u);
     (void)dc_reg_write(adev, 2u, r->dpp_cursor_control + dpp, 0u);
 
     (void)dc_reg_write(adev, 2u, r->otg_master_update_lock + otg, 0u);
+    dp_stream_resync_and_unblank(
+        adev,
+        r,
+        dig_o,
+        snap->dp_steer_fifo,
+        snap->dp_vid_stream_cntl,
+        snap->dig_fifo_ctrl0
+    );
 }
 
 /* Program DPP DSCL scaler for 1:1 bypass or arbitrary source-to-output resolution scaling. */
@@ -244,11 +607,18 @@ static void program_vrr(
         }
         (void)dc_reg_write(adev, 2u, r->otg_v_total_min + otg, v_total - 1u);
         (void)dc_reg_write(adev, 2u, r->otg_v_total_max + otg, v_max - 1u);
+        u32 dbuf = 0;
+        (void)dc_reg_read(adev, 2u, r->otg_double_buffer_control + otg, &dbuf);
+        dbuf = (dbuf & ~(0x3u << 24)) | (2u << 24);
+        (void)dc_reg_write(adev, 2u, r->otg_double_buffer_control + otg, dbuf);
         (void)dc_reg_write(
             adev,
             2u,
             r->otg_v_total_control + otg,
-            OTG_V_TOTAL_MIN_SEL_BIT | OTG_V_TOTAL_MAX_SEL_BIT | OTG_SET_V_TOTAL_MIN_MASK_EN_BIT
+            OTG_V_TOTAL_MIN_SEL_BIT
+                | OTG_V_TOTAL_MAX_SEL_BIT
+                | OTG_SET_V_TOTAL_MIN_MASK_EN_BIT
+                | OTG_SET_V_TOTAL_MIN_MASK_FLIP
         );
         p->vrr_enabled = true;
     } else {
@@ -275,14 +645,31 @@ static void program_hdr10(
 
     /* DCN SURFACE_PIXEL_FORMAT: 8 = ARGB8888 (8bpc), 10 = ARGB2101010 (10bpc). */
     u32 fmt = enable ? 10u : 8u;
-    (void)dc_reg_write(adev, 2u, r->hubp_surface_config + hubp, fmt);
+    u32 surf_cfg = 0;
+    (void)dc_reg_read(adev, 2u, r->hubp_surface_config + hubp, &surf_cfg);
+    (void)dc_reg_write(adev, 2u, r->hubp_surface_config + hubp, (surf_cfg & ~0x7Fu) | fmt);
     (void)dc_reg_write(adev, 2u, r->cnvc_pixel_format + dpp, fmt);
     (void)dc_reg_write(adev, 2u, r->cm_hdr_mult + dpp, enable ? 0x00010000u : 0x00008000u);
-    /* DP MSA MISC0 bits [7:5]: 1 = 8bpc, 2 = 10bpc. */
-    u32 misc = 0;
-    (void)dc_reg_read(adev, 2u, r->dp_msa_misc + dig_o, &misc);
-    misc = (misc & ~0xE0u) | (enable ? (2u << 5) : (1u << 5));
-    (void)dc_reg_write(adev, 2u, r->dp_msa_misc + dig_o, misc);
+    u32 dp_fmt = 0;
+    (void)dc_reg_read(adev, 2u, r->dp_pixel_format + dig_o, &dp_fmt);
+    u32 depth_code = enable ? 2u : 1u;
+    (void)dc_reg_write(adev, 2u, r->dp_pixel_format + dig_o, (dp_fmt & ~(0x7u << 8)) | (depth_code << 8));
+    u32 col = 0;
+    (void)dc_reg_read(adev, 2u, r->dp_msa_colorimetry + dig_o, &col);
+    u32 misc0 = (depth_code << 5) | 1u;
+    u32 new_col = p->boot_snapshot.msa_misc0_high
+        ? ((col & 0x00FFFFFFu) | (misc0 << 24))
+        : ((col & 0xFFFFFF00u) | (misc0 & 0xFFu));
+    (void)dc_reg_write(adev, 2u, r->dp_msa_colorimetry + dig_o, new_col);
+    /* MSA_MISC1 bit 6 = use VSC SDP for BT.2020/HDR colorimetry (dcn401_dio_stream_encoder.c). */
+    u32 misc1 = 0;
+    (void)dc_reg_read(adev, 2u, r->dp_msa_misc + dig_o, &misc1);
+    if (enable) {
+        misc1 |= (1u << 6);
+    } else {
+        misc1 &= ~(1u << 6);
+    }
+    (void)dc_reg_write(adev, 2u, r->dp_msa_misc + dig_o, misc1);
     p->hdr_enabled = enable;
 }
 
@@ -368,6 +755,242 @@ static void write_vsync_surface_mc(struct amdgpu_device *adev, const struct dc_r
     (void)dc_reg_write(adev, 2u, r->hubp_primary_addr + hubp, lo);
 }
 
+/* Program DCCG DP pixel-rate DTO (`dccg401_set_dp_dto` in dcn401_dccg.c):
+ *   dto_int    = pclk_hz / refclk_hz   (4-bit field DPDTO{0..3}_INT in OTG_PIXEL_RATE_DIV, 0..15)
+ *   dto_phase  = pclk_hz - dto_int * refclk_hz
+ *   dto_modulo = refclk_hz
+ * and enable BOTH `DP_DTO_ENABLE` (bit 4) and `PIPE_DTO_SRC_SEL` (bit 12) in `OTG_PIXEL_RATE_CNTL`. */
+static void program_dp_dto(
+    struct amdgpu_device *adev,
+    const struct dc_reg_table *r,
+    u8 pipe,
+    u32 prev_pdiv,
+    u32 prev_cntl,
+    u32 pclk_khz,
+    u32 refclk_khz,
+    u32 *out_dto_int,
+    u32 *out_dto_phase
+) {
+    u32 dccg = (u32)pipe * 4u;
+    u32 refclk = refclk_khz >= 50000u ? refclk_khz : 100000u;
+    u32 dto_int = pclk_khz / refclk;
+    u32 rem_khz = pclk_khz - dto_int * refclk;
+    if (dto_int > 15u) {
+        dto_int = 15u;
+        rem_khz = refclk - 1u;
+    }
+    /* Match AMD dcn401_dccg.c Hz units (fits cleanly in u32 up to 4.29 GHz). */
+    u32 dto_modulo_hz = refclk * 1000u;
+    u32 dto_phase_hz = rem_khz * 1000u;
+    (void)dc_reg_write(adev, 1u, r->dccg_dp_dto_phase + dccg, dto_phase_hz);
+    (void)dc_reg_write(adev, 1u, r->dccg_dp_dto_modulo + dccg, dto_modulo_hz);
+    if (r->has_otg_pixel_rate_div) {
+        /* DPDTO{0..3}_INT are 4-bit fields at shifts 1, 6, 11, 16 (`dcn_4_1_0_sh_mask.h`). */
+        u32 shift = 1u + (u32)(pipe & 3u) * 5u;
+        u32 pdiv = (prev_pdiv & ~(0xFu << shift)) | ((dto_int & 0xFu) << shift);
+        (void)dc_reg_write(adev, 1u, r->dccg_otg_pixel_rate_div, pdiv);
+    }
+    u32 cntl_bits = DP_DTO_ENABLE_BIT | (r->has_otg_pixel_rate_div ? PIPE_DTO_SRC_SEL_BIT : 0u);
+    (void)dc_reg_write(adev, 1u, r->dccg_otg_pixel_rate_cntl + dccg, prev_cntl | cntl_bits);
+    if (out_dto_int) *out_dto_int = dto_int;
+    if (out_dto_phase) *out_dto_phase = rem_khz;
+}
+
+/* AMD DENTIST DID <-> divider*4 conversions (`dcn10_dentist_get_divider_from_did` / `dentist_get_did_from_divider`). */
+static u32 dentist_did_to_div_x4(u32 did) {
+    did &= 0x7Fu;
+    if (did < 8u) return 0u;
+    if (did < 64u) return did;
+    if (did < 96u) return 64u + (did - 64u) * 2u;
+    return 128u + (did - 96u) * 4u;
+}
+
+static u32 dentist_div_x4_to_did(u32 div_x4) {
+    u32 did;
+    if (div_x4 <= 8u) did = 8u;
+    else if (div_x4 <= 64u) did = div_x4;
+    else if (div_x4 <= 128u) did = 64u + (div_x4 - 64u) / 2u;
+    else did = 96u + (div_x4 - 128u) / 4u;
+    if (did > 127u) did = 127u;
+    return did;
+}
+
+static u32 dcn401_read_vco_khz(const struct amdgpu_device *adev) {
+    if (!adev || adev->dcn_version != DC_DCN_4_0_1) return 4500000u;
+    u32 pll = amdgpu_rreg32(adev, DCN401_CLK0_PLL_REQ_BYTE);
+    if (pll != 0 && pll != 0xFFFFFFFFu) {
+        u32 fb_int = pll & 0x1FFu;
+        u32 fb_frac = (pll >> 16) & 0xFFFFu;
+        u64 vco = (u64)fb_int * 100000ULL + (((u64)fb_frac * 100000ULL) >> 16);
+        if (vco >= 2000000ULL && vco <= 8000000ULL) {
+            return (u32)vco;
+        }
+    }
+    return 4500000u;
+}
+
+static u32 dcn401_dfs_did_to_khz(u32 vco_khz, u32 dfs_reg) {
+    if (dfs_reg == 0 || dfs_reg == 0xFFFFFFFFu) return 0u;
+    u32 div_x4 = dentist_did_to_div_x4(dfs_reg & 0x7Fu);
+    if (div_x4 == 0) return 0u;
+    return (u32)((4ULL * (u64)vco_khz) / (u64)div_x4);
+}
+
+/* Raise DISPCLK/DPPCLK directly via DENTIST_DISPCLK_CNTL (`dcn401_update_clocks_update_dentist`)
+ * whenever SMU PMFW is unavailable and current DISPCLK/DPPCLK sits below the target mode pixel clock. */
+static void program_dentist_clocks(
+    struct amdgpu_device *adev,
+    const struct dc_reg_table *r,
+    u32 req_dispclk_mhz,
+    u32 req_dppclk_mhz
+) {
+    if (!adev || !r || r->dccg_dentist_dispclk_cntl == 0 || adev->smu.pmfw_alive) {
+        return;
+    }
+    u32 dent = 0;
+    if (!dc_reg_read(adev, 1u, r->dccg_dentist_dispclk_cntl, &dent) || dent == 0 || dent == 0xFFFFFFFFu) {
+        return;
+    }
+    u32 vco_khz = dcn401_read_vco_khz(adev);
+    u32 cur_disp_did = dent & 0x7Fu;
+    if (req_dispclk_mhz >= 100u && cur_disp_did >= 8u && cur_disp_did <= 127u) {
+        u32 target_khz = req_dispclk_mhz * 1000u;
+        u32 div_x4 = (u32)((4ULL * (u64)vco_khz) / (u64)target_khz);
+        u32 new_did = dentist_div_x4_to_did(div_x4);
+        if (new_did < 12u) new_did = 12u; /* safety ceiling: <= 1500 MHz at 4.5 GHz VCO */
+        if (new_did < cur_disp_did) {
+            dent = (dent & ~0x7Fu) | (new_did & 0x7Fu);
+            (void)dc_reg_write(adev, 1u, r->dccg_dentist_dispclk_cntl, dent);
+            for (u32 i = 0; i < 400u; i++) {
+                u32 st = 0;
+                if (!dc_reg_read(adev, 1u, r->dccg_dentist_dispclk_cntl, &st)) break;
+                if ((st & DENTIST_DISPCLK_CHG_DONE_BIT) != 0) break;
+                amdgpu_udelay(adev, 50u);
+            }
+        }
+    }
+    (void)dc_reg_read(adev, 1u, r->dccg_dentist_dispclk_cntl, &dent);
+    u32 cur_dpp_did = (dent >> 24) & 0x7Fu;
+    if (req_dppclk_mhz >= 100u && cur_dpp_did >= 8u && cur_dpp_did <= 127u) {
+        u32 target_khz = req_dppclk_mhz * 1000u;
+        u32 div_x4 = (u32)((4ULL * (u64)vco_khz) / (u64)target_khz);
+        u32 new_did = dentist_div_x4_to_did(div_x4);
+        if (new_did < 12u) new_did = 12u;
+        if (new_did < cur_dpp_did) {
+            dent = (dent & ~(0x7Fu << 24)) | ((new_did & 0x7Fu) << 24);
+            (void)dc_reg_write(adev, 1u, r->dccg_dentist_dispclk_cntl, dent);
+            for (u32 i = 0; i < 400u; i++) {
+                u32 st = 0;
+                if (!dc_reg_read(adev, 1u, r->dccg_dentist_dispclk_cntl, &st)) break;
+                if ((st & DENTIST_DPPCLK_CHG_DONE_BIT) != 0) break;
+                amdgpu_udelay(adev, 50u);
+            }
+        }
+    }
+}
+
+static u32 scale_dlg_field(u32 boot_val, u64 num, u64 den, u32 mask) {
+    if (boot_val == 0 || num == 0 || den == 0) return boot_val & mask;
+    u64 v = ((u64)boot_val * num + (den / 2ULL)) / den;
+    if (v == 0) v = 1ULL;
+    if (v > (u64)mask) v = (u64)mask;
+    return (u32)v;
+}
+
+/* Reprogram DCN 4.0.1 HUBP DLG & TTU deadline timers proportionally from UEFI's calibrated boot
+ * snapshot (`hubp401_program_deadline` / `hubp401_setup_interdependent`) so high-refresh modes
+ * (e.g. 60 -> 240 Hz with 4x shorter scanlines and different v_blank_end) never underflow HUBP. */
+static void program_hubp_dlg_ttu(
+    struct amdgpu_device *adev,
+    const struct dc_reg_table *r,
+    const struct dc_pipe_state *p,
+    const struct dc_timing *target,
+    u32 h_total,
+    u32 h_blank_end,
+    u32 v_blank_end,
+    u32 vstartup
+) {
+    const struct dc_pipe_reg_snapshot *bs = &p->boot_snapshot;
+    if (!r || r->hubp_blank_offset_0 == 0 || bs->boot_pclk_khz == 0 || target->pixel_clock_khz == 0) {
+        return;
+    }
+    if (bs->hubp_blank_offset_0 == 0 || bs->hubp_blank_offset_0 == 0xFFFFFFFFu) {
+        return;
+    }
+    u32 hubp = (u32)p->pipe_idx * r->hubp_stride;
+    u64 p_boot = (u64)bs->boot_pclk_khz;
+    u64 p_new = (u64)target->pixel_clock_khz;
+    u64 ht_boot = bs->boot_h_total ? (u64)bs->boot_h_total : (u64)h_total;
+    u64 hbe_boot = bs->boot_h_blank_end ? (u64)bs->boot_h_blank_end : (u64)h_blank_end;
+    u64 ha_boot = bs->dst_width ? (u64)bs->dst_width : (u64)target->h_active;
+    u64 vb_boot = bs->boot_v_blank ? (u64)bs->boot_v_blank : (u64)target->v_blank;
+
+    /* BLANK_OFFSET_0: [12:0] REFCYC_H_BLANK_END, [30:16] DLG_V_BLANK_END */
+    u32 hbe_ref = scale_dlg_field(bs->hubp_blank_offset_0 & 0x1FFFu, (u64)h_blank_end * p_boot, hbe_boot * p_new, 0x1FFFu);
+    u32 bo0 = (bs->hubp_blank_offset_0 & ~(0x1FFFu | (0x7FFFu << 16)))
+        | hbe_ref
+        | ((v_blank_end & 0x7FFFu) << 16);
+    (void)dc_reg_write(adev, 2u, r->hubp_blank_offset_0 + hubp, bo0);
+
+    /* DST_DIMENSIONS: [20:0] REFCYC_PER_HTOTAL */
+    if (bs->hubp_dst_dimensions != 0 && bs->hubp_dst_dimensions != 0xFFFFFFFFu) {
+        u32 rph = scale_dlg_field(bs->hubp_dst_dimensions & 0x1FFFFFu, (u64)h_total * p_boot, ht_boot * p_new, 0x1FFFFFu);
+        (void)dc_reg_write(adev, 2u, r->hubp_dst_dimensions + hubp, (bs->hubp_dst_dimensions & ~0x1FFFFFu) | rph);
+    }
+
+    /* REF_FREQ_TO_PIX_FREQ: [20:0] */
+    if (bs->hubp_ref_freq_to_pix_freq != 0 && bs->hubp_ref_freq_to_pix_freq != 0xFFFFFFFFu) {
+        u32 r2p = scale_dlg_field(bs->hubp_ref_freq_to_pix_freq & 0x1FFFFFu, p_boot, p_new, 0x1FFFFFu);
+        (void)dc_reg_write(adev, 2u, r->hubp_ref_freq_to_pix_freq + hubp, (bs->hubp_ref_freq_to_pix_freq & ~0x1FFFFFu) | r2p);
+    }
+
+    /* PER_LINE_DELIVERY & PER_LINE_DELIVERY_PRE: [12:0] L, [28:16] C */
+    if (bs->hubp_per_line_delivery != 0 && bs->hubp_per_line_delivery != 0xFFFFFFFFu) {
+        u32 l_val = scale_dlg_field(bs->hubp_per_line_delivery & 0x1FFFu, (u64)target->h_active * p_boot, ha_boot * p_new, 0x1FFFu);
+        u32 c_val = scale_dlg_field((bs->hubp_per_line_delivery >> 16) & 0x1FFFu, (u64)target->h_active * p_boot, ha_boot * p_new, 0x1FFFu);
+        u32 pld = (bs->hubp_per_line_delivery & ~(0x1FFFu | (0x1FFFu << 16))) | l_val | (c_val << 16);
+        (void)dc_reg_write(adev, 2u, r->hubp_per_line_delivery + hubp, pld);
+    }
+    if (bs->hubp_per_line_delivery_pre != 0 && bs->hubp_per_line_delivery_pre != 0xFFFFFFFFu) {
+        u32 l_val = scale_dlg_field(bs->hubp_per_line_delivery_pre & 0x1FFFu, (u64)target->h_active * p_boot, ha_boot * p_new, 0x1FFFu);
+        u32 c_val = scale_dlg_field((bs->hubp_per_line_delivery_pre >> 16) & 0x1FFFu, (u64)target->h_active * p_boot, ha_boot * p_new, 0x1FFFu);
+        u32 pldp = (bs->hubp_per_line_delivery_pre & ~(0x1FFFu | (0x1FFFu << 16))) | l_val | (c_val << 16);
+        (void)dc_reg_write(adev, 2u, r->hubp_per_line_delivery_pre + hubp, pldp);
+    }
+
+    /* DCN_SURF0_TTU_CNTL0 / CNTL1: [22:0] REFCYC_PER_REQ_DELIVERY(_PRE) */
+    if (bs->hubp_surf0_ttu_cntl0 != 0 && bs->hubp_surf0_ttu_cntl0 != 0xFFFFFFFFu) {
+        u32 rpr = scale_dlg_field(bs->hubp_surf0_ttu_cntl0 & 0x7FFFFFu, p_boot, p_new, 0x7FFFFFu);
+        (void)dc_reg_write(adev, 2u, r->hubp_surf0_ttu_cntl0 + hubp, (bs->hubp_surf0_ttu_cntl0 & ~0x7FFFFFu) | rpr);
+    }
+    if (bs->hubp_surf0_ttu_cntl1 != 0 && bs->hubp_surf0_ttu_cntl1 != 0xFFFFFFFFu) {
+        u32 rprp = scale_dlg_field(bs->hubp_surf0_ttu_cntl1 & 0x7FFFFFu, p_boot, p_new, 0x7FFFFFu);
+        (void)dc_reg_write(adev, 2u, r->hubp_surf0_ttu_cntl1 + hubp, (bs->hubp_surf0_ttu_cntl1 & ~0x7FFFFFu) | rprp);
+    }
+
+    /* DCN_GLOBAL_TTU_CNTL: [23:0] MIN_TTU_VBLANK */
+    if (bs->hubp_ttu_global_cntl != 0 && bs->hubp_ttu_global_cntl != 0xFFFFFFFFu) {
+        u32 mtv = scale_dlg_field(
+            bs->hubp_ttu_global_cntl & 0xFFFFFFu,
+            (u64)target->v_blank * (u64)h_total * p_boot,
+            vb_boot * ht_boot * p_new,
+            0xFFFFFFu
+        );
+        (void)dc_reg_write(adev, 2u, r->hubp_ttu_global_cntl + hubp, (bs->hubp_ttu_global_cntl & ~0xFFFFFFu) | mtv);
+    }
+
+    /* Update HUBP_VREADY_AT_OR_AFTER_VSYNC coherently with vstartup vs v_blank_end (`hubp401_vready_at_or_After_vsync`). */
+    if (bs->hubp_cntl != 0 && bs->hubp_cntl != 0xFFFFFFFFu) {
+        u32 hctl = bs->hubp_cntl & ~HUBP_UNDERFLOW_CLEAR_BIT;
+        if (vstartup <= v_blank_end) {
+            hctl |= HUBP_VREADY_AT_OR_AFTER_VSYNC_BIT;
+        } else {
+            hctl &= ~HUBP_VREADY_AT_OR_AFTER_VSYNC_BIT;
+        }
+        (void)dc_reg_write(adev, 2u, r->hubp_cntl + hubp, hctl);
+    }
+}
+
 /* Reprogram DCN pipe timing, DCCG DTO, HUBP/DSCL, DIG MSA, DSC, and verify live progression. */
 static int apply_modeset(
     struct amdgpu_device *adev,
@@ -382,8 +1005,16 @@ static int apply_modeset(
     /* Save pre-modeset registers for instant rollback if live verification fails. */
     struct dc_pipe_reg_snapshot prev;
     capture_pipe_snapshot(adev, r, p->pipe_idx, p->dig_idx, &prev);
+    prev.msa_h_low = p->boot_snapshot.msa_h_low;
+    prev.msa_misc0_high = p->boot_snapshot.msa_misc0_high;
+    prev.dscl_static_valid = p->boot_snapshot.dscl_static_valid;
+    prev.dpp_size_reg_count = p->boot_snapshot.dpp_size_reg_count;
+    for (u8 i = 0; i < prev.dpp_size_reg_count && i < 4u; i++) {
+        prev.dpp_size_regs[i] = p->boot_snapshot.dpp_size_regs[i];
+        (void)dc_reg_read(adev, 2u, prev.dpp_size_regs[i], &prev.dpp_size_saved[i]);
+    }
 
-    /* 1. Request SMU/PMFW minimum display clocks before increasing pixel clock. */
+    /* 1. Record / request minimum display clocks (SMU v14.0.2 & DENTIST fallback). */
     (void)amdgpu_smu_set_display_clocks(
         adev,
         plan->dispclk_mhz,
@@ -392,12 +1023,28 @@ static int apply_modeset(
         plan->dtbclk_mhz,
         plan->uclk_mhz
     );
+    program_dentist_clocks(adev, r, plan->dispclk_mhz, plan->dppclk_mhz);
 
-    /* 2. Retrain DP 1.4/2.1 or HDMI 2.1 FRL link only when target mode exceeds current trained link. */
+    /* 2. Retrain DP 1.4/2.1 or HDMI 2.1 FRL link only when target mode exceeds current trained link.
+     * Never touch sink DPCD 0x0100/0x0102 when UEFI owns DMCUB (no GPU PHY transmitter control). */
     if (conn && conn->connected) {
         u64 cur_bw = (u64)conn->trained_lanes * (u64)conn->trained_rate_mbps;
         u64 req_bw = (u64)plan->req_lanes * (u64)plan->req_rate_mbps;
         if (req_bw > cur_bw || (plan->requires_uhbr && conn->link_type != DC_LINK_DP_2_1)) {
+            if (!dc->dmub.ring_owned) {
+                struct dc_log_buf lb = { { 0 }, 0 };
+                dlog_str(&lb, "amdgpu: dc: modeset refused: link retrain needs ");
+                dlog_u32(&lb, plan->req_lanes);
+                dlog_str(&lb, "x");
+                dlog_u32(&lb, plan->req_rate_mbps);
+                dlog_str(&lb, "Mbps > trained ");
+                dlog_u32(&lb, conn->trained_lanes);
+                dlog_str(&lb, "x");
+                dlog_u32(&lb, conn->trained_rate_mbps);
+                dlog_str(&lb, "Mbps (UEFI DMUB owns PHY)");
+                dlog_emit(adev, &lb);
+                return -ENOTSUP;
+            }
             int lrc = (conn->link_type == DC_LINK_HDMI_21)
                 ? dc_link_train_hdmi_frl(adev, dc, conn, plan->req_lanes, plan->req_rate_mbps)
                 : dc_link_train_dp(adev, dc, conn, plan->req_lanes, plan->req_rate_mbps);
@@ -428,8 +1075,8 @@ static int apply_modeset(
     u32 otg = (u32)p->pipe_idx * r->otg_stride;
     u32 hubp = (u32)p->pipe_idx * r->hubp_stride;
     u32 dig_o = (u32)p->dig_idx * r->dig_stride;
-    u32 dccg = (u32)p->pipe_idx * 4u;
 
+    dp_stream_blank(adev, r, dig_o);
     (void)dc_reg_write(adev, 2u, r->otg_master_update_lock + otg, 1u);
 
     u32 h_total = target->h_active + target->h_blank;
@@ -439,74 +1086,345 @@ static int apply_modeset(
     u32 v_blank_end = target->v_blank > target->v_front_porch ? (target->v_blank - target->v_front_porch) : 4u;
     u32 v_blank_start = v_blank_end + target->v_active;
 
-    (void)dc_reg_write(adev, 2u, r->otg_h_total + otg, (h_total - 1u) & 0xFFFFu);
-    (void)dc_reg_write(adev, 2u, r->otg_h_blank + otg, ((h_blank_end & 0xFFFFu) << 16) | (h_blank_start & 0xFFFFu));
-    (void)dc_reg_write(adev, 2u, r->otg_h_sync_a + otg, (target->h_sync_width & 0xFFFFu) << 16);
+    (void)dc_reg_write(adev, 2u, r->otg_h_total + otg, (h_total - 1u) & 0x7FFFu);
+    (void)dc_reg_write(adev, 2u, r->otg_h_blank + otg, ((h_blank_end & 0x7FFFu) << 16) | (h_blank_start & 0x7FFFu));
+    (void)dc_reg_write(adev, 2u, r->otg_h_sync_a + otg, (target->h_sync_width & 0x7FFFu) << 16);
     (void)dc_reg_write(adev, 2u, r->otg_h_sync_a_cntl + otg, target->h_sync_pos ? 0u : 1u);
 
-    (void)dc_reg_write(adev, 2u, r->otg_v_total + otg, (v_total - 1u) & 0xFFFFu);
-    (void)dc_reg_write(adev, 2u, r->otg_v_blank + otg, ((v_blank_end & 0xFFFFu) << 16) | (v_blank_start & 0xFFFFu));
-    (void)dc_reg_write(adev, 2u, r->otg_v_sync_a + otg, (target->v_sync_width & 0xFFFFu) << 16);
+    (void)dc_reg_write(adev, 2u, r->otg_v_total + otg, (v_total - 1u) & 0x7FFFu);
+    (void)dc_reg_write(adev, 2u, r->otg_v_blank + otg, ((v_blank_end & 0x7FFFu) << 16) | (v_blank_start & 0x7FFFu));
+    (void)dc_reg_write(adev, 2u, r->otg_v_sync_a + otg, (target->v_sync_width & 0x7FFFu) << 16);
     (void)dc_reg_write(adev, 2u, r->otg_v_sync_a_cntl + otg, target->v_sync_pos ? 0u : 1u);
-
-    /* DCCG fractional DP DTO: phase / modulo = target_pclk_khz / src_clk_khz. */
-    u32 src_clk_khz = p->boot_snapshot.dto_src_clk_khz;
-    if (src_clk_khz < 100000u) src_clk_khz = plan->dtbclk_mhz * 1000u;
-    if (r->has_otg_pixel_rate_div && plan->pixel_rate_div >= 2u) {
-        u32 pdiv = prev.dccg_pixel_rate_div;
-        u32 shift = (u32)p->pipe_idx * 4u;
-        pdiv = (pdiv & ~(0x0Fu << shift)) | (1u << shift);
-        (void)dc_reg_write(adev, 1u, r->dccg_otg_pixel_rate_div, pdiv);
-        src_clk_khz = src_clk_khz * 2u;
+    /* Ensure stale VRR/DRR vertical limits cannot clamp the newly programmed v_total. */
+    if (!p->vrr_enabled) {
+        (void)dc_reg_write(adev, 2u, r->otg_v_total_control + otg, 0u);
+        (void)dc_reg_write(adev, 2u, r->otg_v_total_min + otg, (v_total - 1u) & 0x7FFFu);
+        (void)dc_reg_write(adev, 2u, r->otg_v_total_max + otg, (v_total - 1u) & 0x7FFFu);
     }
-    u32 eff_pclk = target->pixel_clock_khz;
-    if (eff_pclk > src_clk_khz) eff_pclk = src_clk_khz;
-    (void)dc_reg_write(adev, 1u, r->dccg_dp_dto_modulo + dccg, src_clk_khz);
-    (void)dc_reg_write(adev, 1u, r->dccg_dp_dto_phase + dccg, eff_pclk);
-    (void)dc_reg_write(adev, 1u, r->dccg_otg_pixel_rate_cntl + dccg, prev.dccg_pixel_rate_cntl | 1u);
 
-    /* Reprogram HUBP viewport + pitch + DPP DSCL scaler (handles arbitrary resolution scaling!). */
-    u32 pitch_px = (target->h_active + 63u) & ~63u;
-    (void)dc_reg_write(adev, 2u, r->hubp_viewport_start + hubp, 0u);
-    (void)dc_reg_write(adev, 2u, r->hubp_viewport_dim + hubp, ((target->v_active & 0xFFFFu) << 16) | (target->h_active & 0xFFFFu));
-    (void)dc_reg_write(adev, 2u, r->hubp_surface_pitch + hubp, (pitch_px - 1u) & 0x3FFFu);
-    program_dpp_scaler(adev, r, p->pipe_idx, target->h_active, target->v_active, target->h_active, target->v_active);
+    /* Synchronize VTG0_VCOUNT_INIT / VTG0_FP2, OTG_VSTARTUP_PARAM, and HUBP DLG/TTU deadlines
+     * with the new timing (`optc1_set_vtg_params` + `hubp401_program_deadline`). */
+    u32 vstartup = p->boot_snapshot.otg_vstartup_param & 0x3FFu;
+    if (vstartup < 14u) vstartup = 14u;
+    if (p->boot_snapshot.boot_v_blank_end > 0 && v_blank_end > p->boot_snapshot.boot_v_blank_end) {
+        u32 scaled = (vstartup * v_blank_end) / p->boot_snapshot.boot_v_blank_end;
+        if (scaled > vstartup) vstartup = scaled;
+    }
+    if (v_blank_end >= 14u && vstartup > v_blank_end) {
+        vstartup = v_blank_end;
+    } else if (target->v_blank > 2u && vstartup >= target->v_blank) {
+        vstartup = target->v_blank - 1u;
+    }
+    if (r->vtg_control != 0 || r->otg_vstartup_param != 0) {
+        if (r->otg_vstartup_param != 0) {
+            (void)dc_reg_write(adev, 2u, r->otg_vstartup_param + otg, vstartup & 0x3FFu);
+        }
+        if (r->vtg_control != 0) {
+            u32 v_fp2 = (vstartup > (v_blank_end + 1u)) ? (vstartup - (v_blank_end + 1u)) : 0u;
+            u32 vtg_val = (1u << 31) | ((v_blank_start & 0x7FFFu) << 16) | (v_fp2 & 0x7FFFu);
+            (void)dc_reg_write(adev, 2u, r->vtg_control + (u32)p->pipe_idx, vtg_val);
+        }
+    }
+    program_hubp_dlg_ttu(adev, r, p, target, h_total, h_blank_end, v_blank_end, vstartup);
 
-    /* Program DIG DP Main Stream Attributes (MSA) + automatic DP M/N generation + STEER FIFO reset. */
-    (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param1 + dig_o, ((v_total & 0xFFFFu) << 16) | (h_total & 0xFFFFu));
-    (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param2 + dig_o, ((v_blank_end & 0xFFFFu) << 16) | (h_blank_end & 0xFFFFu));
-    (void)dc_reg_write(
+    /* Unthrottle per-pipe DCCG DPPCLK DTO to 100% of global DPPCLK (`dccg401_update_dpp_dto`)
+     * so high-refresh modes (e.g. 240 Hz / 580 MHz) never underflow on UEFI's 60 Hz DPPCLK divider. */
+    if (r->dccg_dppclk_dto_param != 0) {
+        (void)dc_reg_write(adev, 1u, r->dccg_dppclk_dto_param + (u32)p->pipe_idx, (0xFFu << 16) | 0xFFu);
+    }
+    if (r->dccg_dppclk_ctrl != 0) {
+        u32 dpp_en = 1u << ((u32)(p->pipe_idx & 3u) * 3u);
+        (void)dc_reg_write(adev, 1u, r->dccg_dppclk_ctrl, prev.dccg_dppclk_ctrl | dpp_en);
+    }
+
+    u32 refclk = p->boot_snapshot.dto_src_clk_khz;
+    if (refclk < 50000u) refclk = r->has_otg_pixel_rate_div ? 100000u : 1000000u;
+    u32 dto_int = 0u, dto_phase = 0u;
+    program_dp_dto(
         adev,
-        2u,
-        r->dp_msa_timing_param3 + dig_o,
-        ((target->v_sync_width & 0x7FFFu) << 16) | (target->h_sync_width & 0x7FFFu)
+        r,
+        p->pipe_idx,
+        prev.dccg_pixel_rate_div,
+        prev.dccg_pixel_rate_cntl,
+        target->pixel_clock_khz,
+        refclk,
+        &dto_int,
+        &dto_phase
     );
-    (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param4 + dig_o, ((target->v_active & 0xFFFFu) << 16) | (target->h_active & 0xFFFFu));
-    (void)dc_reg_write(adev, 2u, r->dp_vid_timing + dig_o, prev.dp_vid_timing | DP_VID_M_N_GEN_EN_BIT);
-    (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, DP_STEER_FIFO_RESET_BIT);
-    (void)dc_reg_write(adev, 2u, r->dp_steer_fifo + dig_o, 0u);
 
-    /* Program DSC 1.2a hardware encoder & DPCD 0x0160 if needed. */
-    (void)dc_dsc_program_hw(adev, dc, p->pipe_idx, plan->requires_dsc ? &pps : NULL, plan->requires_dsc);
-    if (conn && (conn->link_type == DC_LINK_DP_1_4 || conn->link_type == DC_LINK_DP_2_1) && conn->dsc_capable) {
-        u8 dsc_en = plan->requires_dsc ? 0x01u : 0x00u;
-        (void)dc_dpcd_write(adev, r, conn->aux_idx, 0x0160u, &dsc_en, 1u);
+    /* Only reprogram HUBP viewport/pitch + DPP geometry when output resolution actually changes;
+     * preserve firmware's live HUBP/DPP pipeline for same-resolution refresh-rate switches (e.g. 60 -> 240 Hz). */
+    bool res_changed = (target->h_active != p->src_width || target->v_active != p->src_height);
+    u32 pitch_px = p->pitch_bytes / 4u;
+    if (res_changed) {
+        pitch_px = (target->h_active + 63u) & ~63u;
+        u32 dim = ((target->v_active & 0x3FFFu) << 16) | (target->h_active & 0x3FFFu);
+        (void)dc_reg_write(adev, 2u, r->hubp_viewport_start + hubp, 0u);
+        (void)dc_reg_write(adev, 2u, r->hubp_viewport_dim + hubp, dim);
+        (void)dc_reg_write(adev, 2u, r->hubp_surface_pitch + hubp, (pitch_px - 1u) & 0x3FFFu);
+        if (p->boot_snapshot.dscl_static_valid) {
+            program_dpp_scaler(adev, r, p->pipe_idx, target->h_active, target->v_active, target->h_active, target->v_active);
+        } else {
+            for (u8 i = 0; i < p->boot_snapshot.dpp_size_reg_count && i < 4u; i++) {
+                (void)dc_reg_write(adev, 2u, p->boot_snapshot.dpp_size_regs[i], dim);
+            }
+        }
+    }
+
+    /* Program DIG DP Main Stream Attributes (MSA) matching the live silicon layout detected at boot
+     * (`msa_h_low = true` = AMD DCN standard: H in [15:0], V in [31:16]; else H in [31:16], V in [15:0]). */
+    if (p->boot_snapshot.msa_h_low) {
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param1 + dig_o, ((v_total & 0xFFFFu) << 16) | (h_total & 0xFFFFu));
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param2 + dig_o, ((v_blank_end & 0xFFFFu) << 16) | (h_blank_end & 0xFFFFu));
+        u32 msa3 = (target->h_sync_width & 0x7FFFu)
+            | ((target->h_sync_pos ? 0u : 1u) << 15)
+            | ((target->v_sync_width & 0x7FFFu) << 16)
+            | ((target->v_sync_pos ? 0u : 1u) << 31);
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param3 + dig_o, msa3);
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param4 + dig_o, ((target->v_active & 0xFFFFu) << 16) | (target->h_active & 0xFFFFu));
+    } else {
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param1 + dig_o, ((h_total & 0xFFFFu) << 16) | (v_total & 0xFFFFu));
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param2 + dig_o, ((h_blank_end & 0xFFFFu) << 16) | (v_blank_end & 0xFFFFu));
+        u32 msa3 = (target->v_sync_width & 0x7FFFu)
+            | ((target->v_sync_pos ? 0u : 1u) << 15)
+            | ((target->h_sync_width & 0x7FFFu) << 16)
+            | ((target->h_sync_pos ? 0u : 1u) << 31);
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param3 + dig_o, msa3);
+        (void)dc_reg_write(adev, 2u, r->dp_msa_timing_param4 + dig_o, ((target->h_active & 0xFFFFu) << 16) | (target->v_active & 0xFFFFu));
+    }
+
+    /* Preserve firmware's working DP_PIXEL_FORMAT & DP_MSA_COLORIMETRY for normal 8-bpc SDR modes;
+     * only touch component depth / DSC / MISC0 bits when bpc or DSC actually changes.
+     * (`dcn_4_1_0_sh_mask.h`: PIXEL_ENCODING_TYPE = bit 0, UNCOMPRESSED_COMPONENT_DEPTH = [10:8],
+     *  DP_MSA_MISC0 = [31:24]). */
+    if (plan->bpc != 8u || plan->requires_dsc || p->hdr_enabled || p->dsc_enabled) {
+        u32 depth_code = (plan->bpc >= 10u) ? 2u : 1u; /* 1 = 8bpc, 2 = 10bpc */
+        u32 dp_fmt = (prev.dp_pixel_format & ~((0x7u << 8) | 1u))
+            | (depth_code << 8)
+            | (plan->requires_dsc ? 1u : 0u);
+        (void)dc_reg_write(adev, 2u, r->dp_pixel_format + dig_o, dp_fmt);
+        u32 misc0 = (depth_code << 5) | 1u; /* synchronous clock + bpc */
+        u32 new_col = p->boot_snapshot.msa_misc0_high
+            ? ((prev.dp_msa_colorimetry & 0x00FFFFFFu) | (misc0 << 24))
+            : ((prev.dp_msa_colorimetry & 0xFFFFFF00u) | (misc0 & 0xFFu));
+        (void)dc_reg_write(adev, 2u, r->dp_msa_colorimetry + dig_o, new_col);
+    }
+
+    /* Seed initial DP_VID_N / DP_VID_M for the new pixel clock (matching dcn401_dio_stream_encoder.c),
+     * then re-enable automatic hardware M/N tracking (`DP_VID_M_N_GEN_EN = 1`). */
+    {
+        u32 rate_mbps = (conn && conn->trained_rate_mbps > 0) ? conn->trained_rate_mbps : DC_DP_RATE_HBR2_MBPS;
+        u64 f_ls_khz = (rate_mbps >= DC_DP_RATE_UHBR10_MBPS)
+            ? (((u64)rate_mbps * 1000ULL) / 32ULL)
+            : ((u64)rate_mbps * 100ULL);
+        u32 n_vid = 0x8000u;
+        u32 m_vid = f_ls_khz
+            ? (u32)(((u64)target->pixel_clock_khz * (u64)n_vid + (f_ls_khz / 2ULL)) / f_ls_khz)
+            : 0x2000u;
+        (void)dc_reg_write(adev, 2u, r->dp_vid_timing + dig_o, prev.dp_vid_timing & ~DP_VID_M_N_GEN_EN_BIT);
+        (void)dc_reg_write(adev, 2u, r->dp_vid_n + dig_o, n_vid);
+        (void)dc_reg_write(adev, 2u, r->dp_vid_m + dig_o, m_vid);
+        (void)dc_reg_write(adev, 2u, r->dp_vid_timing + dig_o, prev.dp_vid_timing | DP_VID_M_N_GEN_EN_BIT);
+    }
+
+    /* Program DSC 1.2a hardware encoder & DPCD 0x0160 only when enabling or disabling DSC. */
+    if (plan->requires_dsc || p->dsc_enabled) {
+        (void)dc_dsc_program_hw(adev, dc, p->pipe_idx, plan->requires_dsc ? &pps : NULL, plan->requires_dsc);
+        if (conn && (conn->link_type == DC_LINK_DP_1_4 || conn->link_type == DC_LINK_DP_2_1) && conn->dsc_capable) {
+            u8 dsc_en = plan->requires_dsc ? 0x01u : 0x00u;
+            (void)dc_dpcd_write(adev, r, conn->aux_idx, 0x0160u, &dsc_en, 1u);
+        }
     }
 
     (void)dc_reg_write(adev, 2u, r->otg_master_update_lock + otg, 0u);
 
-    /* 5. Live post-modeset verification: confirm OTG frame counter advances cleanly without stalling. */
-    u32 fc0 = read_otg_frame_count(adev, r, p->pipe_idx);
-    amdgpu_udelay(adev, 20000u); /* 20 ms covers >= 1 frame at >= 50 Hz */
-    u32 fc1 = read_otg_frame_count(adev, r, p->pipe_idx);
-    if (frame_count_delta(fc1, fc0) == 0) {
-        /* Second brief check for low-refresh panels (24-48 Hz). */
-        amdgpu_udelay(adev, 30000u);
-        fc1 = read_otg_frame_count(adev, r, p->pipe_idx);
+    /* Wait for OTG to latch the unlocked timing on the next frame boundary (max ~25 ms) before
+     * resetting DP_STEER_FIFO & DIG_FIFO_CTRL0 so the FIFOs sync cleanly to the NEW timing! */
+    {
+        u32 fc_pre = read_otg_frame_count(adev, r, p->pipe_idx);
+        for (u32 wstep = 0; wstep < 25u; wstep++) {
+            amdgpu_udelay(adev, 1000u);
+            if (read_otg_frame_count(adev, r, p->pipe_idx) != fc_pre) break;
+        }
     }
-    if (frame_count_delta(fc1, fc0) == 0) {
+
+    /* Reset & re-enable DP_STEER_FIFO, DIG_FIFO_CTRL0 (DCN 4.0.1), and DP_VID_STREAM_CNTL. */
+    dp_stream_resync_and_unblank(
+        adev,
+        r,
+        dig_o,
+        prev.dp_steer_fifo,
+        prev.dp_vid_stream_cntl,
+        prev.dig_fifo_ctrl0
+    );
+
+    /* 5. Live post-modeset verification & one-shot DTBCLK self-calibration when boot DTO was disabled. */
+    u32 total_df = 0;
+    u32 measured_mhz = measure_otg_refresh_mhz(adev, r, p->pipe_idx, &total_df);
+    if (total_df == 0) {
         restore_pipe_snapshot(adev, r, &prev);
+        struct dc_log_buf lb = { { 0 }, 0 };
+        dlog_str(&lb, "amdgpu: dc: modeset rollback (OTG stalled) target=");
+        dlog_u32(&lb, target->h_active);
+        dlog_str(&lb, "x");
+        dlog_u32(&lb, target->v_active);
+        dlog_str(&lb, "@");
+        dlog_u32(&lb, target->refresh_mhz / 1000u);
+        dlog_str(&lb, "Hz pclk=");
+        dlog_u32(&lb, target->pixel_clock_khz);
+        dlog_str(&lb, "kHz ref=");
+        dlog_u32(&lb, refclk);
+        dlog_emit(adev, &lb);
         return -EIO;
+    }
+
+    if (!p->boot_snapshot.dto_src_calibrated && measured_mhz >= 20000u && target->refresh_mhz >= 20000u) {
+        u32 diff = measured_mhz > target->refresh_mhz
+            ? (measured_mhz - target->refresh_mhz)
+            : (target->refresh_mhz - measured_mhz);
+        if (diff > (target->refresh_mhz / 25u)) {
+            u64 real_ref = ((u64)refclk * (u64)measured_mhz) / (u64)target->refresh_mhz;
+            if (real_ref >= 100000ULL && real_ref <= 3000000ULL) {
+                refclk = (u32)real_ref;
+                p->boot_snapshot.dto_src_clk_khz = refclk;
+                p->boot_snapshot.dto_src_calibrated = true;
+                dp_stream_blank(adev, r, dig_o);
+    (void)dc_reg_write(adev, 2u, r->otg_master_update_lock + otg, 1u);
+                program_dp_dto(
+                    adev,
+                    r,
+                    p->pipe_idx,
+                    prev.dccg_pixel_rate_div,
+                    prev.dccg_pixel_rate_cntl,
+                    target->pixel_clock_khz,
+                    refclk,
+                    &dto_int,
+                    &dto_phase
+                );
+                (void)dc_reg_write(adev, 2u, r->otg_master_update_lock + otg, 0u);
+                dp_stream_resync_and_unblank(
+                    adev,
+                    r,
+                    dig_o,
+                    prev.dp_steer_fifo,
+                    prev.dp_vid_stream_cntl,
+                    prev.dig_fifo_ctrl0
+                );
+                u32 cal_df = 0;
+                u32 cal_mhz = measure_otg_refresh_mhz(adev, r, p->pipe_idx, &cal_df);
+                if (cal_df == 0) {
+                    restore_pipe_snapshot(adev, r, &prev);
+                    return -EIO;
+                }
+                if (cal_mhz > 0) measured_mhz = cal_mhz;
+            }
+        } else {
+            p->boot_snapshot.dto_src_calibrated = true;
+        }
+    }
+
+    {
+        struct dc_log_buf lb = { { 0 }, 0 };
+        dlog_str(&lb, "amdgpu: dc: modeset OK pipe=");
+        dlog_u32(&lb, p->pipe_idx);
+        dlog_str(&lb, " dig=");
+        dlog_u32(&lb, p->dig_idx);
+        dlog_str(&lb, " ");
+        dlog_u32(&lb, target->h_active);
+        dlog_str(&lb, "x");
+        dlog_u32(&lb, target->v_active);
+        dlog_str(&lb, "@");
+        dlog_u32(&lb, target->refresh_mhz / 1000u);
+        dlog_str(&lb, "Hz (meas=");
+        dlog_u32(&lb, measured_mhz / 1000u);
+        dlog_str(&lb, "Hz pclk=");
+        dlog_u32(&lb, target->pixel_clock_khz);
+        dlog_str(&lb, "kHz dto=");
+        dlog_u32(&lb, dto_int);
+        dlog_str(&lb, "+");
+        dlog_u32(&lb, dto_phase);
+        dlog_str(&lb, "/");
+        dlog_u32(&lb, refclk);
+        dlog_str(&lb, " smu=");
+        dlog_u32(&lb, adev->smu.pmfw_alive ? 1u : 0u);
+        dlog_str(&lb, ")");
+        dlog_emit(adev, &lb);
+    }
+    /* Clear any transient HUBP/OPTC underflow flags latched during the mode transition,
+     * then wait one steady-state frame before sampling diagnostic status. */
+    {
+        u32 hctl = 0;
+        if (dc_reg_read(adev, 2u, r->hubp_cntl + hubp, &hctl) && hctl != 0xFFFFFFFFu) {
+            (void)dc_reg_write(adev, 2u, r->hubp_cntl + hubp, hctl | HUBP_UNDERFLOW_CLEAR_BIT);
+            (void)dc_reg_write(adev, 2u, r->hubp_cntl + hubp, hctl & ~HUBP_UNDERFLOW_CLEAR_BIT);
+        }
+        if (r->optc_input_global_ctrl != 0) {
+            u32 og = 0;
+            u32 og_off = r->optc_input_global_ctrl + (u32)p->pipe_idx * r->optc_input_stride;
+            if (dc_reg_read(adev, 2u, og_off, &og) && og != 0xFFFFFFFFu) {
+                (void)dc_reg_write(adev, 2u, og_off, og | OPTC_UNDERFLOW_CLEAR_BIT);
+                (void)dc_reg_write(adev, 2u, og_off, og & ~OPTC_UNDERFLOW_CLEAR_BIT);
+            }
+        }
+        u32 fc_clr = read_otg_frame_count(adev, r, p->pipe_idx);
+        for (u32 wstep = 0; wstep < 25u; wstep++) {
+            amdgpu_udelay(adev, 1000u);
+            if (read_otg_frame_count(adev, r, p->pipe_idx) != fc_clr) break;
+        }
+    }
+
+    {
+        u32 st_df = 0, st_sf = 0, st_vs = 0, st_vtg = 0, st_dpp = 0;
+        if (r->dig_fifo_ctrl0 != 0) (void)dc_reg_read(adev, 2u, r->dig_fifo_ctrl0 + dig_o, &st_df);
+        (void)dc_reg_read(adev, 2u, r->dp_steer_fifo + dig_o, &st_sf);
+        if (r->dp_vid_stream_cntl != 0) (void)dc_reg_read(adev, 2u, r->dp_vid_stream_cntl + dig_o, &st_vs);
+        if (r->vtg_control != 0) (void)dc_reg_read(adev, 2u, r->vtg_control + (u32)p->pipe_idx, &st_vtg);
+        if (r->dccg_dppclk_dto_param != 0) (void)dc_reg_read(adev, 1u, r->dccg_dppclk_dto_param + (u32)p->pipe_idx, &st_dpp);
+        struct dc_log_buf lb = { { 0 }, 0 };
+        dlog_str(&lb, "amdgpu: dc: post df=");
+        dlog_hex(&lb, st_df);
+        dlog_str(&lb, " sf=");
+        dlog_hex(&lb, st_sf);
+        dlog_str(&lb, " vs=");
+        dlog_hex(&lb, st_vs);
+        dlog_str(&lb, " vtg=");
+        dlog_hex(&lb, st_vtg);
+        dlog_str(&lb, " dpp=");
+        dlog_hex(&lb, st_dpp);
+        dlog_emit(adev, &lb);
+    }
+    {
+        u32 st_hubp = 0, st_optc = 0, st_bo0 = 0, st_r2p = 0, st_dent = 0;
+        (void)dc_reg_read(adev, 2u, r->hubp_cntl + hubp, &st_hubp);
+        if (r->optc_input_global_ctrl != 0) {
+            (void)dc_reg_read(adev, 2u, r->optc_input_global_ctrl + (u32)p->pipe_idx * r->optc_input_stride, &st_optc);
+        }
+        if (r->hubp_blank_offset_0 != 0) {
+            (void)dc_reg_read(adev, 2u, r->hubp_blank_offset_0 + hubp, &st_bo0);
+            (void)dc_reg_read(adev, 2u, r->hubp_ref_freq_to_pix_freq + hubp, &st_r2p);
+        }
+        if (r->dccg_dentist_dispclk_cntl != 0) {
+            (void)dc_reg_read(adev, 1u, r->dccg_dentist_dispclk_cntl, &st_dent);
+        }
+        u32 vco_khz = dcn401_read_vco_khz(adev);
+        u32 disp_mhz = dcn401_dfs_did_to_khz(vco_khz, amdgpu_rreg32(adev, DCN401_CLK0_DISP_DFS_BYTE)) / 1000u;
+        u32 dpp_mhz = dcn401_dfs_did_to_khz(vco_khz, amdgpu_rreg32(adev, DCN401_CLK0_DPP_DFS_BYTE)) / 1000u;
+        struct dc_log_buf lb = { { 0 }, 0 };
+        dlog_str(&lb, "amdgpu: dc: post2 hubp=");
+        dlog_hex(&lb, st_hubp);
+        dlog_str(&lb, " optc=");
+        dlog_hex(&lb, st_optc);
+        dlog_str(&lb, " bo0=");
+        dlog_hex(&lb, st_bo0);
+        dlog_str(&lb, " r2p=");
+        dlog_hex(&lb, st_r2p);
+        dlog_str(&lb, " dent=");
+        dlog_hex(&lb, st_dent);
+        dlog_str(&lb, " clk=");
+        dlog_u32(&lb, disp_mhz);
+        dlog_str(&lb, "/");
+        dlog_u32(&lb, dpp_mhz);
+        dlog_emit(adev, &lb);
     }
 
     p->current_mode = *target;
@@ -571,7 +1489,7 @@ int dc_init(struct amdgpu_device *adev) {
         memset(p, 0, sizeof(*p));
         p->active = true;
         p->pipe_idx = pipe;
-        p->dig_idx = (u8)find_dig_for_pipe(adev, r, pipe);
+        p->dig_idx = (u8)find_dig_for_pipe(adev, r, pipe, w, h, h_total, v_total);
         p->pending_buf = -1;
 
         /* Pair with connected connector: prefer exact DIG match with EDID, then any EDID sink, then any connected sink. */
@@ -604,48 +1522,63 @@ int dc_init(struct amdgpu_device *adev) {
 
         capture_pipe_snapshot(adev, r, pipe, p->dig_idx, &p->boot_snapshot);
 
+        /* Auto-detect live DP MSA H/V bit layout & MISC0 byte position from UEFI's working registers.
+         * Official DCN 4.0.1 (`dcn_4_1_0_sh_mask.h`) puts H in [31:16], V in [15:0] (`msa_h_low = false`),
+         * and DP_MSA_MISC0 in [31:24] (`msa_misc0_high = true`). */
+        {
+            u32 p4 = p->boot_snapshot.dp_msa_param4;
+            if (((p4 >> 16) & 0xFFFFu) == w && (p4 & 0xFFFFu) == h) {
+                p->boot_snapshot.msa_h_low = false;
+            } else if ((p4 & 0xFFFFu) == w && ((p4 >> 16) & 0xFFFFu) == h) {
+                p->boot_snapshot.msa_h_low = true;
+            } else {
+                p->boot_snapshot.msa_h_low = false;
+            }
+            u32 col = p->boot_snapshot.dp_msa_colorimetry;
+            if (((col >> 24) & 0xFFu) != 0) {
+                p->boot_snapshot.msa_misc0_high = true;
+            } else if ((col & 0xFFu) != 0) {
+                p->boot_snapshot.msa_misc0_high = false;
+            } else {
+                p->boot_snapshot.msa_misc0_high = true;
+            }
+
+            u32 dim_wh = ((h & 0x3FFFu) << 16) | (w & 0x3FFFu);
+            p->boot_snapshot.dscl_static_valid =
+                (p->boot_snapshot.dscl_recout_size == dim_wh || p->boot_snapshot.dscl_mpc_size == dim_wh);
+            if (!p->boot_snapshot.dscl_static_valid) {
+                probe_dpp_size_regs(adev, r, pipe, w, h, &p->boot_snapshot);
+            }
+        }
+
         /* Measure live refresh rate from OTG_STATUS_FRAME_COUNT (bounded to ~55 ms, exits early at high Hz). */
-        u32 fc0 = read_otg_frame_count(adev, r, pipe);
-        u32 fc_start = fc0;
-        u64 t_start = amdgpu_now_ns(adev);
-        for (u32 step = 0; step < 25u; step++) {
-            amdgpu_udelay(adev, 1000u);
-            u32 cur = read_otg_frame_count(adev, r, pipe);
-            if (cur != fc0) {
-                fc_start = cur;
-                t_start = amdgpu_now_ns(adev);
-                break;
-            }
-        }
-        u32 fc_last = fc_start;
-        u64 t_last = t_start;
-        for (u32 step = 0; step < 50u; step++) {
-            amdgpu_udelay(adev, 1000u);
-            u32 cur = read_otg_frame_count(adev, r, pipe);
-            if (cur != fc_last) {
-                fc_last = cur;
-                t_last = amdgpu_now_ns(adev);
-                if (frame_count_delta(fc_last, fc_start) >= 3u && (t_last - t_start) >= 12000000ULL) {
-                    break;
-                }
-            }
-        }
-        u32 df = frame_count_delta(fc_last, fc_start);
-        u32 total_df = frame_count_delta(fc_last, fc0);
-        u32 refresh_mhz = 60000u;
-        if (df > 0 && t_last > t_start) {
-            u64 dt_ns = t_last - t_start;
-            u64 mhz = ((u64)df * 1000000000000ULL) / dt_ns;
-            if (mhz >= 24000ULL && mhz <= 1000000ULL) {
-                refresh_mhz = (u32)mhz;
-            }
-        }
+        u32 total_df = 0;
+        u32 measured_mhz = measure_otg_refresh_mhz(adev, r, pipe, &total_df);
+        u32 refresh_mhz = measured_mhz ? measured_mhz : 60000u;
 
         dc_timing_cvt_rb(w, h, refresh_mhz, &p->current_mode);
         p->current_mode.h_blank = (h_total > w) ? (h_total - w) : 80u;
         p->current_mode.v_blank = (v_total > h) ? (v_total - h) : 45u;
         p->current_mode.refresh_mhz = refresh_mhz;
         p->current_mode.pixel_clock_khz = (u32)(((u64)h_total * (u64)v_total * (u64)refresh_mhz) / 1000000ULL);
+        /* Snap boot pixel clock to exact matching EDID DTD (same H/V active & totals, within +-2 Hz)
+         * to eliminate frame-counter measurement jitter in DCCG DTO reference clock derivation. */
+        if (p->conn_idx < dc->connector_count) {
+            const struct dc_connector *c = &dc->connectors[p->conn_idx];
+            for (u32 m = 0; m < c->mode_count; m++) {
+                const struct dc_timing *t = &c->modes[m];
+                u32 d = t->refresh_mhz > refresh_mhz ? (t->refresh_mhz - refresh_mhz) : (refresh_mhz - t->refresh_mhz);
+                if (t->h_active == w && t->v_active == h
+                    && (t->h_active + t->h_blank) == h_total
+                    && (t->v_active + t->v_blank) == v_total
+                    && d <= 2000u && t->pixel_clock_khz > 0) {
+                    p->current_mode.pixel_clock_khz = t->pixel_clock_khz;
+                    p->current_mode.refresh_mhz = t->refresh_mhz;
+                    refresh_mhz = t->refresh_mhz;
+                    break;
+                }
+            }
+        }
         p->src_width = w;
         p->src_height = h;
         p->pitch_bytes = ((p->boot_snapshot.hubp_surface_pitch & 0x3FFFu) + 1u) * 4u;
@@ -655,10 +1588,122 @@ int dc_init(struct amdgpu_device *adev) {
         p->boot_snapshot.dst_width = w;
         p->boot_snapshot.dst_height = h;
         p->boot_snapshot.refresh_mhz = refresh_mhz;
-        if (p->boot_snapshot.dccg_dto_modulo > 0 && p->boot_snapshot.dccg_dto_phase > 0) {
-            p->boot_snapshot.dto_src_clk_khz = (u32)(((u64)p->current_mode.pixel_clock_khz * (u64)p->boot_snapshot.dccg_dto_modulo) / (u64)p->boot_snapshot.dccg_dto_phase);
-        } else {
-            p->boot_snapshot.dto_src_clk_khz = 1000000u; /* 1000 MHz DTBCLK default */
+        p->boot_snapshot.boot_pclk_khz = p->current_mode.pixel_clock_khz;
+        p->boot_snapshot.boot_h_total = h_total;
+        p->boot_snapshot.boot_h_blank_end = h_bend;
+        p->boot_snapshot.boot_v_blank = (v_total > h) ? (v_total - h) : 45u;
+        p->boot_snapshot.boot_v_blank_end = v_bend;
+        u32 dto_src = r->has_otg_pixel_rate_div ? 100000u : 1000000u; /* 100 MHz REFCLK on DCN 4.0.1/3.2 */
+        bool boot_dto_en = ((p->boot_snapshot.dccg_pixel_rate_cntl & DP_DTO_ENABLE_BIT) != 0);
+        if (boot_dto_en && p->boot_snapshot.dccg_dto_modulo > 0) {
+            u32 old_int = r->has_otg_pixel_rate_div
+                ? ((p->boot_snapshot.dccg_pixel_rate_div >> (1u + (u32)(pipe & 3u) * 5u)) & 0xFu)
+                : 0u;
+            u64 den = (u64)old_int * (u64)p->boot_snapshot.dccg_dto_modulo + (u64)p->boot_snapshot.dccg_dto_phase;
+            if (den > 0 && p->current_mode.pixel_clock_khz > 0) {
+                u64 derived = ((u64)p->current_mode.pixel_clock_khz * (u64)p->boot_snapshot.dccg_dto_modulo) / den;
+                if (derived >= 50000ULL && derived <= 3000000ULL) {
+                    dto_src = (u32)derived;
+                    p->boot_snapshot.dto_src_calibrated = true;
+                }
+            }
+        }
+        p->boot_snapshot.dto_src_clk_khz = dto_src;
+
+        {
+            const struct dc_connector *c = (p->conn_idx < dc->connector_count) ? &dc->connectors[p->conn_idx] : NULL;
+            struct dc_log_buf lb = { { 0 }, 0 };
+            dlog_str(&lb, "amdgpu: dc: pipe");
+            dlog_u32(&lb, pipe);
+            dlog_str(&lb, " dig=");
+            dlog_u32(&lb, p->dig_idx);
+            dlog_str(&lb, " msa_h_low=");
+            dlog_u32(&lb, p->boot_snapshot.msa_h_low ? 1u : 0u);
+            dlog_str(&lb, " ");
+            dlog_u32(&lb, w);
+            dlog_str(&lb, "x");
+            dlog_u32(&lb, h);
+            dlog_str(&lb, "@");
+            dlog_u32(&lb, refresh_mhz / 1000u);
+            dlog_str(&lb, "Hz dto_en=");
+            dlog_u32(&lb, boot_dto_en ? 1u : 0u);
+            dlog_str(&lb, " src=");
+            dlog_u32(&lb, dto_src);
+            dlog_str(&lb, "kHz p4=");
+            dlog_hex(&lb, p->boot_snapshot.dp_msa_param4);
+            dlog_str(&lb, " col=");
+            dlog_hex(&lb, p->boot_snapshot.dp_msa_colorimetry);
+            if (c && c->connected) {
+                dlog_str(&lb, " link=");
+                dlog_u32(&lb, c->trained_lanes);
+                dlog_str(&lb, "x");
+                dlog_u32(&lb, c->trained_rate_mbps);
+                dlog_str(&lb, "Mbps modes=");
+                dlog_u32(&lb, c->mode_count);
+            }
+            dlog_emit(adev, &lb);
+        }
+        {
+            struct dc_log_buf lb = { { 0 }, 0 };
+            dlog_str(&lb, "amdgpu: dc: boot ctl=");
+            dlog_hex(&lb, p->boot_snapshot.dccg_pixel_rate_cntl);
+            dlog_str(&lb, " div=");
+            dlog_hex(&lb, p->boot_snapshot.dccg_pixel_rate_div);
+            dlog_str(&lb, " ph=");
+            dlog_u32(&lb, p->boot_snapshot.dccg_dto_phase);
+            dlog_str(&lb, " mod=");
+            dlog_u32(&lb, p->boot_snapshot.dccg_dto_modulo);
+            dlog_str(&lb, " steer=");
+            dlog_hex(&lb, p->boot_snapshot.dp_steer_fifo);
+            dlog_str(&lb, " vs=");
+            dlog_hex(&lb, p->boot_snapshot.dp_vid_stream_cntl);
+            dlog_str(&lb, " df=");
+            dlog_hex(&lb, p->boot_snapshot.dig_fifo_ctrl0);
+            dlog_str(&lb, " vtg=");
+            dlog_hex(&lb, p->boot_snapshot.vtg_control);
+            dlog_str(&lb, " vsu=");
+            dlog_hex(&lb, p->boot_snapshot.otg_vstartup_param);
+            dlog_str(&lb, " dpp=");
+            dlog_hex(&lb, p->boot_snapshot.dccg_dppclk_dto_param);
+            dlog_emit(adev, &lb);
+        }
+        if (adev->dcn_version == DC_DCN_4_0_1) {
+            u32 vco_khz = dcn401_read_vco_khz(adev);
+            u32 disp_mhz = dcn401_dfs_did_to_khz(vco_khz, amdgpu_rreg32(adev, DCN401_CLK0_DISP_DFS_BYTE)) / 1000u;
+            u32 dpp_mhz = dcn401_dfs_did_to_khz(vco_khz, amdgpu_rreg32(adev, DCN401_CLK0_DPP_DFS_BYTE)) / 1000u;
+            u32 dcf_mhz = dcn401_dfs_did_to_khz(vco_khz, amdgpu_rreg32(adev, DCN401_CLK0_DCF_DFS_BYTE)) / 1000u;
+            u32 dtb_mhz = dcn401_dfs_did_to_khz(vco_khz, amdgpu_rreg32(adev, DCN401_CLK0_DTB_DFS_BYTE)) / 1000u;
+            u32 optc_g = 0;
+            if (r->optc_input_global_ctrl != 0) {
+                (void)dc_reg_read(adev, 2u, r->optc_input_global_ctrl + (u32)pipe * r->optc_input_stride, &optc_g);
+            }
+            struct dc_log_buf lb = { { 0 }, 0 };
+            dlog_str(&lb, "amdgpu: dc: clk vco=");
+            dlog_u32(&lb, vco_khz / 1000u);
+            dlog_str(&lb, " disp=");
+            dlog_u32(&lb, disp_mhz);
+            dlog_str(&lb, " dpp=");
+            dlog_u32(&lb, dpp_mhz);
+            dlog_str(&lb, " dcf=");
+            dlog_u32(&lb, dcf_mhz);
+            dlog_str(&lb, " dtb=");
+            dlog_u32(&lb, dtb_mhz);
+            dlog_str(&lb, " dent=");
+            dlog_hex(&lb, p->boot_snapshot.dccg_dentist_dispclk_cntl);
+            dlog_emit(adev, &lb);
+
+            struct dc_log_buf lb2 = { { 0 }, 0 };
+            dlog_str(&lb2, "amdgpu: dc: hubp cntl=");
+            dlog_hex(&lb2, p->boot_snapshot.hubp_cntl);
+            dlog_str(&lb2, " optc=");
+            dlog_hex(&lb2, optc_g);
+            dlog_str(&lb2, " bo0=");
+            dlog_hex(&lb2, p->boot_snapshot.hubp_blank_offset_0);
+            dlog_str(&lb2, " r2p=");
+            dlog_hex(&lb2, p->boot_snapshot.hubp_ref_freq_to_pix_freq);
+            dlog_str(&lb2, " vsu=");
+            dlog_hex(&lb2, p->boot_snapshot.otg_vstartup_param);
+            dlog_emit(adev, &lb2);
         }
 
         /* Protect original UEFI GOP VRAM range and allocate triple-buffered scanout + 256 KiB HW cursor. */
@@ -856,6 +1901,13 @@ int dc_atomic_check_and_commit(
         if (dml_rc != 0) {
             return dml_rc;
         }
+        if (conn && conn->connected && !dc->dmub.ring_owned) {
+            u64 cur_bw = (u64)conn->trained_lanes * (u64)conn->trained_rate_mbps;
+            u64 req_bw = (u64)plan.req_lanes * (u64)plan.req_rate_mbps;
+            if (req_bw > cur_bw || (plan.requires_uhbr && conn->link_type != DC_LINK_DP_2_1)) {
+                return -ENOTSUP;
+            }
+        }
     }
 
     /* ATOMIC_TEST_ONLY stops cleanly here without mutating hardware registers. */
@@ -915,17 +1967,24 @@ int dc_atomic_check_and_commit(
                 adev,
                 2u,
                 dc->regs->hubp_viewport_dim + hubp,
-                ((req->primary_height & 0xFFFFu) << 16) | (req->primary_width & 0xFFFFu)
+                ((req->primary_height & 0x3FFFu) << 16) | (req->primary_width & 0x3FFFu)
             );
-            program_dpp_scaler(
-                adev,
-                dc->regs,
-                p->pipe_idx,
-                req->primary_width,
-                req->primary_height,
-                p->current_mode.h_active,
-                p->current_mode.v_active
-            );
+            if (p->boot_snapshot.dscl_static_valid) {
+                program_dpp_scaler(
+                    adev,
+                    dc->regs,
+                    p->pipe_idx,
+                    req->primary_width,
+                    req->primary_height,
+                    p->current_mode.h_active,
+                    p->current_mode.v_active
+                );
+            } else {
+                u32 dim = ((p->current_mode.v_active & 0x3FFFu) << 16) | (p->current_mode.h_active & 0x3FFFu);
+                for (u8 i = 0; i < p->boot_snapshot.dpp_size_reg_count && i < 4u; i++) {
+                    (void)dc_reg_write(adev, 2u, p->boot_snapshot.dpp_size_regs[i], dim);
+                }
+            }
             p->src_width = req->primary_width;
             p->src_height = req->primary_height;
         }

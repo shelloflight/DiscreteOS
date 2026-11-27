@@ -35,6 +35,9 @@ const PBKDF2_ITER: u32 = 16_000;
 const STORE_DIR: &[u8] = b"identities";
 const STORE_FILE: &[u8] = b"identities/store.toml";
 const STORE_TMP: &[u8] = b"identities/store.tmp";
+const HOME_CFG_DIR: &[u8] = b".dos";
+const HOME_STORE_FILE: &[u8] = b".dos/identities.toml";
+const HOME_STORE_TMP: &[u8] = b".dos/identities.tmp";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
@@ -97,18 +100,37 @@ fn probe_tpm(tpm_res: Handle) -> bool {
 
 fn load_store() -> IdentityStore {
     let ns = fp::Namespace::get();
-    for vol in [b"/data" as &[u8], b"/system"] {
+    for (vol, path, label) in [
+        (b"/home" as &[u8], HOME_STORE_FILE, "/home/.dos/identities.toml"),
+        (b"/data" as &[u8], STORE_FILE, "/data/identities/store.toml"),
+        (b"/system" as &[u8], STORE_FILE, "/system/identities/store.toml"),
+    ] {
         let Some((dir, _)) = ns.resolve(vol) else { continue };
         let d = fp::Node::from(dir);
         let parsed = (|| {
-            let (f, _, size) = d.open(STORE_FILE, 0, fp::R_READ).ok()?;
+            let (f, _, size) = d.open(path, 0, fp::R_READ).ok()?;
             let size = usize::try_from(size).ok()?;
             if size == 0 || size > 64 * 1024 {
+                println!("identity: ignoring {} (size {} out of range)", label, size);
                 return None;
             }
             let mut buf = alloc::vec![0u8; size];
             let n = f.read(0, &mut buf).ok()?;
-            IdentityStore::from_toml(&buf[..n]).ok()
+            match IdentityStore::from_toml(&buf[..n]) {
+                Ok(store) => {
+                    println!(
+                        "identity: loaded {} ({} identity(s), lock_at_boot={})",
+                        label,
+                        store.identities.len(),
+                        store.lock_policy.lock_at_boot
+                    );
+                    Some(store)
+                }
+                Err(e) => {
+                    println!("identity: failed to parse {} ({} bytes): {}", label, n, e.message());
+                    None
+                }
+            }
         })();
         let _ = d.into_handle();
         if let Some(s) = parsed {
@@ -118,31 +140,58 @@ fn load_store() -> IdentityStore {
     IdentityStore::default_store()
 }
 
-fn save_store(store: &IdentityStore) {
-    let ns = fp::Namespace::get();
-    let Some((dir, _)) = ns.resolve(b"/data") else { return };
-    let d = fp::Node::from(dir);
+fn write_store_at(dir_h: Handle, dir_name: &[u8], tmp_path: &[u8], dst_path: &[u8], text: &str) -> bool {
+    let d = fp::Node::from(dir_h);
     let can_write = d.stat().is_ok_and(|st| st.rights & fp::R_WRITE != 0);
+    let mut wrote = false;
     if can_write {
-        let _ = d.open(STORE_DIR, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
-        let text = store.to_toml();
-        if let Ok((f, _, _)) = d.open(STORE_TMP, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+        let _ = d.open(dir_name, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
+        if let Ok((f, _, _)) = d.open(tmp_path, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
             && f.write(0, text.as_bytes()).is_ok()
         {
             drop(f);
-            if d.rename(STORE_TMP, STORE_FILE, true).is_err()
-                && let Ok((f2, _, _)) = d.open(STORE_FILE, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            if d.rename(tmp_path, dst_path, true).is_err()
+                && let Ok((f2, _, _)) = d.open(dst_path, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
             {
                 let _ = f2.write(0, text.as_bytes());
             }
             let _ = d.sync();
+            wrote = true;
         }
     }
     let _ = d.into_handle();
+    wrote
+}
+
+fn save_store(store: &IdentityStore) {
+    let ns = fp::Namespace::get();
+    let text = store.to_toml();
+    if let Some((dir, _)) = ns.resolve(b"/home")
+        && write_store_at(dir, HOME_CFG_DIR, HOME_STORE_TMP, HOME_STORE_FILE, &text)
+    {
+        return;
+    }
+    if let Some((dir, _)) = ns.resolve(b"/data") {
+        let _ = write_store_at(dir, STORE_DIR, STORE_TMP, STORE_FILE, &text);
+    }
 }
 
 fn ensure_home_dir(name: &str) {
     let ns = fp::Namespace::get();
+    if let Some((dir, _)) = ns.resolve(b"/home") {
+        let d = fp::Node::from(dir);
+        let ok = if d.stat().is_ok_and(|st| st.rights & fp::R_WRITE != 0) {
+            let _ = d.open(name.as_bytes(), fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
+            let _ = d.sync();
+            true
+        } else {
+            false
+        };
+        let _ = d.into_handle();
+        if ok {
+            return;
+        }
+    }
     let Some((dir, _)) = ns.resolve(b"/data") else { return };
     let d = fp::Node::from(dir);
     if d.stat().is_ok_and(|st| st.rights & fp::R_WRITE != 0)

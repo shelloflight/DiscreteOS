@@ -305,7 +305,7 @@ impl DrmDriver for AmdGpu {
         res_out.connector_kind = info.connector_kind;
         res_out.crtc_id = (self.active_slot as u32) + 1;
         res_out.pipe = self.active_slot as u8;
-        res_out.plane_count = if info.hw_cursor != 0 { 2 } else { 1 };
+        res_out.plane_count = 1;
         res_out.edid_blocks = info.edid_blocks;
         res_out.width = info.width;
         res_out.height = info.height;
@@ -323,9 +323,6 @@ impl DrmDriver for AmdGpu {
         }
         if info.active_pipes > 0 {
             res_out.status_flags |= gpu::KMS_STATUS_CONNECTED | gpu::KMS_STATUS_CRTC_ACTIVE;
-        }
-        if info.hw_cursor != 0 {
-            res_out.status_flags |= gpu::KMS_STATUS_CURSOR_PLANE;
         }
         if info.vrr_capable != 0 {
             res_out.status_flags |= gpu::KMS_STATUS_VRR_CAPABLE;
@@ -824,14 +821,14 @@ pub fn main(s: *const Startup) -> i32 {
         caps |= gpu::CAP_SYS_FIRMWARE;
     }
     if native {
+        // Omit `CAP_HW_CURSOR` on AMD DCN so D-AWMI composites crisp context-aware cursors into
+        // its backbuffer over tear-free DCN vsync flips (DCN 4.0.1 moved cursor blending out of
+        // DPP into MPC, where unconfigured MPC cursor registers leave a HW cursor invisible).
         caps |= gpu::CAP_NATIVE_KMS
             | gpu::CAP_SCANOUT_2D
             | gpu::CAP_PAGE_FLIP
             | gpu::CAP_ASYNC_FLIP
             | gpu::CAP_ATOMIC_KMS;
-        if info.hw_cursor != 0 {
-            caps |= gpu::CAP_HW_CURSOR;
-        }
         if info.edid_blocks > 0 {
             caps |= gpu::CAP_EDID;
         }

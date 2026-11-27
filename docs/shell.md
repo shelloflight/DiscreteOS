@@ -24,7 +24,7 @@ data ▸ copy report.txt /backup
 | Process | Holds | Does not hold |
 |---|---|---|
 | `terminal` | the `display` device, `devmgr.input` | any file, endpoint or right of the session (offers `terminal.indicator` to `audio.dsvc` for the `[MIC LIVE]` badge, `terminal.display` to the compositor, which stops and restarts its drawing for a graphical session, and `terminal.view` to the terminal window) |
-| `shell` | its manifest: every volume (`namespace = ["*"]`, with the rights the volume has: read-only on a normal boot), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, `awmi.admin`, `awmi.query`, `identity.query`, `identity.admin`, `appmgr.query`, `appmgr.admin`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting, `identity.session`, `tpm-seal`, any window's pixels |
+| `shell` | its manifest: every volume (`namespace = ["*"]`, with `/home` scoped strictly to the active identity's `/home/<user>` directory on installed disks), `log.read`, `clock.time`, `audio.playback`, `audio.control`, `net.client`, `net.icmp`, `net.control`, `gpu.query`, `awmi.admin`, `awmi.query`, `identity.query`, `identity.admin`, `appmgr.query`, `appmgr.admin`, `storaged.admin`, a manager channel (`services`, `power`), the tools | the screen, the keyboard, the microphone, display modesetting, `identity.session`, `tpm-seal`, any window's pixels |
 | a tool | an output channel, one node per path argument with the rights its manifest declares, the log | the namespace, endpoints, anything else of the shell |
 
 The terminal and the shell are separate so that neither gets the other's authority: a bug in the
@@ -73,9 +73,11 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   `end`/`kill`, `time`/`date`, `go`/`cd`, `net`/`ip`). An unknown command suggests the closest
   name. `help` lists everything; `help <command>` shows its usage and, for a tool, the rights each
   parameter gives.
-- **Places**: there is no global root. `/` is the list of the session's places (`/data`,
-  `/system`, ...); `places` shows them with their rights and sizes. The prompt is the current place
-  (`data/notes ▸`). Relative names resolve in the current place; absolute paths go exactly there;
+- **Places**: there is no global root. `/` is the list of the session's places (`/home`, `/data`,
+  `/system`, ...); `places` shows them with their rights and sizes. When `/home` is mounted, new
+  shell sessions start in `/home`, and `go` / `cd` with no arguments (or `~`) returns to `/home`
+  (falling back to `/` when `/home` is absent). The prompt is the current place (`home ▸` or
+  `data/notes ▸`). Relative names resolve in the current place; absolute paths go exactly there;
   `..` never leaves the namespace.
 - **Records**: every command produces records with typed fields (text, integer, size, time, path,
   bool). Filters work on them: `where <field> <op> <value>` (`=`, `!=`, `<`, `>`, `<=`, `>=`,
@@ -103,8 +105,12 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   manage non-root D-OS identities, TPM-sealed credentials and lock policy;
   [identity.md](identity.md)), `apps [list | launch <name> | stop <name> | perms <name> | grant
   <name> <perm> | revoke <name> <perm> | verify <path>]` (`app`: inspect, launch, stop and
-  grant/revoke permissions on signed `.dapp` bundles; [apps.md](apps.md)), `power off | restart |
-  sleep` (the manager stops every service cleanly first), `clear`, `run <tool> [arguments]`.
+  grant/revoke permissions on signed `.dapp` bundles; [apps.md](apps.md)), `install [disks | parts
+  <disk> | plan <disk> [dual|whole|wipe [--confirm]] | delete-part <disk> <idx> --confirm | run
+  <disk> [dual|whole|wipe [--confirm]]]` (dual-boot safe disk installer, whole-disk install, and
+  partition management; [storage.md](storage.md)), `setup [status | skip | complete [lang] [kbd]
+  [tz] [skip|dhcp]]` (`oobe`: inspect, skip, or complete first-boot setup on installed disks),
+  `power off | restart | sleep` (the manager stops every service cleanly first), `clear`, `run <tool> [arguments]`.
 - **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
   (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place
   (with the session's rights there) as its working directory, an output channel and the wall

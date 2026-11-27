@@ -27,7 +27,7 @@ trusts only its own key; `DOS_SIGNING_KEY` points at another key file.
 Use `.\dbuild.ps1` on Windows or `./dbuild.sh` on Linux:
 
 ```sh
-./dbuild.sh                           # build build/discrete.img (BIOS + UEFI, 64 MiB GPT image)
+./dbuild.sh                           # build build/discrete.img and build/discrete.iso (BIOS + UEFI, 80 MiB)
 ./dbuild.sh run                       # build and boot in QEMU, serial on this console (--uefi, --smp N, --iommu amd, --audio hda|virtio|usb|none, --net virtio|e1000e|none, --gpu std|virtio|virtio-vga|none; a virtio tablet is the pointer for `gui`)
 ./dbuild.sh debug                     # boot paused with a GDB stub on localhost:1234
 ./dbuild.sh test                      # run the full test suite (repro + QEMU/Bochs + host + static)
@@ -39,8 +39,8 @@ Use `.\dbuild.ps1` on Windows or `./dbuild.sh` on Linux:
 ./dbuild.sh clean                     # remove build/
 ```
 
-Outputs: `build/discrete.img`, `build/kernel.elf` (with symbols, for GDB), `build/kernel.map`,
-`build/SHA256SUMS`, and per-case serial logs under `build/ktest/`.
+Outputs: `build/discrete.img`, `build/discrete.iso`, `build/kernel.elf` (with symbols, for GDB),
+`build/kernel.map`, `build/SHA256SUMS`, and per-case serial logs under `build/ktest/`.
 
 ### Kernel debugger
 
@@ -67,12 +67,12 @@ Main test groups (see `tools/dbuild/src/test.rs` for the full list):
 
 | Group | Cases |
 |---|---|
-| Boot | `boot`, `boot-amd`, `uefi`, `uefi-uniproc`, `uniproc`, `bios-badsig`, `uefi-badsig`, `manydevices` |
+| Boot | `boot`, `boot-amd`, `uefi`, `uefi-uniproc`, `uniproc`, `iso-bios`, `iso-uefi`, `bios-badsig`, `uefi-badsig`, `manydevices` |
 | Protections fire | `stackprot`, `cet`, `cet-cp`, `cet-user`, `nx`, `wx`, `nullderef`, `stackguard`, `heapguard`, `doublefree`, `uaf`, `bounds`, `roinit`, `smap`, `smep`, `spec`, `spec-intel`, `kaslr`, ... |
 | Kernel | `selftest`, `sched`, `cpupm`, `cpupm-bochs`, `smp`, `smp-xapic`, `objects`, `lockup`, `softlockup`, `soak`, `bench`, `profile` |
 | Sanitizers | `ubsan`, `ubsan-smp`, `ubsantrap`, `kasan`, `kasan-user`, `kasan-fuzz`, `kasanoob`, `kasanuaf` |
-| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `services`, `shell`, `audio-hda`, `audio-virtio`, `audio-usb`, `audio-sec`, `net-virtio`, `net-e1000e`, `net-shell`, `gpu-virtio`, `gpu-virtio-amd`, `gpu-gop`, `gpu-shell`, `awmi-virtio`, `awmi-gop`, `desktop-virtio`, `desktop-gop`, `time`, `time-uefi`, `attest`, `attest-tpm`, `powerbutton`, `poweroff`, `poweroff-uefi`, `reboot`, `hwbench`, `kdb` |
-| Host | `storage-host`, `audio-host`, `net-host`, `gpu-host`, `awmi-host`, `ui-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |
+| User space | `user`, `libd`, `fuzz`, `compat`, `drivers`, `drivers-amd`, `keyboard`, `usbkbd`, `usbnokbd`, `usbhub`, `usbplug`, `usbtwo`, `usbrepeat`, `usbhold`, `usbstorage`, `usbstorage2`, `storage`, `readonly`, `install-dual`, `install-e2e`, `services`, `shell`, `audio-hda`, `audio-virtio`, `audio-usb`, `audio-sec`, `net-virtio`, `net-e1000e`, `net-shell`, `gpu-virtio`, `gpu-virtio-amd`, `gpu-gop`, `gpu-shell`, `awmi-virtio`, `awmi-gop`, `desktop-virtio`, `desktop-gop`, `identity-tpm`, `apps-virtio`, `time`, `time-uefi`, `attest`, `attest-tpm`, `powerbutton`, `poweroff`, `poweroff-uefi`, `reboot`, `hwbench`, `kdb` |
+| Host | `storage-host`, `audio-host`, `net-host`, `gpu-host`, `awmi-host`, `ui-host`, `identity-host`, `app-host`, `crypto-host`, `manifest-host`, `aml-host`, `kaslr-host`, `static` |
 
 ## Adding a test
 

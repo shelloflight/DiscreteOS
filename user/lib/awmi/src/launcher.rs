@@ -274,6 +274,24 @@ impl Launcher {
         true
     }
 
+    /// Update the pinned-to-dock state of `(owner, app)`. Returns true if the state changed.
+    pub fn set_pinned(&mut self, owner: u32, app: u8, pinned: bool) -> bool {
+        if let Some(x) = self.apps[..self.napps].iter_mut().find(|x| x.owner == owner && x.app == app)
+            && x.pinned != pinned
+        {
+            x.pinned = pinned;
+            return true;
+        }
+        false
+    }
+
+    /// Toggle the pinned-to-dock state of `(owner, app)`. Returns `Some(new_pinned)` if found.
+    pub fn toggle_pinned(&mut self, owner: u32, app: u8) -> Option<bool> {
+        let x = self.apps[..self.napps].iter_mut().find(|x| x.owner == owner && x.app == app)?;
+        x.pinned = !x.pinned;
+        Some(x.pinned)
+    }
+
     /// Collect up to `MAX_DOCK_PINNED` pinned entries for the floating dock.
     pub fn pinned_entries(&self, out: &mut [crate::dock::DockPinnedEntry; crate::dock::MAX_DOCK_PINNED]) -> usize {
         let mut n = 0usize;

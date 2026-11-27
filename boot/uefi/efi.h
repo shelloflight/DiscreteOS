@@ -77,7 +77,8 @@ typedef struct {
     efi_status (*set_watchdog_timer)(uint64_t timeout, uint64_t code, uint64_t size, const char16 *data);
     void *connect_controller, *disconnect_controller;
     void *open_protocol, *close_protocol, *open_protocol_information;
-    void *protocols_per_handle, *locate_handle_buffer;
+    void *protocols_per_handle;
+    efi_status (*locate_handle_buffer)(uint32_t search_type, const efi_guid *proto, void *search_key, uint64_t *no_handles, efi_handle **buffer);
     efi_status (*locate_protocol)(const efi_guid *proto, void *registration, void **out);
     void *install_multiple, *uninstall_multiple;
     void *calculate_crc32, *copy_mem, *set_mem, *create_event_ex;
@@ -88,7 +89,7 @@ typedef struct {
     void *table;
 } efi_configuration_table;
 
-/* EFI_TIME and the start of EFI_RUNTIME_SERVICES (only GetTime is used, before ExitBootServices). */
+/* EFI_TIME and EFI_RUNTIME_SERVICES (only GetTime and GetVariable/SetVariable are used, before ExitBootServices). */
 typedef struct {
     uint16_t year;          /* 1900 - 9999 */
     uint8_t  month, day, hour, minute, second, pad1;
@@ -97,9 +98,17 @@ typedef struct {
     uint8_t  daylight, pad2;
 } efi_time;
 
+#define EFI_VAR_NV_BS_RT 0x00000007u
+#define EFI_LOCATE_BY_PROTOCOL 2u
+
 typedef struct {
     efi_table_header hdr;
     efi_status (*get_time)(efi_time *time, void *capabilities);
+    void *set_time, *get_wakeup_time, *set_wakeup_time;
+    void *set_virtual_address_map, *convert_pointer;
+    efi_status (*get_variable)(const char16 *name, const efi_guid *vendor, uint32_t *attrs, uint64_t *size, void *data);
+    void *get_next_variable_name;
+    efi_status (*set_variable)(const char16 *name, const efi_guid *vendor, uint32_t attrs, uint64_t size, const void *data);
 } efi_runtime_services;
 
 typedef struct {
@@ -205,5 +214,6 @@ typedef struct efi_rng {
 #define GUID_GOP          { 0x9042A9DE, 0x23DC, 0x4A38, { 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A } }
 #define GUID_ACPI_20      { 0x8868E871, 0xE4F1, 0x11D3, { 0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81 } }
 #define GUID_ACPI_10      { 0xEB9D2D30, 0x2D88, 0x11D3, { 0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D } }
+#define GUID_GLOBAL_VAR   { 0x8BE4DF61, 0x93CA, 0x11D2, { 0xAA, 0x0D, 0x00, 0xE0, 0x98, 0x03, 0x2B, 0x8C } }
 
 #endif

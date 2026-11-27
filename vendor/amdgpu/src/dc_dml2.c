@@ -170,7 +170,8 @@ int dc_dml2_plan_mode(
     /* Memory bandwidth demand: width*height*4B*refresh -> DCFCLK @ 64B/cycle with 1.4x urgent headroom. */
     u64 mem_bps = pclk_khz * 1000ULL * 4ULL;
     u32 dcfclk_mhz = (u32)DIV_ROUND_UP((mem_bps * 14ULL) / 10ULL, 64ULL * 1000000ULL);
-    if (dcfclk_mhz < 300u) dcfclk_mhz = 300u;
+    u32 min_dcf = (pclk_khz >= 300000ULL) ? 500u : 300u;
+    if (dcfclk_mhz < min_dcf) dcfclk_mhz = min_dcf;
     if (dcfclk_mhz > lim.max_dcfclk_mhz) {
         return -ERANGE;
     }

@@ -23,6 +23,8 @@
 
 extern crate alloc;
 
+mod install;
+
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -45,6 +47,8 @@ libd::entry!(_start, main);
 
 const KEY_DISKS: u64 = 1;
 const KEY_CTL: u64 = 2;
+const KEY_ADMIN_BASE: u64 = 0x20;
+const MAX_ADMINS: usize = 16;
 const KEY_CONN: u64 = 0x100;
 const MAX_CONNS: usize = 1024;
 const SEC: u64 = 1_000_000_000;
@@ -244,7 +248,7 @@ impl Remote {
                     let handle = if nh > 0 { hs[0] } else { 0 };
                     if let Some(h) = h
                         && h.op == fp::DISK_ADD
-                        && &buf[HEADER..n] == self.name.as_bytes()
+                        && buf[HEADER..n].split(|&b| b == 0).next() == Some(self.name.as_bytes())
                         && handle != 0
                     {
                         sys::handle_close(self.ch);
@@ -373,13 +377,13 @@ impl Remote {
 
 // A handful of volumes per boot, each held for its lifetime: boxing the larger variant buys nothing.
 #[allow(clippy::large_enum_variant)]
-enum VolFs {
+pub(crate) enum VolFs {
     Fat(Fat<Box<dyn BlockDev>>),
     Dfs(Dfs),
 }
 
 impl VolFs {
-    fn fs(&mut self) -> &mut dyn FileSystem {
+    pub(crate) fn fs(&mut self) -> &mut dyn FileSystem {
         match self {
             VolFs::Fat(f) => f,
             VolFs::Dfs(d) => d,
@@ -387,26 +391,33 @@ impl VolFs {
     }
 }
 
-struct Volume {
-    name: String,
-    kind: u64,
-    fs: Option<VolFs>,
+pub(crate) struct Volume {
+    pub(crate) name: String,
+    pub(crate) kind: u64,
+    pub(crate) disk_idx: usize,
+    pub(crate) part_first: u64,
+    pub(crate) part_len: u64,
+    pub(crate) fs: Option<VolFs>,
     /// The power-cut simulator under the filesystem (test mode).
-    cut: Option<Rc<RefCell<CutDev<Part>>>>,
-    dirty: bool,
+    pub(crate) cut: Option<Rc<RefCell<CutDev<Part>>>>,
+    pub(crate) dirty: bool,
 }
 
-struct Disk {
-    remote: Rc<RefCell<Remote>>,
-    cache: Rc<RefCell<CacheDev<RemoteDev>>>,
+pub(crate) struct Disk {
+    pub(crate) key: u64,
+    pub(crate) model: String,
+    pub(crate) is_live_boot: bool,
+    pub(crate) is_optical: bool,
+    pub(crate) remote: Rc<RefCell<Remote>>,
+    pub(crate) cache: Rc<RefCell<CacheDev<RemoteDev>>>,
 }
 
 /// The read cache per disk: 8 MiB (`dosfs::dev::CacheDev`: 4 KiB blocks, read-ahead up to
 /// 128 KiB for sequential reads, write-through).
-const CACHE_BYTES: usize = 8 << 20;
+pub(crate) const CACHE_BYTES: usize = 8 << 20;
 
 /// A disk's Remote, shared with the cache above it (`probe_write` and reattaching use it directly).
-struct RemoteDev(Rc<RefCell<Remote>>);
+pub(crate) struct RemoteDev(pub(crate) Rc<RefCell<Remote>>);
 
 impl BlockDev for RemoteDev {
     fn sectors(&self) -> u64 {
@@ -431,14 +442,15 @@ struct Conn {
     rights: u64,
 }
 
-struct Svc {
+pub(crate) struct Svc {
     port: Port,
     disks_ch: Rc<Cell<Handle>>,
     ctl: Handle,
     pending: Rc<RefCell<Vec<Pending>>>,
-    disks: Vec<Disk>,
-    vols: Vec<Volume>,
+    pub(crate) disks: Vec<Disk>,
+    pub(crate) vols: Vec<Volume>,
     conns: Vec<Option<Conn>>,
+    admins: Vec<Option<Handle>>,
     test: bool,
     /// Volumes may be written (only with `test`): otherwise mounted read-only (RoDev, read rights).
     writable: bool,
@@ -490,17 +502,25 @@ impl Svc {
         name
     }
 
-    fn disk_added(&mut self, key: u64, sectors: u64, name: &[u8], ch: Handle) {
-        let name = String::from(core::str::from_utf8(name).unwrap_or("?"));
-        if let Some(d) = self.disks.iter().find(|d| d.remote.borrow().name == name) {
+    fn disk_added(&mut self, key: u64, sectors: u64, payload: &[u8], ch: Handle) {
+        let (name_b, model_b) = match payload.iter().position(|&b| b == 0) {
+            Some(i) => (&payload[..i], &payload[i + 1..]),
+            None => (payload, &[][..]),
+        };
+        let name = String::from(core::str::from_utf8(name_b).unwrap_or("?"));
+        let model = String::from(core::str::from_utf8(model_b).unwrap_or(""));
+        let is_optical = (key & (1u64 << 63)) != 0;
+        let raw_key = key & !(1u64 << 63);
+        if let Some(d) = self.disks.iter_mut().find(|d| d.remote.borrow().name == name) {
             let mut r = d.remote.borrow_mut();
             sys::handle_close(r.ch);
             r.ch = ch;
             r.setup_ring();
+            d.key = raw_key;
+            d.is_optical = is_optical;
             println!("storaged: {}: reattached", name);
             return;
         }
-        let _ = key;
         let mut rem = Remote {
             name: name.clone(),
             ch,
@@ -515,7 +535,15 @@ impl Svc {
         rem.setup_ring();
         let remote = Rc::new(RefCell::new(rem));
         let cache = Rc::new(RefCell::new(CacheDev::new(RemoteDev(remote.clone()), CACHE_BYTES)));
-        self.disks.push(Disk { remote: remote.clone(), cache: cache.clone() });
+        let disk_idx = self.disks.len();
+        self.disks.push(Disk {
+            key: raw_key,
+            model,
+            is_live_boot: false,
+            is_optical,
+            remote: remote.clone(),
+            cache: cache.clone(),
+        });
         if self.rocheck {
             let st = remote.borrow_mut().probe_write(0);
             if st == sys::ERR_ACCESS_DENIED {
@@ -591,7 +619,19 @@ impl Svc {
                     continue;
                 }
             };
-            let mut v = Volume { name: vname, kind, fs: Some(fs), cut, dirty: false };
+            let mut v = Volume {
+                name: vname,
+                kind,
+                disk_idx,
+                part_first: p.first,
+                part_len: p.sectors(),
+                fs: Some(fs),
+                cut,
+                dirty: false,
+            };
+            if v.name == "sys" && kind == fp::KIND_DFS {
+                self.disks[disk_idx].is_live_boot = true;
+            }
             let (info, extra) = match v.fs.as_mut() {
                 Some(VolFs::Dfs(d)) => {
                     let i = d.info();
@@ -655,6 +695,78 @@ impl Svc {
         }
     }
 
+    /// Ask `devmgr` (over `storaged.disks`) to enable or disable raw writes on `disk_idx`.
+    pub(crate) fn enable_disk_rw(&self, disk_idx: usize, enable: bool) -> Result<(), i64> {
+        let ch = self.disks_ch.get();
+        let Some(d) = self.disks.get(disk_idx) else {
+            return Err(fp::ERR_NOT_FOUND);
+        };
+        if ch == 0 || d.is_optical || self.rocheck {
+            return Err(sys::ERR_ACCESS_DENIED);
+        }
+        let mut req = [0u8; HEADER];
+        Header { txid: 0, op: fp::DISK_ENABLE_RW, status: 0, a: d.key, b: u64::from(enable) }.put(&mut req);
+        let mut rep = [0u8; HEADER];
+        let n = sys::channel_call(ch, &req, &mut rep, 5 * SEC)? as usize;
+        let h = Header::get(&rep[..n]).ok_or(sys::ERR_BAD_STATE)?;
+        if h.status == 0 { Ok(()) } else { Err(i64::from(h.status)) }
+    }
+
+    /// Remount the `home` DFS volume read-write (called by `init` ONLY on installed systems).
+    fn unlock_home_volume(&mut self) -> Result<Handle, i64> {
+        if self.rocheck {
+            return Err(sys::ERR_ACCESS_DENIED);
+        }
+        let Some(vi) = self.vols.iter().position(|v| v.name == "home" && v.kind == fp::KIND_DFS) else {
+            return Err(fp::ERR_NOT_FOUND);
+        };
+        let (disk_idx, start, len) = (self.vols[vi].disk_idx, self.vols[vi].part_first, self.vols[vi].part_len);
+        self.enable_disk_rw(disk_idx, true)?;
+        let shared: dosfs::dev::Shared = self.disks[disk_idx].cache.clone();
+        let part = Part { disk: shared, start, len };
+        let dfs = Dfs::mount(Box::new(part)).map_err(|(e, _)| status(e))?;
+        let root = dfs.root();
+        self.vols[vi].fs = Some(VolFs::Dfs(dfs));
+        self.vols[vi].dirty = false;
+        let hd = self.add_conn(vi, root, Kind::Dir, R_ALL)?;
+        println!("storaged: volume 'home': remounted read-write (installed system)");
+        Ok(hd)
+    }
+
+    fn admin_ready(&mut self, slot: usize) {
+        loop {
+            let Some(Some(ch)) = self.admins.get(slot).copied() else { return };
+            let mut hs = [0 as Handle; 1];
+            let mut buf = core::mem::take(&mut self.buf);
+            match sys::channel_read_h(ch, &mut buf, &mut hs, 0) {
+                Ok((n, nh)) => {
+                    if nh > 0 {
+                        sys::handle_close(hs[0]);
+                    }
+                    if let Some(h) = Header::get(&buf[..n]) {
+                        let (st, a, b, body) = self.handle_admin(&h, &buf[HEADER..n]);
+                        let mut rep = vec![0u8; HEADER + body.len()];
+                        Header { txid: h.txid, op: h.op, status: st as i32, a, b }.put(&mut rep);
+                        rep[HEADER..].copy_from_slice(&body);
+                        sys::channel_write(ch, &rep);
+                    }
+                    self.buf = buf;
+                }
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.buf = buf;
+                    self.port.arm(ch, sys::READABLE | sys::PEER_CLOSED, KEY_ADMIN_BASE + slot as u64);
+                    return;
+                }
+                Err(_) => {
+                    self.buf = buf;
+                    sys::handle_close(ch);
+                    self.admins[slot] = None;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Drain a channel of messages that may carry one handle.
     fn drain(&mut self, ch: Handle, key: u64) {
         loop {
@@ -683,6 +795,42 @@ impl Svc {
                         sys::handle_close(self.disks_ch.get());
                         self.disks_ch.set(handle);
                         self.port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_DISKS);
+                    } else if let Some(h) = h
+                        && h.op == svc::CONNECT
+                        && &buf[HEADER..n] == b"admin"
+                        && handle != 0
+                    {
+                        let slot = match self.admins.iter().position(Option::is_none) {
+                            Some(i) => Some(i),
+                            None if self.admins.len() < MAX_ADMINS => {
+                                self.admins.push(None);
+                                Some(self.admins.len() - 1)
+                            }
+                            None => None,
+                        };
+                        if let Some(s) = slot {
+                            self.admins[s] = Some(handle);
+                            self.port.arm(handle, sys::READABLE | sys::PEER_CLOSED, KEY_ADMIN_BASE + s as u64);
+                        } else {
+                            sys::handle_close(handle);
+                        }
+                    } else if let Some(h) = h
+                        && h.op == fp::UNLOCK_HOME
+                    {
+                        if handle != 0 {
+                            sys::handle_close(handle);
+                        }
+                        let mut r = [0u8; HEADER];
+                        match self.unlock_home_volume() {
+                            Ok(hd) => {
+                                Header { txid: h.txid, op: fp::UNLOCK_HOME, status: 0, a: 1, b: 0 }.put(&mut r);
+                                sys::channel_write_h(self.ctl, &r, &[MsgHandle { handle: hd, rights: sys::RIGHTS_SAME }]);
+                            }
+                            Err(e) => {
+                                Header { txid: h.txid, op: fp::UNLOCK_HOME, status: e as i32, a: 0, b: 0 }.put(&mut r);
+                                sys::channel_write(self.ctl, &r);
+                            }
+                        }
                     } else if let Some(h) = h
                         && h.op == svc::SYNC
                     {
@@ -1150,6 +1298,7 @@ fn main(s: *const Startup) -> i32 {
         disks: Vec::new(),
         vols: Vec::new(),
         conns: Vec::new(),
+        admins: Vec::new(),
         test,
         writable: test,
         rocheck,
@@ -1186,6 +1335,9 @@ fn main(s: *const Startup) -> i32 {
                 svc.drain(ch, KEY_DISKS);
             }
             KEY_CTL => svc.drain(ctl, KEY_CTL),
+            k if (KEY_ADMIN_BASE..KEY_ADMIN_BASE + MAX_ADMINS as u64).contains(&k) => {
+                svc.admin_ready((k - KEY_ADMIN_BASE) as usize)
+            }
             k if k >= KEY_CONN => svc.conn_ready((k - KEY_CONN) as usize),
             _ => {}
         }

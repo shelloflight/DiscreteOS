@@ -296,6 +296,91 @@ static efi_status read_file(efi_file *root, const char16 *path, const char *name
     return EFI_SUCCESS;
 }
 
+/* Optional UEFI NVRAM boot entry registration on installed ESPs: if \EFI\DOS\BOOTENTRY.BIN exists
+ * (written by the D-OS installer), ensure Boot00D0 and BootOrder contain DiscreteOS before
+ * ExitBootServices. Never fatal and never touched when no installed ESP is present. */
+static bool maybe_register_boot_entry(efi_file *root)
+{
+    if (!st->runtime_services || !st->runtime_services->get_variable || !st->runtime_services->set_variable)
+        return false;
+    efi_file *f;
+    if (root->open(root, &f, u"\\EFI\\DOS\\BOOTENTRY.BIN", EFI_FILE_MODE_READ, 0))
+        return false;
+    uint8_t entry[512];
+    uint64_t len = sizeof(entry);
+    efi_status rs = f->read(f, &len, entry);
+    f->close(f);
+    if (rs || len < 24 || len == sizeof(entry))
+        return false;
+    static const efi_guid gv = GUID_GLOBAL_VAR;
+    uint8_t cur[512];
+    uint64_t cur_len = sizeof(cur);
+    uint32_t attrs = 0;
+    bool need_write = st->runtime_services->get_variable(u"Boot00D0", &gv, &attrs, &cur_len, cur) != EFI_SUCCESS ||
+                      cur_len != len;
+    if (!need_write) {
+        for (uint64_t i = 0; i < len; i++) {
+            if (cur[i] != entry[i]) {
+                need_write = true;
+                break;
+            }
+        }
+    }
+    if (need_write) {
+        if (st->runtime_services->set_variable(u"Boot00D0", &gv, EFI_VAR_NV_BS_RT, len, entry) != EFI_SUCCESS)
+            return true;
+        say("D-OS: registered UEFI NVRAM boot entry Boot00D0\n");
+    }
+    uint16_t order[64];
+    uint64_t olen = sizeof(order) - sizeof(uint16_t);
+    uint32_t oattrs = 0;
+    uint64_t count = 0;
+    if (st->runtime_services->get_variable(u"BootOrder", &gv, &oattrs, &olen, order) == EFI_SUCCESS)
+        count = olen / sizeof(uint16_t);
+    for (uint64_t i = 0; i < count; i++) {
+        if (order[i] == 0x00D0u)
+            return true;
+    }
+    if (count < 63) {
+        for (uint64_t i = count; i > 0; i--)
+            order[i] = order[i - 1];
+        order[0] = 0x00D0u;
+        st->runtime_services->set_variable(u"BootOrder", &gv, EFI_VAR_NV_BS_RT, (count + 1) * sizeof(uint16_t), order);
+    }
+    return true;
+}
+
+/* Check the boot volume first; when booted from live media (no BOOTENTRY.BIN on boot_root), scan
+ * other attached UEFI filesystems so dual-boot and internal-disk installs get Boot00D0 registered
+ * in firmware NVRAM automatically. */
+static void register_installed_boot_entries(efi_handle boot_dev, efi_file *boot_root)
+{
+    if (maybe_register_boot_entry(boot_root))
+        return;
+    if (!bs->locate_handle_buffer || !bs->free_pool)
+        return;
+    static const efi_guid fs_guid = GUID_SIMPLE_FS;
+    uint64_t count = 0;
+    efi_handle *handles = NULL;
+    if (bs->locate_handle_buffer(EFI_LOCATE_BY_PROTOCOL, &fs_guid, NULL, &count, &handles) || !handles)
+        return;
+    for (uint64_t i = 0; i < count; i++) {
+        if (handles[i] == boot_dev)
+            continue;
+        efi_simple_fs *fs = NULL;
+        efi_file *root = NULL;
+        if (bs->handle_protocol(handles[i], &fs_guid, (void **)&fs) || !fs)
+            continue;
+        if (fs->open_volume(fs, &root) || !root)
+            continue;
+        bool found = maybe_register_boot_entry(root);
+        root->close(root);
+        if (found)
+            break;
+    }
+    bs->free_pool(handles);
+}
+
 /* The kernel and its signature from the volume this loader was started from. */
 static efi_status read_kernel(efi_handle image, uint8_t **out, uint64_t *size, uint8_t **sig)
 {
@@ -316,6 +401,7 @@ static efi_status read_kernel(efi_handle image, uint8_t **out, uint64_t *size, u
         root->close(root);
         return fail(s, "cannot read the kernel");
     }
+    register_installed_boot_entries(li->device, root);
     root->close(root);
     return EFI_SUCCESS;
 }

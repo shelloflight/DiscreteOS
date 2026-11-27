@@ -22,6 +22,7 @@ bench = false
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
 dosawmi = { path = "../lib/awmi" }
+dosid = { path = "../lib/identity" }
 dosui = { path = "../lib/ui" }
 dosfont = { path = "../lib/font" }
 

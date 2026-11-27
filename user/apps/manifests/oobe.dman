@@ -1,0 +1,22 @@
+kind = "app"
+name = "oobe"
+title = "Welcome to D-OS"
+version = "1.0.0"
+binary = "oobe.dx"
+description = "First-boot setup: language, keyboard, timezone, optional network, and local account"
+pinned = false
+autostart = false
+
+[permissions]
+required = [
+    "window",
+    "identity:query",
+    "identity:admin",
+    "net:status",
+    "net:control",
+]
+
+[quota]
+memory = "48M"
+handles = 256
+threads = 4

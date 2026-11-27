@@ -101,18 +101,35 @@ struct amdgpu_asic_id amdgpu_identify_asic(u16 device_id) {
 
 static u32 hw_mmio_r32(void *ctx, u64 byte_off) {
     struct amdgpu_device *adev = (struct amdgpu_device *)ctx;
-    if (!adev || adev->mmio_addr == 0 || byte_off + 4ULL > adev->mmio_len || (byte_off & 3ULL) != 0) {
+    if (!adev || adev->mmio_addr == 0 || (byte_off & 3ULL) != 0) {
         return 0u;
     }
-    return readl((const volatile void __iomem *)(uintptr_t)(adev->mmio_addr + byte_off));
+    if (byte_off + 4ULL <= adev->mmio_len) {
+        return readl((const volatile void __iomem *)(uintptr_t)(adev->mmio_addr + byte_off));
+    }
+    /* Indirect MM_INDEX/MM_DATA register read for offsets beyond BAR5 aperture (matches amdgpu_device_rreg). */
+    if (adev->mmio_len >= 0x20ULL && byte_off < 0x80000000ULL) {
+        writel((u32)(byte_off & 0x7FFFFFFCu), (volatile void __iomem *)(uintptr_t)(adev->mmio_addr + 0x0000ULL));
+        writel(0u, (volatile void __iomem *)(uintptr_t)(adev->mmio_addr + 0x0018ULL));
+        return readl((const volatile void __iomem *)(uintptr_t)(adev->mmio_addr + 0x0004ULL));
+    }
+    return 0u;
 }
 
 static void hw_mmio_w32(void *ctx, u64 byte_off, u32 val) {
     struct amdgpu_device *adev = (struct amdgpu_device *)ctx;
-    if (!adev || adev->mmio_addr == 0 || byte_off + 4ULL > adev->mmio_len || (byte_off & 3ULL) != 0) {
+    if (!adev || adev->mmio_addr == 0 || (byte_off & 3ULL) != 0) {
         return;
     }
-    writel(val, (volatile void __iomem *)(uintptr_t)(adev->mmio_addr + byte_off));
+    if (byte_off + 4ULL <= adev->mmio_len) {
+        writel(val, (volatile void __iomem *)(uintptr_t)(adev->mmio_addr + byte_off));
+        return;
+    }
+    if (adev->mmio_len >= 0x20ULL && byte_off < 0x80000000ULL) {
+        writel((u32)(byte_off & 0x7FFFFFFCu), (volatile void __iomem *)(uintptr_t)(adev->mmio_addr + 0x0000ULL));
+        writel(0u, (volatile void __iomem *)(uintptr_t)(adev->mmio_addr + 0x0018ULL));
+        writel(val, (volatile void __iomem *)(uintptr_t)(adev->mmio_addr + 0x0004ULL));
+    }
 }
 
 int amdgpu_hw_ensure_vram_window(struct amdgpu_device *adev, u64 vram_base, u64 len) {

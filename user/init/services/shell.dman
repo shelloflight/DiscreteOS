@@ -19,6 +19,7 @@ gpu = ["query"]
 awmi = ["admin", "query"]
 identity = ["admin", "query"]
 appmgr = ["admin", "query"]
+storaged = ["admin"]
 namespace = ["*"]
 manager = ["services", "power"]
 tools = true

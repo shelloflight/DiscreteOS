@@ -127,6 +127,9 @@ pub const GPU_DEV: u32 = 24;
 pub const GPU_ATTACH: u32 = 25;
 /// GPU driver -> manager: GPU adapter removed/offline.
 pub const GPU_GONE: u32 = 26;
+/// Manager -> block driver (control channel, call): enable (`b = 1`) or disable (`b = 0`) writes
+/// on unit `a`. Refused (`ERR_ACCESS_DENIED`) on read-only optical media or when write-locked.
+pub const BLK_SET_RW: u32 = 27;
 /// Manager -> driver (tests): fault on purpose (restart test).
 pub const TEST_CRASH: u32 = 20;
 /// Manager -> block driver (tests): point a request at memory the device was not given (the

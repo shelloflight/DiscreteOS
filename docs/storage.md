@@ -36,12 +36,32 @@ Storage is entirely in user space: disk drivers, a storage service and filesyste
   storaged makes every written volume durable (`SYNC`) before any driver stops.
 - All DMA buffers are pinned through the IOMMU.
 
-## Read-only by default
+## Read-only by default & installed disks
 
-A normal boot **never writes a disk** ([hardware.md](hardware.md)). Drivers refuse writes unless
-started with `rw` (only in tests), and storaged mounts every volume read-only and hands out read
-rights only. Keep it that way: any change that could write a disk on a normal boot must be opt-in
-and tested by `readonly`.
+A normal live boot **never writes a disk** ([hardware.md](hardware.md)). Block drivers refuse writes
+by default (and AHCI ATAPI CD-ROM drives are permanently read-only), and `storaged` mounts every
+volume read-only and hands out read rights only. Any change that could write a disk on a live boot
+must be opt-in and verified by `readonly`.
+
+- **Installed `/home` unlock:** When `esp:/DOS/BOOT.CFG` declares `installed = true` (written by
+  the installer), `init` sends `UNLOCK_HOME` to `storaged`, which unlocks block writes only on the
+  installed disk's `home` DFS volume (`sys` always stays immutable read-only, and live media never
+  unlocks writes).
+- **Disk installer & partitioning (`storaged.admin`):** Capability-gated to `shell` and
+  `installer.dapp` (`Permission::StorageAdmin`, Operator-only; refused on live/optical media and
+  under `ro` lock). Supports three modes planned and validated in `dosfs::install`:
+  1. **Dual Boot (default):** Installs `sys` and `home` DFS volumes into unallocated GPT free space
+     via `gpt::write_preserving()` without touching any existing OS partition, non-destructively
+     adding `\EFI\DOS\BOOTX64.EFI`, `\EFI\DOS\BOOTENTRY.BIN`, `\DOS\KERNEL.BIN`, `\DOS\KERNEL.DSIG`,
+     and `\DOS\BOOT.CFG` to an existing ESP while preserving existing `\EFI\BOOT\BOOTX64.EFI` and
+     other OS bootloaders.
+  2. **Use Entire Disk:** Formats a blank/unpartitioned disk with GPT (`bios-boot`, `esp`, `sys`,
+     `home`); refuses disks with any existing partition table.
+  3. **Wipe & Repartition (+ `delete-part`):** Explicitly confirmed full wipe (`--confirm` / UI
+     confirmation toggle) or individual GPT partition deletion so users can reclaim space on
+     existing drives. New ESPs are sized to 260 MiB FAT32 with 4 KiB clusters on drives ≥ 512 MiB
+     (100 MiB on 256–512 MiB, 36 MiB minimum on smaller virtual images), verified by post-write GPT
+     and FAT32 readback alongside `Dfs::fsck()` on `sys` and `home`.
 
 ## Files as handles
 
@@ -117,6 +137,14 @@ are refused. FAT has no crash consistency; use DFS for data that must survive a 
 - `time`, `time-uefi`: file times on DFS and FAT32 kept across a reboot ([services.md](services.md)).
 - `readonly`: every driver refuses raw writes, every volume refuses writes, disk images are
   byte-identical afterwards.
+- `iso-bios`, `iso-uefi`: AHCI ATAPI CD-ROM read-only detection and read-only `esp`/`sys` mounts.
+- `install-dual`: dual-boot NVMe installation into unallocated GPT free space; host post-check
+  proves existing Windows NTFS partition and Windows/fallback EFI loaders are 100% byte-identical
+  while D-OS boot files and `sys`/`home` DFS volumes pass `fsck`, then boots live UEFI media with
+  the dual-boot drive attached to confirm automatic multi-volume `Boot00D0` NVRAM registration.
+- `install-e2e`: blank-disk install, confirmed wipe & repartition, individual partition deletion,
+  UEFI reboot directly from the installed disk (no live media), OOBE auto-launch/bypass, and
+  persistent multi-user `/home` isolation.
 
 ## Limitations
 

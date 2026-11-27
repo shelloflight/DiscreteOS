@@ -352,7 +352,7 @@ impl crate::blkserve::Disk for UsbDisks<'_> {
 /// closed (the storage service let the disk go).
 pub(super) fn serve_disk(x: &mut Xhci, u: usize, port: &Port, key: u64, msg: &mut [u8], data: &mut [u8]) {
     let Some(ch) = x.disks[u].as_ref().map(|d| d.ch).filter(|&c| c != 0) else { return };
-    let writable = x.writable;
+    let writable = x.disk_rw[u];
     loop {
         let mut hs = [0 as Handle; 2];
         let (n, nh) = match sys::channel_read_h(ch, msg, &mut hs, 0) {

@@ -6,7 +6,7 @@ group = "system"
 description = "disks, volumes and files"
 
 [provides]
-endpoints = ["disks"]   # the device manager hands each disk over this
+endpoints = ["disks", "admin"]   # disks from devmgr; admin for disk installer
 volumes = true          # announces the volumes it mounts
 
 [grants]

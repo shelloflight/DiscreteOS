@@ -30,6 +30,7 @@ name = "audio"
 version = "0.1.0"
 dependencies = [
  "dosaudio",
+ "dosid",
  "libd",
 ]
 
@@ -39,6 +40,7 @@ version = "0.1.0"
 dependencies = [
  "dosawmi",
  "dosfont",
+ "dosid",
  "dosui",
  "libd",
 ]
@@ -190,6 +192,7 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "dosid",
  "dosnet",
  "libd",
 ]
@@ -201,6 +204,7 @@ dependencies = [
  "dman",
  "dosapp",
  "dosaudio",
+ "dosid",
  "dosnet",
  "libd",
 ]

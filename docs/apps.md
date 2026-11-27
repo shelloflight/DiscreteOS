@@ -78,6 +78,7 @@ threads = 16
 | `identity:admin` | `identity.admin` | `IDENTITY_ADMIN` |
 | `apps:query` | `appmgr.query` | *(always allowed)* |
 | `apps:admin` | `appmgr.admin` | `APP_ADMIN` |
+| `storage:admin` | `storaged.admin` (disk inspection, partitioning, installation) | `SYSTEM_ADMIN` |
 
 ### Compositor permission prompt & live revocation
 
@@ -90,8 +91,9 @@ threads = 16
   identity's capability mask. A Standard identity cannot grant `display:admin` or `identity:admin`.
 - **Immediate live revocation:** Revoking a permission in **Settings -> Apps & Permissions** or via
   `apps revoke <app> <perm>` (`OP_SET_PERM`) updates the per-identity ledger
-  (`/data/system/app-perms.toml` when writable) and immediately terminates every running instance of
-  that app that held the revoked capability. Relaunching the app omits those handles completely.
+  (`/home/.dos/permissions.toml` on installed systems, falling back to `/data/apps/permissions.toml`)
+  and immediately terminates every running instance of that app that held the revoked capability.
+  Relaunching the app omits those handles completely.
 - **Service linking (`MGR_LINK`):** `appmgr` requests fresh client channels on behalf of launched
   apps via `grants.manager = ["apps"]` (`svc::MGR_LINK`). `init` enforces a strict whitelist of
   non-privileged service endpoints (never `identity.session`, `devmgr.*`, `gpu.display`,
@@ -100,7 +102,7 @@ threads = 16
 
 ## Core native apps (`sys:/apps/*.dapp`)
 
-All five shipped desktop applications are signed `.dapp` bundles built from in-tree `dosui` /
+All seven shipped desktop applications are signed `.dapp` bundles built from in-tree `dosui` /
 D-AWMI code and registered with the compositor launcher and dock via `awmi.launcher`:
 
 | Bundle | Title | Pinned / Autostart | Role & capabilities |
@@ -108,8 +110,10 @@ D-AWMI code and registered with the compositor launcher and dock via `awmi.launc
 | `terminal.dapp` | **Terminal** | pinned, autostart | Graphical terminal (`console.dx`) attached to `terminal.view`; shares session history and scrollback with the text console. |
 | `files.dapp` | **Files** | pinned | File Manager (`files.dx`): browse `/home` (and `/data` for Operator) with double-click / Enter directory navigation, parent navigation, folder summary & scrollable file preview inspector, create folder/file, delete (requires `files:write`), live namespace indicator. |
 | `editor.dapp` | **Text Editor** | pinned | Multiline monospace text editor (`editor.dx`, `dosui::textarea`): open/edit files in `/home`, save with `Ctrl+S` (prompts for `files:write` via compositor prompt; runs read-only if denied), unsaved indicator. |
-| `settings.dapp` | **Settings** | pinned | 6-tab system settings (`settings.dx`): **Display** (output selector, mode/Hz switching, VRR, HDR10, per-output scale via `awmi.admin` `OP_SET_DISPLAY`), **Appearance** (Dark Slate / High Contrast theme, 100–200% text scale, reduce motion), **Audio** (output selection, volume, mute/unmute), **Network** (link/IP/DNS status and refresh), **Identity & Lock** (active identity, lock now, enroll passphrase, create non-root identity, idle timeout & lock-on-sleep policy), **Apps & Permissions** (list bundles, launch/stop, live grant/revoke permission toggles). |
+| `settings.dapp` | **Settings** | pinned | 6-tab system settings (`settings.dx`): **Display** (output selector, mode/Hz switching, VRR, HDR10, per-output scale via `awmi.admin` `OP_SET_DISPLAY`), **Appearance** (Dark Slate / High Contrast theme, 100–200% text scale, reduce motion), **Audio** (output selection, volume, mute/unmute, microphone gate; persisted in `/home/.dos/audio.toml`), **Network** (link/IP/DNS status, DHCP/static IPv4 & DNS editing; persisted in `/home/.dos/network.toml`), **Identity & Lock** (active identity, lock now, enroll passphrase, create non-root identity, idle timeout & lock-on-sleep/boot policy; persisted in `/home/.dos/identities.toml`), **Apps & Permissions** (list bundles, pin/unpin on taskbar, live grant/revoke permission toggles). |
 | `sysmon.dapp` | **System Monitor** | launcher | 4-tab live monitor (`sysmon.dx`): **Overview** (system summary & memory/handle/thread totals), **Services** (live service table + read-only kernel handle inspector via `MGR_OBJECTS`), **Apps** (installed `.dapp` bundles, verified status, running counts, granted permissions), **System Log** (live `log.read` viewer with level filter). |
+| `installer.dapp` | **Install D-OS** | pinned (live media only) | Disk installer (`installer.dx`, `storage:admin`): drive list (protecting live/optical media), partition table viewer with confirmed partition deletion, Dual Boot (recommended), Use Entire Disk, and confirmed Wipe & Repartition modes with dry-run plan preview. Automatically unpinned by default on installed systems. |
+| `oobe.dapp` | **Welcome to D-OS** | first-boot | Skippable first-boot setup wizard (`oobe.dx`): automatically launched once by `appmgr` on newly installed disks when `/home/.dos/oobe.toml` has `completed = false`, covering language/keyboard, timezone, optional network (skip/DHCP/static), and local non-root account creation (enabling boot sign-in once a personal account or passphrase is set); bypassed once completed or skipped. |
 
 ## Capability model (`grants.appmgr`)
 

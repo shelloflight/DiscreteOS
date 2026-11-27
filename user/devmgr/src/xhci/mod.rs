@@ -404,8 +404,10 @@ struct Xhci {
     audio_armed: [Handle; MAX_AUDIO_DEVS],
     /// The control channel to the device manager (KEY, POINTER, DISK messages).
     ctl: Handle,
-    /// Disks may be written (started with `rw`).
-    writable: bool,
+    /// Strictly read-only locked (`ro` argument: refuses `BLK_SET_RW`).
+    ro_locked: bool,
+    /// Per-disk write permission (starts true only with `rw`, or unlocked via `BLK_SET_RW`).
+    disk_rw: [bool; MAX_DISKS],
     /// Block requests served.
     requests: u64,
     /// Root port status changes seen (bit p-1).
@@ -1305,7 +1307,8 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         audios: [const { None }; MAX_AUDIO_DEVS],
         audio_armed: [0; MAX_AUDIO_DEVS],
         ctl: ch,
-        writable: libd::args() == b"rw",
+        ro_locked: libd::args() == b"ro",
+        disk_rw: [libd::args() == b"rw"; MAX_DISKS],
         requests: 0,
         port_events: 0,
         deferred: [Trb { param: 0, status: 0, control: 0 }; REPORTS * 4],
@@ -1433,6 +1436,15 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
                             }
                             let (st, a, b) = match h.op {
                                 proto::STATS => (0, sys::interrupt_ack(x.irq).unwrap_or(0), x.reports + x.requests),
+                                proto::BLK_SET_RW => {
+                                    let u = h.a as usize;
+                                    if x.ro_locked || u >= MAX_DISKS || x.disks[u].is_none() {
+                                        (sys::ERR_ACCESS_DENIED as i32, 0, 0)
+                                    } else {
+                                        x.disk_rw[u] = h.b != 0;
+                                        (0, 0, 0)
+                                    }
+                                }
                                 proto::TEST_CRASH => {
                                     // SAFETY: deliberately faults (test).
                                     unsafe { core::ptr::write_volatile(0x10 as *mut u32, 1) };

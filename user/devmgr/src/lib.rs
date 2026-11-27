@@ -90,6 +90,8 @@ const MAX_DEFERRED_GPU: usize = 8;
 const MAX_INPUT_CLIENTS: usize = 8;
 /// Port key of the control channel from the service manager.
 const KEY_MGR: u64 = (MAX_DRIVERS as u64) << 8 | 3;
+/// Port key of the `storaged.disks` channel (for capability-gated `DISK_ENABLE_RW` requests).
+const KEY_STORAGE: u64 = (MAX_DRIVERS as u64) << 8 | 4;
 /// Port keys of the input endpoint's clients (`+ slot`): their requests (`proto::INPUT_GRAB`).
 const KEY_INPUT_BASE: u64 = (MAX_DRIVERS as u64) << 8 | 0x10;
 
@@ -99,6 +101,7 @@ struct Disk {
     drv: usize,
     unit: u64,
     sectors: u64,
+    read_only: bool,
     model: [u8; 40],
     model_len: usize,
 }
@@ -214,6 +217,8 @@ struct Mgr {
     grab: Option<usize>,
     /// Block drivers may write (argument `rw` or `test`); otherwise they start read-only.
     writable: bool,
+    /// Strictly read-only locked (`ro` argument, used by `readonly` test: refuses `DISK_ENABLE_RW`).
+    ro_locked: bool,
     /// Which keyboards may type (trust.rs).
     trust: trust::Trust,
     /// Drivers whose pointer input has been reported once (bit = driver index).
@@ -310,7 +315,13 @@ impl Mgr {
             handles: if is_gpu { 512 } else { 256 },
             threads: if is_gpu { 8 } else { 4 },
         };
-        let args: &[u8] = if self.writable { b"rw" } else { b"" };
+        let args: &[u8] = if self.writable {
+            b"rw"
+        } else if self.ro_locked {
+            b"ro"
+        } else {
+            b""
+        };
         match sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), d.image, &name[..n + 5], args, &hs[..nhs], &limits) {
             Ok(p) => {
                 d.proc = p;
@@ -335,6 +346,10 @@ impl Mgr {
         let Some((key, _)) = self.port.wait(timeout) else { return false };
         if key == KEY_MGR {
             self.manager();
+            return true;
+        }
+        if key == KEY_STORAGE {
+            self.storage_request();
             return true;
         }
         if (KEY_INPUT_BASE..KEY_INPUT_BASE + MAX_INPUT_CLIENTS as u64).contains(&key) {
@@ -467,11 +482,13 @@ impl Mgr {
                                 sys::handle_close(self.storage);
                             }
                             self.storage = handle;
+                            self.port.arm(self.storage, sys::READABLE | sys::PEER_CLOSED, KEY_STORAGE);
                             let known = self.known;
                             let mut again = 0;
                             for k in known.iter().flatten() {
                                 if self.drv[k.drv].as_ref().is_some_and(|d| d.ready) {
-                                    self.disk(k.drv, k.unit, k.sectors, &k.model[..k.model_len]);
+                                    let u_val = k.unit | if k.read_only { 1u64 << 63 } else { 0 };
+                                    self.disk(k.drv, u_val, k.sectors, &k.model[..k.model_len]);
                                     again += 1;
                                 }
                             }
@@ -929,13 +946,15 @@ impl Mgr {
     }
 
     /// A driver announced a disk: attach a channel to it and hand the other end to storage.
-    fn disk(&mut self, i: usize, unit: u64, sectors: u64, model: &[u8]) {
+    fn disk(&mut self, i: usize, unit_raw: u64, sectors: u64, model: &[u8]) {
         let Some(d) = self.drv[i].as_ref() else { return };
+        let read_only = (unit_raw & (1u64 << 63)) != 0;
+        let unit = unit_raw & 0xFFFF;
         let mut name = [0u8; 64];
         let mut w = Cursor { b: &mut name, n: 0 };
         let _ = core::fmt::write(&mut w, format_args!("{}:{}:{}", d.prog, d.info.name(), unit));
         let len = w.n;
-        let mut rec = Disk { drv: i, unit, sectors, model: [0; 40], model_len: model.len().min(40) };
+        let mut rec = Disk { drv: i, unit, sectors, read_only, model: [0; 40], model_len: model.len().min(40) };
         rec.model[..rec.model_len].copy_from_slice(&model[..rec.model_len]);
         let slot = self.known.iter().position(|k| k.is_some_and(|k| k.drv == i && k.unit == unit));
         let first = slot.is_none();
@@ -965,11 +984,70 @@ impl Mgr {
             sys::handle_close(mine);
             return;
         }
-        let mut msg = [0u8; HEADER + 64];
-        Header { txid: 0, op: fs::DISK_ADD, status: 0, a: (i as u64) << 8 | unit, b: sectors }.put(&mut msg);
+        // Payload: `<disk_name>\0<model>` so storaged can show human-readable drive models.
+        let mut msg = [0u8; HEADER + 112];
+        let key = ((i as u64) << 8) | unit | if read_only { 1u64 << 63 } else { 0 };
+        Header { txid: 0, op: fs::DISK_ADD, status: 0, a: key, b: sectors }.put(&mut msg);
         msg[HEADER..HEADER + len].copy_from_slice(&name[..len]);
-        if sys::channel_write_h(self.storage, &msg[..HEADER + len], &[sys::MsgHandle { handle: mine, rights: sys::RIGHTS_SAME }]) == 0 {
+        let total = if rec.model_len > 0 && len + 1 + rec.model_len <= 112 {
+            msg[HEADER + len] = 0;
+            msg[HEADER + len + 1..HEADER + len + 1 + rec.model_len].copy_from_slice(&rec.model[..rec.model_len]);
+            len + 1 + rec.model_len
+        } else {
+            len
+        };
+        if sys::channel_write_h(self.storage, &msg[..HEADER + total], &[sys::MsgHandle { handle: mine, rights: sys::RIGHTS_SAME }]) == 0 {
             self.disks += 1;
+        }
+    }
+
+    /// Requests from `storaged` on `storaged.disks` (per-disk write unlock for installed `/home` or installer).
+    fn storage_request(&mut self) {
+        let mut buf = [0u8; HEADER + 32];
+        loop {
+            if self.storage == 0 {
+                return;
+            }
+            match sys::channel_read(self.storage, &mut buf, 0) {
+                Ok(n) => {
+                    let Some(h) = Header::get(&buf[..n as usize]) else { continue };
+                    let status = if h.op == fs::DISK_ENABLE_RW {
+                        if self.ro_locked {
+                            sys::ERR_ACCESS_DENIED
+                        } else {
+                            let key = h.a & !(1u64 << 63);
+                            let drv_i = (key >> 8) as usize;
+                            let unit = key & 0xFF;
+                            if drv_i < MAX_DRIVERS
+                                && let Some(d) = self.drv[drv_i].as_ref()
+                                && d.ch != 0
+                            {
+                                let mut req = [0u8; HEADER];
+                                Header { txid: 0, op: proto::BLK_SET_RW, status: 0, a: unit, b: h.b }.put(&mut req);
+                                let mut rep = [0u8; HEADER];
+                                match sys::channel_call(d.ch, &req, &mut rep, 5 * SEC) {
+                                    Ok(rn) => Header::get(&rep[..rn as usize]).map_or(sys::ERR_BAD_STATE, |rh| i64::from(rh.status)),
+                                    Err(e) => e,
+                                }
+                            } else {
+                                fs::ERR_NOT_FOUND
+                            }
+                        }
+                    } else {
+                        sys::ERR_NOT_SUPPORTED
+                    };
+                    if h.txid != 0 {
+                        let mut rep = [0u8; HEADER];
+                        Header { txid: h.txid, op: h.op, status: status as i32, a: 0, b: 0 }.put(&mut rep);
+                        sys::channel_write(self.storage, &rep);
+                    }
+                }
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    self.port.arm(self.storage, sys::READABLE | sys::PEER_CLOSED, KEY_STORAGE);
+                    return;
+                }
+                Err(_) => return,
+            }
         }
     }
 
@@ -1248,6 +1326,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
         return -1;
     }
     let test = libd::args().starts_with(b"test");
+    let ro_locked = libd::args() == b"ro";
     let writable = test || libd::args() == b"rw";
     let Ok(port) = Port::new(64) else {
         println!("devmgr: cannot create a port");
@@ -1284,6 +1363,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
         input: [0; MAX_INPUT_CLIENTS],
         grab: None,
         writable,
+        ro_locked,
         trust: trust::Trust::new(),
         pointer_seen: 0,
     };
@@ -1292,6 +1372,9 @@ fn devmgr_main(s: *const Startup) -> i32 {
     }
     if m.mgr != 0 {
         m.port.arm(m.mgr, sys::READABLE | sys::PEER_CLOSED, KEY_MGR);
+    }
+    if m.storage != 0 {
+        m.port.arm(m.storage, sys::READABLE | sys::PEER_CLOSED, KEY_STORAGE);
     }
     // Bind drivers to devices.
     let mut ndev = 0;

@@ -109,6 +109,26 @@ fn toml_and_wire_roundtrip_and_fail_closed() {
     let parsed = IdentityStore::from_toml(toml_text.as_bytes()).unwrap();
     assert_eq!(parsed, store);
 
+    // Realistic hardware TPM 2.0 sealed blob (~360 bytes -> 720 hex chars, > dman::toml::MAX_STRING)
+    // and maximum-size 1024-byte TPM blob (2048 hex chars) must round-trip cleanly across reboots.
+    let mut tpm_store = IdentityStore::default_store();
+    tpm_store.lock_policy.lock_at_boot = true;
+    let bob_id = tpm_store.create_identity("bob", "Bob", IdentityRole::Operator).unwrap();
+    let (_, ver, iter) = Credential::prepare_tpm(bob_id, "bob", b"secret-pass", [7; 16], &[9; 32], 100).unwrap();
+    let mut big_blob = b"DTPM".to_vec();
+    big_blob.extend_from_slice(&[0xA5; 356]);
+    tpm_store.find_by_id_mut(bob_id).unwrap().cred =
+        Credential::from_tpm_blob([7; 16], iter, ver, big_blob).unwrap();
+    let tpm_toml = tpm_store.to_toml();
+    assert_eq!(IdentityStore::from_toml(tpm_toml.as_bytes()).unwrap(), tpm_store);
+
+    let mut max_blob = b"DTPM".to_vec();
+    max_blob.extend_from_slice(&[0x5A; MAX_BLOB_LEN - 4]);
+    tpm_store.find_by_id_mut(bob_id).unwrap().cred =
+        Credential::from_tpm_blob([7; 16], iter, ver, max_blob).unwrap();
+    let max_toml = tpm_store.to_toml();
+    assert_eq!(IdentityStore::from_toml(max_toml.as_bytes()).unwrap(), tpm_store);
+
     // Wire round-trip.
     let w = IdentityWire::from_identity(store.find_by_id(id).unwrap(), false);
     let mut buf = [0u8; IDENTITY_WIRE_BYTES];

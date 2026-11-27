@@ -106,7 +106,7 @@ pub fn client(name: &str, color: u32, title: &[u8], retitle: Option<&[u8]>, want
                 check!(active, "the session ended before the close request");
                 continue;
             }
-            Event::Launch { .. } | Event::Settings { .. } | Event::PermResult { .. } => continue,
+            Event::Launch { .. } | Event::Settings { .. } | Event::PermResult { .. } | Event::AppPin { .. } => continue,
         };
         check!(win == w.id, "received an event for window {} (ours is {})", win, w.id);
         match ev {

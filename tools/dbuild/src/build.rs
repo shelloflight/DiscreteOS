@@ -88,6 +88,8 @@ const CORE_DAPPS: &[(&str, &str)] = &[
     ("editor", "editor.dx"),
     ("settings", "settings.dx"),
     ("sysmon", "sysmon.dx"),
+    ("installer", "installer.dx"),
+    ("oobe", "oobe.dx"),
 ];
 
 fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
@@ -252,6 +254,7 @@ pub struct BuildOpts {
 
 pub struct BuildResult {
     pub image: PathBuf,
+    pub iso: Option<PathBuf>,
 }
 
 fn log(quiet: bool, msg: &str) {
@@ -716,7 +719,7 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
     log(opts.quiet, "  NASM  boot/stage2.asm");
     {
         let mut args = vec!["-f".into(), "bin".into(), "-o".into(), stage2_bin.to_string_lossy().into_owned()];
-        args.extend(layout_defs);
+        args.extend(layout_defs.iter().cloned());
         args.push(env.root.join("boot").join("stage2.asm").to_string_lossy().into_owned());
         run_cmd(nasm, &args, None, &[], opts.quiet)?;
     }
@@ -726,6 +729,16 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
             "stage2.bin is {s2_len} bytes; reserved area is {}",
             STAGE2_SECTORS * SECTOR_SIZE
         ));
+    }
+
+    let isoboot_bin = out_dir.join("isoboot.bin");
+    let build_iso = opts.kernel_test.is_none();
+    if build_iso {
+        log(opts.quiet, "  NASM  boot/isoboot.asm");
+        let mut args = vec!["-f".into(), "bin".into(), "-o".into(), isoboot_bin.to_string_lossy().into_owned()];
+        args.extend(layout_defs);
+        args.push(env.root.join("boot").join("isoboot.asm").to_string_lossy().into_owned());
+        run_cmd(nasm, &args, None, &[], opts.quiet)?;
     }
 
     // --- Stage 3 & UEFI loader ------------------------------------------------
@@ -827,7 +840,16 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         &sys_files,
     )?;
 
-    let shipped = [
+    let iso = if build_iso {
+        let iso_path = out_dir.join("discrete.iso");
+        log(opts.quiet, "  ISO   discrete.iso");
+        crate::iso::make_hybrid_iso(&image, &isoboot_bin, &iso_path)?;
+        Some(iso_path)
+    } else {
+        None
+    };
+
+    let mut shipped: Vec<&PathBuf> = vec![
         &image,
         &stage1_bin,
         &stage2_bin,
@@ -836,6 +858,10 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         &kernel_sig,
         &efi_bin,
     ];
+    if let Some(ref iso_path) = iso {
+        shipped.insert(1, iso_path);
+        shipped.push(&isoboot_bin);
+    }
     let mut sums = Vec::with_capacity(shipped.len());
     for f in shipped {
         let h = sha256_file(f)?;
@@ -855,8 +881,12 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         ),
     );
     log(opts.quiet, &format!("  sha256 {}", sums[0]));
+    if let Some(ref iso_path) = iso {
+        log(opts.quiet, &format!("Built {} ({size_mib} MiB, hybrid ISO 9660 + El Torito BIOS/UEFI + GPT)", env.rel(iso_path)));
+        log(opts.quiet, &format!("  sha256 {}", sums[1]));
+    }
 
-    Ok(BuildResult { image })
+    Ok(BuildResult { image, iso })
 }
 
 fn build_kernel_asm(env: &Env, obj_dir: &Path, quiet: bool) -> Result<Vec<PathBuf>, String> {

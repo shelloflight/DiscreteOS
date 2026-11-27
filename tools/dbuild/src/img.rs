@@ -540,7 +540,8 @@ pub fn cli(args: &[String]) -> Result<(), String> {
                ls <img> <part> [dir]\n\
                cat <img> <part> <path>\n\
                fsck <img> <part>\n\
-               extract <img> <part> <out>"
+               extract <img> <part> <out>\n\
+               iso <src.img> <isoboot.bin> <out.iso>"
         );
         return Ok(());
     }
@@ -669,6 +670,234 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "extract" => extract_part(Path::new(a(1)?), idx(2)?, Path::new(a(3)?)),
+        "iso" => crate::iso::make_hybrid_iso(Path::new(a(1)?), Path::new(a(2)?), Path::new(a(3)?)),
         other => Err(format!("unknown img command '{other}'")),
     }
+}
+
+fn dual_sentinel_win_boot() -> Vec<u8> {
+    (0..8192usize).map(|i| ((i.wrapping_mul(73) ^ 0x5A) & 0xFF) as u8).collect()
+}
+
+fn dual_sentinel_fallback_efi() -> Vec<u8> {
+    (0..4096usize).map(|i| ((i.wrapping_mul(41) ^ 0xA5) & 0xFF) as u8).collect()
+}
+
+pub fn make_blank_target(path: &Path, mib: u64) -> Result<(), String> {
+    let _ = open(path, Some(mib))?;
+    Ok(())
+}
+
+/// Create a 160 MiB GPT dual-boot test target disk containing an existing 36 MiB FAT32 ESP
+/// (with simulated Windows Boot Manager + existing `\EFI\BOOT\BOOTX64.EFI`) and a 20 MiB
+/// NTFS/Basic Data partition filled with deterministic bytes, followed by ~102 MiB of
+/// unallocated GPT free space. Returns the SHA-256 hex digest of the 20 MiB Windows partition.
+pub fn make_dualboot_target(path: &Path) -> Result<String, String> {
+    let disk = open(path, Some(160))?;
+    let made = ok(
+        gpt::write(
+            &mut *disk.borrow_mut(),
+            &[
+                gpt::NewPart { type_guid: gpt::TYPE_ESP, name: "EFI System", sectors: 36 * 2048 },
+                gpt::NewPart { type_guid: gpt::TYPE_BASIC_DATA, name: "Windows", sectors: 20 * 2048 },
+            ],
+            *b"DUAL-BOOT-TEST-0",
+        ),
+        "gpt write dualboot",
+    )?;
+    let mut esp_p = Part { disk: disk.clone(), start: made[0].first, len: made[0].sectors() };
+    ok(
+        fat::format(&mut esp_p, &fat::Format { label: b"WIN_ESP", serial: 0x1122_3344, hidden: made[0].first as u32 }),
+        "format dualboot esp",
+    )?;
+    let mut esp_fs = ok(Fat::mount(esp_p), "mount dualboot esp")?;
+    put(&mut esp_fs, "EFI/Microsoft/Boot/bootmgfw.efi", &dual_sentinel_win_boot())?;
+    put(&mut esp_fs, "EFI/BOOT/BOOTX64.EFI", &dual_sentinel_fallback_efi())?;
+    ok(esp_fs.sync(), "sync dualboot esp")?;
+    drop(esp_fs);
+
+    // Fill the 20 MiB Windows NTFS partition with an NTFS boot sector signature + deterministic data.
+    let mut win_bytes = vec![0u8; (made[1].sectors() as usize) * SECTOR];
+    win_bytes[3..11].copy_from_slice(b"NTFS    ");
+    win_bytes[510] = 0x55;
+    win_bytes[511] = 0xAA;
+    for (i, b) in win_bytes[512..].iter_mut().enumerate() {
+        *b = ((i.wrapping_mul(31) ^ (i >> 8).wrapping_mul(17)) & 0xFF) as u8;
+    }
+    let sha = to_hex(&doscrypt::sha2::sha256(&win_bytes));
+    ok(disk.borrow_mut().write(made[1].first, &win_bytes), "write windows partition")?;
+    ok(disk.borrow_mut().flush(), "flush dualboot target")?;
+    Ok(sha)
+}
+
+/// Create a 128 MiB GPT disk filled with two existing partitions (`OldOS` 64 MiB + `OldData` 40 MiB),
+/// leaving insufficient free space for dual-boot so `delete-part` and confirmed `wipe` are exercised.
+pub fn make_wipe_target(path: &Path) -> Result<(), String> {
+    let disk = open(path, Some(128))?;
+    ok(
+        gpt::write(
+            &mut *disk.borrow_mut(),
+            &[
+                gpt::NewPart { type_guid: gpt::TYPE_LINUX_FS, name: "OldOS", sectors: 64 * 2048 },
+                gpt::NewPart { type_guid: gpt::TYPE_LINUX_FS, name: "OldData", sectors: 40 * 2048 },
+            ],
+            *b"WIPE-DISK-TEST-0",
+        ),
+        "gpt write wipe target",
+    )?;
+    ok(disk.borrow_mut().flush(), "flush wipe target")?;
+    Ok(())
+}
+
+/// Host-side post-check for a dual-boot installation: proves zero-byte alteration of the existing
+/// Windows NTFS partition and existing EFI bootloaders, presence of D-OS UEFI boot files +
+/// `installed = true` config, and clean `Dfs::fsck()` on both newly created `sys` and `home` volumes.
+pub fn verify_dualboot_target(path: &Path, orig_win_sha: &str) -> Result<bool, String> {
+    let disk = open(path, None)?;
+    let (parts, _) = ok(gpt::read(&mut *disk.borrow_mut()), "gpt read dualboot")?;
+    let Some(win_p) = parts.iter().find(|p| p.name == "Windows") else {
+        println!("  dualboot: Windows partition missing!");
+        return Ok(false);
+    };
+    let mut win_bytes = vec![0u8; (win_p.sectors() as usize) * SECTOR];
+    ok(disk.borrow_mut().read(win_p.first, &mut win_bytes), "read windows partition")?;
+    let got_sha = to_hex(&doscrypt::sha2::sha256(&win_bytes));
+    if got_sha != orig_win_sha {
+        println!("  dualboot: Windows partition SHA-256 CHANGED! want={orig_win_sha} got={got_sha}");
+        return Ok(false);
+    }
+    println!("  host: dualboot: existing Windows NTFS partition 100% byte-identical ({})", &got_sha[..16]);
+
+    let Some(esp_p) = parts.iter().find(|p| p.type_guid == gpt::TYPE_ESP) else {
+        println!("  dualboot: ESP missing!");
+        return Ok(false);
+    };
+    let ep = Part { disk: disk.clone(), start: esp_p.first, len: esp_p.sectors() };
+    let mut esp_fs = ok(Fat::mount(ep), "mount dualboot esp")?;
+    let read_esp = |fs: &mut Fat<Part>, p: &str| -> Result<Vec<u8>, String> {
+        let ino = resolve(fs, p)?;
+        let sz = ok(fs.stat(ino), p)?.size as usize;
+        let mut buf = vec![0u8; sz];
+        ok(fs.read(ino, 0, &mut buf), p)?;
+        Ok(buf)
+    };
+    if read_esp(&mut esp_fs, "EFI/Microsoft/Boot/bootmgfw.efi")? != dual_sentinel_win_boot() {
+        println!("  dualboot: existing Microsoft bootmgfw.efi was modified!");
+        return Ok(false);
+    }
+    if read_esp(&mut esp_fs, "EFI/BOOT/BOOTX64.EFI")? != dual_sentinel_fallback_efi() {
+        println!("  dualboot: existing EFI/BOOT/BOOTX64.EFI was overwritten!");
+        return Ok(false);
+    }
+    for req in ["EFI/DOS/BOOTX64.EFI", "EFI/DOS/BOOTENTRY.BIN", "DOS/KERNEL.BIN", "DOS/KERNEL.DSIG"] {
+        let b = read_esp(&mut esp_fs, req)?;
+        if b.is_empty() {
+            println!("  dualboot: {req} is empty");
+            return Ok(false);
+        }
+    }
+    let cfg = read_esp(&mut esp_fs, "DOS/BOOT.CFG")?;
+    if !String::from_utf8_lossy(&cfg).contains("installed = true") {
+        println!("  dualboot: DOS/BOOT.CFG missing 'installed = true'");
+        return Ok(false);
+    }
+    println!("  host: dualboot: existing Windows EFI loaders untouched, \\EFI\\DOS\\BOOTX64.EFI + BOOTENTRY.BIN + BOOT.CFG present");
+    drop(esp_fs);
+    drop(disk);
+
+    verify_installed_dfs(path)
+}
+
+/// Verify that an installed target disk contains `sys` and `home` DFS partitions and both pass
+/// `Dfs::fsck()` with zero errors.
+pub fn verify_installed_dfs(path: &Path) -> Result<bool, String> {
+    let disk = open(path, None)?;
+    let (parts, _) = ok(gpt::read(&mut *disk.borrow_mut()), "gpt read installed")?;
+    let mut found_sys = false;
+    let mut found_home = false;
+    for p in &parts {
+        if p.type_guid == gpt::TYPE_DFS && (p.name == "sys" || p.name == "home") {
+            let part_dev = Part { disk: disk.clone(), start: p.first, len: p.sectors() };
+            let mut dfs = Dfs::mount(Box::new(part_dev)).map_err(|(e, _)| format!("mount {}: {e:?}", p.name))?;
+            let r = ok(dfs.fsck(), &format!("fsck {}", p.name))?;
+            if r.errors != 0 {
+                println!("  host: fsck {} failed ({} error(s))", p.name, r.errors);
+                return Ok(false);
+            }
+            println!(
+                "  host: {} DFS fsck clean ({} nodes, {} data blocks, 0 errors)",
+                p.name, r.nodes, r.data_blocks
+            );
+            if p.name == "sys" {
+                found_sys = true;
+            } else {
+                found_home = true;
+            }
+        }
+    }
+    if !found_sys || !found_home {
+        println!("  host: missing sys ({found_sys}) or home ({found_home}) DFS partition");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Host-side post-check after Reboot #2 of `install-e2e`: proves OOBE persistence, multi-user
+/// identity persistence, strict bidirectional `/home/<user>` isolation, and immutable `/sys`.
+pub fn verify_home_multiuser(path: &Path) -> Result<bool, String> {
+    if !verify_installed_dfs(path)? {
+        return Ok(false);
+    }
+    let disk = open(path, None)?;
+    let (parts, _) = ok(gpt::read(&mut *disk.borrow_mut()), "gpt read multiuser")?;
+    let Some(home_p) = parts.iter().find(|p| p.type_guid == gpt::TYPE_DFS && p.name == "home") else {
+        println!("  host: home partition missing");
+        return Ok(false);
+    };
+    let Some(sys_p) = parts.iter().find(|p| p.type_guid == gpt::TYPE_DFS && p.name == "sys") else {
+        println!("  host: sys partition missing");
+        return Ok(false);
+    };
+
+    let home_dev = Part { disk: disk.clone(), start: home_p.first, len: home_p.sectors() };
+    let mut home = Dfs::mount(Box::new(home_dev)).map_err(|(e, _)| format!("mount home: {e:?}"))?;
+    let read_text = |fs: &mut Dfs, p: &str| -> Result<String, String> {
+        let ino = resolve(fs, p)?;
+        let sz = ok(fs.stat(ino), p)?.size as usize;
+        let mut buf = vec![0u8; sz];
+        ok(fs.read(ino, 0, &mut buf), p)?;
+        Ok(String::from_utf8_lossy(&buf).into_owned())
+    };
+    let oobe_toml = read_text(&mut home, ".dos/oobe.toml")?;
+    if !oobe_toml.contains("completed = true") || !oobe_toml.contains("language = \"en-US\"") {
+        println!("  host: unexpected .dos/oobe.toml: {oobe_toml}");
+        return Ok(false);
+    }
+    let id_toml = read_text(&mut home, ".dos/identities.toml")?;
+    if !id_toml.contains("alice") || !id_toml.contains("bob") {
+        println!("  host: identities.toml missing alice or bob");
+        return Ok(false);
+    }
+    for must_exist in ["alice/alice_secret.txt", "alice/alice_copy.txt", "bob/bob_note.txt", "bob/bob_copy.txt"] {
+        if resolve(&mut home, must_exist).is_err() {
+            println!("  host: expected /home/{must_exist} is missing");
+            return Ok(false);
+        }
+    }
+    for must_not_exist in ["alice/leaked.txt", "alice/bob_note.txt", "bob/leaked.txt", "bob/alice_secret.txt"] {
+        if resolve(&mut home, must_not_exist).is_ok() {
+            println!("  host: ISOLATION VIOLATION: /home/{must_not_exist} exists!");
+            return Ok(false);
+        }
+    }
+    drop(home);
+
+    let sys_dev = Part { disk: disk.clone(), start: sys_p.first, len: sys_p.sectors() };
+    let mut sys = Dfs::mount(Box::new(sys_dev)).map_err(|(e, _)| format!("mount sys: {e:?}"))?;
+    if resolve(&mut sys, "ro_check.txt").is_ok() {
+        println!("  host: IMMUTABILITY VIOLATION: /sys/ro_check.txt was created!");
+        return Ok(false);
+    }
+    println!("  host: multi-user /home verified: OOBE + identities persisted, alice/bob strictly isolated, /sys immutable");
+    Ok(true)
 }

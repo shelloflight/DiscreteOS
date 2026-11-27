@@ -59,6 +59,7 @@ struct amdgpu_psp_state {
 struct amdgpu_smu_state {
     bool initialized;
     bool pmfw_alive;
+    bool use_main_mailbox;
     u32 smu_version;
     u32 min_dispclk_mhz;
     u32 min_dppclk_mhz;

@@ -3,6 +3,7 @@
 mod build;
 mod commit;
 mod img;
+mod iso;
 mod nettest;
 mod qemu;
 mod test;
@@ -27,7 +28,7 @@ fn print_help() {
            dbuild [command] [options]\n\
          \n\
          Commands:\n\
-           build        Assemble, compile, link, and sign build/discrete.img (default)\n\
+           build        Assemble, compile, link, and sign build/discrete.img + build/discrete.iso (default)\n\
            run          Build and boot discrete.img in QEMU (serial on this terminal)\n\
            debug        Build and boot QEMU paused with GDB stub on localhost:1234\n\
            test         Run the automated test suite (repro + QEMU/Bochs + host + static)\n\

@@ -55,7 +55,8 @@ E820_ENTRY_SIZE equ 24
 
 BOUNCE_SEG      equ 0x1000          ; physical 0x10000
 BOUNCE_PHYS     equ 0x10000
-CHUNK_SECTORS   equ 64              ; 32 KiB per INT 13h read
+CHUNK_SECTORS   equ 64              ; 32 KiB per INT 13h read (512-byte sectors)
+CHUNK_CD        equ 16              ; 32 KiB per INT 13h read (2048-byte CD sectors)
 STAGE3_SEG      equ 0x2000          ; stage 3 at physical 0x20000
 STAGE3_PHYS     equ 0x20000
 STAGE3_STACK    equ 0x30000
@@ -93,6 +94,7 @@ stage2_entry:
     call check_long_mode
     call enable_a20
     call read_e820
+    call detect_sector_size
     call load_stage3
     call load_kernel
     call fill_bootinfo
@@ -261,10 +263,29 @@ enter_unreal:
     ret
 
 ; -----------------------------------------------------------------------------
+; detect_sector_size: INT 13h AH=48h detects 2048-byte El Torito CD-ROM boot
+; -----------------------------------------------------------------------------
+detect_sector_size:
+    mov byte [cd_boot], 0
+    mov word [drive_params], 30
+    mov ah, 0x48
+    mov dl, [boot_drive]
+    mov si, drive_params
+    int 0x13
+    jc .done
+    cmp word [drive_params + 24], 2048
+    jne .done
+    mov byte [cd_boot], 1
+.done:
+    ret
+
+; -----------------------------------------------------------------------------
 ; load_stage3: stage 3 (STAGE3_SECTORS from STAGE3_LBA) to 0x20000, the kernel's .dsig (one sector
-; at KSIG_LBA) to 0x30000. Both are below 1 MiB: plain real-mode reads.
+; at KSIG_LBA) to 0x30000. Supports both 512-byte HDD and 2048-byte El Torito CD sectors.
 ; -----------------------------------------------------------------------------
 load_stage3:
+    cmp byte [cd_boot], 0
+    jne .cd
     mov word [dap_count], STAGE3_SECTORS
     mov word [dap_off], 0
     mov word [dap_seg], STAGE3_SEG
@@ -284,6 +305,26 @@ load_stage3:
     int 0x13
     jc .err
     ret
+.cd:
+    mov word [dap_count], STAGE3_SECTORS / 4
+    mov word [dap_off], 0
+    mov word [dap_seg], STAGE3_SEG
+    mov dword [dap_lba], STAGE3_LBA / 4
+    mov dword [dap_lba + 4], 0
+    mov si, dap
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    int 0x13
+    jc .err
+    mov word [dap_count], 1
+    mov word [dap_seg], KSIG_SEG
+    mov dword [dap_lba], KSIG_LBA / 4
+    mov si, dap
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    int 0x13
+    jc .err
+    ret
 .err:
     mov si, msg_disk3
     jmp fatal
@@ -292,6 +333,8 @@ load_stage3:
 ; load_kernel: read KERNEL_SECTORS from KERNEL_LBA, copy to KERNEL_PHYS
 ; -----------------------------------------------------------------------------
 load_kernel:
+    cmp byte [cd_boot], 0
+    jne .cd
     mov dword [ld_lba], KERNEL_LBA
     mov dword [ld_left], KERNEL_SECTORS
     mov dword [ld_dest], KERNEL_PHYS
@@ -335,6 +378,50 @@ load_kernel:
     shl eax, 9
     add [ld_dest], eax
     jmp .next
+.cd:
+    mov dword [ld_lba], KERNEL_LBA / 4
+    mov dword [ld_left], (KERNEL_SECTORS + 3) / 4
+    mov dword [ld_dest], KERNEL_PHYS
+.cd_next:
+    mov eax, [ld_left]
+    test eax, eax
+    jz .done
+    cmp eax, CHUNK_CD
+    jbe .cd_ok
+    mov eax, CHUNK_CD
+.cd_ok:
+    mov [dap_count], ax
+    mov word [dap_off], 0
+    mov word [dap_seg], BOUNCE_SEG
+    mov eax, [ld_lba]
+    mov [dap_lba], eax
+    mov dword [dap_lba + 4], 0
+
+    mov si, dap
+    mov ah, 0x42
+    mov dl, [boot_drive]
+    int 0x13
+    jc .err
+
+    call enter_unreal
+    movzx ecx, word [dap_count]
+    shl ecx, 9                      ; 2048-byte CD sectors -> dwords (2048 / 4)
+    mov esi, BOUNCE_PHYS
+    mov edi, [ld_dest]
+.cd_copy:
+    mov eax, [fs:esi]
+    mov [fs:edi], eax
+    add esi, 4
+    add edi, 4
+    dec ecx
+    jnz .cd_copy
+
+    movzx eax, word [dap_count]
+    add [ld_lba], eax
+    sub [ld_left], eax
+    shl eax, 11                     ; 2048 bytes per CD sector
+    add [ld_dest], eax
+    jmp .cd_next
 .done:
     ret
 .err:
@@ -502,6 +589,9 @@ ld_left     dd 0
 ld_dest     dd 0
 mmap_count  dw 0
 boot_drive  db 0
+cd_boot     db 0
+align 2
+drive_params times 30 db 0
 
 msg_stage2   db "D-OS: stage2 OK", 13, 10, 0
 msg_enter_lm db "D-OS: entering long mode", 13, 10, 0

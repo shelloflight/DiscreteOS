@@ -19,6 +19,7 @@ bench = false
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
 dosaudio = { path = "../lib/audio" }
+dosid = { path = "../lib/identity" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

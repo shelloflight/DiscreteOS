@@ -104,6 +104,7 @@ enum Msg {
     CreateUser,
     // Apps & Permissions
     SelectApp(usize),
+    ToggleAppPin,
     ToggleAppPerm(u8),
 }
 
@@ -661,6 +662,10 @@ impl SettingsApp {
         let mut perm_rows: Vec<Node<Msg>> = Vec::new();
         if let Some(a) = self.apps.get(self.sel_app) {
             perm_rows.push(label(format!("Permissions for {} ({})", a.title_str(), a.name_str())));
+            perm_rows.push(
+                toggle("Pin to taskbar (or right-click dock icon to unpin)", a.pinned).on_toggle(Msg::ToggleAppPin),
+            );
+            perm_rows.push(divider());
             perm_rows.push(caption("Revoking a permission immediately stops running instances holding it."));
             let declared = a.required_perms | a.optional_perms | a.prompt_perms;
             for p in Permission::ALL {
@@ -1089,6 +1094,22 @@ impl App for SettingsApp {
                 }
             }
             Msg::SelectApp(i) => self.sel_app = i,
+            Msg::ToggleAppPin => {
+                if let Some(a) = self.apps.get(self.sel_app).cloned() {
+                    let want = !a.pinned;
+                    match appmgr::set_pin(self.app_admin, a.name_str(), want) {
+                        Ok(()) => {
+                            self.refresh_apps();
+                            self.status = format!(
+                                "{} {} taskbar",
+                                if want { "Pinned" } else { "Unpinned" },
+                                a.title_str()
+                            );
+                        }
+                        Err(e) => self.status = format!("Taskbar pin update failed: {}", sys::status(e)),
+                    }
+                }
+            }
             Msg::ToggleAppPerm(bit) => {
                 if let Some(a) = self.apps.get(self.sel_app).cloned() {
                     let was_on = (a.effective_perms & (1u32 << bit)) != 0;

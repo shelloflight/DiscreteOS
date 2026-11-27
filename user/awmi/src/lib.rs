@@ -43,6 +43,7 @@ use dosawmi::{
     AwmiStatus, BitmapText, Canvas, CursorKind, DamageSet, LockIdentity, LockMode, LockReason, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, Theme, ThemeId, TrustTier, UiSettings,
     WINDOW_INFO_BYTES, WmAction, WmState, encode_window_info, split_connect,
 };
+use dosid::DesktopSettings;
 use dosui::{FontText, fonts};
 use libd::fs as fp;
 use libd::awmi as wire;
@@ -226,12 +227,69 @@ struct Awmi {
     scale_set: bool,
     /// Per-output explicit scale overrides (`(adapter_id, scale_pct)`).
     output_scales: Vec<(u32, u16)>,
+    /// Persisted desktop/display/taskbar settings (`/home/.dos/settings.toml`).
+    saved_output_scale: u16,
+    saved_display_mode: Option<(u32, u32, u32)>,
+    pending_display_mode: Option<(u32, u32, u32)>,
+    saved_vrr: bool,
+    saved_hdr: bool,
+    saved_pinned_apps: Option<Vec<String>>,
+    applied_saved_display: bool,
     /// Launcher entries programs/appmgr registered; replayed into each session.
     apps: Vec<RegisteredApp>,
     /// What the session was started with (`SESSION_DEMO`, `SESSION_DESKTOP`).
     session_flags: u64,
     /// Boot: start a desktop session once a display is there (until this time).
     autostart_until: u64,
+}
+
+const HOME_CFG_DIR: &[u8] = b".dos";
+const HOME_SETTINGS_FILE: &[u8] = b".dos/settings.toml";
+const HOME_SETTINGS_TMP: &[u8] = b".dos/settings.tmp";
+
+fn load_desktop_settings() -> Option<DesktopSettings> {
+    let ns = fp::Namespace::get();
+    let (dir, _) = ns.resolve(b"/home")?;
+    let d = fp::Node::from(dir);
+    let parsed = (|| {
+        let (f, _, size) = d.open(HOME_SETTINGS_FILE, 0, fp::R_READ).ok()?;
+        let size = usize::try_from(size).ok()?;
+        if size == 0 || size > 32 * 1024 {
+            return None;
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let n = f.read(0, &mut buf).ok()?;
+        DesktopSettings::from_toml(&buf[..n]).ok()
+    })();
+    let _ = d.into_handle();
+    parsed
+}
+
+fn save_desktop_settings_file(cfg: &DesktopSettings) -> bool {
+    let ns = fp::Namespace::get();
+    let Some((dir, _)) = ns.resolve(b"/home") else {
+        return false;
+    };
+    let d = fp::Node::from(dir);
+    let mut wrote = false;
+    if d.stat().is_ok_and(|st| st.rights & fp::R_WRITE != 0) {
+        let text = cfg.to_toml();
+        let _ = d.open(HOME_CFG_DIR, fp::O_DIRECTORY | fp::O_CREATE, fp::R_READ | fp::R_WRITE);
+        if let Ok((f, _, _)) = d.open(HOME_SETTINGS_TMP, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            && f.write(0, text.as_bytes()).is_ok()
+        {
+            drop(f);
+            if d.rename(HOME_SETTINGS_TMP, HOME_SETTINGS_FILE, true).is_err()
+                && let Ok((f2, _, _)) = d.open(HOME_SETTINGS_FILE, fp::O_CREATE | fp::O_TRUNCATE, fp::R_READ | fp::R_WRITE)
+            {
+                let _ = f2.write(0, text.as_bytes());
+            }
+            let _ = d.sync();
+            wrote = true;
+        }
+    }
+    let _ = d.into_handle();
+    wrote
 }
 
 /// Read a whole file from the system volume (`/sys` in this service's namespace).
@@ -522,7 +580,8 @@ impl Awmi {
             if let Some(o) = self.outs.iter().find(|o| o.hw_cursor) {
                 // Hardware cursor plane moves atomically without triggering a full frame composite.
                 let p = self.wm.pointer;
-                let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, 0, 0);
+                let (hx, hy) = self.wm.cursor_kind.hotspot();
+                let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, hx as u16, hy as u16);
             } else {
                 self.cursor_moved = true;
             }
@@ -562,7 +621,7 @@ impl Awmi {
         let mut infos = [idwire::IdentityInfo::default(); dosawmi::MAX_LOCK_IDENTITIES];
         let cnt = idwire::list(self.identity, &mut infos).unwrap_or(0);
         let mut active_id = 1u32;
-        let mut active_enrolled = false;
+        let mut any_enrolled = false;
         let mut lock_ids = [LockIdentity::EMPTY; dosawmi::MAX_LOCK_IDENTITIES];
         for (i, info) in infos[..cnt].iter().enumerate() {
             lock_ids[i] = LockIdentity::new(
@@ -572,15 +631,17 @@ impl Awmi {
                 info.seal == idwire::SEAL_TPM2,
                 info.enrolled,
             );
+            if info.enrolled {
+                any_enrolled = true;
+            }
             if info.active {
                 active_id = info.id;
-                active_enrolled = info.enrolled;
             }
         }
         if cnt > 0 {
             self.wm.lock.set_identities(&lock_ids[..cnt], active_id, tpm);
         }
-        (active_enrolled, lock_at_boot)
+        (any_enrolled, lock_at_boot)
     }
 
     fn engage_lock_screen(&mut self, mode: LockMode, reason: LockReason) {
@@ -658,18 +719,58 @@ impl Awmi {
                 println!("awmi: launcher: opening entry {} of client {}", app, owner);
                 self.send_to(owner, wire::EVT_LAUNCH, u64::from(app), 0);
             }
+            WmAction::SetAppPinned { owner, app, pinned } => {
+                if let Some(entry) = self.apps.iter_mut().find(|a| a.owner == owner && a.app == app) {
+                    entry.pinned = pinned;
+                }
+                self.send_to(owner, wire::EVT_APP_PIN, u64::from(app), u64::from(pinned));
+                self.snapshot_pinned_apps();
+                self.persist_settings();
+            }
             WmAction::Setting(s) => {
                 if matches!(s, Setting::TextLarger | Setting::TextSmaller) {
                     self.scale_set = true;
                 }
                 self.settings = self.settings.apply(s);
                 self.apply_settings();
+                self.persist_settings();
             }
             _ => {}
         }
     }
 
     // ---- settings ---------------------------------------------------------------------------------
+
+    fn snapshot_pinned_apps(&mut self) {
+        let mut pins = Vec::new();
+        for a in &self.apps {
+            if a.pinned
+                && let Ok(name) = core::str::from_utf8(&a.identity)
+                && !name.is_empty()
+                && !pins.iter().any(|p| p == name)
+            {
+                pins.push(String::from(name));
+            }
+        }
+        self.saved_pinned_apps = Some(pins);
+    }
+
+    fn persist_settings(&self) {
+        if self.test_mode {
+            return;
+        }
+        let cfg = DesktopSettings {
+            theme: String::from(if self.settings.theme == ThemeId::HighContrast { "high-contrast" } else { "dark-slate" }),
+            text_scale: if self.scale_set { Some(self.settings.text_scale) } else { None },
+            reduce_motion: self.settings.reduce_motion,
+            output_scale: self.saved_output_scale,
+            display_mode: self.saved_display_mode,
+            display_vrr: self.saved_vrr,
+            display_hdr: self.saved_hdr,
+            pinned_apps: self.saved_pinned_apps.clone(),
+        };
+        let _ = save_desktop_settings_file(&cfg);
+    }
 
     /// Apply the settings: text engine scale, the window manager's theme and chrome metrics, and
     /// every window program is told.
@@ -902,12 +1003,14 @@ impl Awmi {
 
     fn relayout(&mut self) {
         self.wm.layout.clear();
-        for o in &self.outs {
+        for (idx, o) in self.outs.iter().enumerate() {
             let scale = self
                 .output_scales
                 .iter()
                 .find(|&&(id, _)| id == o.adapter)
-                .map_or_else(|| dosawmi::Output::recommended_scale(o.width), |&(_, sc)| sc);
+                .map(|&(_, sc)| sc)
+                .or_else(|| (idx == 0 && self.saved_output_scale != 0).then_some(self.saved_output_scale))
+                .unwrap_or_else(|| dosawmi::Output::recommended_scale(o.width));
             self.wm.layout.add_output_scaled(o.adapter, o.width, o.height, o.refresh_mhz, o.hw_cursor, scale);
         }
         self.wm.fit_windows_to_layout();
@@ -1005,6 +1108,27 @@ impl Awmi {
             println!("awmi: no display output: the session cannot start");
             return Err(sys::ERR_NOT_SUPPORTED);
         }
+        if !self.test_mode && !self.firmware_display && !self.applied_saved_display {
+            self.applied_saved_display = true;
+            if let Some(primary) = self.outs.iter().find(|o| o.adapter != 0 && o.native_kms) {
+                let adapter = primary.adapter;
+                let cur = (primary.width, primary.height, primary.refresh_mhz);
+                if let Some((w, hh, hz)) = self.saved_display_mode
+                    && (cur.0 != w || cur.1 != hh || cur.2.abs_diff(hz) > 1_000)
+                    && gpu::kms_modeset_atomic(self.gpu, adapter, w, hh, hz, true, false).is_ok()
+                    && gpu::kms_modeset_atomic(self.gpu, adapter, w, hh, hz, false, false).is_ok()
+                {
+                    println!("awmi: restored saved display mode {}x{} @ {} Hz", w, hh, hz / 1000);
+                    n = self.attach_outputs();
+                }
+                if self.saved_vrr {
+                    let _ = gpu::kms_set_vrr_atomic(self.gpu, adapter, true);
+                }
+                if self.saved_hdr {
+                    let _ = gpu::kms_set_hdr_atomic(self.gpu, adapter, true);
+                }
+            }
+        }
         self.demo = flags & wire::SESSION_DEMO != 0;
         self.session_flags = flags;
         self.autostart_until = 0;
@@ -1023,10 +1147,10 @@ impl Awmi {
         }
         self.term_call(term::DISPLAY_RELEASE);
         self.grab(true);
-        self.upload_cursor();
         if let Some(p) = self.wm.layout.primary() {
             self.wm.pointer = Point::new(p.bounds.x + p.bounds.w as i32 / 2, p.bounds.y + p.bounds.h as i32 / 2);
         }
+        self.upload_cursor();
         self.cursor_moved = true;
         self.active = true;
         self.last_input_ns = sys::clock_ns();
@@ -1037,7 +1161,10 @@ impl Awmi {
         if require_login {
             self.wm.engage_lock(LockMode::Login, LockReason::Boot);
             self.session_notified = false;
-            println!("awmi: session locked at boot (awaiting user sign-in)");
+            println!(
+                "awmi: session locked at boot (enrolled={}, policy_lock={}, cfg_lock={})",
+                enrolled, lock_at_boot, self.lock_at_boot_cfg
+            );
         } else {
             self.session_notified = true;
         }
@@ -1299,7 +1426,8 @@ impl Awmi {
             self.cursor_moved = false;
             if let Some(o) = self.outs.iter().find(|o| o.hw_cursor) {
                 let p = self.wm.pointer;
-                let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, 0, 0);
+                let (hx, hy) = self.wm.cursor_kind.hotspot();
+                let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, hx as u16, hy as u16);
             }
         }
         if any_async && !failed {
@@ -1454,6 +1582,7 @@ impl Awmi {
                 if s != self.settings {
                     self.settings = s;
                     self.apply_settings();
+                    self.persist_settings();
                 }
                 ok(self.settings.pack(), 0)
             }
@@ -1479,6 +1608,13 @@ impl Awmi {
                         }
                         match gpu::kms_modeset_atomic(self.gpu, adapter_id, w, hh, refresh_mhz, false, require_confirm) {
                             Ok(()) => {
+                                if require_confirm {
+                                    self.pending_display_mode = Some((w, hh, refresh_mhz));
+                                } else {
+                                    self.pending_display_mode = None;
+                                    self.saved_display_mode = Some((w, hh, refresh_mhz));
+                                    self.persist_settings();
+                                }
                                 self.reattach = true;
                                 self.flip_pending = false;
                                 self.flip_deadline = 0;
@@ -1499,7 +1635,11 @@ impl Awmi {
                     wire::DISPLAY_SET_VRR => {
                         let enable = (h.b & 1) != 0;
                         match gpu::kms_set_vrr_atomic(self.gpu, adapter_id, enable) {
-                            Ok(()) => ok(0, 0),
+                            Ok(()) => {
+                                self.saved_vrr = enable;
+                                self.persist_settings();
+                                ok(0, 0)
+                            }
                             Err(e) => err(e),
                         }
                     }
@@ -1507,6 +1647,8 @@ impl Awmi {
                         let enable = (h.b & 1) != 0;
                         match gpu::kms_set_hdr_atomic(self.gpu, adapter_id, enable) {
                             Ok(()) => {
+                                self.saved_hdr = enable;
+                                self.persist_settings();
                                 self.wm.damage_all();
                                 ok(0, 0)
                             }
@@ -1517,7 +1659,13 @@ impl Awmi {
                         let confirm = (h.b & 1) != 0;
                         match gpu::kms_confirm_mode(self.gpu, adapter_id, confirm) {
                             Ok(()) => {
-                                if !confirm {
+                                if confirm {
+                                    if let Some(m) = self.pending_display_mode.take() {
+                                        self.saved_display_mode = Some(m);
+                                        self.persist_settings();
+                                    }
+                                } else {
+                                    self.pending_display_mode = None;
                                     self.reattach = true;
                                     self.flip_pending = false;
                                     self.flip_deadline = 0;
@@ -1548,6 +1696,10 @@ impl Awmi {
                             self.output_scales.push((resolved, scale));
                         }
                         let is_primary = self.wm.layout.primary().is_some_and(|o| o.adapter_id == resolved);
+                        if is_primary {
+                            self.saved_output_scale = scale;
+                            self.persist_settings();
+                        }
                         if is_primary && !self.scale_set {
                             if let Some(p) = self.wm.layout.primary() {
                                 self.settings.text_scale = p.scale;
@@ -1596,6 +1748,7 @@ impl Awmi {
             wire::OP_APP_REGISTER if role == Role::Window || role == Role::Launcher => {
                 let app = h.a as u8;
                 let pinned = (h.b & wire::APP_FLAG_PINNED) != 0;
+                let user_override = (h.b & wire::APP_FLAG_USER_PIN) != 0;
                 let max_per = if role == Role::Launcher { dosawmi::launcher::MAX_APPS_PER_CLIENT } else { 4 };
                 let (raw_label, raw_ident, eff_trust) = if role == Role::Launcher {
                     let (lbl, aid) = match payload.iter().position(|&b| b == 0) {
@@ -1614,6 +1767,13 @@ impl Awmi {
                 if self.apps.len() >= dosawmi::launcher::MAX_LAUNCH_APPS && !self.apps.iter().any(|a| a.owner == id && a.app == app) {
                     return err(sys::ERR_NO_RESOURCES);
                 }
+                let eff_pinned = if user_override {
+                    pinned
+                } else if let Some(saved) = &self.saved_pinned_apps {
+                    core::str::from_utf8(&ident).is_ok_and(|name| saved.iter().any(|p| p == name))
+                } else {
+                    pinned
+                };
                 self.apps.retain(|a| !(a.owner == id && a.app == app));
                 self.apps.push(RegisteredApp {
                     owner: id,
@@ -1621,10 +1781,16 @@ impl Awmi {
                     label: label.clone(),
                     identity: ident.clone(),
                     trust: eff_trust,
-                    pinned,
+                    pinned: eff_pinned,
                 });
                 if self.active {
-                    self.wm.register_app_ex(id, app, &label, &ident, eff_trust, pinned);
+                    self.wm.register_app_ex(id, app, &label, &ident, eff_trust, eff_pinned);
+                }
+                if user_override {
+                    self.snapshot_pinned_apps();
+                    self.persist_settings();
+                } else if eff_pinned != pinned && role == Role::Launcher {
+                    self.send_to(id, wire::EVT_APP_PIN, u64::from(app), u64::from(eff_pinned));
                 }
                 ok(0, 0)
             }
@@ -1869,6 +2035,33 @@ fn main(s: *const Startup) -> i32 {
         }
     };
     let themes = [load_theme(ThemeId::DarkSlate), load_theme(ThemeId::HighContrast)];
+    let persisted = if test_mode { None } else { load_desktop_settings() };
+    let mut init_settings = UiSettings::DEFAULT;
+    let mut init_scale_set = false;
+    let mut init_output_scale = 0u16;
+    let mut init_display_mode = None;
+    let mut init_vrr = false;
+    let mut init_hdr = false;
+    let mut init_pinned = None;
+    if let Some(p) = persisted {
+        init_settings.theme = if p.theme == "high-contrast" { ThemeId::HighContrast } else { ThemeId::DarkSlate };
+        if let Some(sc) = p.text_scale {
+            init_settings.text_scale = sc;
+            init_scale_set = true;
+        }
+        init_settings.reduce_motion = p.reduce_motion;
+        init_output_scale = p.output_scale;
+        init_display_mode = p.display_mode;
+        init_vrr = p.display_vrr;
+        init_hdr = p.display_hdr;
+        init_pinned = p.pinned_apps;
+        println!(
+            "awmi: loaded saved settings (theme={}, text={}%, motion={})",
+            init_settings.theme.name(),
+            init_settings.text_scale,
+            if init_settings.reduce_motion { "reduced" } else { "on" }
+        );
+    }
     let mut a = Awmi {
         port,
         ctl: libd::startup_handle(proto::TAG_CONTROL),
@@ -1922,9 +2115,16 @@ fn main(s: *const Startup) -> i32 {
         pack_vmo,
         pack_len,
         themes,
-        settings: UiSettings::DEFAULT,
-        scale_set: false,
+        settings: init_settings,
+        scale_set: init_scale_set,
         output_scales: Vec::new(),
+        saved_output_scale: init_output_scale,
+        saved_display_mode: init_display_mode,
+        pending_display_mode: None,
+        saved_vrr: init_vrr,
+        saved_hdr: init_hdr,
+        saved_pinned_apps: init_pinned,
+        applied_saved_display: false,
         apps: Vec::new(),
         session_flags: 0,
         autostart_until: if autostart { sys::clock_ns() + AUTOSTART_WAIT_NS } else { 0 },

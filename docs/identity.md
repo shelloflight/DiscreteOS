@@ -21,9 +21,9 @@ throttling, TOML store codec, wire codecs), `user/identity/` (`identity.dsvc`),
 |---|---|
 | Names | Lowercase `a-z`, `0-9`, `-` (1..24 chars, starting with a letter). `"root"` is refused with `"D-OS has no root user"`; `superuser`, `su`, `sudo`, `wheel`, `system`, `kernel`, `init`, `nobody` are also reserved. |
 | Roles | Templates that choose initial defaults, never ambient authority: **Standard** (`files:read/write`, `net:client`, `audio:*`, `display:query`, `system:query`) and **Operator** (adds `net:control`, `display:admin`, `system:admin`, `app:admin`, `identity:admin`). |
-| Namespaces | Each identity gets an isolated `/home` mapped under `/data/home/<name>`. An **Operator** identity may also reach `/data`; a **Standard** identity cannot cross into another identity's home directory. |
-| Default boot | A single default `user` (Operator) exists with no enrolled passphrase so a fresh boot lands directly on the desktop. Enrolling a passphrase (or setting `lock = on` in `esp:/DOS/BOOT.CFG`) engages the compositor login/lock screen on boot. |
-| Persistence | Metadata and sealed credential blobs are stored in `/data/system/identities.toml` when `/data` is writable; otherwise the store operates in memory. |
+| Namespaces | On installed systems with a dedicated `home` DFS volume, each identity gets an isolated `/home` mapped directly to `home:/<name>` (falling back to `/data/home/<name>` on live/test media). Enforced by both `appmgr` and `shell` (updating automatically on `identity switch`). An **Operator** identity may also reach `/data`; a **Standard** identity cannot cross into another identity's home directory. |
+| Default boot | A single default `user` (Operator) exists with no enrolled passphrase so a fresh boot lands directly on the desktop. On newly installed disks, `appmgr` launches the skippable first-boot setup wizard (`oobe.dapp`, config persisted in `/home/.dos/oobe.toml`) once and bypasses it thereafter. Enrolling a passphrase (or setting `lock = on` in `esp:/DOS/BOOT.CFG`) engages the compositor login/lock screen on boot. |
+| Persistence | Metadata and sealed credential blobs are stored in `/home/.dos/identities.toml` on installed systems (falling back to `/data/identities/store.toml`); otherwise the store operates in memory. |
 
 ## TPM 2.0 credential sealing (ABI v16)
 

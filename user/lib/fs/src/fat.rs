@@ -1065,6 +1065,15 @@ impl<D: BlockDev> FileSystem for Fat<D> {
                 s[488..492].copy_from_slice(&self.free.to_le_bytes());
                 s[492..496].copy_from_slice(&self.hint.to_le_bytes());
                 self.dev.write(self.fsinfo, &s)?;
+                if self.fsinfo + 6 < self.fat_start {
+                    let mut bk = [0u8; SECTOR];
+                    if self.dev.read(self.fsinfo + 6, &mut bk).is_ok()
+                        && le32(&bk, 0) == 0x4161_5252
+                        && le32(&bk, 484) == 0x6141_7272
+                    {
+                        let _ = self.dev.write(self.fsinfo + 6, &s);
+                    }
+                }
             }
         }
         self.dev.flush()

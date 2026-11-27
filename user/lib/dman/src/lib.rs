@@ -208,6 +208,8 @@ pub struct Manifest {
     /// Application manager capabilities (`grants.appmgr`: `query`, `admin`).
     pub appmgr_query: bool,
     pub appmgr_admin: bool,
+    /// Storage administration capabilities (`grants.storaged`: `admin`).
+    pub storaged_admin: bool,
     pub quota: Quota,
     pub restart: Restart,
 }
@@ -342,6 +344,7 @@ const KEYS: &[(&str, &str, Want)] = &[
     ("grants", "awmi", Want::Strings),
     ("grants", "identity", Want::Strings),
     ("grants", "appmgr", Want::Strings),
+    ("grants", "storaged", Want::Strings),
     ("quota", "memory", Want::Size),
     ("quota", "handles", Want::Int),
     ("quota", "threads", Want::Int),
@@ -416,6 +419,7 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
         identity_query: false,
         appmgr_query: false,
         appmgr_admin: false,
+        storaged_admin: false,
         quota: DEFAULT_QUOTA,
         restart: DEFAULT_RESTART,
     };
@@ -714,6 +718,21 @@ pub fn parse(src: &[u8]) -> Result<Manifest, Error> {
                                 _ => return Err(invalid("unknown appmgr right (query, admin)", s)),
                             };
                             let c = Connect { service: "appmgr".to_string(), endpoint: ep.to_string() };
+                            if !m.connect.contains(&c) {
+                                m.connect.push(c);
+                            }
+                        }
+                    }
+                    "grants.storaged" => {
+                        for s in &list {
+                            let ep = match s.as_str() {
+                                "admin" => {
+                                    m.storaged_admin = true;
+                                    "admin"
+                                }
+                                _ => return Err(invalid("unknown storaged right (admin)", s)),
+                            };
+                            let c = Connect { service: "storaged".to_string(), endpoint: ep.to_string() };
                             if !m.connect.contains(&c) {
                                 m.connect.push(c);
                             }

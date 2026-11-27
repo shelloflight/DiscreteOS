@@ -543,7 +543,9 @@ impl IdentityStore {
     /// Fail-closed parser: refuses unknown tables/keys, `"root"`, invalid hex, or missing fields.
     pub fn from_toml(src: &[u8]) -> Result<Self, IdentityError> {
         use dman::toml::{self, Value};
-        let doc = toml::parse(src).map_err(|_| IdentityError::InvalidFormat)?;
+        // Hardware TPM 2.0 sealed blobs can reach `MAX_BLOB_LEN` raw bytes (`MAX_BLOB_LEN * 2` hex).
+        let doc = toml::parse_with_limits(src, 32 * 1024, MAX_BLOB_LEN * 2)
+            .map_err(|_| IdentityError::InvalidFormat)?;
         let mut version = 0u64;
         let mut active_id = 0u32;
         let mut next_id = 0u32;

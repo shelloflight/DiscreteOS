@@ -145,8 +145,29 @@ fn start_system(overrides: &[(&str, &str)], groups: &[Group], load_sys: bool) ->
     // underneath, and comes back when the desktop is left or cannot start, unless the boot
     // volume asks for the text console.
     let mut overrides: Vec<(&str, &str)> = overrides.to_vec();
+    let cfg = if load_sys { boot_cfg(&m) } else { BootCfg::default() };
+    let rocheck = overrides.iter().any(|&(n, a)| n == "storaged" && a == "rocheck");
+    if cfg.installed && !rocheck && m.volumes.iter().any(|v| v.name == "home")
+        && let Some(si) = m.find("storaged")
+    {
+        let ctl = m.svcs[si].ctl.raw();
+        if ctl != 0 {
+            let mut req = [0u8; libd::proto::HEADER];
+            libd::proto::Header { txid: 0, op: fp::UNLOCK_HOME, status: 0, a: 0, b: 0 }.put(&mut req);
+            let mut rep = [0u8; libd::proto::HEADER];
+            let mut hs = [0 as Handle; 1];
+            if let Ok((n, nh)) = sys::channel_call_h(ctl, &req, &[], &mut rep, &mut hs, 10 * SEC)
+                && libd::proto::Header::get(&rep[..n]).is_some_and(|h| h.status == 0)
+                && nh > 0
+                && hs[0] != 0
+            {
+                m.volumes.retain(|v| v.name != "home");
+                m.volumes.push(mgr::Volume { name: String::from("home"), root: fp::Node::from(hs[0]) });
+                println!("init: installed system detected: /home unlocked read-write (sys stays immutable)");
+            }
+        }
+    }
     if load_sys && groups == [Group::System] && overrides.is_empty() {
-        let cfg = boot_cfg(&m);
         if cfg.firmware_display {
             println!("init: boot: firmware display (DOS/BOOT.CFG: display = firmware)");
         }
@@ -188,18 +209,36 @@ struct BootCfg {
     desktop: bool,
     firmware_display: bool,
     lock: bool,
+    installed: bool,
+}
+
+impl Default for BootCfg {
+    fn default() -> Self {
+        Self { desktop: true, firmware_display: false, lock: false, installed: false }
+    }
 }
 
 /// Parse optional unsigned `esp:/DOS/BOOT.CFG`:
 /// - `desktop = off|no|false|0` starts in the text console;
 /// - `display = firmware|gop` forces the UEFI GOP framebuffer path over verified native AMD display;
-/// - `lock = on|yes|true|1` requires the compositor sign-in screen before starting the desktop.
+/// - `lock = on|yes|true|1` requires the compositor sign-in screen before starting the desktop;
+/// - `installed = true|yes|on|1` marks an installed disk so `/home` is mounted read-write while `sys` stays immutable.
 fn boot_cfg(m: &Mgr) -> BootCfg {
-    let mut cfg = BootCfg { desktop: true, firmware_display: false, lock: false };
-    let Some(root) = m.volumes.iter().find(|v| v.name == "esp").and_then(|v| v.root.clone_with(fp::R_READ).ok()) else {
-        return cfg;
+    let mut cfg = BootCfg::default();
+    // Prefer a volume named "esp", then fall back to any mounted volume carrying DOS/BOOT.CFG
+    // (e.g. a dual-boot Windows ESP named "EFI system partition").
+    let open_cfg = |v: &mgr::Volume| -> Option<(fp::Node, u64)> {
+        let root = v.root.clone_with(fp::R_READ).ok()?;
+        let (f, _, size) = root.open(b"DOS/BOOT.CFG", 0, fp::R_READ).ok()?;
+        Some((f, size))
     };
-    let Ok((f, _, size)) = root.open(b"DOS/BOOT.CFG", 0, fp::R_READ) else {
+    let found = m
+        .volumes
+        .iter()
+        .find(|v| v.name == "esp")
+        .and_then(open_cfg)
+        .or_else(|| m.volumes.iter().find_map(open_cfg));
+    let Some((f, size)) = found else {
         return cfg;
     };
     let mut b = alloc::vec![0u8; (size as usize).min(4096)];
@@ -216,6 +255,8 @@ fn boot_cfg(m: &Mgr) -> BootCfg {
                 cfg.firmware_display = matches!(val.as_str(), "firmware" | "gop");
             } else if key.eq_ignore_ascii_case("lock") {
                 cfg.lock = matches!(val.as_str(), "on" | "yes" | "true" | "1");
+            } else if key.eq_ignore_ascii_case("installed") {
+                cfg.installed = matches!(val.as_str(), "on" | "yes" | "true" | "1");
             }
         }
     }
@@ -300,7 +341,7 @@ fn main(s: *const Startup) -> i32 {
         "storage test" | "storage readonly" | "bench" => {
             let (sargs, dargs) = match a {
                 "storage test" => ("test", "rw"),
-                "storage readonly" => ("rocheck", ""),
+                "storage readonly" => ("rocheck", "ro"),
                 _ => ("", ""),
             };
             let Some(mut m) = start_system(&[("storaged", sargs), ("devmgr", dargs)], &[Group::System], false) else { return 1 };

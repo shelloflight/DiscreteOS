@@ -770,3 +770,34 @@ fn mode_switch_refits_pointer_snapped_and_floating_windows() {
     assert!(ff.x + ff.w as i32 <= work.x + work.w as i32);
     assert!(ff.y + ff.h as i32 <= work.y + work.h as i32);
 }
+
+#[test]
+fn right_click_unpins_dock_app_and_toggles_launcher_pin() {
+    let mut wm = WmState::new();
+    wm.layout.add_output(0, 1280, 800, 60_000, false).unwrap();
+    assert!(wm.register_app_ex(7, 0, b"Terminal", b"terminal", TrustTier::Native, true));
+    assert!(wm.register_app_ex(7, 1, b"Install D-OS", b"installer", TrustTier::Native, true));
+
+    let out = wm.layout.primary().unwrap();
+    let dl = wm.dock_layout_for(out);
+    assert_eq!(dl.pinned_count, 2);
+    let (_, _, pill) = dl.pinned_rects[1];
+    let pt = Point::new(pill.x + 8, pill.y + 8);
+    // Right-click (button bit 1 = value 2) on the second pinned pill unpins it.
+    let act = wm.handle_pointer(0, 0, Some(pt), 2);
+    assert_eq!(act, WmAction::SetAppPinned { owner: 7, app: 1, pinned: false });
+    wm.handle_pointer(0, 0, Some(pt), 0);
+    let dl2 = wm.dock_layout_for(wm.layout.primary().unwrap());
+    assert_eq!(dl2.pinned_count, 1);
+
+    // Re-pinning via open launcher right-click restores it to the dock.
+    wm.toggle_launcher();
+    let prim = wm.layout.primary().unwrap();
+    let rects = wm.launcher.rects(prim.bounds.w, prim.bounds.h, wm.line_h);
+    let row1 = rects.rows[1];
+    let rpt = Point::new(prim.bounds.x + row1.x + 12, prim.bounds.y + row1.y + 8);
+    let act2 = wm.handle_pointer(0, 0, Some(rpt), 2);
+    assert_eq!(act2, WmAction::SetAppPinned { owner: 7, app: 1, pinned: true });
+    let dl3 = wm.dock_layout_for(wm.layout.primary().unwrap());
+    assert_eq!(dl3.pinned_count, 2);
+}

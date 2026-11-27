@@ -17,6 +17,7 @@ bench = false
 
 [dependencies]
 libd = { path = "../lib/libd", features = ["alloc"] }
+dosid = { path = "../lib/identity" }
 dosnet = { path = "../lib/net" }
 
 [lints.rust]

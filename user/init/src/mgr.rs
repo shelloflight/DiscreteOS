@@ -856,6 +856,7 @@ impl Mgr {
             "identity.admin",
             "appmgr.query",
             "appmgr.admin",
+            "storaged.admin",
             "manager.services-ro",
         ];
         if !dman::valid_name(app_name) || !ALLOWED.contains(&endpoint) {

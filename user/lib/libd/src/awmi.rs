@@ -47,6 +47,8 @@ pub const OP_FONTS: u32 = 905;
 /// payload = label. Shown with the program's verified identity and trust tier.
 pub const OP_APP_REGISTER: u32 = 906;
 pub const APP_FLAG_PINNED: u64 = 1;
+/// Set when a pin/unpin came from an explicit user action (Settings / taskbar) rather than manifest defaults.
+pub const APP_FLAG_USER_PIN: u64 = 2;
 
 // ---- compositor -> window client (events, txid 0) -----------------------------------------------
 
@@ -76,6 +78,9 @@ pub const EVT_SETTINGS: u32 = 928;
 /// `awmi.launcher`: user answered the compositor permission prompt (`a` = request_id, `b` = choice:
 /// 1 = Allow, 2 = Deny & Launch, 3 = Cancel).
 pub const EVT_PERM_RESULT: u32 = 929;
+/// `awmi.launcher`: user pinned or unpinned an app directly on the dock/launcher (`a` = app entry,
+/// `b` = 1 pinned / 0 unpinned).
+pub const EVT_APP_PIN: u32 = 950;
 
 // ---- `awmi.admin`, `awmi.query`, `awmi.indicator` (calls) ---------------------------------------
 
@@ -296,13 +301,29 @@ pub fn register_app_pinned(ep: Handle, app: u8, label: &[u8], pinned: bool) -> R
 
 /// Register launcher entry on `awmi.launcher` with explicit `<label>\0<verified_app_id>`.
 pub fn register_launcher_app(ep: Handle, app: u8, label: &[u8], app_id: &[u8], pinned: bool) -> Result<(), i64> {
+    register_launcher_app_ex(ep, app, label, app_id, pinned, false)
+}
+
+/// Register or update a launcher entry on `awmi.launcher`, optionally marking `user_override`
+/// so the compositor persists the updated pin state.
+pub fn register_launcher_app_ex(
+    ep: Handle,
+    app: u8,
+    label: &[u8],
+    app_id: &[u8],
+    pinned: bool,
+    user_override: bool,
+) -> Result<(), i64> {
     let mut p = [0u8; 64];
     let ll = label.len().min(32);
     let il = app_id.len().min(24);
     p[..ll].copy_from_slice(&label[..ll]);
     p[ll] = 0;
     p[ll + 1..ll + 1 + il].copy_from_slice(&app_id[..il]);
-    let flags = if pinned { APP_FLAG_PINNED } else { 0 };
+    let mut flags = if pinned { APP_FLAG_PINNED } else { 0 };
+    if user_override {
+        flags |= APP_FLAG_USER_PIN;
+    }
     simple(ep, OP_APP_REGISTER, u64::from(app), flags, &p[..ll + 1 + il]).map(|_| ())
 }
 
@@ -578,6 +599,8 @@ pub enum Event {
     Settings { settings: u64, theme: [u8; THEME_MAX] },
     /// `awmi.launcher`: compositor modal permission prompt answer.
     PermResult { request_id: u32, choice: u8 },
+    /// `awmi.launcher`: user pinned or unpinned a launcher entry on the dock/launcher.
+    AppPin { app: u8, pinned: bool },
 }
 
 /// Room for an encoded theme in `Event::Settings`.
@@ -611,6 +634,7 @@ impl Event {
                 Self::Settings { settings: h.a, theme }
             }
             EVT_PERM_RESULT => Self::PermResult { request_id: h.a as u32, choice: h.b as u8 },
+            EVT_APP_PIN => Self::AppPin { app: h.a as u8, pinned: h.b != 0 },
             _ => return None,
         })
     }

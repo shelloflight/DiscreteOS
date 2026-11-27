@@ -54,6 +54,7 @@ int dc_dmub_init(struct amdgpu_device *adev, struct dc_state *dc) {
 
     if (already_running) {
         dc->dmub.fw_alive = true;
+        dc->dmub.ring_owned = false; /* Firmware owns inbox1_base; never clobber its live ring. */
         if ((scratch0 & DMUB_SCRATCH0_FW_BOOT_COMPLETE) != 0) {
             u32 ver = 0;
             if (dmub_gpint_exec(adev, r, DMUB_GPINT__GET_FW_VERSION, &ver) && ver != 0) {
@@ -85,6 +86,7 @@ int dc_dmub_init(struct amdgpu_device *adev, struct dc_state *dc) {
             (void)dc_reg_read(adev, 2u, r->dmcub_scratch0, &scratch0);
             if ((scratch0 & DMUB_SCRATCH0_FW_BOOT_COMPLETE) != 0) {
                 dc->dmub.fw_alive = true;
+                dc->dmub.ring_owned = true;
                 break;
             }
             amdgpu_udelay(adev, 100u);
@@ -113,7 +115,7 @@ int dc_dmub_submit_cmd(struct amdgpu_device *adev, struct dc_state *dc, const u3
     if (!adev || !dc || !dc->regs || !cmd_dwords || !dc->dmub.initialized) {
         return -EINVAL;
     }
-    if (!dc->dmub.fw_alive || !dc->dmub.ring_dma.cpu_addr) {
+    if (!dc->dmub.fw_alive || !dc->dmub.ring_owned || !dc->dmub.ring_dma.cpu_addr) {
         return -ENODEV;
     }
     /* Each DMUB command packet is 64 bytes (16 dwords) in a 4 KiB circular ring. */

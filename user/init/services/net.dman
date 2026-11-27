@@ -3,7 +3,7 @@
 name = "net"
 image = "net.dsvc"
 group = "system"
-after = ["devmgr", "clock"]
+after = ["devmgr", "storaged", "clock"]
 description = "in-tree TCP/IP, DHCP, and DNS networking service"
 
 [provides]
@@ -12,6 +12,7 @@ endpoints = ["client", "icmp", "control", "status"]
 [grants]
 log = true
 connect = ["devmgr.net", "clock.time"]
+namespace = ["*"]
 
 [quota]
 memory = "32M"

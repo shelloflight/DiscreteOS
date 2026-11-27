@@ -48,7 +48,7 @@ fn refused(src: &str) -> String {
 fn the_system_manifests_parse() {
     let s = parse(STORAGED).unwrap();
     assert_eq!((s.name.as_str(), s.image.as_str(), s.group), ("storaged", "storaged.dx", Group::System));
-    assert_eq!(s.endpoints, vec!["disks".to_string()]);
+    assert_eq!(s.endpoints, vec!["disks".to_string(), "admin".to_string()]);
     assert!(s.volumes && s.log && !s.vmex && !s.power && s.devices.is_empty() && !s.kernel_log && !s.boot_time);
     assert_eq!(s.connect, vec![Connect { service: "clock".into(), endpoint: "time".into() }]);
     assert_eq!(s.log_level, LEVEL_INFO);
@@ -311,8 +311,9 @@ fn the_shell_manifest_grants_its_session() {
     let s = parse(include_bytes!("../../../init/services/shell.dman")).unwrap();
     assert!(s.tools && s.manage_services && s.manage_power && s.log && s.vmex);
     assert_eq!(s.namespace, vec![NsGrant { path: "*".into(), volume: "*".into(), rights: NS_READ | NS_WRITE }]);
-    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, audio.playback, audio.control, net.client, net.icmp, net.control, gpu.query, awmi.admin, awmi.query, identity.admin, identity.query, appmgr.admin, appmgr.query, every volume, VMEX, manager (services, power), tools, audio (playback, control), net (client, icmp, control), gpu (query), awmi (admin, query), identity (admin, query), appmgr (query, admin)");
-    assert!(s.awmi_admin && s.awmi_query && !s.awmi_window && !s.awmi_indicator && !s.identify);
+    assert_eq!(summary(&s), "log, programs dcmpl.dx, terminal.session, log.read, clock.time, audio.playback, audio.control, net.client, net.icmp, net.control, gpu.query, awmi.admin, awmi.query, identity.admin, identity.query, appmgr.admin, appmgr.query, storaged.admin, every volume, VMEX, manager (services, power), tools, audio (playback, control), net (client, icmp, control), gpu (query), awmi (admin, query), identity (admin, query), appmgr (query, admin)");
+    assert!(s.awmi_admin && s.awmi_query && !s.awmi_window && !s.awmi_indicator && !s.identify && s.storaged_admin);
+    assert!(refused("name = \"x\"\nimage = \"x.dx\"\ngroup = \"test\"\n[grants]\nstoraged = [\"root\"]\n").contains("unknown storaged right"));
     assert!(refused("name = \"x\"
 image = \"x.dx\"
 group = \"test\"

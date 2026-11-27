@@ -585,13 +585,15 @@ int dc_link_probe_all(struct amdgpu_device *adev, struct dc_state *dc) {
                 c->dsc_capable = true;
             }
 
-            /* Read current trained link configuration (DPCD 0x0100..0x0101). */
+            /* Read current trained link configuration (DPCD 0x0100..0x0101); default to sink max on read hiccup. */
+            c->trained_rate_mbps = c->max_rate_mbps;
+            c->trained_lanes = c->max_lanes;
             u8 cur_cfg[2] = { 0, 0 };
             if (dc_dpcd_read(adev, r, a, DPCD_LINK_BW_SET, cur_cfg, 2u) == 0) {
                 u32 tr = dpcd_byte_to_mbps(cur_cfg[0]);
                 u8 tl = cur_cfg[1] & 0x1Fu;
-                c->trained_rate_mbps = tr ? tr : c->max_rate_mbps;
-                c->trained_lanes = (tl >= 1u && tl <= 4u) ? tl : c->max_lanes;
+                if (tr != 0) c->trained_rate_mbps = tr;
+                if (tl >= 1u && tl <= 4u) c->trained_lanes = tl;
             }
 
             /* Read E-DDC EDID over I2C-over-AUX and extract modes/VRR/HDR10. */
@@ -630,8 +632,14 @@ int dc_link_train_dp(
         return -ENOTSUP;
     }
 
-    /* Request DMCUB PHY transmitter setup if DMCUB is active. */
-    if (dc->dmub.fw_alive) {
+    /* Preserve prior DPCD link configuration so any training failure restores the live link cleanly. */
+    u8 old_bw[2] = { mbps_to_dpcd_byte(conn->trained_rate_mbps), (u8)(conn->trained_lanes | 0x80u) };
+    u8 old_coding = (conn->link_type == DC_LINK_DP_2_1) ? 0x02u : 0x01u;
+    (void)dc_dpcd_read(adev, r, conn->aux_idx, DPCD_LINK_BW_SET, old_bw, 2u);
+    (void)dc_dpcd_read(adev, r, conn->aux_idx, DPCD_MAIN_LINK_CHANNEL_CODING_SET, &old_coding, 1u);
+
+    /* Request DMCUB PHY transmitter setup only when DMCUB ring is owned by this driver. */
+    if (dc->dmub.fw_alive && dc->dmub.ring_owned) {
         u32 cmd[16];
         memset(cmd, 0, sizeof(cmd));
         cmd[0] = 0x00000043u; /* DMUB_CMD__VBIOS_DIG1_TRANSMITTER_CONTROL */
@@ -651,7 +659,7 @@ int dc_link_train_dp(
     (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_MAIN_LINK_CHANNEL_CODING_SET, &coding, 1u);
 
     /* Phase 1: Clock Recovery (TPS1 for 8b/10b, 128b/132b_TPS1 for UHBR). */
-    u8 tps1 = uhbr ? 0x21u : 0x21u; /* Pattern 1 + scrambling disabled */
+    u8 tps1 = 0x21u; /* Pattern 1 + scrambling disabled */
     (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_TRAINING_PATTERN_SET, &tps1, 1u);
 
     u8 lane_set[4] = { 0, 0, 0, 0 };
@@ -683,6 +691,8 @@ int dc_link_train_dp(
 
     if (!cr_ok) {
         u8 stop = 0;
+        (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_LINK_BW_SET, old_bw, 2u);
+        (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_MAIN_LINK_CHANNEL_CODING_SET, &old_coding, 1u);
         (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_TRAINING_PATTERN_SET, &stop, 1u);
         return -EIO;
     }
@@ -716,8 +726,12 @@ int dc_link_train_dp(
         }
     }
 
-    /* Exit training pattern -> normal video transmission. */
+    /* Exit training pattern -> normal video transmission (restore prior link settings on failure). */
     u8 stop = 0;
+    if (!eq_ok) {
+        (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_LINK_BW_SET, old_bw, 2u);
+        (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_MAIN_LINK_CHANNEL_CODING_SET, &old_coding, 1u);
+    }
     (void)dc_dpcd_write(adev, r, conn->aux_idx, DPCD_TRAINING_PATTERN_SET, &stop, 1u);
     if (!eq_ok) {
         return -EIO;
