@@ -28,7 +28,7 @@ impl Rng {
 /// What an accepted image must satisfy (the loader maps by these numbers).
 fn sane(img: &Image, file_len: usize) -> bool {
     let mut prev = img.size_of_headers;
-    let mut entry_ok = false;
+    let mut entry_ok = img.is_dll && img.entry == 0;
     for s in img.sections() {
         let end = u64::from(s.rva) + u64::from(s.pages());
         if s.rva < prev
@@ -59,7 +59,8 @@ pub fn run(rounds: u64) -> i32 {
     let mut stage: Vec<u8> = alloc::vec![0; STAGE as usize];
     let mut work: Vec<u8> = alloc::vec![0; 256 * 1024];
     programs(|h, name| {
-        if !name.ends_with(b".exe") {
+        let is_dll = name.ends_with(b".dll");
+        if !name.ends_with(b".exe") && !is_dll {
             return;
         }
         let Ok(file) = read_image(h, 256 * 1024) else {
@@ -70,7 +71,8 @@ pub fn run(rounds: u64) -> i32 {
         let len = file.len();
         let orig = &file[..];
         images += 1;
-        match pe::parse(orig) {
+        let parsed = if is_dll { pe::parse_dll(orig) } else { pe::parse(orig) };
+        match parsed {
             Ok(img) if sane(&img, len) => {}
             _ => {
                 println!("dcmpl: pe fuzz: FAIL: embedded {} does not parse cleanly", text(name));
@@ -103,7 +105,7 @@ pub fn run(rounds: u64) -> i32 {
                 n = (rng.next() % len as u64) as usize;
             }
             let data = &buf[..n];
-            let Ok(img) = pe::parse(data) else { continue };
+            let Ok(img) = (if is_dll { pe::parse_dll(data) } else { pe::parse(data) }) else { continue };
             accepted += 1;
             if !sane(&img, n) {
                 println!("dcmpl: pe fuzz: FAIL: a mutated {} was accepted with broken invariants", text(name));
@@ -125,6 +127,8 @@ pub fn run(rounds: u64) -> i32 {
             let _ = img.relocate(out, delta);
             let _ = img.bind(out, dummy_resolve);
             let _ = img.tls(out, img.image_base.wrapping_add(delta));
+            let _ = img.export_by_name(out, b"test");
+            let _ = img.export_by_ordinal(out, 1);
         }
     });
     println!(

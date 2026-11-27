@@ -117,11 +117,13 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   partition management; [storage.md](storage.md)), `setup [status | skip | complete [lang] [kbd]
   [tz] [skip|dhcp]]` (`oobe`: inspect, skip, or complete first-boot setup on installed disks),
   `power off | restart | sleep` (the manager stops every service cleanly first), `clear`, `run <tool> [arguments]`.
-- **Foreign programs**: `run <file> [arguments]` with a file that is not a tool starts a Windows
-  (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the current place
-  (with the session's rights there) as its working directory, an output channel and the wall
-  clock, and nothing else ([compat.md](compat.md#running-a-program)). Its output shows like a
-  tool's text.
+- **Foreign programs**: `run [--prefix <dir>] <file> [arguments]` with a file that is not a tool
+  starts a Windows (PE) or Linux (ELF) program under D-CMPL, told apart by its header. It gets the
+  current place (with the session's rights there) as its working directory, the executable's parent
+  directory read-only (for sibling `.dll`/`.so` files), an optional explicit per-app prefix
+  directory (`--prefix <dir>`, with the session's rights there; `/` is refused), an output channel
+  and the wall clock, and nothing else ([compat.md](compat.md#running-a-program)). Its output shows
+  like a tool's text.
 
 ## Tools and declared rights
 

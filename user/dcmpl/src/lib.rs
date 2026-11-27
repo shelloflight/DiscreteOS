@@ -153,13 +153,36 @@ fn main(s: *const Startup) -> i32 {
     }
     set_time_base();
     path::init();
-    let a = libd::args();
+    let mut a = libd::args();
+    loop {
+        match word(a, 0) {
+            b"--prefix" => {
+                let p = word(a, 1);
+                if p.is_empty() {
+                    println!("dcmpl: --prefix requires a directory");
+                    return EXIT_USAGE;
+                }
+                path::set_prefix(p);
+                a = rest(a, 2);
+            }
+            b"--app-dir" => {
+                let d = word(a, 1);
+                if d.is_empty() {
+                    println!("dcmpl: --app-dir requires a directory");
+                    return EXIT_USAGE;
+                }
+                path::set_app_dir(d);
+                a = rest(a, 2);
+            }
+            _ => break,
+        }
+    }
     let code = match word(a, 0) {
         b"win" => win::run(word(a, 1), rest(a, 2)),
         b"linux" => linux::run(word(a, 1), rest(a, 1)),
         b"pefuzz" => fuzz::run(parse_u(word(a, 1))),
         _ => {
-            println!("dcmpl: usage: win <exe> [args] | linux <elf> [args] | pefuzz <rounds> (got '{}')", text(a));
+            println!("dcmpl: usage: [--prefix <dir>] win <exe> [args] | linux <elf> [args] | pefuzz <rounds> (got '{}')", text(a));
             EXIT_USAGE
         }
     };

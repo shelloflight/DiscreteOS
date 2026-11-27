@@ -29,8 +29,10 @@
 //! Linux image read from a file is allowed as unsigned code with the VMEX resource (a measured
 //! decision, like any `vmo_allow_unsigned`).
 
+mod elf;
 mod fs;
 mod mem;
+mod vfs;
 
 use alloc::vec::Vec;
 
@@ -38,7 +40,7 @@ use libd::handle::Owned;
 use libd::println;
 use libd::sys::{self, ExceptionMsg, Handle, Regs};
 
-use crate::{EXIT_REFUSED, EXIT_USAGE, USER_TOP, find_image, text, tool_image, word};
+use crate::{EXIT_REFUSED, EXIT_USAGE, USER_TOP, find_image, path, read_image, text, tool_image, word};
 
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
@@ -161,40 +163,6 @@ impl Mem {
 
 // ---- the initial stack ------------------------------------------------------------------------
 
-/// Where the program headers are mapped (for AT_PHDR), from the ELF header: PT_PHDR, or the
-/// PT_LOAD that contains them. 0 if neither (AT_PHDR is then left out).
-struct ElfInfo {
-    phdr: u64,
-    phnum: u64,
-}
-
-fn elf_info(image: Handle) -> Option<ElfInfo> {
-    let mut h = [0u8; 64];
-    if sys::vmo_read(image, 0, &mut h) < 0 || h[0..4] != [0x7F, b'E', b'L', b'F'] || h[4] != 2 {
-        return None; // identified by magic, never by name
-    }
-    let u16_at = |b: &[u8], o: usize| u64::from(u16::from_le_bytes([b[o], b[o + 1]]));
-    let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap_or([0; 8]));
-    let (phoff, phnum) = (u64_at(&h, 32), u16_at(&h, 56).min(64));
-    let mut phdr = 0;
-    for i in 0..phnum {
-        let mut p = [0u8; 56];
-        if sys::vmo_read(image, phoff.saturating_add(i * 56), &mut p) < 0 {
-            break;
-        }
-        let ty = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-        let (off, vaddr, filesz) = (u64_at(&p, 8), u64_at(&p, 16), u64_at(&p, 32));
-        if ty == 6 {
-            phdr = vaddr; // PT_PHDR
-            break;
-        }
-        if ty == 1 && phdr == 0 && phoff >= off && phoff - off < filesz {
-            phdr = vaddr + (phoff - off); // PT_LOAD containing the table
-        }
-    }
-    Some(ElfInfo { phdr, phnum })
-}
-
 /// 16 random bytes: RDRAND when the CPU has it (CPUID.1:ECX bit 30), else TSC mixing.
 pub fn random_bytes(out: &mut [u8]) {
     let has_rdrand = core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0;
@@ -220,9 +188,17 @@ pub fn random_bytes(out: &mut [u8]) {
     }
 }
 
+struct StartAux {
+    phdr: u64,
+    phnum: u64,
+    base: u64,
+    entry: u64,
+}
+
 /// Build the Linux initial stack below the startup block and point the registers at it:
 /// RSP -> argc, argv[], NULL, envp[], NULL, auxv pairs, AT_NULL; strings and AT_RANDOM above.
-fn initial_stack(m: Mem, r: &mut Regs, argv: &[&[u8]], env: &[&[u8]], elf: &ElfInfo) -> Result<(), &'static str> {
+/// Returns the serialized `auxv` bytes (for `/proc/self/auxv`).
+fn initial_stack(m: Mem, r: &mut Regs, argv: &[&[u8]], env: &[&[u8]], aux: &StartAux) -> Result<Vec<u8>, &'static str> {
     const AREA: usize = 8192;
     let top = r.rsp & !15; // the kernel's startup block starts here (unused by a Linux program)
     let base = top.checked_sub(AREA as u64).ok_or("stack too small")?;
@@ -252,26 +228,24 @@ fn initial_stack(m: Mem, r: &mut Regs, argv: &[&[u8]], env: &[&[u8]], elf: &ElfI
     for (i, e) in env.iter().take(8).enumerate() {
         envp[i] = push(e, true, &mut p)?;
     }
-    // Program image bias (0 for ET_EXEC) from the startup block, for AT_PHDR.
-    let bias = m.u64(r.rdi.wrapping_add(24)).ok_or("cannot read the startup block")?;
     let auxv: [(u64, u64); 17] = [
-        (3, if elf.phdr != 0 { bias.wrapping_add(elf.phdr) } else { 0 }), // AT_PHDR
-        (4, 56),                                                             // AT_PHENT
-        (5, elf.phnum),                                                      // AT_PHNUM
-        (6, 4096),                                                           // AT_PAGESZ
-        (7, 0),                                                              // AT_BASE (no interpreter)
-        (8, 0),                                                              // AT_FLAGS
-        (9, r.rip),                                                          // AT_ENTRY
-        (11, 1000),                                                          // AT_UID
-        (12, 1000),                                                          // AT_EUID
-        (13, 1000),                                                          // AT_GID
-        (14, 1000),                                                          // AT_EGID
-        (15, platform),                                                      // AT_PLATFORM
-        (16, 0),                                                             // AT_HWCAP
-        (17, 100),                                                           // AT_CLKTCK
-        (23, 0),                                                             // AT_SECURE
-        (25, random),                                                        // AT_RANDOM
-        (31, argp[0]),                                                       // AT_EXECFN
+        (3, aux.phdr),     // AT_PHDR
+        (4, 56),           // AT_PHENT
+        (5, aux.phnum),    // AT_PHNUM
+        (6, 4096),         // AT_PAGESZ
+        (7, aux.base),     // AT_BASE (interpreter load base, or 0)
+        (8, 0),            // AT_FLAGS
+        (9, aux.entry),    // AT_ENTRY (executable entry)
+        (11, 1000),        // AT_UID
+        (12, 1000),        // AT_EUID
+        (13, 1000),        // AT_GID
+        (14, 1000),        // AT_EGID
+        (15, platform),    // AT_PLATFORM
+        (16, 0),           // AT_HWCAP
+        (17, 100),         // AT_CLKTCK
+        (23, 0),           // AT_SECURE
+        (25, random),      // AT_RANDOM
+        (31, argp[0]),     // AT_EXECFN
     ];
     let nenv = env.len().min(8);
     let nwords = 1 + argv.len() + 1 + nenv + 1 + 2 * auxv.len() + 2;
@@ -290,13 +264,18 @@ fn initial_stack(m: Mem, r: &mut Regs, argv: &[&[u8]], env: &[&[u8]], elf: &ElfI
         put(*e);
     }
     put(0); // envp end
+    let mut auxv_bytes = Vec::with_capacity((auxv.len() + 1) * 16);
     for (k, v) in auxv {
         let k = if k == 3 && v == 0 { 1 } else { k }; // AT_PHDR unknown: AT_IGNORE
         put(k);
         put(v);
+        auxv_bytes.extend_from_slice(&k.to_le_bytes());
+        auxv_bytes.extend_from_slice(&v.to_le_bytes());
     }
     put(0); // AT_NULL
     put(0);
+    auxv_bytes.extend_from_slice(&0u64.to_le_bytes());
+    auxv_bytes.extend_from_slice(&0u64.to_le_bytes());
     if !m.write(base + sp as u64, &buf[sp..]) {
         return Err("cannot write the initial stack");
     }
@@ -304,7 +283,7 @@ fn initial_stack(m: Mem, r: &mut Regs, argv: &[&[u8]], env: &[&[u8]], elf: &ElfI
     r.rdi = 0;
     r.rsi = 0;
     r.rdx = 0; // no rtld_fini
-    Ok(())
+    Ok(auxv_bytes)
 }
 
 // ---- threads, waits, signals -------------------------------------------------------------------
@@ -371,7 +350,7 @@ enum Next {
 pub struct Server<'a> {
     pub mem: Mem,
     name: &'a [u8],
-    pid: i64,
+    pub pid: i64,
     threads: Vec<Thread>,
     next_tid: i64,
     pending_clones: Vec<(u64, Regs)>,
@@ -381,6 +360,13 @@ pub struct Server<'a> {
     pub vmex: Handle,
     pub fds: fs::Fds,
     pub mm: mem::Mm,
+    pub comm: Vec<u8>,
+    pub exe_path: Vec<u8>,
+    pub exe_bytes: Vec<u8>,
+    pub cmdline_nul: Vec<u8>,
+    pub environ_nul: Vec<u8>,
+    pub auxv_bytes: Vec<u8>,
+    pub no_new_privs: bool,
 }
 
 fn signal_of(vector: u32) -> (u32, i32) {
@@ -410,6 +396,9 @@ fn unix_ns() -> i64 {
 }
 
 impl Server<'_> {
+    pub fn thread_count(&self) -> usize {
+        self.threads.len().max(1)
+    }
     fn ti(&self, koid: u64) -> Option<usize> {
         self.threads.iter().position(|t| t.koid == koid)
     }
@@ -854,9 +843,30 @@ impl Server<'_> {
         let nr = r.rax;
         let (a0, a1, a2, a3) = (r.rdi, r.rsi, r.rdx, r.r10);
         let v: i64 = match nr {
-            0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 17 | 18 | 19 | 20 | 21 | 32 | 33 | 72 | 74 | 75 | 76 | 77 | 79 | 80 | 81 | 82
-            | 83 | 84 | 87 | 89 | 217 | 257 | 258 | 262 | 263 | 264 | 267 | 269 | 292 | 316 | 439 => {
+            0 | 1 | 2 | 3 | 4 | 5 | 6 | 8 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 32 | 33 | 72 | 74 | 75 | 76 | 77 | 79 | 80 | 81 | 82
+            | 83 | 84 | 87 | 89 | 137 | 138 | 217 | 257 | 258 | 262 | 263 | 264 | 267 | 269 | 292 | 293 | 316 | 332 | 439 => {
                 fs::syscall(self, nr, r)
+            }
+            7 | 271 => {
+                // poll(fds, nfds, timeout_ms) / ppoll(fds, nfds, tmo_p, sigmask, sigsetsize)
+                match fs::poll_once(self, a0, a1) {
+                    Ok(n) if n > 0 => n,
+                    Ok(_) => {
+                        let wait_ns = if nr == 7 {
+                            let ms = a2 as i32;
+                            if ms <= 0 { 0 } else { (ms as u64).min(50) * 1_000_000 }
+                        } else if a2 == 0 {
+                            0
+                        } else {
+                            self.timespec(a2).unwrap_or(0).min(50_000_000)
+                        };
+                        if wait_ns > 0 {
+                            return Next::Park(Wait::Sleep { rem: 0 }, sys::clock_ns().saturating_add(wait_ns));
+                        }
+                        0
+                    }
+                    Err(e) => e,
+                }
             }
             9 => mem::mmap(self, a0, a1, a2, a3, r.r8 as i64, r.r9),
             10 => mem::mprotect(self, a0, a1, a2),
@@ -864,6 +874,65 @@ impl Server<'_> {
             12 => mem::brk(self, a0) as i64,
             25 => -ENOMEM, // mremap: callers fall back to a new mapping and a copy
             28 => 0,       // madvise: advice only
+            63 => {
+                // uname(struct utsname *buf): 5 x 65-byte fields + 65-byte domainname = 390 bytes
+                let mut u = [0u8; 390];
+                let put_f = |buf: &mut [u8], idx: usize, s: &[u8]| {
+                    let at = idx * 65;
+                    let n = s.len().min(64);
+                    buf[at..at + n].copy_from_slice(&s[..n]);
+                };
+                put_f(&mut u, 0, b"Linux");
+                put_f(&mut u, 1, b"dos");
+                put_f(&mut u, 2, b"6.6.0-dos");
+                put_f(&mut u, 3, b"#1 SMP D-CMPL");
+                put_f(&mut u, 4, b"x86_64");
+                if self.mem.write(a0, &u) { 0 } else { -EFAULT }
+            }
+            98 => {
+                // getrusage: zeroed 144-byte struct rusage
+                if self.mem.write(a1, &[0u8; 144]) { 0 } else { -EFAULT }
+            }
+            99 => {
+                // sysinfo: 112-byte struct sysinfo (bounded to process quota, never leaks host RAM)
+                let mut si = [0u8; 112];
+                let up = (sys::clock_ns() / 1_000_000_000) as i64;
+                si[0..8].copy_from_slice(&up.to_le_bytes());
+                si[32..40].copy_from_slice(&(128u64 << 20).to_le_bytes()); // totalram
+                si[40..48].copy_from_slice(&(96u64 << 20).to_le_bytes()); // freeram
+                si[80..82].copy_from_slice(&(self.thread_count() as u16).to_le_bytes()); // procs
+                si[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
+                if self.mem.write(a0, &si) { 0 } else { -EFAULT }
+            }
+            157 => match a0 {
+                // prctl
+                15 => {
+                    // PR_SET_NAME
+                    match self.mem.cstr(a1, 16) {
+                        Some(mut n) => {
+                            n.truncate(15);
+                            self.comm = n;
+                            0
+                        }
+                        None => -EFAULT,
+                    }
+                }
+                16 => {
+                    // PR_GET_NAME
+                    let mut b = [0u8; 16];
+                    let n = self.comm.len().min(15);
+                    b[..n].copy_from_slice(&self.comm[..n]);
+                    if self.mem.write(a1, &b) { 0 } else { -EFAULT }
+                }
+                38 => {
+                    // PR_SET_NO_NEW_PRIVS
+                    self.no_new_privs = a1 != 0;
+                    0
+                }
+                39 => i64::from(self.no_new_privs),
+                _ => -EINVAL,
+            },
+            324 => 0, // membarrier
             13 => self.rt_sigaction(a0, a1, a2),
             14 => self.rt_sigprocmask(i, a0, a1, a2),
             15 => return self.sigreturn(i, r),
@@ -995,7 +1064,15 @@ impl Server<'_> {
     }
 
     /// One exception message.
-    fn handle(&mut self, m: &ExceptionMsg, exc: Owned, argv: &[&[u8]], env: &[&[u8]], elf: &ElfInfo) {
+    fn handle(
+        &mut self,
+        m: &ExceptionMsg,
+        exc: Owned,
+        argv: &[&[u8]],
+        env: &[&[u8]],
+        parsed: &elf::Elf64,
+        userspace_load: bool,
+    ) {
         let mut r = m.regs;
         match m.kind {
             sys::EXC_START => {
@@ -1022,8 +1099,53 @@ impl Server<'_> {
                     alt: (0, 2, 0),
                     parked: None,
                 });
-                match initial_stack(self.mem, &mut r, argv, env, elf) {
-                    Ok(()) => self.finish(0, exc, Next::Resume(r)),
+                let aux = if userspace_load {
+                    let mapped_exe = match elf::map_into(self.vmar, self.vmex, &self.exe_bytes, parsed, &mut self.mm, &self.exe_path) {
+                        Ok(me) => me,
+                        Err(e) => {
+                            println!("dcmpl: {}: cannot map ELF: {}", text(self.name), e);
+                            sys::exception_resume(exc.raw(), sys::EXC_KILL, EXIT_REFUSED);
+                            return;
+                        }
+                    };
+                    if let Some(ref interp_path) = parsed.interp {
+                        let Some(interp_bytes) = load_interpreter_bytes(interp_path) else {
+                            println!("dcmpl: {}: PT_INTERP '{}' not found", text(self.name), text(interp_path));
+                            sys::exception_resume(exc.raw(), sys::EXC_KILL, EXIT_REFUSED);
+                            return;
+                        };
+                        let interp_elf = match elf::parse(&interp_bytes) {
+                            Ok(ie) => ie,
+                            Err(e) => {
+                                println!("dcmpl: {}: bad PT_INTERP '{}': {}", text(self.name), text(interp_path), e);
+                                sys::exception_resume(exc.raw(), sys::EXC_KILL, EXIT_REFUSED);
+                                return;
+                            }
+                        };
+                        let mapped_interp = match elf::map_into(self.vmar, self.vmex, &interp_bytes, &interp_elf, &mut self.mm, interp_path) {
+                            Ok(mi) => mi,
+                            Err(e) => {
+                                println!("dcmpl: {}: cannot map PT_INTERP '{}': {}", text(self.name), text(interp_path), e);
+                                sys::exception_resume(exc.raw(), sys::EXC_KILL, EXIT_REFUSED);
+                                return;
+                            }
+                        };
+                        r.rip = mapped_interp.entry;
+                        StartAux { phdr: mapped_exe.phdr, phnum: mapped_exe.phnum, base: mapped_interp.bias, entry: mapped_exe.entry }
+                    } else {
+                        r.rip = mapped_exe.entry;
+                        StartAux { phdr: mapped_exe.phdr, phnum: mapped_exe.phnum, base: 0, entry: mapped_exe.entry }
+                    }
+                } else {
+                    let bias = self.mem.u64(r.rdi.wrapping_add(24)).unwrap_or(0);
+                    let phdr = if parsed.phdr_vaddr != 0 { bias.wrapping_add(parsed.phdr_vaddr) } else { 0 };
+                    StartAux { phdr, phnum: parsed.phnum, base: 0, entry: r.rip }
+                };
+                match initial_stack(self.mem, &mut r, argv, env, &aux) {
+                    Ok(auxv_bytes) => {
+                        self.auxv_bytes = auxv_bytes;
+                        self.finish(0, exc, Next::Resume(r));
+                    }
                     Err(e) => {
                         println!("dcmpl: {}: cannot start: {}", text(self.name), e);
                         sys::exception_resume(exc.raw(), sys::EXC_KILL, EXIT_REFUSED);
@@ -1096,6 +1218,37 @@ impl Server<'_> {
     }
 }
 
+/// Locate the `PT_INTERP` dynamic linker (e.g. `/lib64/ld-linux-x86-64.so.2`) via the active
+/// prefix, namespace, app dir, or embedded program VMOs.
+fn load_interpreter_bytes(interp_path: &[u8]) -> Option<Vec<u8>> {
+    let mapped = path::map_linux_path(interp_path, true);
+    if let Ok(b) = path::read_file(&mapped, 16 << 20) {
+        return Some(b);
+    }
+    let leaf = interp_path.rsplit(|&c| c == b'/').next().unwrap_or(interp_path);
+    if let Some(ad) = path::app_dir() {
+        let p = path::join_abs(ad.as_bytes(), leaf);
+        if let Ok(b) = path::read_file(&p, 16 << 20) {
+            return Some(b);
+        }
+        let upper: Vec<u8> = leaf.iter().map(u8::to_ascii_uppercase).collect();
+        let pu = path::join_abs(ad.as_bytes(), &upper);
+        if let Ok(b) = path::read_file(&pu, 16 << 20) {
+            return Some(b);
+        }
+    }
+    let mut found = None;
+    crate::programs(|h, name| {
+        if found.is_none() && name.eq_ignore_ascii_case(leaf) {
+            found = Some(h);
+        }
+    });
+    if let Some(h) = found {
+        return read_image(h, 16 << 20).ok();
+    }
+    None
+}
+
 pub fn run(name: &[u8], cmdline: &[u8]) -> i32 {
     if name.is_empty() {
         println!("dcmpl: linux: which program?");
@@ -1105,15 +1258,47 @@ pub fn run(name: &[u8], cmdline: &[u8]) -> i32 {
         println!("dcmpl: linux: no program '{}'", text(name));
         return EXIT_USAGE;
     };
-    let Some(elf) = elf_info(image) else {
-        println!("dcmpl: linux: {} refused: not an ELF64 executable", text(name));
-        return EXIT_REFUSED;
+    let exe_bytes = match read_image(image, 64 << 20) {
+        Ok(b) => b,
+        Err(_) => {
+            println!("dcmpl: linux: {} refused: cannot read image", text(name));
+            return EXIT_REFUSED;
+        }
+    };
+    let parsed = match elf::parse(&exe_bytes) {
+        Ok(e) => e,
+        Err(why) => {
+            println!("dcmpl: linux: {} refused: not an ELF64 executable ({})", text(name), why);
+            return EXIT_REFUSED;
+        }
     };
     let vmex = libd::startup_handle(sys::TAG_VMEX);
-    if tool_image() && sys::vmo_allow_unsigned(image, vmex) < 0 {
-        println!("dcmpl: linux: {} refused: cannot allow it as unsigned code (no VMEX resource)", text(name));
-        return EXIT_REFUSED;
-    }
+    let userspace_load = elf::needs_userspace_loader(&parsed);
+    let spawn_img_owned: Option<Owned>;
+    let spawn_image = if userspace_load {
+        if vmex == 0 {
+            println!("dcmpl: linux: {} refused: dynamic ELF requires VMEX resource", text(name));
+            return EXIT_REFUSED;
+        }
+        let stub = elf::build_stub_elf();
+        let Ok(v) = sys::vmo_create(stub.len() as u64) else {
+            return EXIT_REFUSED;
+        };
+        if sys::vmo_write(v, 0, &stub) < 0 || sys::vmo_allow_unsigned(v, vmex) < 0 {
+            sys::handle_close(v);
+            return EXIT_REFUSED;
+        }
+        spawn_img_owned = Some(Owned::from_raw(v));
+        v
+    } else {
+        if tool_image() && sys::vmo_allow_unsigned(image, vmex) < 0 {
+            println!("dcmpl: linux: {} refused: cannot allow it as unsigned code (no VMEX resource)", text(name));
+            return EXIT_REFUSED;
+        }
+        spawn_img_owned = None;
+        image
+    };
+
     let mut argv: [&[u8]; MAX_ARGS] = [&[]; MAX_ARGS];
     let mut argc = 0;
     while argc < MAX_ARGS && !word(cmdline, argc).is_empty() {
@@ -1122,12 +1307,33 @@ pub fn run(name: &[u8], cmdline: &[u8]) -> i32 {
     }
     let mut pwd = Vec::from(&b"PWD="[..]);
     pwd.extend_from_slice(crate::path::cwd().as_bytes());
-    let env: [&[u8]; 2] = [&pwd, b"LANG=C.UTF-8"];
+    let env: [&[u8]; 3] = [&pwd, b"LANG=C.UTF-8", b"LD_LIBRARY_PATH=/lib64:/lib:/usr/lib"];
+
+    let mut cmdline_nul = Vec::new();
+    for a in &argv[..argc.max(1)] {
+        cmdline_nul.extend_from_slice(a);
+        cmdline_nul.push(0);
+    }
+    let mut environ_nul = Vec::new();
+    for e in env {
+        environ_nul.extend_from_slice(e);
+        environ_nul.push(0);
+    }
+    let exe_path = match path::app_dir() {
+        Some(ad) => path::join_abs(ad.as_bytes(), name),
+        None => {
+            let mut p = Vec::with_capacity(name.len() + 1);
+            p.push(b'/');
+            p.extend_from_slice(name);
+            p
+        }
+    };
+    let comm = name[..name.len().min(15)].to_vec();
 
     let mut ch: Handle = 0;
     let s = sys::Spawn {
         parent: libd::startup_handle(sys::TAG_PROC_SELF),
-        image,
+        image: spawn_image,
         name: name.as_ptr() as u64,
         name_len: name.len() as u64,
         args: 0,
@@ -1145,6 +1351,7 @@ pub fn run(name: &[u8], cmdline: &[u8]) -> i32 {
             return EXIT_REFUSED;
         }
     };
+    drop(spawn_img_owned);
     let ch = Owned::from_raw(ch);
     let vmar = match sys::process_vmar(proc.raw()) {
         Ok(v) => Owned::from_raw(v),
@@ -1167,6 +1374,13 @@ pub fn run(name: &[u8], cmdline: &[u8]) -> i32 {
         vmex,
         fds: fs::Fds::new(),
         mm: mem::Mm::default(),
+        comm,
+        exe_path,
+        exe_bytes,
+        cmdline_nul,
+        environ_nul,
+        auxv_bytes: Vec::new(),
+        no_new_privs: false,
     };
     let mut m = ExceptionMsg::default();
     let mut deadline = sys::WAIT_FOREVER;
@@ -1182,12 +1396,12 @@ pub fn run(name: &[u8], cmdline: &[u8]) -> i32 {
                 let exc = Owned::from_raw(if nh > 0 { hs[0] } else { 0 });
                 if n != core::mem::size_of::<ExceptionMsg>() || nh == 0 {
                     println!("dcmpl: linux: bad exception message");
-                    continue; // dropping `exc` leaves it unresolved: the kernel kills the program
+                    continue;
                 }
-                srv.handle(&m, exc, &argv[..argc.max(1)], &env, &elf);
+                srv.handle(&m, exc, &argv[..argc.max(1)], &env, &parsed, userspace_load);
             }
             Err(sys::ERR_TIMED_OUT) => {}
-            Err(_) => break, // PEER_CLOSED: the program has ended
+            Err(_) => break,
         }
         deadline = srv.expire();
     }

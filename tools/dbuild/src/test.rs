@@ -260,11 +260,25 @@ const HALTED: &str = "System halted.";
 fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
     let mut shell_lines: Vec<&str> = vec!["places", "go data", "make notes"];
     if has_w2 {
-        shell_lines.extend(["run /esp/DOS/APPS/W2.EXE alpha beta notes", "@~20000"]);
+        shell_lines.extend([
+            "run /esp/DOS/APPS/W2.EXE alpha beta notes",
+            "@~20000",
+            "make w3pfx",
+            "run --prefix /data/w3pfx /esp/DOS/APPS/W3.EXE C:/w3-pfx.txt",
+            "@~20000",
+            "delete w3pfx",
+        ]);
     }
     shell_lines.extend([
         "run /esp/DOS/APPS/L2 notes",
         "@~15000",
+        "make l3pfx",
+        "make l3pfx/lib64",
+        "copy /esp/DOS/APPS/LDL3.SO l3pfx/lib64/ld-linux-x86-64.so.2",
+        "copy /esp/DOS/APPS/LIBL3.SO l3pfx/lib64/libl3.so",
+        "run --prefix /data/l3pfx /esp/DOS/APPS/L3 /l3-pfx.txt",
+        "@~15000",
+        "delete l3pfx/lib64/ld-linux-x86-64.so.2 l3pfx/lib64/libl3.so l3pfx/lib64 l3pfx",
         "run /boot/README.TXT",
         "copy /boot/README.TXT notes",
         "create notes/empty.txt",
@@ -298,12 +312,19 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             "shell: run /esp/DOS/APPS/W2.EXE (Windows, under D-CMPL) in /data",
             "terminal| W2: files    ok: 100 lines read back",
             "terminal| W2: 0 checks failed",
+            "shell: run /esp/DOS/APPS/W3.EXE (Windows, under D-CMPL) in /data [prefix /data/w3pfx]",
+            "terminal| W3: prefix   ok: 50 lines in prefix, escape refused=1",
+            "terminal| W3: 0 checks failed",
         ]);
     }
     shell_expect.extend([
         "shell: run /esp/DOS/APPS/L2 (Linux, under D-CMPL) in /data",
         "terminal| L2: files ok: 100 lines read back",
         "terminal| L2: 0 checks failed",
+        "shell: run /esp/DOS/APPS/L3 (Linux, under D-CMPL) in /data [prefix /data/l3pfx]",
+        "terminal| L3: dyn ok:",
+        "terminal| L3: prefix ok: prefix read/write/unlink ok, escape refused",
+        "terminal| L3: 0 checks failed",
         "terminal| x run: /boot/README.TXT is not a program D-CMPL runs",
         "terminal| v copied /data/notes/README.TXT (58 B)",
         "terminal| v created /data/notes/empty.txt",
@@ -336,8 +357,8 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "user fault: process 'w1fault.exe'",
         "Hello, world from Linux (L1)",
         "L1: argv/auxv on the stack, TLS at FS, set_tid_address served",
-        "unsupported Linux syscall 63 (uname) -> ENOSYS",
-        "L1: uname -> ENOSYS, handled cleanly",
+        "unsupported Linux syscall 101 (ptrace) -> ENOSYS",
+        "L1: ptrace -> ENOSYS, handled cleanly",
         "l1: SIGSEGV",
         "BENCH compat: forwarded Linux syscall round trip",
     ];
@@ -351,6 +372,14 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             "W2: 0 checks failed",
             "dcmpl: w2.exe: unhandled exception 0xc0000005",
             "user fault: process 'w2.exe'",
+            "Hello from Windows (W3): MSVC dynamic CRT (/MD) + PE DLLs on D-CMPL",
+            "W3: dll_stat ok",
+            "W3: dll_dyn  ok",
+            "W3: dll_tls  ok",
+            "W3: crt_md   ok",
+            "W3: seh_dll  ok",
+            "W3: cxx_md   ok",
+            "W3: 0 checks failed",
         ]);
     }
     compat_expect.extend([
@@ -360,6 +389,13 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
         "L2: futex ok",
         "L2: enosys ok",
         "L2: 0 checks failed",
+        "Hello from Linux (L3): dynamic ELF + ld-linux.so + /proc + /dev on D-CMPL",
+        "L3: dyn ok",
+        "L3: relro ok",
+        "L3: proc ok",
+        "L3: dev ok",
+        "L3: syscalls ok",
+        "L3: 0 checks failed",
         "dcmpl: pe fuzz:",
         "utest: compat: PASSED",
         "init: utest compat exited with code 0",

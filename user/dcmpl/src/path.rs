@@ -2,8 +2,10 @@
 //!
 //! D-OS paths are absolute (`/data/notes/a.txt`) and reach nothing outside the namespace the
 //! spawner granted. The working directory starts at the first namespace entry (the place `run`
-//! was typed in). Each personality maps its own syntax onto this first (Windows: `\` is `/`, a
-//! drive letter is dropped; Linux: as it is).
+//! was typed in). An optional explicit per-app namespace prefix (`--prefix <dir>`) scopes
+//! Windows `C:\...` / `drive_c/...` paths and Linux root-relative library/runtime lookups
+//! (`/lib64/...`, `/usr/lib/...`, `/etc/...`) inside that prefix while still refusing any access
+//! outside the granted namespace handles.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,6 +16,8 @@ use libd::sync::Mutex;
 use libd::sys;
 
 static CWD: Mutex<String> = Mutex::new(String::new());
+static PREFIX: Mutex<Option<String>> = Mutex::new(None);
+static APP_DIR: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn init() {
     let ns = Namespace::get();
@@ -21,8 +25,106 @@ pub fn init() {
     *CWD.lock() = first.unwrap_or_else(|| String::from("/"));
 }
 
+pub fn set_prefix(p: &[u8]) {
+    if p.is_empty() {
+        return;
+    }
+    let abs = absolute(p);
+    *PREFIX.lock() = Some(String::from_utf8_lossy(&abs).into_owned());
+}
+
+pub fn prefix() -> Option<String> {
+    PREFIX.lock().clone()
+}
+
+pub fn set_app_dir(p: &[u8]) {
+    if p.is_empty() {
+        return;
+    }
+    let abs = absolute(p);
+    *APP_DIR.lock() = Some(String::from_utf8_lossy(&abs).into_owned());
+}
+
+pub fn app_dir() -> Option<String> {
+    APP_DIR.lock().clone()
+}
+
 pub fn cwd() -> String {
     CWD.lock().clone()
+}
+
+/// Join two absolute/relative path components and normalize `.` / `..`.
+pub fn join_abs(base: &[u8], rel: &[u8]) -> Vec<u8> {
+    let mut full = Vec::with_capacity(base.len() + 1 + rel.len());
+    full.extend_from_slice(base);
+    full.push(b'/');
+    full.extend_from_slice(rel);
+    absolute(&full)
+}
+
+/// Map a Windows drive-rooted path (`rel`, starting with `/`) through the active prefix if one is
+/// set. If `rel` already targets an explicitly granted namespace mount (e.g. `/data/...`), it is
+/// kept as-is; otherwise under `--prefix <dir>`, `/foo` maps to `<prefix>/drive_c/foo` when
+/// `<prefix>/drive_c` exists, else `<prefix>/foo`.
+pub fn map_win_rooted(rel: &[u8]) -> Vec<u8> {
+    let norm = absolute(rel);
+    let ns = Namespace::get();
+    if ns.resolve(&norm).is_some() {
+        return norm;
+    }
+    if let Some(pfx) = prefix() {
+        let drive_c = join_abs(pfx.as_bytes(), b"drive_c");
+        let base = if open(&drive_c, fp::O_DIRECTORY, fp::R_READ).is_ok() {
+            drive_c
+        } else {
+            pfx.into_bytes()
+        };
+        return join_abs(&base, norm.trim_ascii_start().strip_prefix(b"/").unwrap_or(&norm));
+    }
+    norm
+}
+
+/// Map an absolute Linux path through the active prefix if one is set: prefers `<prefix><abs>`
+/// when `<prefix>` is active and the path is not already inside `<prefix>` or a direct namespace
+/// hit for writing; for reads falls back to `<abs>`.
+pub fn map_linux_path(abs: &[u8], prefer_prefix: bool) -> Vec<u8> {
+    let norm = absolute(abs);
+    if let Some(pfx) = prefix() {
+        let pb = pfx.as_bytes();
+        let already_in_pfx = norm.starts_with(pb) && (norm.len() == pb.len() || norm[pb.len()] == b'/');
+        if !already_in_pfx {
+            let under = join_abs(pb, norm.strip_prefix(b"/").unwrap_or(&norm));
+            if prefer_prefix {
+                if open(&under, 0, fp::R_READ).is_ok() {
+                    return under;
+                }
+                if Namespace::get().resolve(&norm).is_none() {
+                    return under;
+                }
+            } else if Namespace::get().resolve(&norm).is_none() {
+                return under;
+            }
+        }
+    }
+    norm
+}
+
+/// Read an entire file from the namespace (at most `max` bytes).
+pub fn read_file(abs: &[u8], max: usize) -> Result<Vec<u8>, i64> {
+    let (node, kind, size) = open(abs, 0, fp::R_READ)?;
+    if kind != fp::KIND_FILE {
+        return Err(fp::ERR_IS_DIR);
+    }
+    let sz = usize::try_from(size).map_err(|_| sys::ERR_OUT_OF_RANGE)?;
+    if sz == 0 || sz > max {
+        return Err(sys::ERR_OUT_OF_RANGE);
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(sz).map_err(|_| sys::ERR_NO_MEMORY)?;
+    buf.resize(sz, 0);
+    let got = node.read(0, &mut buf)?;
+    buf.truncate(got);
+    Ok(buf)
 }
 
 /// `p` made absolute against the working directory, `.` and `..` worked out (never above `/`).

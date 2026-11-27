@@ -49,7 +49,7 @@ const MAX_JOBS: usize = 16;
 /// What a tool may use (its share of the session's own quota).
 const TOOL_LIMITS: sys::Limits = sys::Limits { memory: 16 << 20, handles: 128, threads: 4 };
 /// What a foreign program may use, D-CMPL included (Windows threads have 1 MiB stacks).
-const FOREIGN_LIMITS: sys::Limits = sys::Limits { memory: 128 << 20, handles: 256, threads: 16 };
+const FOREIGN_LIMITS: sys::Limits = sys::Limits { memory: 128 << 20, handles: 512, threads: 16 };
 /// The largest foreign program `run` reads.
 const MAX_FOREIGN: u64 = 64 << 20;
 
@@ -434,15 +434,28 @@ impl Shell {
         }
     }
 
-    /// `run <file> [arguments]` for a program that is not a tool: a Windows (PE) or Linux (ELF)
-    /// program, told apart by its header, run by D-CMPL. It gets the current place (with the
-    /// session's rights there) as its working directory, an output channel and the wall clock;
-    /// nothing else of the session (no other place, no endpoint, no manager).
-    fn launch_foreign(&mut self, prog: &str, args: &[String], line: &str, background: bool, filters: Vec<Vec<String>>) -> Result<(), String> {
+    /// `run [--prefix <dir>] <file> [arguments]` for a program that is not a tool: a Windows (PE)
+    /// or Linux (ELF) program, told apart by its header, run by D-CMPL. It gets the current place
+    /// (with the session's rights there) as its working directory, the program's directory
+    /// read-only (for sibling DLLs / shared libraries), an optional explicit `--prefix <dir>`
+    /// namespace root, an output channel and the wall clock; nothing else of the session.
+    fn launch_foreign(
+        &mut self,
+        prog: &str,
+        args: &[String],
+        prefix: Option<&str>,
+        line: &str,
+        background: bool,
+        filters: Vec<Vec<String>>,
+    ) -> Result<(), String> {
         if self.jobs.len() >= MAX_JOBS {
             return Err(format!("run: too many jobs ({}); end one first", MAX_JOBS));
         }
         let abs = normalize(&self.place, prog);
+        let (app_dir_raw, leaf_str) = split_parent(&abs);
+        let app_dir = app_dir_raw.to_string();
+        let leaf = leaf_str.to_string();
+        let prefix_abs = prefix.map(|p| normalize(&self.place, p));
         let (file, kind) = self.open("run", &abs, 0, fp::R_READ)?;
         if kind != fp::KIND_FILE {
             return Err(format!("run: {} is a directory", abs));
@@ -469,7 +482,6 @@ impl Shell {
         if vmex == 0 {
             return Err(String::from("run: this session may not run foreign programs (no VMEX grant)"));
         }
-        let leaf = split_parent(&abs).1.to_string();
         // Every handle it gets (closed again if something fails before the spawn).
         let mut hs: Vec<SpawnHandle> = Vec::new();
         let close_all = |hs: &[SpawnHandle]| {
@@ -503,20 +515,61 @@ impl Shell {
             sys::vmo_write(v, 0, &b);
             hs.push(SpawnHandle { handle: v, rights: sys::RIGHT_READ, tag: tool::TAG_TIME_BASE, reserved: 0 });
         }
-        // The current place, with the session's rights there: its working directory.
+        // Explicit namespace grants: CWD (first entry), optional --prefix root, and read-only
+        // application directory (for sibling DLLs / shared libraries).
+        let mut ns = fp::NsBuilder::new();
+        let mut mounted: Vec<String> = Vec::new();
         if self.place != "/" {
             let place = self.place.clone();
             let rights = self.resolve(&place).map_or(fp::R_READ, |(pl, _)| pl.rights & (fp::R_READ | fp::R_WRITE));
             let (dir, _) = self.open("run", &place, fp::O_DIRECTORY, rights).inspect_err(|_| close_all(&hs))?;
-            let mut ns = fp::NsBuilder::new();
             ns.add(place.as_bytes(), dir);
-            let mut nh = [SpawnHandle::default(); 2];
+            mounted.push(place);
+        }
+        if let Some(ref pfx) = prefix_abs {
+            if pfx == "/" {
+                close_all(&hs);
+                return Err(String::from("run: --prefix must name a specific directory, not /"));
+            }
+            if !mounted.iter().any(|m| m == pfx) {
+                let rights = self.resolve(pfx).map_or(fp::R_READ, |(pl, _)| pl.rights & (fp::R_READ | fp::R_WRITE));
+                let (dir, kind) = self.open("run", pfx, fp::O_DIRECTORY, rights).inspect_err(|_| close_all(&hs))?;
+                if kind != fp::KIND_DIR {
+                    close_all(&hs);
+                    return Err(format!("run: --prefix {} is not a directory", pfx));
+                }
+                ns.add(pfx.as_bytes(), dir);
+                mounted.push(pfx.clone());
+            }
+        }
+        if app_dir != "/"
+            && !mounted.iter().any(|m| m == &app_dir)
+            && let Ok((dir, fp::KIND_DIR)) = self.open("run", &app_dir, fp::O_DIRECTORY, fp::R_READ)
+        {
+            ns.add(app_dir.as_bytes(), dir);
+            mounted.push(app_dir.clone());
+        }
+        if !mounted.is_empty() {
+            let mut nh = [SpawnHandle::default(); 8];
             let n = ns.finish(&mut nh).map_err(|e| fail(&hs, e))?;
             hs.extend_from_slice(&nh[..n]);
         }
         let (mine, theirs) = sys::channel_pair().map_err(|e| fail(&hs, e))?;
         hs.push(SpawnHandle { handle: theirs, rights: sys::RIGHTS_SAME, tag: tool::TAG_OUTPUT, reserved: 0 });
-        let mut argv = format!("{} {}", personality, leaf);
+        let mut argv = String::new();
+        if let Some(ref pfx) = prefix_abs {
+            argv.push_str("--prefix ");
+            argv.push_str(pfx);
+            argv.push(' ');
+        }
+        if app_dir != "/" {
+            argv.push_str("--app-dir ");
+            argv.push_str(&app_dir);
+            argv.push(' ');
+        }
+        argv.push_str(personality);
+        argv.push(' ');
+        argv.push_str(&leaf);
         for a in args {
             argv.push(' ');
             argv.push_str(a);
@@ -525,7 +578,21 @@ impl Shell {
             sys::handle_close(mine);
             format!("run: {}: cannot start: {}", leaf, sys::status(e))
         })?;
-        println!("shell: run {} ({}, under D-CMPL) in {}", abs, if personality == "win" { "Windows" } else { "Linux" }, self.place);
+        match prefix_abs {
+            Some(ref pfx) => println!(
+                "shell: run {} ({}, under D-CMPL) in {} [prefix {}]",
+                abs,
+                if personality == "win" { "Windows" } else { "Linux" },
+                self.place,
+                pfx
+            ),
+            None => println!(
+                "shell: run {} ({}, under D-CMPL) in {}",
+                abs,
+                if personality == "win" { "Windows" } else { "Linux" },
+                self.place
+            ),
+        }
         self.add_job(&leaf, p, mine, line, background, filters);
         Ok(())
     }
@@ -660,12 +727,25 @@ impl Shell {
             return;
         }
         if name == "run" {
-            let Some(first) = args.first() else {
-                return self.error("run: run what? (run <tool or program> [arguments])");
+            let mut idx = 0usize;
+            let mut prefix: Option<&str> = None;
+            if args.get(idx).is_some_and(|a| a == "--prefix" || a == "-p") {
+                let Some(dir) = args.get(idx + 1) else {
+                    return self.error("run: --prefix requires a directory (run [--prefix <dir>] <program> [arguments])");
+                };
+                prefix = Some(dir.as_str());
+                idx += 2;
+            }
+            let Some(first) = args.get(idx) else {
+                return self.error("run: run what? (run [--prefix <dir>] <tool or program> [arguments])");
             };
-            let r = match self.find_tool(first).cloned() {
-                Some(t) => self.launch(&t, &args[1..], shown, l.background, filters),
-                None => self.launch_foreign(first, &args[1..], shown, l.background, filters),
+            let rest = &args[idx + 1..];
+            let r = if prefix.is_none()
+                && let Some(t) = self.find_tool(first).cloned()
+            {
+                self.launch(&t, rest, shown, l.background, filters)
+            } else {
+                self.launch_foreign(first, rest, prefix, shown, l.background, filters)
             };
             if let Err(e) = r {
                 self.error(&e);

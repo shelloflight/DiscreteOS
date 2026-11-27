@@ -98,7 +98,20 @@ fn extra_embedded_for_test(ktest: Option<&str>, name: &str) -> bool {
         }
         Some("COMPAT") => matches!(
             name,
-            "utest.dx" | "dcmpl.dx" | "w1.exe" | "w1_32.exe" | "w1fault.exe" | "w1bad.exe" | "l1" | "w2.exe" | "l2"
+            "utest.dx"
+                | "dcmpl.dx"
+                | "w1.exe"
+                | "w1_32.exe"
+                | "w1fault.exe"
+                | "w1bad.exe"
+                | "l1"
+                | "w2.exe"
+                | "l2"
+                | "w3.exe"
+                | "w3lib.dll"
+                | "l3"
+                | "libl3.so"
+                | "ld-linux-x86-64.so.2"
         ),
         Some("LIBD") => matches!(name, "ltest.dx" | "ctest.dx"),
         Some("SERVICES" | "TIME" | "AUDIO" | "NET" | "GPU" | "AWMI" | "IDENTITY" | "APP") => name == "ltest.dx",
@@ -773,6 +786,21 @@ pub fn build_image(env: &Env, opts: &BuildOpts) -> Result<BuildResult, String> {
         }
         if let Some(l2) = all_programs.iter().find(|p| p.name == "l2") {
             extra_files.push(("DOS/APPS/L2".into(), l2.path.clone()));
+        }
+        if let Some(w3) = all_programs.iter().find(|p| p.name == "w3.exe") {
+            extra_files.push(("DOS/APPS/W3.EXE".into(), w3.path.clone()));
+        }
+        if let Some(w3lib) = all_programs.iter().find(|p| p.name == "w3lib.dll") {
+            extra_files.push(("DOS/APPS/W3LIB.DLL".into(), w3lib.path.clone()));
+        }
+        if let Some(l3) = all_programs.iter().find(|p| p.name == "l3") {
+            extra_files.push(("DOS/APPS/L3".into(), l3.path.clone()));
+        }
+        if let Some(libl3) = all_programs.iter().find(|p| p.name == "libl3.so") {
+            extra_files.push(("DOS/APPS/LIBL3.SO".into(), libl3.path.clone()));
+        }
+        if let Some(ld) = all_programs.iter().find(|p| p.name == "ld-linux-x86-64.so.2") {
+            extra_files.push(("DOS/APPS/LDL3.SO".into(), ld.path.clone()));
         }
     }
 
@@ -1565,7 +1593,10 @@ fn build_compat(env: &Env, out_dir: &Path, quiet: bool) -> Result<(Vec<ProgramEn
 
     let mut progs = Vec::new();
     let w1_src = src.join("win/w1.c");
-    let defs = collect_files(&src.join("win"), "def", false);
+    let defs: Vec<PathBuf> = collect_files(&src.join("win"), "def", false)
+        .into_iter()
+        .filter(|p| p.file_name().and_then(|s| s.to_str()) != Some("w3lib.def"))
+        .collect();
 
     // W1: use MSVC when present (tests real MSVC PE codegen), else Clang + llvm-dlltool + lld-link
     // so Linux hosts build W1 natively with zero MSVC dependency.
@@ -1794,13 +1825,137 @@ fn build_compat(env: &Env, out_dir: &Path, quiet: bool) -> Result<(Vec<ProgramEn
             write_stamp(&w2, "msvc-w2");
         }
         progs.push(ProgramEntry { name: "w2.exe".into(), path: w2 });
+
+        // W3: MSVC dynamic CRT (/MD, /EHsc) + real PE DLL (w3lib.dll).
+        let mut inc_paths = vec![msvc.vc_root.join("include")];
+        inc_paths.extend(sdk.include.iter().cloned());
+        let mut lib_paths = vec![msvc.vc_root.join("lib/x64")];
+        lib_paths.extend(sdk.lib.iter().cloned());
+        let join_semi = |ps: &[PathBuf]| -> String {
+            ps.iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        let msvc_env = vec![
+            ("INCLUDE".into(), join_semi(&inc_paths)),
+            ("LIB".into(), join_semi(&lib_paths)),
+        ];
+        let w3lib_c = src.join("win/w3lib.c");
+        let w3lib_def = src.join("win/w3lib.def");
+        let w3lib_dll = out.join("w3lib.dll");
+        let w3lib_imp = out.join("w3lib.lib");
+        let w3lib_m = newest_mtime(&[w3lib_c.clone(), w3lib_def.clone()]);
+        if needs_rebuild(&w3lib_dll, w3lib_m, "msvc-w3lib") || !w3lib_imp.is_file() {
+            let o = out.join("w3lib.obj");
+            log(quiet, "  CL    compat/win/w3lib.c [MSVC /MD /LD]");
+            run_cmd(
+                &msvc.cl,
+                &[
+                    "/nologo".into(),
+                    "/c".into(),
+                    "/MD".into(),
+                    "/O2".into(),
+                    "/GS".into(),
+                    "/W4".into(),
+                    "/WX".into(),
+                    "/Brepro".into(),
+                    format!("/Fo{}", o.to_string_lossy()),
+                    w3lib_c.to_string_lossy().into_owned(),
+                ],
+                None,
+                &msvc_env,
+                quiet,
+            )?;
+            run_cmd(
+                &msvc.link,
+                &[
+                    "/nologo".into(),
+                    "/DLL".into(),
+                    "/MACHINE:X64".into(),
+                    "/Brepro".into(),
+                    "/DYNAMICBASE".into(),
+                    "/HIGHENTROPYVA".into(),
+                    "/NXCOMPAT".into(),
+                    "/MANIFEST:NO".into(),
+                    "/DEBUG:NONE".into(),
+                    format!("/DEF:{}", w3lib_def.to_string_lossy()),
+                    format!("/IMPLIB:{}", w3lib_imp.to_string_lossy()),
+                    format!("/OUT:{}", w3lib_dll.to_string_lossy()),
+                    o.to_string_lossy().into_owned(),
+                ],
+                None,
+                &msvc_env,
+                quiet,
+            )?;
+            write_stamp(&w3lib_dll, "msvc-w3lib");
+        }
+        progs.push(ProgramEntry { name: "w3lib.dll".into(), path: w3lib_dll });
+
+        let w3_c = src.join("win/w3.c");
+        let w3_cpp = src.join("win/w3cxx.cpp");
+        let w3 = out.join("w3.exe");
+        let w3_m = newest_mtime(&[w3_c.clone(), w3_cpp.clone(), w3lib_imp.clone()]);
+        if needs_rebuild(&w3, w3_m, "msvc-w3") {
+            let mut w3_objs = Vec::new();
+            for f in [&w3_c, &w3_cpp] {
+                let stem = f.file_stem().and_then(|s| s.to_str()).unwrap_or("x");
+                let o = out.join(format!("{stem}.obj"));
+                log(quiet, &format!("  CL    {} [MSVC /MD]", env.rel(f)));
+                run_cmd(
+                    &msvc.cl,
+                    &[
+                        "/nologo".into(),
+                        "/c".into(),
+                        "/MD".into(),
+                        "/O2".into(),
+                        "/EHsc".into(),
+                        "/GS".into(),
+                        "/W4".into(),
+                        "/WX".into(),
+                        "/Brepro".into(),
+                        format!("/Fo{}", o.to_string_lossy()),
+                        f.to_string_lossy().into_owned(),
+                    ],
+                    None,
+                    &msvc_env,
+                    quiet,
+                )?;
+                w3_objs.push(o);
+            }
+            let mut link_args = vec![
+                "/nologo".into(),
+                "/SUBSYSTEM:CONSOLE".into(),
+                "/MACHINE:X64".into(),
+                "/Brepro".into(),
+                "/DYNAMICBASE".into(),
+                "/HIGHENTROPYVA".into(),
+                "/NXCOMPAT".into(),
+                "/MANIFEST:NO".into(),
+                "/DEBUG:NONE".into(),
+                format!("/OUT:{}", w3.to_string_lossy()),
+            ];
+            link_args.extend(w3_objs.iter().map(|o| o.to_string_lossy().into_owned()));
+            link_args.push(w3lib_imp.to_string_lossy().into_owned());
+            run_cmd(&msvc.link, &link_args, None, &msvc_env, quiet)?;
+            write_stamp(&w3, "msvc-w3");
+        }
+        progs.push(ProgramEntry { name: "w3.exe".into(), path: w3 });
     } else {
-        log(quiet, "  NOTE  compat/win/w2.exe skipped (MSVC / Windows SDK not found)");
+        log(quiet, "  NOTE  compat/win/w2.exe and w3.exe skipped (MSVC / Windows SDK not found)");
     }
 
     // L2: static Linux ELF
     let l2 = build_linux_compat(env, clang, lld, &src.join("linux/l2.c"), &out, "l2", quiet)?;
     progs.push(ProgramEntry { name: "l2".into(), path: l2 });
+
+    // L3: dynamic Linux ELF (PT_INTERP ld-linux-x86-64.so.2 + libl3.so + l3)
+    let ld_so = build_linux_shared(env, clang, lld, &src.join("linux/ld_dos.c"), &out, "ld-linux-x86-64.so.2", Some("_start"), true, quiet)?;
+    let libl3 = build_linux_shared(env, clang, lld, &src.join("linux/libl3.c"), &out, "libl3.so", None, false, quiet)?;
+    let l3 = build_linux_dynamic(env, clang, lld, &src.join("linux/l3.c"), &libl3, &out, "l3", quiet)?;
+    progs.push(ProgramEntry { name: "ld-linux-x86-64.so.2".into(), path: ld_so });
+    progs.push(ProgramEntry { name: "libl3.so".into(), path: libl3 });
+    progs.push(ProgramEntry { name: "l3".into(), path: l3 });
 
     Ok((progs, has_w2))
 }
@@ -1862,6 +2017,156 @@ fn build_linux_compat(
                 "-o".into(),
                 bin.to_string_lossy().into_owned(),
                 o.to_string_lossy().into_owned(),
+            ],
+            None,
+            &[],
+            quiet,
+        )?;
+        write_stamp(&bin, &stamp);
+    }
+    Ok(bin)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_linux_shared(
+    env: &Env,
+    clang: &Path,
+    lld: &Path,
+    src: &Path,
+    out_dir: &Path,
+    name: &str,
+    entry: Option<&str>,
+    symbolic: bool,
+    quiet: bool,
+) -> Result<PathBuf, String> {
+    let o = out_dir.join(format!("{name}.o"));
+    let bin = out_dir.join(name);
+    let stamp = format!("linux-so-{name}");
+    if needs_rebuild(&bin, mtime_of(src), &stamp) {
+        log(quiet, &format!("  CC    {} -> {name} [x86_64-linux shared]", env.rel(src)));
+        let mut cc_args = vec![
+            "--target=x86_64-linux-gnu".into(),
+            "-std=c17".into(),
+            "-O2".into(),
+            "-g0".into(),
+            "-ffreestanding".into(),
+            "-fno-builtin".into(),
+            "-nostdinc".into(),
+            "-fPIC".into(),
+            "-fno-stack-protector".into(),
+            "-fno-asynchronous-unwind-tables".into(),
+        ];
+        cc_args.extend(prefix_map_flags(&env.root));
+        cc_args.extend([
+            "-Wall".into(),
+            "-Wextra".into(),
+            "-Werror".into(),
+            "-c".into(),
+            "-o".into(),
+            o.to_string_lossy().into_owned(),
+            src.to_string_lossy().into_owned(),
+        ]);
+        run_cmd(clang, &cc_args, None, &[], quiet)?;
+        let mut ld_args = vec![
+            "-shared".into(),
+            "-nostdlib".into(),
+            "--build-id=none".into(),
+            "-s".into(),
+            "-soname".into(),
+            name.into(),
+            "-z".into(),
+            "noexecstack".into(),
+            "-z".into(),
+            "relro".into(),
+            "-z".into(),
+            "now".into(),
+            "-z".into(),
+            "separate-loadable-segments".into(),
+            "-z".into(),
+            "max-page-size=4096".into(),
+        ];
+        if symbolic {
+            ld_args.push("-Bsymbolic".into());
+        }
+        if let Some(e) = entry {
+            ld_args.push("-e".into());
+            ld_args.push(e.into());
+        }
+        ld_args.extend([
+            "-o".into(),
+            bin.to_string_lossy().into_owned(),
+            o.to_string_lossy().into_owned(),
+        ]);
+        run_cmd(lld, &ld_args, None, &[], quiet)?;
+        write_stamp(&bin, &stamp);
+    }
+    Ok(bin)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_linux_dynamic(
+    env: &Env,
+    clang: &Path,
+    lld: &Path,
+    src: &Path,
+    lib_so: &Path,
+    out_dir: &Path,
+    name: &str,
+    quiet: bool,
+) -> Result<PathBuf, String> {
+    let o = out_dir.join(format!("{name}.o"));
+    let bin = out_dir.join(name);
+    let stamp = format!("linux-dyn-{name}");
+    let in_m = newest_mtime(&[src.to_path_buf(), lib_so.to_path_buf()]);
+    if needs_rebuild(&bin, in_m, &stamp) {
+        log(quiet, &format!("  CC    {} -> {name} [x86_64-linux dynamic]", env.rel(src)));
+        let mut cc_args = vec![
+            "--target=x86_64-linux-gnu".into(),
+            "-std=c17".into(),
+            "-O2".into(),
+            "-g0".into(),
+            "-ffreestanding".into(),
+            "-fno-builtin".into(),
+            "-nostdinc".into(),
+            "-fPIE".into(),
+            "-fno-stack-protector".into(),
+            "-fno-asynchronous-unwind-tables".into(),
+        ];
+        cc_args.extend(prefix_map_flags(&env.root));
+        cc_args.extend([
+            "-Wall".into(),
+            "-Wextra".into(),
+            "-Werror".into(),
+            "-c".into(),
+            "-o".into(),
+            o.to_string_lossy().into_owned(),
+            src.to_string_lossy().into_owned(),
+        ]);
+        run_cmd(clang, &cc_args, None, &[], quiet)?;
+        run_cmd(
+            lld,
+            &[
+                "-pie".into(),
+                "-nostdlib".into(),
+                "-e".into(),
+                "_start".into(),
+                "--dynamic-linker=/lib64/ld-linux-x86-64.so.2".into(),
+                "--build-id=none".into(),
+                "-s".into(),
+                "-z".into(),
+                "noexecstack".into(),
+                "-z".into(),
+                "relro".into(),
+                "-z".into(),
+                "now".into(),
+                "-z".into(),
+                "separate-loadable-segments".into(),
+                "-z".into(),
+                "max-page-size=4096".into(),
+                "-o".into(),
+                bin.to_string_lossy().into_owned(),
+                o.to_string_lossy().into_owned(),
+                lib_so.to_string_lossy().into_owned(),
             ],
             None,
             &[],

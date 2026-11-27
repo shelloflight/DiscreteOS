@@ -117,7 +117,7 @@ static int64_t run_dcmpl(const char *pname, const char *args)
         if (d > 0)
             hs[nh++] = (struct dos_spawn_handle){ (dos_handle_t)d, DOS_RIGHTS_SAME, DOS_TAG_PROGRAM, 0 };
     }
-    struct dos_limits limits = { 48u << 20, 512, 8 };
+    struct dos_limits limits = { 64u << 20, 512, 16 };
     struct dos_spawn s = {
         .parent = self_proc, .image = image,
         .name = (uint64_t)(uintptr_t)pname, .name_len = strlen(pname),
@@ -166,17 +166,22 @@ void test_compat(void)
     EXPECT(run_dcmpl("l1", "linux w1.exe"), REFUSED);       /* a PE is not an ELF */
     EXPECT(run_dcmpl("l1", "linux l1 bench 5000"), 0);
 
-    /* W2 and L2: programs on their runtimes (files are tested from the shell, which has disks).
-     * W2 requires MSVC + the Windows SDK on the build host; skip only W2 when not embedded. */
+    /* W2, W3, L2, and L3: static & dynamic foreign runtimes. */
     if (has_program("w2.exe")) {
         EXPECT(run_dcmpl("w2.exe", "win w2.exe alpha beta"), 0);
         EXPECT(run_dcmpl("w2.exe", "win w2.exe fault"), DOS_EXIT_FAULT);
     } else {
         dos_printf("utest: compat: w2.exe not built (no Windows SDK)\n");
     }
+    if (has_program("w3.exe")) {
+        EXPECT(run_dcmpl("w3.exe", "win w3.exe"), 0);
+    } else {
+        dos_printf("utest: compat: w3.exe not built (no Windows SDK)\n");
+    }
     EXPECT(run_dcmpl("l2", "linux l2"), 0);
+    EXPECT(run_dcmpl("l3", "linux l3"), 0);
 
-    /* The PE parser against mutated images. */
+    /* The PE parser against mutated images (EXEs and DLLs). */
     EXPECT(run_dcmpl("dcmpl", "pefuzz 20000"), 0);
     dos_printf("utest: compat: %s (%u failures)\n", failures ? "FAILED" : "PASSED", failures);
 }

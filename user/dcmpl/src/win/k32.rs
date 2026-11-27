@@ -133,16 +133,61 @@ fn to_wide(b: &[u8], strict: bool) -> Option<Vec<u16>> {
     Some(s.encode_utf16().collect())
 }
 
-/// A Windows path as an absolute D-OS path.
+/// A Windows path as an absolute D-OS path (honoring `--prefix` for drive/root paths).
 fn win_path(p: &[u8]) -> Vec<u8> {
     let mut s: Vec<u8> = p.iter().map(|&c| if c == b'\\' { b'/' } else { c }).collect();
     if s.starts_with(b"//?/") || s.starts_with(b"//./") {
         s.drain(..4);
     }
+    let mut had_drive = false;
     if s.len() >= 2 && s[1] == b':' && s[0].is_ascii_alphabetic() {
         s.drain(..2);
+        had_drive = true;
     }
-    path::absolute(&s)
+    if had_drive || s.starts_with(b"/") {
+        if !s.starts_with(b"/") {
+            s.insert(0, b'/');
+        }
+        path::map_win_rooted(&s)
+    } else {
+        path::absolute(&s)
+    }
+}
+
+pub(super) fn win_path_pub(p: &[u8]) -> Vec<u8> {
+    win_path(p)
+}
+
+pub(super) fn cmdline_a() -> Vec<u8> {
+    let p = PROC.lock();
+    let n = p.cmd_a.iter().position(|&c| c == 0).unwrap_or(p.cmd_a.len());
+    p.cmd_a[..n].to_vec()
+}
+
+pub(super) fn env_value(name: &[u8]) -> Option<Vec<u8>> {
+    let p = PROC.lock();
+    env_find(&p.env, name).map(|i| p.env[i].1.clone())
+}
+
+pub(super) fn env_set_pub(name: Vec<u8>, value: Option<Vec<u8>>) -> bool {
+    env_set(name, value) != FALSE
+}
+
+pub(super) fn heap_alloc_pub(size: usize, zero: bool) -> *mut u8 {
+    heap_alloc(size, zero)
+}
+pub(super) fn heap_realloc_pub(p: *mut u8, size: usize) -> *mut u8 {
+    heap_realloc_w(PROCESS_HEAP, 0, p, size)
+}
+pub(super) fn heap_free_pub(p: *mut u8) {
+    heap_free(p);
+}
+pub(super) fn heap_size_pub(p: *mut u8) -> usize {
+    heap_size_w(PROCESS_HEAP, 0, p)
+}
+
+pub(super) fn create_thread_pub(sec: u64, stack: usize, start: u64, param: u64, flags: u32, tid: *mut u32) -> u64 {
+    create_thread(sec, stack, start, param, flags, tid)
 }
 
 fn fs_err(e: i64) -> u32 {
@@ -364,31 +409,82 @@ extern "win64" fn get_module_handle_w(name: *const u16) -> u64 {
     if name.is_null() {
         return image().base;
     }
-    set_err(ERROR_MOD_NOT_FOUND);
-    0
+    let s = from_wide(&wstr(name));
+    match super::find_loaded_module(&s) {
+        Some(h) => h,
+        None => {
+            set_err(ERROR_MOD_NOT_FOUND);
+            0
+        }
+    }
 }
 extern "win64" fn get_module_handle_a(name: *const u8) -> u64 {
     if name.is_null() {
         return image().base;
     }
-    set_err(ERROR_MOD_NOT_FOUND);
-    0
+    match super::find_loaded_module(&cstr(name)) {
+        Some(h) => h,
+        None => {
+            set_err(ERROR_MOD_NOT_FOUND);
+            0
+        }
+    }
 }
 extern "win64" fn get_module_handle_ex_w(flags: u32, name: u64, out: *mut u64) -> Bool {
-    let im = image();
-    let ok = if flags & 4 != 0 { name >= im.base && name < im.base + im.size } else { name == 0 };
-    put(out, if ok { im.base } else { 0 });
-    if !ok {
-        set_err(ERROR_MOD_NOT_FOUND);
+    const FROM_ADDRESS: u32 = 4;
+    let h = if flags & FROM_ADDRESS != 0 {
+        super::module_for_pc(name).map(|m| m.base)
+    } else if name == 0 {
+        Some(image().base)
+    } else {
+        let s = from_wide(&wstr(name as *const u16));
+        super::find_loaded_module(&s)
+    };
+    match h {
+        Some(h) => {
+            put(out, h);
+            TRUE
+        }
+        None => {
+            put(out, 0);
+            set_err(ERROR_MOD_NOT_FOUND);
+            FALSE
+        }
     }
-    Bool::from(ok)
+}
+extern "win64" fn get_module_handle_ex_a(flags: u32, name: u64, out: *mut u64) -> Bool {
+    const FROM_ADDRESS: u32 = 4;
+    let h = if flags & FROM_ADDRESS != 0 {
+        super::module_for_pc(name).map(|m| m.base)
+    } else if name == 0 {
+        Some(image().base)
+    } else {
+        super::find_loaded_module(&cstr(name as *const u8))
+    };
+    match h {
+        Some(h) => {
+            put(out, h);
+            TRUE
+        }
+        None => {
+            put(out, 0);
+            set_err(ERROR_MOD_NOT_FOUND);
+            FALSE
+        }
+    }
 }
 extern "win64" fn get_module_file_name_w(h: u64, buf: *mut u16, size: u32) -> u32 {
-    if h != 0 && h != image().base {
-        set_err(ERROR_MOD_NOT_FOUND);
-        return 0;
-    }
-    let m = PROC.lock().module_w.clone();
+    let m = if h == 0 || h == image().base {
+        super::module_win_path(0).unwrap_or_else(|| PROC.lock().module_w.clone())
+    } else {
+        match super::module_win_path(h) {
+            Some(p) => p,
+            None => {
+                set_err(ERROR_MOD_NOT_FOUND);
+                return 0;
+            }
+        }
+    };
     if size == 0 {
         set_err(ERROR_INSUFFICIENT_BUFFER);
         return 0;
@@ -406,11 +502,18 @@ extern "win64" fn get_module_file_name_w(h: u64, buf: *mut u16, size: u32) -> u3
     n as u32
 }
 extern "win64" fn get_module_file_name_a(h: u64, buf: *mut u8, size: u32) -> u32 {
-    if h != 0 && h != image().base {
-        set_err(ERROR_MOD_NOT_FOUND);
-        return 0;
-    }
-    let m = from_wide(&PROC.lock().module_w);
+    let mw = if h == 0 || h == image().base {
+        super::module_win_path(0).unwrap_or_else(|| PROC.lock().module_w.clone())
+    } else {
+        match super::module_win_path(h) {
+            Some(p) => p,
+            None => {
+                set_err(ERROR_MOD_NOT_FOUND);
+                return 0;
+            }
+        }
+    };
+    let m = from_wide(&mw);
     if size == 0 {
         set_err(ERROR_INSUFFICIENT_BUFFER);
         return 0;
@@ -423,30 +526,73 @@ extern "win64" fn get_module_file_name_a(h: u64, buf: *mut u8, size: u32) -> u32
     }
     n as u32
 }
-extern "win64" fn get_proc_address(_h: u64, _name: u64) -> u64 {
-    set_err(ERROR_PROC_NOT_FOUND);
-    0
+extern "win64" fn get_proc_address(h: u64, name: u64) -> u64 {
+    if h == 0 || name == 0 {
+        set_err(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let res = if name <= 0xFFFF {
+        super::get_proc_address_ord(h, name as u16)
+    } else {
+        let s = cstr(name as *const u8);
+        super::get_proc_address(h, &s)
+    };
+    match res {
+        Some(addr) => addr,
+        None => {
+            set_err(ERROR_PROC_NOT_FOUND);
+            0
+        }
+    }
 }
-extern "win64" fn load_library_ex_w(_name: *const u16, _file: u64, _flags: u32) -> u64 {
-    set_err(ERROR_MOD_NOT_FOUND);
-    0
+extern "win64" fn load_library_ex_w(name: *const u16, _file: u64, _flags: u32) -> u64 {
+    if name.is_null() {
+        set_err(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    let s = from_wide(&wstr(name));
+    match super::load_dll(&s, true) {
+        Ok(h) => h,
+        Err(_) => {
+            set_err(ERROR_MOD_NOT_FOUND);
+            0
+        }
+    }
 }
-extern "win64" fn load_library_w(_name: *const u16) -> u64 {
-    set_err(ERROR_MOD_NOT_FOUND);
-    0
+extern "win64" fn load_library_ex_a(name: *const u8, _file: u64, _flags: u32) -> u64 {
+    if name.is_null() {
+        set_err(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    match super::load_dll(&cstr(name), true) {
+        Ok(h) => h,
+        Err(_) => {
+            set_err(ERROR_MOD_NOT_FOUND);
+            0
+        }
+    }
 }
-extern "win64" fn load_library_a(_name: *const u8) -> u64 {
-    set_err(ERROR_MOD_NOT_FOUND);
-    0
+extern "win64" fn load_library_w(name: *const u16) -> u64 {
+    load_library_ex_w(name, 0, 0)
 }
-extern "win64" fn free_library(_h: u64) -> Bool {
-    TRUE
+extern "win64" fn load_library_a(name: *const u8) -> u64 {
+    load_library_ex_a(name, 0, 0)
 }
-extern "win64" fn free_library_and_exit_thread(_h: u64, code: u32) -> ! {
+extern "win64" fn free_library(h: u64) -> Bool {
+    if super::free_dll(h) {
+        TRUE
+    } else {
+        set_err(ERROR_INVALID_HANDLE);
+        FALSE
+    }
+}
+extern "win64" fn free_library_and_exit_thread(h: u64, code: u32) -> ! {
+    let _ = super::free_dll(h);
     super::finish_thread(code)
 }
 
 pub extern "win64" fn exit_process(code: u32) -> ! {
+    super::detach_all_dlls();
     out::flush_all();
     sys::process_exit(code as i32)
 }
@@ -2040,6 +2186,7 @@ exports! {
     b"GetModuleFileNameA" => get_module_file_name_a,
     b"GetModuleFileNameW" => get_module_file_name_w,
     b"GetModuleHandleA" => get_module_handle_a,
+    b"GetModuleHandleExA" => get_module_handle_ex_a,
     b"GetModuleHandleExW" => get_module_handle_ex_w,
     b"GetModuleHandleW" => get_module_handle_w,
     b"GetNativeSystemInfo" => get_system_info,
@@ -2072,6 +2219,7 @@ exports! {
     b"LCMapStringW" => lc_map_string_w,
     b"LeaveCriticalSection" => leave_critical_section,
     b"LoadLibraryA" => load_library_a,
+    b"LoadLibraryExA" => load_library_ex_a,
     b"LoadLibraryExW" => load_library_ex_w,
     b"LoadLibraryW" => load_library_w,
     b"MoveFileExW" => move_file_ex_w,
@@ -2128,7 +2276,11 @@ exports! {
     b"WriteFile" => write_file,
 }
 
-/// The import binder's resolver: KERNEL32.dll only.
+pub fn lookup_builtin(func: &[u8]) -> Option<u64> {
+    lookup(func)
+}
+
+/// The import binder's resolver (built-in shims used by the fuzzer).
 pub fn resolve(dll: &[u8], func: &[u8]) -> Option<u64> {
-    if dll.eq_ignore_ascii_case(b"kernel32.dll") { lookup(func) } else { None }
+    super::builtin_for(dll).and_then(|b| b.resolve(func))
 }

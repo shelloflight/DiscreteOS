@@ -27,9 +27,10 @@ use core::fmt;
 
 pub const MAX_FILE: usize = 64 << 20;
 pub const MAX_IMAGE: u32 = 64 << 20;
-pub const MAX_SECTIONS: usize = 16;
+pub const MAX_SECTIONS: usize = 32;
 const MAX_DLLS: usize = 64;
 const MAX_IMPORTS: usize = 4096;
+const MAX_EXPORTS: usize = 16384;
 const MAX_NAME: usize = 256;
 const PAGE: u32 = 4096;
 
@@ -45,6 +46,7 @@ pub const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 pub const SCN_MEM_READ: u32 = 0x4000_0000;
 pub const SCN_MEM_WRITE: u32 = 0x8000_0000;
 
+const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
 const DIR_EXCEPTION: usize = 3;
 const DIR_SECURITY: usize = 4; // a file offset, not an RVA
@@ -171,8 +173,10 @@ pub struct Image {
     pub size_of_headers: u32,
     pub entry: u32,
     pub subsystem: u16,
+    pub is_dll: bool,
     pub sections: [Section; MAX_SECTIONS],
     pub nsec: usize,
+    pub export: Dir,
     pub import: Dir,
     pub reloc: Dir,
     pub tls: Dir,
@@ -190,8 +194,17 @@ impl Image {
     }
 }
 
-/// Parse and validate the headers and section table of a PE32+ executable.
+/// Parse and validate the headers and section table of a PE32+ executable (`.exe`).
 pub fn parse(data: &[u8]) -> R<Image> {
+    parse_kind(data, false)
+}
+
+/// Parse and validate a PE32+ dynamic-link library (`.dll`).
+pub fn parse_dll(data: &[u8]) -> R<Image> {
+    parse_kind(data, true)
+}
+
+fn parse_kind(data: &[u8], expect_dll: bool) -> R<Image> {
     if data.len() > MAX_FILE {
         return Err(PeError::Unsupported("file larger than 64 MiB"));
     }
@@ -215,11 +228,15 @@ pub fn parse(data: &[u8]) -> R<Image> {
     if fchars & FILE_EXECUTABLE_IMAGE == 0 {
         return Err(PeError::Bad("not marked executable"));
     }
-    if fchars & FILE_DLL != 0 {
+    let is_dll = fchars & FILE_DLL != 0;
+    if !expect_dll && is_dll {
         return Err(PeError::Unsupported("a DLL, not an EXE"));
     }
+    if expect_dll && !is_dll {
+        return Err(PeError::Bad("not marked as a DLL"));
+    }
     if nsec == 0 || nsec > MAX_SECTIONS {
-        return Err(PeError::Unsupported("no sections or more than 16"));
+        return Err(PeError::Unsupported("no sections or more than 32"));
     }
     let opt = coff + 20;
     if opt_size < 112 {
@@ -294,8 +311,10 @@ pub fn parse(data: &[u8]) -> R<Image> {
         size_of_headers,
         entry,
         subsystem,
+        is_dll,
         sections: [Section::default(); MAX_SECTIONS],
         nsec,
+        export: dirs[DIR_EXPORT],
         import: dirs[DIR_IMPORT],
         reloc: dirs[DIR_BASERELOC],
         tls: dirs[DIR_TLS],
@@ -342,12 +361,14 @@ pub fn parse(data: &[u8]) -> R<Image> {
         *slot = Section { name, rva, mem, raw_off, copy, chars };
         prev_end = end;
     }
-    let in_code = img
-        .sections()
-        .iter()
-        .any(|s| s.executable() && entry >= s.rva && u64::from(entry) < u64::from(s.rva) + u64::from(s.mem));
-    if !in_code {
-        return Err(PeError::Bad("entry point not in an executable section"));
+    if !is_dll || entry != 0 {
+        let in_code = img
+            .sections()
+            .iter()
+            .any(|s| s.executable() && entry >= s.rva && u64::from(entry) < u64::from(s.rva) + u64::from(s.mem));
+        if !in_code {
+            return Err(PeError::Bad("entry point not in an executable section"));
+        }
     }
     Ok(img)
 }
@@ -412,7 +433,17 @@ impl Image {
 
     /// Bind every import of the laid-out image: `resolve(dll, function)` gives the address, or
     /// None (the image is refused, naming the import). Returns the number of IAT slots written.
-    pub fn bind(&self, img: &mut [u8], mut resolve: impl FnMut(&[u8], &[u8]) -> Option<u64>) -> R<u32> {
+    pub fn bind(&self, img: &mut [u8], resolve: impl FnMut(&[u8], &[u8]) -> Option<u64>) -> R<u32> {
+        self.bind_ex(img, resolve, |_, _| None)
+    }
+
+    /// Bind imports by name or ordinal.
+    pub fn bind_ex(
+        &self,
+        img: &mut [u8],
+        mut resolve_name: impl FnMut(&[u8], &[u8]) -> Option<u64>,
+        mut resolve_ord: impl FnMut(&[u8], u16) -> Option<u64>,
+    ) -> R<u32> {
         if self.import.size == 0 {
             return Ok(0);
         }
@@ -446,15 +477,21 @@ impl Image {
                 if thunk == 0 {
                     break;
                 }
-                if thunk >> 63 != 0 {
-                    return Err(PeError::Import { dll, func: Name::new(b""), ordinal: Some(thunk as u16) });
-                }
-                if thunk >> 31 != 0 {
-                    return Err(PeError::Bad("bad import thunk"));
-                }
-                let func = cstr(img, (thunk as usize).checked_add(2).ok_or(PeError::Truncated)?)?;
-                let Some(addr) = resolve(cstr(img, name_rva)?, func) else {
-                    return Err(PeError::Import { dll, func: Name::new(func), ordinal: None });
+                let addr = if thunk >> 63 != 0 {
+                    let ord = thunk as u16;
+                    let Some(a) = resolve_ord(cstr(img, name_rva)?, ord) else {
+                        return Err(PeError::Import { dll, func: Name::new(b""), ordinal: Some(ord) });
+                    };
+                    a
+                } else {
+                    if thunk >> 31 != 0 {
+                        return Err(PeError::Bad("bad import thunk"));
+                    }
+                    let func = cstr(img, (thunk as usize).checked_add(2).ok_or(PeError::Truncated)?)?;
+                    let Some(a) = resolve_name(cstr(img, name_rva)?, func) else {
+                        return Err(PeError::Import { dll, func: Name::new(func), ordinal: None });
+                    };
+                    a
                 };
                 wr64(img, ft + 8 * j, addr)?;
                 bound += 1;
@@ -463,6 +500,102 @@ impl Image {
         }
         Ok(bound)
     }
+
+    /// Resolve a PE export table entry by name (supports forwarded exports).
+    pub fn export_by_name<'a>(&self, img: &'a [u8], want: &[u8]) -> R<Option<ExportRef<'a>>> {
+        if self.export.size < 40 {
+            return Ok(None);
+        }
+        let img = img.get(..self.size_of_image as usize).ok_or(PeError::Truncated)?;
+        let ed = self.export.rva as usize;
+        let num_funcs = rd32(img, ed + 20)? as usize;
+        let num_names = rd32(img, ed + 24)? as usize;
+        let funcs_rva = rd32(img, ed + 28)? as usize;
+        let names_rva = rd32(img, ed + 32)? as usize;
+        let ords_rva = rd32(img, ed + 36)? as usize;
+        if num_funcs > MAX_EXPORTS || num_names > MAX_EXPORTS {
+            return Err(PeError::Unsupported("too many exports"));
+        }
+        // Binary search the sorted name table (falls back to linear scan if unsorted).
+        let (mut lo, mut hi) = (0usize, num_names);
+        let mut found_idx = None;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let nrva = rd32(img, names_rva.checked_add(4 * mid).ok_or(PeError::Bad("export name overflow"))?)? as usize;
+            let name = cstr(img, nrva)?;
+            match name.cmp(want) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    found_idx = Some(mid);
+                    break;
+                }
+            }
+        }
+        if found_idx.is_none() {
+            for i in 0..num_names {
+                let nrva = rd32(img, names_rva.checked_add(4 * i).ok_or(PeError::Bad("export name overflow"))?)? as usize;
+                if cstr(img, nrva)? == want {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(idx) = found_idx else { return Ok(None) };
+        let ord_idx = usize::from(rd16(img, ords_rva.checked_add(2 * idx).ok_or(PeError::Bad("export ord overflow"))?)?);
+        if ord_idx >= num_funcs {
+            return Err(PeError::Bad("export ordinal out of range"));
+        }
+        let rva = rd32(img, funcs_rva.checked_add(4 * ord_idx).ok_or(PeError::Bad("export func overflow"))?)?;
+        self.classify_export(img, rva)
+    }
+
+    /// Resolve a PE export table entry by ordinal (1-based `ordinal` minus `Base`).
+    pub fn export_by_ordinal<'a>(&self, img: &'a [u8], ordinal: u16) -> R<Option<ExportRef<'a>>> {
+        if self.export.size < 40 {
+            return Ok(None);
+        }
+        let img = img.get(..self.size_of_image as usize).ok_or(PeError::Truncated)?;
+        let ed = self.export.rva as usize;
+        let base = rd32(img, ed + 16)?;
+        let num_funcs = rd32(img, ed + 20)? as usize;
+        let funcs_rva = rd32(img, ed + 28)? as usize;
+        if num_funcs > MAX_EXPORTS {
+            return Err(PeError::Unsupported("too many exports"));
+        }
+        let Some(idx) = u32::from(ordinal).checked_sub(base) else { return Ok(None) };
+        let idx = idx as usize;
+        if idx >= num_funcs {
+            return Ok(None);
+        }
+        let rva = rd32(img, funcs_rva.checked_add(4 * idx).ok_or(PeError::Bad("export func overflow"))?)?;
+        self.classify_export(img, rva)
+    }
+
+    fn classify_export<'a>(&self, img: &'a [u8], rva: u32) -> R<Option<ExportRef<'a>>> {
+        if rva == 0 {
+            return Ok(None);
+        }
+        let exp_start = self.export.rva;
+        let exp_end = exp_start.saturating_add(self.export.size);
+        if rva >= exp_start && rva < exp_end {
+            let fwd = cstr(img, rva as usize)?;
+            return Ok(Some(ExportRef::Forward(fwd)));
+        }
+        if rva >= self.size_of_image {
+            return Err(PeError::Bad("export RVA outside the image"));
+        }
+        Ok(Some(ExportRef::Rva(rva)))
+    }
+}
+
+/// An export entry in a PE32+ module.
+#[derive(Clone, Copy)]
+pub enum ExportRef<'a> {
+    /// Address relative to the module's load base.
+    Rva(u32),
+    /// Forwarder string (`"OTHERDLL.Func"` or `"OTHERDLL.#123"`).
+    Forward(&'a [u8]),
 }
 
 /// The TLS directory of a laid-out, relocated image loaded at `base` (RVAs inside the image).

@@ -28,7 +28,7 @@ use core::arch::global_asm;
 
 use libd::sys;
 
-use super::{current_thread, image, println_unhandled};
+use super::{ModSpan, current_thread, module_for_base, module_for_pc, println_unhandled};
 
 pub const CONTEXT_SIZE: usize = 0x4D0;
 
@@ -118,7 +118,7 @@ impl ExcRecord {
 
 /// `DISPATCHER_CONTEXT` (x64).
 #[repr(C)]
-struct DispatcherContext {
+pub(super) struct DispatcherContext {
     control_pc: u64,
     image_base: u64,
     function_entry: u64,
@@ -158,30 +158,29 @@ pub struct RtFn {
     pub unwind: u32,
 }
 
-// ---- checked reads ----------------------------------------------------------------------------
+// ---- checked reads (multi-module) -------------------------------------------------------------
 
-/// Bytes of the loaded image at `rva` (inside the image), or None.
-fn img_bytes<const N: usize>(rva: u64) -> Option<[u8; N]> {
-    let im = image();
-    if rva.checked_add(N as u64)? > im.size {
+/// Bytes of module `m` at `rva` (inside `m`), or None.
+fn mod_bytes<const N: usize>(m: ModSpan, rva: u64) -> Option<[u8; N]> {
+    if rva.checked_add(N as u64)? > m.size {
         return None;
     }
     let mut b = [0u8; N];
-    // SAFETY: inside the mapped image (every page of it is mapped readable by the loader).
-    unsafe { core::ptr::copy_nonoverlapping((im.base + rva) as *const u8, b.as_mut_ptr(), N) };
+    // SAFETY: inside the mapped module (every page of it is mapped readable by the loader).
+    unsafe { core::ptr::copy_nonoverlapping((m.base + rva) as *const u8, b.as_mut_ptr(), N) };
     Some(b)
 }
-fn img_u8(rva: u64) -> Option<u8> {
-    img_bytes::<1>(rva).map(|b| b[0])
+fn mod_u8(m: ModSpan, rva: u64) -> Option<u8> {
+    mod_bytes::<1>(m, rva).map(|b| b[0])
 }
-fn img_u16(rva: u64) -> Option<u16> {
-    img_bytes::<2>(rva).map(u16::from_le_bytes)
+fn mod_u16(m: ModSpan, rva: u64) -> Option<u16> {
+    mod_bytes::<2>(m, rva).map(u16::from_le_bytes)
 }
-fn img_u32(rva: u64) -> Option<u32> {
-    img_bytes::<4>(rva).map(u32::from_le_bytes)
+fn mod_u32(m: ModSpan, rva: u64) -> Option<u32> {
+    mod_bytes::<4>(m, rva).map(u32::from_le_bytes)
 }
-fn img_rtfn(rva: u64) -> Option<RtFn> {
-    Some(RtFn { begin: img_u32(rva)?, end: img_u32(rva + 4)?, unwind: img_u32(rva + 8)? })
+fn mod_rtfn(m: ModSpan, rva: u64) -> Option<RtFn> {
+    Some(RtFn { begin: mod_u32(m, rva)?, end: mod_u32(m, rva + 4)?, unwind: mod_u32(m, rva + 8)? })
 }
 
 /// A word of the current thread's stack at `addr`, or None outside it.
@@ -207,24 +206,25 @@ fn in_stack(addr: u64) -> bool {
 
 // ---- lookup -------------------------------------------------------------------------------------
 
-/// The function-table entry covering `pc` (binary search of the image's `.pdata`): its RVA.
-pub fn lookup(pc: u64) -> Option<u64> {
-    let im = image();
-    if pc < im.base || pc >= im.base + im.size || im.pdata_count == 0 {
+/// The function-table entry covering `pc` (binary search of the owning module's `.pdata`):
+/// returns `(module, entry_rva)`.
+pub fn lookup(pc: u64) -> Option<(ModSpan, u64)> {
+    let m = module_for_pc(pc)?;
+    if m.pdata_count == 0 {
         return None;
     }
-    let rva = (pc - im.base) as u32;
-    let (mut lo, mut hi) = (0u64, im.pdata_count);
+    let rva = (pc - m.base) as u32;
+    let (mut lo, mut hi) = (0u64, m.pdata_count);
     while lo < hi {
         let mid = (lo + hi) / 2;
-        let at = u64::from(im.pdata_rva) + 12 * mid;
-        let e = img_rtfn(at)?;
+        let at = u64::from(m.pdata_rva) + 12 * mid;
+        let e = mod_rtfn(m, at)?;
         if rva < e.begin {
             hi = mid;
         } else if rva >= e.end {
             lo = mid + 1;
         } else {
-            return Some(at);
+            return Some((m, at));
         }
     }
     None
@@ -242,17 +242,17 @@ pub struct Unwound {
     pub frame: u64,
 }
 
-/// Undo the prologue of the function `fe` (entry RVA) at `pc` on `ctx`: afterwards `ctx` is the
-/// caller's context. Returns the language handler of type `ty` (0: none), its data and the
-/// establisher frame. None: the unwind data is bad or leaves the stack.
-pub fn virtual_unwind(ty: u32, pc: u64, fe_rva: u64, ctx: &mut Context, mut ptrs: Option<&mut Ptrs>) -> Option<Unwound> {
-    let base = image().base;
-    let mut fe = img_rtfn(fe_rva)?;
+/// Undo the prologue of the function `fe` (entry RVA in `m`) at `pc` on `ctx`: afterwards `ctx`
+/// is the caller's context. Returns the language handler of type `ty` (0: none), its data and
+/// the establisher frame. None: the unwind data is bad or leaves the stack.
+pub fn virtual_unwind(m: ModSpan, ty: u32, pc: u64, fe_rva: u64, ctx: &mut Context, mut ptrs: Option<&mut Ptrs>) -> Option<Unwound> {
+    let base = m.base;
+    let mut fe = mod_rtfn(m, fe_rva)?;
     if fe.unwind & 1 != 0 {
-        fe = img_rtfn(u64::from(fe.unwind & !1))?; // an indirect entry
+        fe = mod_rtfn(m, u64::from(fe.unwind & !1))?; // an indirect entry
     }
     let pc_off = (pc - base).checked_sub(u64::from(fe.begin))?;
-    let hdr = img_bytes::<4>(u64::from(fe.unwind))?;
+    let hdr = mod_bytes::<4>(m, u64::from(fe.unwind))?;
     let (prolog, count) = (u64::from(hdr[1]), u64::from(hdr[2]));
     let (freg, foff) = (usize::from(hdr[3] & 15), u64::from(hdr[3] >> 4));
     let in_prolog = pc_off < prolog;
@@ -260,11 +260,15 @@ pub fn virtual_unwind(ty: u32, pc: u64, fe_rva: u64, ctx: &mut Context, mut ptrs
     // The establisher frame: the frame register's value (minus its offset) once the prologue
     // has set it, else RSP.
     let fp_set = freg != 0
-        && (!in_prolog || (0..count).any(|i| img_u8(codes + 2 * i + 1).is_some_and(|op| op & 15 == 3) && img_u8(codes + 2 * i).is_some_and(|o| u64::from(o) <= pc_off)));
+        && (!in_prolog
+            || (0..count).any(|i| {
+                mod_u8(m, codes + 2 * i + 1).is_some_and(|op| op & 15 == 3)
+                    && mod_u8(m, codes + 2 * i).is_some_and(|o| u64::from(o) <= pc_off)
+            }));
     let frame = if fp_set { ctx.gpr(freg).wrapping_sub(foff * 16) } else { ctx.rsp() };
 
-    if !in_prolog && is_inside_epilog(pc, &fe) {
-        interpret_epilog(pc, ctx, ptrs)?;
+    if !in_prolog && is_inside_epilog(m, pc, &fe) {
+        interpret_epilog(m, pc, ctx, ptrs)?;
         return Some(Unwound { handler: 0, data: 0, frame });
     }
 
@@ -273,7 +277,7 @@ pub fn virtual_unwind(ty: u32, pc: u64, fe_rva: u64, ctx: &mut Context, mut ptrs
     let mut machframe = false;
     let flags;
     loop {
-        let h = img_bytes::<4>(info_rva)?;
+        let h = mod_bytes::<4>(m, info_rva)?;
         let (ver, fl, count) = (h[0] & 7, u32::from(h[0] >> 3), u64::from(h[2]));
         let (freg, foff) = (usize::from(h[3] & 15), u64::from(h[3] >> 4));
         if ver != 1 && ver != 2 {
@@ -282,10 +286,10 @@ pub fn virtual_unwind(ty: u32, pc: u64, fe_rva: u64, ctx: &mut Context, mut ptrs
         let codes = info_rva + 4;
         let mut i = 0u64;
         while i < count {
-            let off = u64::from(img_u8(codes + 2 * i)?);
-            let opb = img_u8(codes + 2 * i + 1)?;
+            let off = u64::from(mod_u8(m, codes + 2 * i)?);
+            let opb = mod_u8(m, codes + 2 * i + 1)?;
             let (op, info) = (opb & 15, usize::from(opb >> 4));
-            let slot16 = |k: u64| img_u16(codes + 2 * (i + k));
+            let slot16 = |k: u64| mod_u16(m, codes + 2 * (i + k));
             let slots = match op {
                 1 if info == 0 => 2,
                 1 => 3,
@@ -357,7 +361,7 @@ pub fn virtual_unwind(ty: u32, pc: u64, fe_rva: u64, ctx: &mut Context, mut ptrs
             flags = fl;
             break;
         }
-        let chained = img_rtfn(codes + 2 * ((count + 1) & !1))?;
+        let chained = mod_rtfn(m, codes + 2 * ((count + 1) & !1))?;
         info_rva = u64::from(chained.unwind & !1);
         primary = false;
     }
@@ -366,20 +370,19 @@ pub fn virtual_unwind(ty: u32, pc: u64, fe_rva: u64, ctx: &mut Context, mut ptrs
         ctx.set_rip(stack_u64(at)?);
         ctx.set_rsp(at + 8);
     }
-    let codes_end = info_rva + 4 + 2 * ((u64::from(img_u8(info_rva + 2)?) + 1) & !1);
+    let codes_end = info_rva + 4 + 2 * ((u64::from(mod_u8(m, info_rva + 2)?) + 1) & !1);
     if flags & ty == 0 || in_prolog {
         return Some(Unwound { handler: 0, data: 0, frame });
     }
-    let h = img_u32(codes_end)?;
+    let h = mod_u32(m, codes_end)?;
     Some(Unwound { handler: base + u64::from(h), data: base + codes_end + 4, frame })
 }
 
 /// Is `pc` inside an epilogue of `fe` (an optional `add rsp`/`lea rsp`, pops, then `ret` or a
 /// jump out of the function)?
-fn is_inside_epilog(pc: u64, fe: &RtFn) -> bool {
-    let base = image().base;
-    let Some(mut at) = pc.checked_sub(base) else { return false };
-    let b = |a: u64| img_u8(a);
+fn is_inside_epilog(m: ModSpan, pc: u64, fe: &RtFn) -> bool {
+    let Some(mut at) = pc.checked_sub(m.base) else { return false };
+    let b = |a: u64| mod_u8(m, a);
     let (Some(b0), Some(b1)) = (b(at), b(at + 1)) else { return false };
     if b0 & 0xF8 == 0x48 {
         match b1 {
@@ -414,7 +417,7 @@ fn is_inside_epilog(pc: u64, fe: &RtFn) -> bool {
             }
             0xC2 | 0xC3 => return true,
             0xE9 => {
-                let Some(d) = img_u32(at + 1) else { return false };
+                let Some(d) = mod_u32(m, at + 1) else { return false };
                 let t = (at + 5).wrapping_add(i64::from(d as i32) as u64);
                 return !(t >= u64::from(fe.begin) && t < u64::from(fe.end));
             }
@@ -432,16 +435,15 @@ fn is_inside_epilog(pc: u64, fe: &RtFn) -> bool {
 }
 
 /// Unwind through the epilogue at `pc` by doing what its instructions do.
-fn interpret_epilog(pc: u64, ctx: &mut Context, mut ptrs: Option<&mut Ptrs>) -> Option<()> {
-    let base = image().base;
-    let mut at = pc - base;
+fn interpret_epilog(m: ModSpan, pc: u64, ctx: &mut Context, mut ptrs: Option<&mut Ptrs>) -> Option<()> {
+    let mut at = pc - m.base;
     for _ in 0..40 {
-        let mut c = img_u8(at)?;
+        let mut c = mod_u8(m, at)?;
         let mut rex = 0u8;
         if c & 0xF0 == 0x40 {
             rex = c & 15;
             at += 1;
-            c = img_u8(at)?;
+            c = mod_u8(m, at)?;
         }
         match c {
             0x58..=0x5F => {
@@ -455,28 +457,28 @@ fn interpret_epilog(pc: u64, ctx: &mut Context, mut ptrs: Option<&mut Ptrs>) -> 
                 at += 1;
             }
             0x81 => {
-                ctx.set_rsp(ctx.rsp().wrapping_add(i64::from(img_u32(at + 2)? as i32) as u64));
+                ctx.set_rsp(ctx.rsp().wrapping_add(i64::from(mod_u32(m, at + 2)? as i32) as u64));
                 at += 6;
             }
             0x83 => {
-                ctx.set_rsp(ctx.rsp().wrapping_add(i64::from(img_u8(at + 2)? as i8) as u64));
+                ctx.set_rsp(ctx.rsp().wrapping_add(i64::from(mod_u8(m, at + 2)? as i8) as u64));
                 at += 3;
             }
             0x8D => {
-                let m = img_u8(at + 1)?;
-                let reg = usize::from(m & 7) + usize::from(rex & 1) * 8;
-                if m >> 6 == 1 {
-                    ctx.set_rsp(ctx.gpr(reg).wrapping_add(i64::from(img_u8(at + 2)? as i8) as u64));
+                let mb = mod_u8(m, at + 1)?;
+                let reg = usize::from(mb & 7) + usize::from(rex & 1) * 8;
+                if mb >> 6 == 1 {
+                    ctx.set_rsp(ctx.gpr(reg).wrapping_add(i64::from(mod_u8(m, at + 2)? as i8) as u64));
                     at += 3;
                 } else {
-                    ctx.set_rsp(ctx.gpr(reg).wrapping_add(i64::from(img_u32(at + 2)? as i32) as u64));
+                    ctx.set_rsp(ctx.gpr(reg).wrapping_add(i64::from(mod_u32(m, at + 2)? as i32) as u64));
                     at += 6;
                 }
             }
             0xC2 => {
                 let sp = ctx.rsp();
                 ctx.set_rip(stack_u64(sp)?);
-                ctx.set_rsp(sp + 8 + u64::from(img_u16(at + 1)?));
+                ctx.set_rsp(sp + 8 + u64::from(mod_u16(m, at + 1)?));
                 return Some(());
             }
             0xC3 | 0xE9 | 0xEB | 0xF3 | 0xFF => {
@@ -491,24 +493,21 @@ fn interpret_epilog(pc: u64, ctx: &mut Context, mut ptrs: Option<&mut Ptrs>) -> 
     None
 }
 
-/// One frame up from `ctx` (also leaf functions, which have no entry): (entry RVA, unwound).
-fn step(ty: u32, ctx: &mut Context, ptrs: Option<&mut Ptrs>) -> Option<(u64, Unwound)> {
+/// One frame up from `ctx` (also leaf functions, which have no entry): (module, entry RVA, unwound).
+fn step(ty: u32, ctx: &mut Context, ptrs: Option<&mut Ptrs>) -> Option<(ModSpan, u64, Unwound)> {
     let pc = ctx.rip();
-    let im = image();
-    if pc < im.base || pc >= im.base + im.size {
-        return None; // outside the program (D-CMPL's own code, or the thread's start): the end
-    }
+    let m = module_for_pc(pc)?;
     match lookup(pc) {
-        Some(fe) => {
-            let u = virtual_unwind(ty, pc, fe, ctx, ptrs)?;
-            Some((fe, u))
+        Some((lm, fe)) => {
+            let u = virtual_unwind(lm, ty, pc, fe, ctx, ptrs)?;
+            Some((lm, fe, u))
         }
         None => {
             // A leaf function: only the return address is on the stack.
             let sp = ctx.rsp();
             ctx.set_rip(stack_u64(sp)?);
             ctx.set_rsp(sp + 8);
-            Some((0, Unwound { handler: 0, data: 0, frame: sp }))
+            Some((m, 0, Unwound { handler: 0, data: 0, frame: sp }))
         }
     }
 }
@@ -527,15 +526,15 @@ fn dispatch(rec: &mut ExcRecord, orig: &mut Context) -> bool {
     for _ in 0..4096 {
         let pc = ctx.rip();
         let mut next = ctx;
-        let Some((fe, u)) = step(UNW_FLAG_EHANDLER, &mut next, None) else { return false };
+        let Some((m, fe, u)) = step(UNW_FLAG_EHANDLER, &mut next, None) else { return false };
         if !u.frame.is_multiple_of(8) || !in_stack(u.frame) {
             return false;
         }
         if u.handler != 0 {
             let mut dc = DispatcherContext {
                 control_pc: pc,
-                image_base: image().base,
-                function_entry: image().base + fe,
+                image_base: m.base,
+                function_entry: m.base + fe,
                 establisher_frame: u.frame,
                 target_ip: 0,
                 context: &raw mut ctx,
@@ -574,7 +573,7 @@ fn unwind(start: Context, target_frame: u64, target_ip: u64, rec: Option<&mut Ex
     for _ in 0..4096 {
         let pc = ctx.rip();
         let mut next = ctx;
-        let Some((fe, u)) = step(UNW_FLAG_UHANDLER, &mut next, Some(&mut ptrs)) else {
+        let Some((m, fe, u)) = step(UNW_FLAG_UHANDLER, &mut next, Some(&mut ptrs)) else {
             fatal("the unwind target was not found on the stack")
         };
         if !u.frame.is_multiple_of(8) || !in_stack(u.frame) || (target_frame != 0 && u.frame > target_frame) {
@@ -586,8 +585,8 @@ fn unwind(start: Context, target_frame: u64, target_ip: u64, rec: Option<&mut Ex
         if u.handler != 0 {
             let mut dc = DispatcherContext {
                 control_pc: pc,
-                image_base: image().base,
-                function_entry: image().base + fe,
+                image_base: m.base,
+                function_entry: m.base + fe,
                 establisher_frame: u.frame,
                 target_ip,
                 context: &raw mut ctx,
@@ -651,8 +650,12 @@ unsafe extern "C" {
     fn dcmpl_restore(ctx: *const Context) -> !;
     fn dcmpl_fault_return(rec: *const sys::ExceptionRecord, fx: *const u8) -> !;
     pub fn dcmpl_fault_entry();
+}
+
+unsafe extern "win64" {
     pub fn dcmpl_capture_context(ctx: *mut Context);
     pub fn dcmpl_raise_exception(code: u32, flags: u32, n: u32, params: *const u64);
+    pub fn dcmpl_cxx_throw_exception(obj: u64, throw_info: u64) -> !;
     pub fn dcmpl_unwind_ex(frame: u64, ip: u64, rec: *mut ExcRecord, retval: u64, ctx: *mut Context, history: u64);
     pub fn dcmpl_restore_context(ctx: *mut Context, rec: *mut ExcRecord);
 }
@@ -713,6 +716,17 @@ global_asm!(
     "mov rcx, r9",
     "mov r8, rsp",
     "call {raise}",
+    "ud2",
+    // _CxxThrowException(obj in RCX, throw_info in RDX): capture the caller directly (so RIP is
+    // inside the throwing PE module, not D-CMPL) and dispatch the MSVC C++ exception.
+    ".globl dcmpl_cxx_throw_exception",
+    "dcmpl_cxx_throw_exception:",
+    "sub rsp, 0x4D8",
+    capture!("rsp", "rsp+0x4E0", "rsp+0x4D8"),
+    "mov rdi, rcx",
+    "mov rsi, rdx",
+    "mov rdx, rsp",
+    "call {cxx_throw}",
     "ud2",
     // RtlUnwindEx(frame, ip, rec, retval, ctx, history)
     ".globl dcmpl_unwind_ex",
@@ -779,6 +793,7 @@ global_asm!(
     "syscall",
     "ud2",
     raise = sym raise_entry,
+    cxx_throw = sym cxx_throw_entry,
     unwind = sym unwind_entry,
     restore_ctx = sym restore_context_entry,
     fault = sym fault_entry,
@@ -963,16 +978,16 @@ extern "sysv64" fn restore_context_entry(ctx: *mut Context, rec: *mut ExcRecord)
     restore(&mut c, rec, &mut ptrs)
 }
 
-// ---- the Rtl exports ---------------------------------------------------------------------------
+// ---- the Rtl exports (multi-module) ------------------------------------------------------------
 
 pub(super) extern "win64" fn rtl_lookup_function_entry(pc: u64, base: *mut u64, _history: u64) -> u64 {
     match lookup(pc) {
-        Some(fe) => {
+        Some((m, fe)) => {
             if !base.is_null() {
                 // SAFETY: the caller's out-pointer.
-                unsafe { base.write(image().base) };
+                unsafe { base.write(m.base) };
             }
-            image().base + fe
+            m.base + fe
         }
         None => 0,
     }
@@ -981,7 +996,7 @@ pub(super) extern "win64" fn rtl_lookup_function_entry(pc: u64, base: *mut u64, 
 #[allow(clippy::too_many_arguments)] // RtlVirtualUnwind's own signature
 pub(super) extern "win64" fn rtl_virtual_unwind(
     ty: u32,
-    _base: u64,
+    base: u64,
     pc: u64,
     fe: u64,
     ctx: *mut Context,
@@ -989,13 +1004,13 @@ pub(super) extern "win64" fn rtl_virtual_unwind(
     frame: *mut u64,
     ptrs: *mut Ptrs,
 ) -> u64 {
-    let im = image();
+    let Some(m) = module_for_base(base).or_else(|| module_for_pc(pc)) else { return 0 };
     // SAFETY: the caller's CONTEXT.
     let Some(ctx) = (unsafe { ctx.as_mut() }) else { return 0 };
-    let fe_rva = fe.wrapping_sub(im.base);
+    let fe_rva = fe.wrapping_sub(m.base);
     // SAFETY: the caller's optional KNONVOLATILE_CONTEXT_POINTERS.
     let p = unsafe { ptrs.as_mut() };
-    let u = if fe == 0 || fe_rva >= im.size {
+    let u = if fe == 0 || fe_rva >= m.size {
         // a leaf function
         let sp = ctx.rsp();
         let Some(ret) = stack_u64(sp) else { return 0 };
@@ -1003,7 +1018,7 @@ pub(super) extern "win64" fn rtl_virtual_unwind(
         ctx.set_rsp(sp + 8);
         Unwound { handler: 0, data: 0, frame: sp }
     } else {
-        match virtual_unwind(ty, pc, fe_rva, ctx, p) {
+        match virtual_unwind(m, ty, pc, fe_rva, ctx, p) {
             Some(u) => u,
             None => return 0,
         }
@@ -1021,11 +1036,548 @@ pub(super) extern "win64" fn rtl_virtual_unwind(
 }
 
 pub(super) extern "win64" fn rtl_pc_to_file_header(pc: u64, base: *mut u64) -> u64 {
-    let im = image();
-    let b = if pc >= im.base && pc < im.base + im.size { im.base } else { 0 };
+    let b = module_for_pc(pc).map_or(0, |m| m.base);
     if !base.is_null() {
         // SAFETY: the caller's out-pointer.
         unsafe { base.write(b) };
     }
     b
+}
+
+// ---- vcruntime140 / vcruntime140_1 SEH & C++ FH4 handlers --------------------------------------
+
+const DISPOSITION_CONTINUE_SEARCH: u32 = 1;
+const CXX_EXCEPTION_CODE: u32 = 0xE06D_7363;
+const CXX_MAGIC: u64 = 0x1993_0520;
+
+/// `__C_specific_handler` (x64 C SEH `__try`/`__except`/`__finally` language handler).
+pub(super) extern "win64" fn c_specific_handler(
+    rec: *mut ExcRecord,
+    frame: u64,
+    ctx: *mut Context,
+    dc: *mut DispatcherContext,
+) -> u32 {
+    // SAFETY: valid pointers from D-CMPL's SEH dispatcher.
+    let (rec_ref, dc_ref) = unsafe { (&mut *rec, &mut *dc) };
+    let Some(m) = module_for_base(dc_ref.image_base) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(ctrl_rva) = dc_ref.control_pc.checked_sub(m.base) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(data_rva) = dc_ref.handler_data.checked_sub(m.base) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(count) = mod_u32(m, data_rva) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let count = u64::from(count.min(4096));
+
+    if rec_ref.flags & (EH_UNWINDING | EH_EXIT_UNWIND) == 0 {
+        // Dispatch pass: run `__except` filters matching `ctrl_rva`.
+        for i in u64::from(dc_ref.scope_index)..count {
+            let ent = data_rva + 4 + i * 16;
+            let (Some(begin), Some(end), Some(handler), Some(target)) =
+                (mod_u32(m, ent), mod_u32(m, ent + 4), mod_u32(m, ent + 8), mod_u32(m, ent + 12))
+            else {
+                break;
+            };
+            if ctrl_rva >= u64::from(begin) && ctrl_rva < u64::from(end) && target != 0 {
+                let disp = if handler == 1 {
+                    1i32 // EXCEPTION_EXECUTE_HANDLER
+                } else {
+                    let mut ptrs = [rec as u64, ctx as u64];
+                    type Filter = extern "win64" fn(*mut [u64; 2], u64) -> i32;
+                    // SAFETY: filter function inside the module's executable code.
+                    let f: Filter = unsafe { core::mem::transmute::<u64, Filter>(m.base + u64::from(handler)) };
+                    f(&mut ptrs, frame)
+                };
+                if disp < 0 {
+                    return DISPOSITION_CONTINUE_EXECUTION;
+                }
+                if disp > 0 {
+                    // SAFETY: initiates second-pass unwind to `m.base + target` (never returns).
+                    unsafe {
+                        dcmpl_unwind_ex(
+                            frame,
+                            m.base + u64::from(target),
+                            rec,
+                            u64::from(rec_ref.code),
+                            dc_ref.context,
+                            dc_ref.history_table,
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        // Unwind pass: execute `__finally` termination handlers covering `ctrl_rva` (unless
+        // `target_ip` stays inside the same scope on `EH_TARGET_UNWIND`).
+        let target_rva = dc_ref.target_ip.wrapping_sub(m.base);
+        while u64::from(dc_ref.scope_index) < count {
+            let i = u64::from(dc_ref.scope_index);
+            dc_ref.scope_index += 1;
+            let ent = data_rva + 4 + i * 16;
+            let (Some(begin), Some(end), Some(handler), Some(target)) =
+                (mod_u32(m, ent), mod_u32(m, ent + 4), mod_u32(m, ent + 8), mod_u32(m, ent + 12))
+            else {
+                break;
+            };
+            if ctrl_rva >= u64::from(begin) && ctrl_rva < u64::from(end) {
+                if rec_ref.flags & EH_TARGET_UNWIND != 0
+                    && target_rva >= u64::from(begin)
+                    && target_rva < u64::from(end)
+                {
+                    break;
+                }
+                if target == 0 && handler != 0 {
+                    type Term = extern "win64" fn(u8, u64);
+                    // SAFETY: `__finally` funclet inside the module's code.
+                    let f: Term = unsafe { core::mem::transmute::<u64, Term>(m.base + u64::from(handler)) };
+                    f(1, frame);
+                }
+            }
+        }
+    }
+    DISPOSITION_CONTINUE_SEARCH
+}
+
+/// `_CxxThrowException(obj, throw_info)` entry after the stub captured the throwing module's
+/// caller `CONTEXT`.
+extern "sysv64" fn cxx_throw_entry(obj: u64, throw_info: u64, ctx: *mut Context) -> ! {
+    let throw_base = module_for_pc(throw_info).map_or(0, |m| m.base);
+    let params = [CXX_MAGIC, obj, throw_info, throw_base];
+    raise_entry(CXX_EXCEPTION_CODE, EXCEPTION_NONCONTINUABLE, 4, params.as_ptr(), ctx)
+}
+
+// ---- MSVC FH4 (`__CxxFrameHandler4`) compressed metadata decoder & dispatcher ------------------
+
+struct Fh4Cur {
+    m: ModSpan,
+    at: u64,
+}
+
+impl Fh4Cur {
+    fn u8(&mut self) -> Option<u8> {
+        let v = mod_u8(self.m, self.at)?;
+        self.at += 1;
+        Some(v)
+    }
+    fn i32(&mut self) -> Option<i32> {
+        let v = mod_u32(self.m, self.at)? as i32;
+        self.at += 4;
+        Some(v)
+    }
+    /// MSVC FH4 variable-length unsigned integer (`ReadUnsigned`).
+    fn u32_var(&mut self) -> Option<u32> {
+        let b0 = self.u8()?;
+        let low = b0 & 0x0F;
+        if low & 1 == 0 {
+            return Some(u32::from(b0 >> 1));
+        }
+        if low & 3 == 1 {
+            let b1 = self.u8()?;
+            return Some((u32::from(b0) >> 2) | (u32::from(b1) << 6));
+        }
+        if low & 7 == 3 {
+            let b1 = self.u8()?;
+            let b2 = self.u8()?;
+            return Some((u32::from(b0) >> 3) | (u32::from(b1) << 5) | (u32::from(b2) << 13));
+        }
+        if low == 7 {
+            let b1 = self.u8()?;
+            let b2 = self.u8()?;
+            let b3 = self.u8()?;
+            return Some((u32::from(b0) >> 4) | (u32::from(b1) << 4) | (u32::from(b2) << 12) | (u32::from(b3) << 20));
+        }
+        // low == 15: full 32-bit little-endian value follows
+        let v = mod_u32(self.m, self.at)?;
+        self.at += 4;
+        Some(v)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Fh4Func {
+    uw_rva: u32,
+    try_rva: u32,
+    ip2state_rva: u32,
+}
+
+fn fh4_parse_func(m: ModSpan, info_rva: u64) -> Option<Fh4Func> {
+    let mut c = Fh4Cur { m, at: info_rva };
+    let hdr = c.u8()?;
+    if hdr & 0x04 != 0 {
+        let _bbt = c.u32_var()?;
+    }
+    let uw_rva = if hdr & 0x08 != 0 { c.i32()? as u32 } else { 0 };
+    let try_rva = if hdr & 0x10 != 0 { c.i32()? as u32 } else { 0 };
+    let ip2state_rva = c.i32()? as u32;
+    Some(Fh4Func { uw_rva, try_rva, ip2state_rva })
+}
+
+/// Find the current FH4 EH state for `ctrl_rva` inside function starting at `func_begin`.
+fn fh4_state_for_ip(m: ModSpan, ip2state_rva: u32, func_begin: u32, ctrl_rva: u32) -> i32 {
+    if ip2state_rva == 0 {
+        return -1;
+    }
+    let mut c = Fh4Cur { m, at: u64::from(ip2state_rva) };
+    let Some(count) = c.u32_var() else { return -1 };
+    let mut prev_ip = func_begin;
+    let mut cur_state: i32 = -1;
+    for _ in 0..count.min(4096) {
+        let Some(delta) = c.u32_var() else { break };
+        let Some(enc_state) = c.u32_var() else { break };
+        let ip = prev_ip.wrapping_add(delta);
+        if ctrl_rva < ip {
+            return cur_state;
+        }
+        cur_state = enc_state as i32 - 1;
+        prev_ip = ip;
+    }
+    cur_state
+}
+
+#[derive(Clone, Copy)]
+struct Fh4UnwindEntry {
+    next_offset: u32,
+    kind: u8,
+    action: u32,
+    obj: u32,
+}
+
+fn fh4_read_unwind_map(m: ModSpan, uw_rva: u32) -> alloc::vec::Vec<Fh4UnwindEntry> {
+    let mut out = alloc::vec::Vec::new();
+    if uw_rva == 0 {
+        return out;
+    }
+    let mut c = Fh4Cur { m, at: u64::from(uw_rva) };
+    let Some(count) = c.u32_var() else { return out };
+    for _ in 0..count.min(1024) {
+        let Some(next_and_type) = c.u32_var() else { break };
+        let kind = (next_and_type & 3) as u8;
+        let next_offset = next_and_type >> 2;
+        let (action, obj) = match kind {
+            0 => (0, 0),                                   // NoUW
+            1 | 2 => match (c.i32(), c.u32_var()) {        // DtorWithObj / DtorWithPtrToObj
+                (Some(a), Some(o)) => (a as u32, o),
+                _ => break,
+            },
+            3 => match c.i32() {                           // RVA (funclet)
+                Some(a) => (a as u32, 0),
+                None => break,
+            },
+            _ => (0, 0),
+        };
+        out.push(Fh4UnwindEntry { next_offset, kind, action, obj });
+    }
+    out
+}
+
+/// Run FH4 unwind actions from `from_state` down to `target_state` (`-1` = unwind all).
+fn fh4_unwind_states(m: ModSpan, uw_rva: u32, frame: u64, from_state: i32, target_state: i32) {
+    let entries = fh4_read_unwind_map(m, uw_rva);
+    let mut st = from_state;
+    let mut steps = 0usize;
+    while st > target_state && st >= 0 && (st as usize) < entries.len() && steps < 1024 {
+        steps += 1;
+        let e = entries[st as usize];
+        let next = if e.next_offset == 0 { -1 } else { st - e.next_offset as i32 };
+        match e.kind {
+            1 if e.action != 0 => {
+                // DtorWithObj: destructor(this = frame + obj)
+                type Dtor = extern "win64" fn(u64);
+                // SAFETY: compiler-emitted destructor in `m`.
+                let f: Dtor = unsafe { core::mem::transmute::<u64, Dtor>(m.base + u64::from(e.action)) };
+                f(frame.wrapping_add(u64::from(e.obj)));
+            }
+            2 if e.action != 0 => {
+                // DtorWithPtrToObj: destructor(*(u64 *)(frame + obj))
+                if let Some(ptr) = stack_u64(frame.wrapping_add(u64::from(e.obj))) {
+                    type Dtor = extern "win64" fn(u64);
+                    // SAFETY: compiler-emitted destructor in `m`.
+                    let f: Dtor = unsafe { core::mem::transmute::<u64, Dtor>(m.base + u64::from(e.action)) };
+                    f(ptr);
+                }
+            }
+            3 if e.action != 0 => {
+                // RVA unwind funclet(0, frame)
+                type Funclet = extern "win64" fn(u64, u64);
+                // SAFETY: compiler-emitted unwind funclet in `m`.
+                let f: Funclet = unsafe { core::mem::transmute::<u64, Funclet>(m.base + u64::from(e.action)) };
+                f(0, frame);
+            }
+            _ => {}
+        }
+        st = next;
+    }
+}
+
+/// Compare two MSVC RTTI `TypeDescriptor` names (`pVFTable` @ 0, `spare` @ 8, `name[]` @ 16).
+fn rtti_name_eq(td1: u64, td2: u64) -> bool {
+    if td1 == 0 || td2 == 0 {
+        return false;
+    }
+    if td1 == td2 {
+        return true;
+    }
+    for i in 0..256usize {
+        // SAFETY: NUL-terminated RTTI mangled type names in module `.data`/`.rdata`.
+        let (a, b) = unsafe { ((td1 + 16 + i as u64) as *const u8).read() }
+            .into_pair(unsafe { ((td2 + 16 + i as u64) as *const u8).read() });
+        if a != b {
+            return false;
+        }
+        if a == 0 {
+            return true;
+        }
+    }
+    false
+}
+
+trait IntoPair: Sized {
+    fn into_pair(self, other: Self) -> (Self, Self) {
+        (self, other)
+    }
+}
+impl IntoPair for u8 {}
+
+/// Match a thrown C++ exception (`ThrowInfo` at `throw_info`, module `throw_base`) against a
+/// catch handler expecting `TypeDescriptor` at `want_td` (`0` = `catch(...)`).
+/// Returns `Some((adjusted_obj_ptr, copy_ctor_va, size, props))` on match.
+fn match_cxx_type(obj: u64, throw_info: u64, throw_base: u64, want_td: u64) -> Option<(u64, u64, u32, u32)> {
+    if want_td == 0 {
+        return Some((obj, 0, 0, 0)); // catch(...)
+    }
+    if throw_info == 0 || throw_base == 0 {
+        return None;
+    }
+    // ThrowInfo (16 bytes): attributes(0), pmfnUnwind(4), pForwardCompat(8), pCatchableTypeArray(12)
+    // SAFETY: compiler-emitted ThrowInfo in the throwing module.
+    let cta_rva = unsafe { ((throw_info + 12) as *const u32).read_unaligned() };
+    if cta_rva == 0 {
+        return None;
+    }
+    let cta = throw_base + u64::from(cta_rva);
+    // CatchableTypeArray: nCatchableTypes(0), arrayOfCatchableTypes[i](4 + 4*i)
+    // SAFETY: compiler-emitted CatchableTypeArray in the throwing module.
+    let ntypes = unsafe { (cta as *const u32).read_unaligned() }.min(64);
+    for i in 0..ntypes {
+        // SAFETY: element `i < ntypes`.
+        let ct_rva = unsafe { ((cta + 4 + 4 * u64::from(i)) as *const u32).read_unaligned() };
+        if ct_rva == 0 {
+            continue;
+        }
+        let ct = throw_base + u64::from(ct_rva);
+        // CatchableType (36 bytes): properties(0), pType(4), mdisp(8), pdisp(12), vdisp(16), sizeOrOffset(20), copyFunction(24)
+        // SAFETY: compiler-emitted CatchableType in the throwing module.
+        let (props, ptype_rva, mdisp, size, copy_rva) = unsafe {
+            (
+                (ct as *const u32).read_unaligned(),
+                ((ct + 4) as *const u32).read_unaligned(),
+                ((ct + 8) as *const i32).read_unaligned(),
+                ((ct + 20) as *const u32).read_unaligned(),
+                ((ct + 24) as *const u32).read_unaligned(),
+            )
+        };
+        if ptype_rva == 0 {
+            continue;
+        }
+        let td = throw_base + u64::from(ptype_rva);
+        if rtti_name_eq(td, want_td) {
+            let adj = obj.wrapping_add(i64::from(mdisp) as u64);
+            let copy = if copy_rva != 0 { throw_base + u64::from(copy_rva) } else { 0 };
+            return Some((adj, copy, size, props));
+        }
+    }
+    None
+}
+
+/// Consolidation callback invoked by `seh::restore` during `STATUS_UNWIND_CONSOLIDATE`:
+/// runs the C++ catch funclet and returns its continuation RIP.
+extern "win64" fn cxx_consolidate_cb(rec: *mut ExcRecord) -> u64 {
+    // SAFETY: valid consolidation `ExcRecord` prepared by `cxx_frame_handler4`.
+    let r = unsafe { &*rec };
+    let funclet_va = r.info[1];
+    let frame = r.info[2];
+    let cont_va = r.info[3];
+    let throw_obj = r.info[4];
+    let throw_info = r.info[5];
+    let throw_base = r.info[6];
+    let prev_rec = r.info[7];
+    let prev_ctx = r.info[8];
+
+    type CatchFunclet = extern "win64" fn(u64, u64) -> u64;
+    // SAFETY: compiler-emitted C++ catch funclet inside the catching module.
+    let f: CatchFunclet = unsafe { core::mem::transmute::<u64, CatchFunclet>(funclet_va) };
+    let ret_ip = f(0, frame);
+
+    // Run exception object's destructor (`ThrowInfo::pmfnUnwind`) after catch block finishes.
+    if throw_obj != 0 && throw_info != 0 && throw_base != 0 {
+        // SAFETY: compiler-emitted ThrowInfo.
+        let dtor_rva = unsafe { ((throw_info + 4) as *const u32).read_unaligned() };
+        if dtor_rva != 0 {
+            type Dtor = extern "win64" fn(u64);
+            // SAFETY: compiler-emitted exception destructor.
+            let d: Dtor = unsafe { core::mem::transmute::<u64, Dtor>(throw_base + u64::from(dtor_rva)) };
+            d(throw_obj);
+        }
+    }
+    if let Some(t) = current_thread() {
+        t.cur_exc_rec = prev_rec;
+        t.cur_exc_ctx = prev_ctx;
+    }
+    if cont_va != 0 { cont_va } else { ret_ip }
+}
+
+/// `__CxxFrameHandler4` (MSVC x64 FH4 C++ exception handler in `vcruntime140_1.dll`).
+pub(super) extern "win64" fn cxx_frame_handler4(
+    rec: *mut ExcRecord,
+    frame: u64,
+    ctx: *mut Context,
+    dc: *mut DispatcherContext,
+) -> u32 {
+    // SAFETY: valid pointers from D-CMPL's SEH dispatcher.
+    let (rec_ref, dc_ref) = unsafe { (&mut *rec, &mut *dc) };
+    let Some(m) = module_for_base(dc_ref.image_base) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(data_rva) = dc_ref.handler_data.checked_sub(m.base) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(info_rva) = mod_u32(m, data_rva) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(fi) = fh4_parse_func(m, u64::from(info_rva)) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(fe_rva) = dc_ref.function_entry.checked_sub(m.base) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let Some(fe) = mod_rtfn(m, fe_rva) else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    let ctrl_rva = dc_ref.control_pc.wrapping_sub(m.base) as u32;
+    let cur_state = fh4_state_for_ip(m, fi.ip2state_rva, fe.begin, ctrl_rva);
+
+    // Second pass (unwind): run local destructors for this frame.
+    if rec_ref.flags & (EH_UNWINDING | EH_EXIT_UNWIND) != 0 {
+        let target_state = if rec_ref.flags & EH_TARGET_UNWIND != 0 && rec_ref.code == STATUS_UNWIND_CONSOLIDATE {
+            rec_ref.info[9] as i32
+        } else {
+            -1
+        };
+        fh4_unwind_states(m, fi.uw_rva, frame, cur_state, target_state);
+        return DISPOSITION_CONTINUE_SEARCH;
+    }
+
+    // First pass (dispatch): only handle MSVC C++ exceptions.
+    if rec_ref.code != CXX_EXCEPTION_CODE || rec_ref.nparams < 3 || fi.try_rva == 0 {
+        return DISPOSITION_CONTINUE_SEARCH;
+    }
+    let throw_obj = rec_ref.info[1];
+    let throw_info = rec_ref.info[2];
+    let throw_base = if rec_ref.nparams >= 4 { rec_ref.info[3] } else { 0 };
+
+    let mut tc = Fh4Cur { m, at: u64::from(fi.try_rva) };
+    let Some(ntries) = tc.u32_var() else {
+        return DISPOSITION_CONTINUE_SEARCH;
+    };
+    for _ in 0..ntries.min(256) {
+        let (Some(try_low), Some(try_high), Some(_catch_high), Some(handlers_rva)) =
+            (tc.u32_var(), tc.u32_var(), tc.u32_var(), tc.i32())
+        else {
+            break;
+        };
+        if cur_state < try_low as i32 || cur_state > try_high as i32 || handlers_rva == 0 {
+            continue;
+        }
+        let mut hc = Fh4Cur { m, at: u64::from(handlers_rva as u32) };
+        let Some(nhandlers) = hc.u32_var() else { continue };
+        for _ in 0..nhandlers.min(64) {
+            let Some(hflags) = hc.u8() else { break };
+            let adjectives = if hflags & 0x01 != 0 { hc.u32_var().unwrap_or(0) } else { 0 };
+            let type_rva = if hflags & 0x02 != 0 { hc.i32().unwrap_or(0) as u32 } else { 0 };
+            let catch_obj_disp = if hflags & 0x04 != 0 { hc.u32_var().unwrap_or(0) } else { 0 };
+            let Some(handler_rva) = hc.i32() else { break };
+            let cont_mode = (hflags >> 4) & 3;
+            let mut cont_va = 0u64;
+            if hflags & 0x08 != 0 {
+                // contIsRVA
+                if cont_mode == 1 {
+                    cont_va = m.base + u64::from(hc.i32().unwrap_or(0) as u32);
+                } else if cont_mode == 2 {
+                    cont_va = m.base + u64::from(hc.i32().unwrap_or(0) as u32);
+                    let _ = hc.i32();
+                }
+            } else if cont_mode == 1 {
+                cont_va = m.base + u64::from(fe.begin) + u64::from(hc.u32_var().unwrap_or(0));
+            } else if cont_mode == 2 {
+                cont_va = m.base + u64::from(fe.begin) + u64::from(hc.u32_var().unwrap_or(0));
+                let _ = hc.u32_var();
+            }
+
+            let want_td = if type_rva != 0 { m.base + u64::from(type_rva) } else { 0 };
+            let Some((adj_obj, copy_ctor, obj_size, _props)) = match_cxx_type(throw_obj, throw_info, throw_base, want_td) else {
+                continue;
+            };
+
+            // Initialize the catch object slot on the establisher frame.
+            if catch_obj_disp != 0 && adj_obj != 0 {
+                let dst = frame.wrapping_add(u64::from(catch_obj_disp));
+                if adjectives & 8 != 0 {
+                    // HT_IsReference: store pointer to the adjusted exception object
+                    // SAFETY: catch object slot in the establisher frame's stack.
+                    unsafe { (dst as *mut u64).write_unaligned(adj_obj) };
+                } else if copy_ctor != 0 {
+                    type CopyCtor = extern "win64" fn(u64, u64);
+                    // SAFETY: compiler-emitted copy constructor.
+                    let f: CopyCtor = unsafe { core::mem::transmute::<u64, CopyCtor>(copy_ctor) };
+                    f(dst, adj_obj);
+                } else if obj_size > 0 && obj_size <= 65536 {
+                    // SAFETY: plain bitwise copy into the catch object slot.
+                    unsafe { core::ptr::copy_nonoverlapping(adj_obj as *const u8, dst as *mut u8, obj_size as usize) };
+                }
+            }
+
+            let (prev_rec, prev_ctx) = match current_thread() {
+                Some(t) => {
+                    let prev = (t.cur_exc_rec, t.cur_exc_ctx);
+                    t.cur_exc_rec = rec as u64;
+                    t.cur_exc_ctx = ctx as u64;
+                    prev
+                }
+                None => (0, 0),
+            };
+
+            // Build STATUS_UNWIND_CONSOLIDATE record and unwind to this frame!
+            let mut cons = ExcRecord::new(STATUS_UNWIND_CONSOLIDATE, 0, dc_ref.control_pc);
+            cons.nparams = 11;
+            cons.info[0] = cxx_consolidate_cb as *const () as u64;
+            cons.info[1] = m.base + u64::from(handler_rva as u32);
+            cons.info[2] = frame;
+            cons.info[3] = cont_va;
+            cons.info[4] = throw_obj;
+            cons.info[5] = throw_info;
+            cons.info[6] = throw_base;
+            cons.info[7] = prev_rec;
+            cons.info[8] = prev_ctx;
+            cons.info[9] = (try_low as i32 - 1) as u64;
+            // SAFETY: unwinds stack to `frame` and invokes `cxx_consolidate_cb` (never returns).
+            unsafe {
+                dcmpl_unwind_ex(frame, cont_va, &raw mut cons, 0, dc_ref.context, dc_ref.history_table);
+            }
+        }
+    }
+    DISPOSITION_CONTINUE_SEARCH
+}
+
+/// `__CxxFrameHandler3` stub fallback (delegates cleanly when FH3 metadata is encountered).
+pub(super) extern "win64" fn cxx_frame_handler3(
+    _rec: *mut ExcRecord,
+    _frame: u64,
+    _ctx: *mut Context,
+    _dc: *mut DispatcherContext,
+) -> u32 {
+    DISPOSITION_CONTINUE_SEARCH
 }

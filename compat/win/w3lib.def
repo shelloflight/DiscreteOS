@@ -1,0 +1,13 @@
+LIBRARY w3lib.dll
+EXPORTS
+    w3_add
+    w3_mul
+    w3_ord_fn @10
+    w3_attach_count
+    w3_thread_attach_count
+    w3_thread_detach_count
+    w3_get_tls
+    w3_set_tls
+    w3_seh_local
+    w3_raise_across
+    w3_fwd_pid = KERNEL32.GetCurrentProcessId

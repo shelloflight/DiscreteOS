@@ -23,7 +23,7 @@ static i64 sys3(i64 n, i64 a, i64 b, i64 c)
     return r;
 }
 
-enum { SYS_write = 1, SYS_getpid = 39, SYS_uname = 63, SYS_arch_prctl = 158, SYS_set_tid_address = 218,
+enum { SYS_write = 1, SYS_getpid = 39, SYS_ptrace = 101, SYS_arch_prctl = 158, SYS_set_tid_address = 218,
        SYS_exit_group = 231 };
 enum { ARCH_SET_FS = 0x1002, ARCH_GET_FS = 0x1003, ENOSYS = 38 };
 enum { AT_NULL = 0, AT_PAGESZ = 6, AT_ENTRY = 9, AT_RANDOM = 25 };
@@ -132,9 +132,8 @@ void l1_main(u64 *sp)
         exit_group(0);
     }
     if (streq(mode, "enosys")) {
-        char buf[400];
-        i64 r = sys3(SYS_uname, (i64)buf, 0, 0);
-        out(r == -ENOSYS ? "L1: uname -> ENOSYS, handled cleanly\n" : "L1: uname did not fail with ENOSYS\n");
+        i64 r = sys3(SYS_ptrace, 0, 0, 0);
+        out(r == -ENOSYS ? "L1: ptrace -> ENOSYS, handled cleanly\n" : "L1: ptrace did not fail with ENOSYS\n");
         exit_group(r == -ENOSYS ? 0 : 14);
     }
     if (streq(mode, "fault")) {
