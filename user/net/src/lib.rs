@@ -846,11 +846,9 @@ impl NetSvc {
         let Some(nic) = self.nic.as_mut() else { return };
         let mut wake: Vec<(u64, u32)> = Vec::new();
         for s in &mut self.sockets {
-            // Pull new SQEs.
-            while s.pending_recv.is_none() {
-                let Some(sqe) = s.ring.pop_sq() else {
-                    break;
-                };
+            // Pull new SQEs (always allow RING_SEND even while a RING_RECV is pending so
+            // full-duplex interactive protocols like SSH never stall on an idle recv).
+            while let Some(sqe) = s.ring.pop_sq() {
                 match sqe.op {
                     net::RING_SEND => {
                         if let Some(src) = s.ring.data(sqe.buf_off, sqe.buf_len) {

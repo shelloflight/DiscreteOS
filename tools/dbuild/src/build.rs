@@ -88,7 +88,6 @@ const CORE_DAPPS: &[(&str, &str)] = &[
     ("editor", "editor.dx"),
     ("settings", "settings.dx"),
     ("sysmon", "sysmon.dx"),
-    ("installer", "installer.dx"),
     ("oobe", "oobe.dx"),
 ];
 

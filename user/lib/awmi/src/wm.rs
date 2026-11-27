@@ -3,7 +3,7 @@
 
 use crate::dock::{DockHit, DockLayout, DockPinnedEntry, DockTrayState, DockWindowEntry, MAX_DOCK_PINNED, MAX_DOCK_WINDOWS};
 use crate::geom::{DamageSet, Point, Rect};
-use crate::launcher::{LaunchTarget, Launcher, OPEN_NS, Outcome, Setting, UiSettings};
+use crate::launcher::{FS_PATH_BYTES, LaunchTarget, Launcher, OPEN_NS, Outcome, PowerAction, PowerHit, Setting, UiSettings};
 use crate::lock::{LockMode, LockOutcome, LockReason, LockScreen};
 use crate::perm::{PermOutcome, PermPrompt};
 use crate::pixel::{Canvas, CursorKind, WinIcon};
@@ -437,6 +437,10 @@ pub enum WmAction {
     ExitSession,
     /// The user opened a program's launcher entry: send it `EVT_LAUNCH`.
     Launch { owner: u32, app: u8 },
+    /// The user opened a file or directory from the launcher lookup.
+    OpenPath { path: [u8; FS_PATH_BYTES], len: u8, is_dir: bool },
+    /// The user activated a power control action (Off, Reboot, Lock, Sleep) in the launcher.
+    Power(PowerAction),
     /// The user picked a built-in action in the launcher.
     Setting(Setting),
     /// User pressed `Super+L` or `Ctrl+Alt+L` (or picked Lock screen in launcher).
@@ -637,6 +641,18 @@ impl WmState {
         self.damage_launcher_output();
     }
 
+    fn activate_launch_target(&self, target: LaunchTarget) -> WmAction {
+        match target {
+            LaunchTarget::App { owner, app } => WmAction::Launch { owner, app },
+            LaunchTarget::File { index } => match self.launcher.fs_entry(index) {
+                Some(e) => WmAction::OpenPath { path: e.path, len: e.path_len, is_dir: e.is_dir },
+                None => WmAction::None,
+            },
+            LaunchTarget::Setting(s) => WmAction::Setting(s),
+            LaunchTarget::Power(p) => WmAction::Power(p),
+        }
+    }
+
     pub fn toggle_launcher(&mut self) {
         if self.lock.active || self.perm_prompt.active {
             return;
@@ -681,7 +697,9 @@ impl WmState {
                 if rects.field.contains_point(local) {
                     return CursorKind::Text;
                 }
-                if rects.rows[..rects.n].iter().any(|r| r.contains_point(local)) {
+                if rects.rows[..rects.n].iter().any(|r| r.contains_point(local))
+                    || self.launcher.hit_power(&rects, local).is_some()
+                {
                     return CursorKind::Pointer;
                 }
             }
@@ -1237,11 +1255,9 @@ impl WmState {
                     WmAction::None
                 }
                 Outcome::Activate(t) => {
+                    let act = self.activate_launch_target(t);
                     self.launcher.hide();
-                    match t {
-                        LaunchTarget::App { owner, app } => WmAction::Launch { owner, app },
-                        LaunchTarget::Setting(s) => WmAction::Setting(s),
-                    }
+                    act
                 }
             };
         }
@@ -1392,6 +1408,27 @@ impl WmState {
             let Some(prim) = self.layout.primary() else { return WmAction::None };
             let local = Point::new(next.x - prim.bounds.x, next.y - prim.bounds.y);
             let rects = self.launcher.rects(prim.bounds.w, prim.bounds.h, self.line_h);
+            let phit = self.launcher.hit_power(&rects, local);
+            if self.launcher.power_hover != phit {
+                self.launcher.power_hover = phit;
+                self.damage.add(rects.panel.translate(prim.bounds.x, prim.bounds.y));
+            }
+            if let Some(ph) = phit {
+                if left_pressed {
+                    match ph {
+                        PowerHit::Toggle => {
+                            self.launcher.power_open = !self.launcher.power_open;
+                            self.damage.add(rects.panel.translate(prim.bounds.x, prim.bounds.y));
+                        }
+                        PowerHit::Action(act) => {
+                            self.launcher.hide();
+                            self.damage.add(prim.bounds);
+                            return WmAction::Power(act);
+                        }
+                    }
+                }
+                return WmAction::None;
+            }
             let (inside, hit) = self.launcher.hit(&rects, local);
             if let Some((idx, target)) = hit {
                 if self.launcher.sel != idx {
@@ -1399,12 +1436,10 @@ impl WmState {
                     self.damage.add(rects.panel.translate(prim.bounds.x, prim.bounds.y));
                 }
                 if left_pressed {
+                    let act = self.activate_launch_target(target);
                     self.launcher.hide();
                     self.damage.add(prim.bounds);
-                    return match target {
-                        LaunchTarget::App { owner, app } => WmAction::Launch { owner, app },
-                        LaunchTarget::Setting(s) => WmAction::Setting(s),
-                    };
+                    return act;
                 } else if right_pressed
                     && let LaunchTarget::App { owner, app } = target
                     && let Some(pinned) = self.launcher.toggle_pinned(owner, app)

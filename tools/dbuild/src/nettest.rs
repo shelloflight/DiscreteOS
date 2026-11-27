@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use dosnet::ssh::server::SshServer;
 use dosnet::tls::server::{ServerKey, TEST_CA_SEED, TlsServer, make_test_rsa_bundle};
 
 pub struct NetTestServer {
@@ -18,6 +19,8 @@ pub struct NetTestServer {
     pub tcp_port: u16,
     pub tls_port: u16,
     pub bad_tls_port: u16,
+    pub ssh_port: u16,
+    pub ssh_exec_port: u16,
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
 }
@@ -99,11 +102,20 @@ impl NetTestServer {
         let (bad_tls_port, th_bad) = spawn_tls_server(bad_leaf, bad_key, Arc::clone(&stop))?;
         threads.push(th_bad);
 
+        // 5. SSH-2 servers on 10.0.2.100:22 (probe) and 10.0.2.100:2222 (exec).
+        // QEMU slirp `guestfwd=tcp:...-tcp:...` opens one chardev socket per rule.
+        let (ssh_port, th_ssh) = spawn_ssh_server(Arc::clone(&stop))?;
+        threads.push(th_ssh);
+        let (ssh_exec_port, th_ssh_exec) = spawn_ssh_server(Arc::clone(&stop))?;
+        threads.push(th_ssh_exec);
+
         Ok(Self {
             dns_port,
             tcp_port,
             tls_port,
             bad_tls_port,
+            ssh_port,
+            ssh_exec_port,
             stop,
             threads,
         })
@@ -111,8 +123,13 @@ impl NetTestServer {
 
     pub fn netdev_arg(&self) -> String {
         format!(
-            "user,id=net0,bootfile=dns:{},guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:{},guestfwd=tcp:10.0.2.100:443-tcp:127.0.0.1:{},guestfwd=tcp:10.0.2.100:444-tcp:127.0.0.1:{}",
-            self.dns_port, self.tcp_port, self.tls_port, self.bad_tls_port
+            "user,id=net0,bootfile=dns:{},guestfwd=tcp:10.0.2.100:80-tcp:127.0.0.1:{},guestfwd=tcp:10.0.2.100:443-tcp:127.0.0.1:{},guestfwd=tcp:10.0.2.100:444-tcp:127.0.0.1:{},guestfwd=tcp:10.0.2.100:22-tcp:127.0.0.1:{},guestfwd=tcp:10.0.2.100:2222-tcp:127.0.0.1:{}",
+            self.dns_port,
+            self.tcp_port,
+            self.tls_port,
+            self.bad_tls_port,
+            self.ssh_port,
+            self.ssh_exec_port
         )
     }
 }
@@ -174,6 +191,68 @@ fn spawn_tls_server(
                 }
                 if srv.closed {
                     break;
+                }
+            }
+        }
+    });
+    Ok((port, handle))
+}
+
+fn spawn_ssh_server(stop: Arc<AtomicBool>) -> Result<(u16, JoinHandle<()>), String> {
+    let l = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind ssh: {e}"))?;
+    let port = l.local_addr().map_err(|e| e.to_string())?.port();
+    let _ = l.set_nonblocking(true);
+    let handle = thread::spawn(move || {
+        let host_seed = [0x5Au8; 32];
+        let mut ctr = 1u8;
+        while !stop.load(Ordering::Relaxed) {
+            let Ok((mut s, _)) = l.accept() else {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            let _ = s.set_nonblocking(false);
+            let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+            let rand64 = [ctr.wrapping_mul(53).wrapping_add(7); 64];
+            ctr = ctr.wrapping_add(1);
+            let mut srv = SshServer::new(
+                &host_seed,
+                &rand64,
+                "user",
+                Some(b"dos-test"),
+                None,
+                true,
+            );
+            let init = srv.take_tx();
+            if !init.is_empty() && s.write_all(&init).is_err() {
+                continue;
+            }
+            let _ = s.flush();
+            let mut buf = [0u8; 4096];
+            while !stop.load(Ordering::Relaxed) {
+                match s.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if srv.feed_rx(&buf[..n]).is_err() {
+                            break;
+                        }
+                        let out = srv.take_tx();
+                        if !out.is_empty() {
+                            if s.write_all(&out).is_err() {
+                                break;
+                            }
+                            let _ = s.flush();
+                        }
+                        if srv.closed {
+                            break;
+                        }
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::TimedOut
+                            || e.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
                 }
             }
         }

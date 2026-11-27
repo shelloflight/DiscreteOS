@@ -102,7 +102,7 @@ threads = 16
 
 ## Core native apps (`sys:/apps/*.dapp`)
 
-All seven shipped desktop applications are signed `.dapp` bundles built from in-tree `dosui` /
+All six shipped desktop applications are signed `.dapp` bundles built from in-tree `dosui` /
 D-AWMI code and registered with the compositor launcher and dock via `awmi.launcher`:
 
 | Bundle | Title | Pinned / Autostart | Role & capabilities |
@@ -112,8 +112,7 @@ D-AWMI code and registered with the compositor launcher and dock via `awmi.launc
 | `editor.dapp` | **Text Editor** | pinned | Multiline monospace text editor (`editor.dx`, `dosui::textarea`): open/edit files in `/home`, save with `Ctrl+S` (prompts for `files:write` via compositor prompt; runs read-only if denied), unsaved indicator. |
 | `settings.dapp` | **Settings** | pinned | 6-tab system settings (`settings.dx`): **Display** (output selector, mode/Hz switching, VRR, HDR10, per-output scale via `awmi.admin` `OP_SET_DISPLAY`), **Appearance** (Dark Slate / High Contrast theme, 100–200% text scale, reduce motion), **Audio** (output selection, volume, mute/unmute, microphone gate; persisted in `/home/.dos/audio.toml`), **Network** (link/IP/DNS status, DHCP/static IPv4 & DNS editing; persisted in `/home/.dos/network.toml`), **Identity & Lock** (active identity, lock now, enroll passphrase, create non-root identity, idle timeout & lock-on-sleep/boot policy; persisted in `/home/.dos/identities.toml`), **Apps & Permissions** (list bundles, pin/unpin on taskbar, live grant/revoke permission toggles). |
 | `sysmon.dapp` | **System Monitor** | launcher | 4-tab live monitor (`sysmon.dx`): **Overview** (system summary & memory/handle/thread totals), **Services** (live service table + read-only kernel handle inspector via `MGR_OBJECTS`), **Apps** (installed `.dapp` bundles, verified status, running counts, granted permissions), **System Log** (live `log.read` viewer with level filter). |
-| `installer.dapp` | **Install D-OS** | pinned (live media only) | Disk installer (`installer.dx`, `storage:admin`): drive list (protecting live/optical media), partition table viewer with confirmed partition deletion, Dual Boot (recommended), Use Entire Disk, and confirmed Wipe & Repartition modes with dry-run plan preview. Automatically unpinned by default on installed systems. |
-| `oobe.dapp` | **Welcome to D-OS** | first-boot | Skippable first-boot setup wizard (`oobe.dx`): automatically launched once by `appmgr` on newly installed disks when `/home/.dos/oobe.toml` has `completed = false`, covering language/keyboard, timezone, optional network (skip/DHCP/static), and local non-root account creation (enabling boot sign-in once a personal account or passphrase is set); bypassed once completed or skipped. |
+| `oobe.dapp` | **Install D-OS** | pinned & auto-launched (live media only; hidden once installed) | Unified Installer & First-Boot Setup (`oobe.dx`, `storage:admin` + reboot-only `manager.power-reboot`): auto-launches on live media (with a *Try Live Desktop* dismiss option) and walks through disk installation (Dual Boot / Whole Disk / confirmed Wipe & Repartition with partition management), live-applied Language & Keyboard layout (`en-US`/`en-GB`/`de-DE`/`fr-FR`/`es-ES` and `us`/`uk`/`de`/`fr`/`es` with interactive test field), Timezone (live clock offset), optional Network setup, optional non-root Account creation, and *Unplug USB & Reboot* (`OP_COMMIT_OOBE` writes all choices directly onto the installed `home` volume and enables boot login). Completely hidden from the dock, launcher, and app list once setup completes on an installed disk. |
 
 ## Capability model (`grants.appmgr`)
 

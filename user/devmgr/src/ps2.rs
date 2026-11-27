@@ -93,11 +93,17 @@ pub fn main(s: *const Startup) -> i32 {
                     if let Some(h) = Header::get(&msg[..n as usize]) {
                         let (st, a) = match h.op {
                             proto::STATS => (0, sys::interrupt_ack(irq).unwrap_or(0)),
+                            proto::SET_KEYMAP => {
+                                keys.set_layout(h.a as u8);
+                                (0, 0)
+                            }
                             _ => (sys::ERR_INVALID_ARGS as i32, 0),
                         };
-                        let mut out = [0u8; HEADER];
-                        Header { txid: h.txid, op: h.op, status: st, a, b: 0 }.put(&mut out);
-                        sys::channel_write(ch, &out);
+                        if h.txid != 0 {
+                            let mut out = [0u8; HEADER];
+                            Header { txid: h.txid, op: h.op, status: st, a, b: 0 }.put(&mut out);
+                            sys::channel_write(ch, &out);
+                        }
                     }
                 }
                 Err(sys::ERR_SHOULD_WAIT) => {}
@@ -127,6 +133,10 @@ pub fn main(s: *const Startup) -> i32 {
                 keymap::LMETA
             } else if ext && raw == 0x5C {
                 keymap::RMETA
+            } else if ext && raw == 0x38 {
+                keymap::RALT
+            } else if ext && raw == 0x1D {
+                keymap::RCTRL
             } else {
                 raw
             };

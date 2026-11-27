@@ -324,7 +324,7 @@ pub fn main(s: *const Startup) -> i32 {
                 widgets = None;
                 about = None;
             }
-            Event::Launch { app } => match app {
+            Event::Launch { app, .. } => match app {
                 ENTRY_WIDGETS => open_widgets(&mut widgets, theme, settings, &mut text),
                 ENTRY_ABOUT => open_about(&mut about, theme, settings, &mut text),
                 _ => {}

@@ -223,6 +223,8 @@ struct Mgr {
     trust: trust::Trust,
     /// Drivers whose pointer input has been reported once (bit = driver index).
     pointer_seen: u64,
+    /// Active keyboard layout id (`keymap::LAYOUT_*`: 0=us, 1=uk, 2=de, 3=fr, 4=es).
+    keymap_layout: u8,
 }
 
 /// Which driver serves a device.
@@ -391,11 +393,18 @@ impl Mgr {
                     }
                     match h.op {
                         proto::READY => {
+                            let mut send_layout_ch = 0 as Handle;
                             if let Some(d) = self.drv[i].as_mut() {
                                 d.ready = true;
                                 d.capacity = h.a;
                                 d.disks_due = h.b.min(64);
                                 println!("devmgr: {}.ddrv ready on {} (start {})", d.prog, d.info.name(), d.starts);
+                                if self.keymap_layout != 0 && matches!(d.prog, "ps2" | "virtio-input" | "xhci") {
+                                    send_layout_ch = d.ch;
+                                }
+                            }
+                            if send_layout_ch != 0 {
+                                proto::send(send_layout_ch, proto::SET_KEYMAP, u64::from(self.keymap_layout), 0);
                             }
                         }
                         proto::KEY => {
@@ -1114,6 +1123,17 @@ impl Mgr {
                             }
                             0
                         }
+                        proto::INPUT_SET_LAYOUT => {
+                            let layout = (h.a as u8).min(keymap::LAYOUT_ES);
+                            self.keymap_layout = layout;
+                            for d in self.drv.iter().flatten() {
+                                if d.ch != 0 && matches!(d.prog, "ps2" | "virtio-input" | "xhci") {
+                                    proto::send(d.ch, proto::SET_KEYMAP, u64::from(layout), 0);
+                                }
+                            }
+                            println!("devmgr: keyboard layout set to {}", keymap::layout_name(layout));
+                            0
+                        }
                         _ => sys::ERR_NOT_SUPPORTED,
                     };
                     if h.txid != 0 {
@@ -1366,6 +1386,7 @@ fn devmgr_main(s: *const Startup) -> i32 {
         ro_locked,
         trust: trust::Trust::new(),
         pointer_seen: 0,
+        keymap_layout: keymap::LAYOUT_US,
     };
     if !writable {
         println!("devmgr: disks are read-only (block drivers refuse writes)");

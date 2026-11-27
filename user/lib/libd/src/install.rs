@@ -17,6 +17,10 @@ pub const OP_PLAN: u32 = 261;
 pub const OP_DELETE_PART: u32 = 262;
 /// Execute installation on `disk_name`; `a = mode | (confirm_wipe << 8)`. Reply payload = UTF-8 summary.
 pub const OP_INSTALL: u32 = 263;
+/// Persist OOBE, network, and sealed identity configuration directly onto a newly installed disk's
+/// `home` DFS partition and finalize `DOS/BOOT.CFG` on its ESP.
+/// Payload: `<disk_name>\0<oobe_toml>\0<network_toml>\0<identities_toml>\0<extra_user_dir>`.
+pub const OP_COMMIT_OOBE: u32 = 264;
 
 pub const MODE_DUAL_BOOT: u8 = 1;
 pub const MODE_WHOLE_DISK: u8 = 2;
@@ -265,4 +269,48 @@ pub fn delete_part(ch: Handle, disk: &str, part_index: u32, confirm: bool, out: 
 pub fn execute(ch: Handle, disk: &str, mode: u8, confirm_wipe: bool, out: &mut [u8]) -> Result<usize, (i64, usize)> {
     let a = u64::from(mode) | (u64::from(confirm_wipe) << 8);
     call_text(ch, OP_INSTALL, a, disk, out)
+}
+
+/// Write finalized OOBE, optional network, and sealed identity files directly into the newly
+/// installed `home` DFS volume on `disk`, and mark `DOS/BOOT.CFG` with `installed = true` & `lock = on`.
+pub fn commit_oobe(
+    ch: Handle,
+    disk: &str,
+    oobe_toml: &str,
+    net_toml: &str,
+    id_toml: &str,
+    extra_user_dir: &str,
+) -> Result<(), i64> {
+    if ch == 0 {
+        return Err(sys::ERR_ACCESS_DENIED);
+    }
+    let total = disk.len() + oobe_toml.len() + net_toml.len() + id_toml.len() + extra_user_dir.len() + 4;
+    if disk.is_empty() || total > 12 * 1024 {
+        return Err(sys::ERR_INVALID_ARGS);
+    }
+    let mut req = [0u8; HEADER + 12 * 1024];
+    Header { txid: 0, op: OP_COMMIT_OOBE, status: 0, a: 0, b: 0 }.put(&mut req);
+    let mut off = HEADER;
+    let push_part = |dst: &mut [u8], off: &mut usize, s: &str, sep: bool| {
+        let b = s.as_bytes();
+        dst[*off..*off + b.len()].copy_from_slice(b);
+        *off += b.len();
+        if sep {
+            dst[*off] = 0;
+            *off += 1;
+        }
+    };
+    push_part(&mut req, &mut off, disk, true);
+    push_part(&mut req, &mut off, oobe_toml, true);
+    push_part(&mut req, &mut off, net_toml, true);
+    push_part(&mut req, &mut off, id_toml, true);
+    push_part(&mut req, &mut off, extra_user_dir, false);
+    let mut rep = [0u8; HEADER + 512];
+    let n = sys::channel_call(ch, &req[..off], &mut rep, 60_000_000_000)? as usize;
+    let h = Header::get(&rep[..n]).ok_or(sys::ERR_INVALID_ARGS)?;
+    if h.status != 0 {
+        Err(i64::from(h.status))
+    } else {
+        Ok(())
+    }
 }

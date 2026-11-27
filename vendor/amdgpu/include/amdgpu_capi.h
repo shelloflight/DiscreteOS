@@ -52,6 +52,13 @@ struct amdgpu_capi_info {
     char asic_name[40];
 };
 
+struct amdgpu_capi_damage_rect {
+    uint32_t x;
+    uint32_t y;
+    uint32_t w;
+    uint32_t h;
+};
+
 struct amdgpu_capi_commit {
     uint32_t pipe_slot;
     uint8_t test_only;
@@ -78,6 +85,8 @@ struct amdgpu_capi_commit {
     uint32_t cursor_size;
     int32_t cursor_x;
     int32_t cursor_y;
+    uint32_t damage_count;
+    struct amdgpu_capi_damage_rect damage[16];
 };
 
 void *amdgpu_capi_open(uint32_t dev_handle);
@@ -109,6 +118,8 @@ int amdgpu_capi_poll_vblank(
 );
 
 int amdgpu_capi_poll_hotplug(void *ctx);
+int amdgpu_capi_has_pending_flip(void *ctx);
+uint32_t amdgpu_capi_refresh_mhz(void *ctx);
 int amdgpu_capi_vm_create(void *ctx, uint32_t vm_id);
 int amdgpu_capi_vm_destroy(void *ctx, uint32_t vm_id);
 int amdgpu_capi_vm_map(

@@ -17,6 +17,7 @@ identify = true
 
 [grants]
 log = true
+manager = ["power"]
 gpu = ["display"]
 audio = ["control"]   # the dock: microphone live, output muted
 net = ["status"]      # the dock: network up (read-only)

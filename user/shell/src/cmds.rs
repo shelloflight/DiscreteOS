@@ -36,6 +36,7 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "net", aliases: &["ip"], usage: "net [check | dhcp | dns <ip|auto> [dns2] | static <ip> <mask> <gw> [dns1] [dns2]]", description: "network status, diagnostics, DHCP renewal, DNS and static IPv4 configuration" },
     Builtin { name: "ping", aliases: &[], usage: "ping <host> [count]", description: "send ICMP echo requests to a host" },
     Builtin { name: "tls", aliases: &[], usage: "tls <host> [port]", description: "verify a TLS 1.3 connection using the system root CAs" },
+    Builtin { name: "ssh", aliases: &[], usage: "ssh [user@]host [-p port] [-i key] [-y] [command...] | ssh probe <host> [port] | ssh keygen [path]", description: "connect to an SSH-2 server, run remote commands, probe host keys, or generate Ed25519 keys" },
     Builtin { name: "gpu", aliases: &["display"], usage: "gpu [modes [id] | display [id] | mode <w> <h> <hz> [id] | confirm [id] | revert [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]", description: "GPU adapters, Atomic KMS topology, refresh/mode, confirm/revert, VRR, HDR, and UI scale" },
     Builtin { name: "gui", aliases: &["awmi"], usage: "gui [demo | status | lock | theme dark|contrast | text 100-200 | motion on|off]", description: "start the desktop (D-AWMI), show its status, lock the screen, or change theme, text size and motion" },
     Builtin { name: "identity", aliases: &["id", "whoami"], usage: "identity [list | enroll <pass> | create <name> <display> [standard|operator] | switch <name> [pass] | policy [idle <sec>|sleep on|off|boot on|off]]", description: "user identities, TPM 2.0 credential sealing, and session lock policy" },
@@ -66,6 +67,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         "audio" | "apps" => 3,
         "gpu" | "identity" | "install" | "setup" => 5,
         "net" => 6,
+        "ssh" => 32,
         _ => 0,
     };
     if args.len() > max_args {
@@ -105,6 +107,7 @@ pub fn run(sh: &mut Shell, name: &str, args: &[String]) -> Option<Res> {
         },
         "ping" => ping_cmd(sh, args),
         "tls" => tls_cmd(sh, args),
+        "ssh" => crate::ssh_cmd::ssh_cmd(sh, args),
         "gpu" => gpu_cmd(sh, args),
         "gui" => gui_cmd(sh, args),
         "identity" => identity_cmd(sh, args),
@@ -1892,6 +1895,12 @@ fn setup_cmd(sh: &Shell, args: &[String]) -> Res {
                 ..OobeConfig::default()
             };
             sh.home_dot_dos_write(b"oobe.toml", cfg.to_toml().as_bytes())?;
+            if sh.awmi_admin != 0 {
+                let lang_id = dosid::Language::from_code(lang).id();
+                let kbd_id = dosid::KeyboardLayout::from_code(kbd).id();
+                let tz_min = dosid::timezone_offset_minutes(tz) as i16;
+                let _ = libd::awmi::set_locale(sh.awmi_admin, lang_id, kbd_id, tz_min);
+            }
             libd::println!("setup: first-boot setup completed (lang={}, kbd={}, tz={}, net={})", lang, kbd, tz, net_mode);
             sh.write(&show::ok_line(&format!(
                 "first-boot setup completed (lang={}, kbd={}, tz={}, net={})",

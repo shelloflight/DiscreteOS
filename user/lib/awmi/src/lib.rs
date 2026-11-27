@@ -24,7 +24,7 @@ mod tests;
 
 pub use dock::{DockHit, DockLayout, DockPinnedEntry, DockTrayState, DockWindowEntry, MAX_DOCK_PINNED};
 pub use geom::{DamageSet, MAX_DAMAGE_RECTS, Point, Rect, Size};
-pub use launcher::{LaunchTarget, Launcher, SETTING_COUNT, Setting, UiSettings};
+pub use launcher::{FS_PATH_BYTES, FsEntry, LaunchTarget, Launcher, MAX_FS_ENTRIES, MAX_RESULTS, PowerAction, PowerHit, SETTING_COUNT, Setting, UiSettings};
 pub use lock::{LockIdentity, LockMode, LockOutcome, LockReason, LockScreen, MAX_LOCK_IDENTITIES};
 pub use perm::{PERM_ALLOW, PERM_CANCEL, PERM_DENY, PermOutcome, PermPrompt};
 pub use pixel::{CURSOR_H, CURSOR_W, Canvas, CursorKind, WinIcon, blend_over, write_hw_cursor_64x64, write_hw_cursor_64x64_kind};

@@ -14,6 +14,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod kdf;
+pub mod locale;
 pub mod model;
 pub mod oobe;
 pub mod settings;
@@ -23,6 +24,7 @@ pub mod wire;
 mod tests;
 
 pub use kdf::{DEFAULT_ITERATIONS, MAX_ITERATIONS, MIN_ITERATIONS, derive_seal_key, derive_verifier, pbkdf2_hmac_sha256};
+pub use locale::{KeyboardLayout, L10n, Language, is_valid_timezone, map_layout_codepoint, timezone_offset_minutes};
 pub use model::{
     AuthThrottle, Credential, Identity, IdentityError, IdentityNsEntry, IdentityRole, IdentityStore, LockPolicy,
     MAX_DISPLAY, MAX_IDENTITIES, MAX_NAME, SealKind, caps, validate_name,

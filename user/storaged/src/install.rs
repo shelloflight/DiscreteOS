@@ -223,6 +223,7 @@ impl Svc {
             wire::OP_PLAN => self.admin_plan(h.a, payload),
             wire::OP_DELETE_PART => self.admin_delete_part(h.a, payload),
             wire::OP_INSTALL => self.admin_install(h.a, payload),
+            wire::OP_COMMIT_OOBE => self.admin_commit_oobe(payload),
             _ => (sys::ERR_NOT_SUPPORTED, 0, 0, Vec::new()),
         }
     }
@@ -586,7 +587,7 @@ impl Svc {
             "DiscreteOS",
             "\\EFI\\DOS\\BOOTX64.EFI",
         );
-        let boot_cfg = b"# D-OS installed disk boot configuration\ninstalled = true\noobe = pending\n";
+        let boot_cfg = b"# D-OS installed disk boot configuration\ninstalled = true\nlock = on\noobe = pending\n";
         let efi_readme = b"DiscreteOS UEFI boot files: \\EFI\\DOS\\BOOTX64.EFI verifies \\DOS\\KERNEL.BIN via \\DOS\\KERNEL.DSIG.\r\n";
         for (path, data) in [
             ("EFI/DOS/BOOTX64.EFI", efi_bin.as_slice()),
@@ -770,5 +771,98 @@ impl Svc {
         let _ = home_fsck;
         println!("storaged: install: complete on {} ({}, {} sys files, {} preserved, fsck OK)", disk_name, mode.as_str(), sys_files_copied, layout.preserved_count);
         (0, u64::from(sys_files_copied), layout.preserved_count as u64, summary.into_bytes())
+    }
+
+    /// Persist finalized OOBE, network, and sealed identity configuration directly onto the newly
+    /// installed target disk's `home` DFS volume and update its ESP `DOS/BOOT.CFG`.
+    fn admin_commit_oobe(&mut self, payload: &[u8]) -> (i64, u64, u64, Vec<u8>) {
+        let mut parts = payload.split(|&b| b == 0);
+        let (Some(d_b), Some(oobe_b), Some(net_b), Some(id_b), Some(user_b)) =
+            (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return (sys::ERR_INVALID_ARGS, 0, 0, b"malformed commit-oobe payload".to_vec());
+        };
+        let Ok(disk_name) = core::str::from_utf8(d_b) else {
+            return (sys::ERR_INVALID_ARGS, 0, 0, b"invalid disk name".to_vec());
+        };
+        let Some(di) = self.find_disk_by_name(disk_name) else {
+            return (libd::fs::ERR_NOT_FOUND, 0, 0, b"target disk not found".to_vec());
+        };
+        if self.disks[di].is_live_boot || self.disks[di].is_optical {
+            return (sys::ERR_ACCESS_DENIED, 0, 0, b"refused: cannot modify live or optical media".to_vec());
+        }
+        if let Err(e) = self.enable_disk_rw(di, true) {
+            return (e, 0, 0, b"failed to unlock writes on target disk".to_vec());
+        }
+        let target_remote = self.disks[di].remote.clone();
+        let target_shared: dosfs::dev::Shared = Rc::new(RefCell::new(RemoteDev(target_remote.clone())));
+        let gpt_info = {
+            let mut raw = RemoteDev(target_remote.clone());
+            match gpt::read_full(&mut raw) {
+                Ok(g) => g,
+                Err(_) => return (libd::fs::ERR_IO, 0, 0, b"target disk has no readable GPT".to_vec()),
+            }
+        };
+        let Some(home_entry) = gpt_info.parts.iter().find(|p| p.name.eq_ignore_ascii_case("home")) else {
+            return (libd::fs::ERR_NOT_FOUND, 0, 0, b"target disk has no 'home' partition".to_vec());
+        };
+        let home_part = Part {
+            disk: target_shared.clone(),
+            start: home_entry.first,
+            len: home_entry.sectors(),
+        };
+        let mut home_fs = match Dfs::mount(Box::new(home_part)) {
+            Ok(fs) => fs,
+            Err((e, _)) => return (libd::fs::ERR_IO, 0, 0, format!("mount target home DFS: {:?}", e).into_bytes()),
+        };
+        if !oobe_b.is_empty()
+            && let Err(e) = put_file(&mut home_fs, ".dos/oobe.toml", oobe_b)
+        {
+            return (libd::fs::ERR_IO, 0, 0, format!("write .dos/oobe.toml: {:?}", e).into_bytes());
+        }
+        if !net_b.is_empty()
+            && let Err(e) = put_file(&mut home_fs, ".dos/network.toml", net_b)
+        {
+            return (libd::fs::ERR_IO, 0, 0, format!("write .dos/network.toml: {:?}", e).into_bytes());
+        }
+        if !id_b.is_empty()
+            && let Err(e) = put_file(&mut home_fs, ".dos/identities.toml", id_b)
+        {
+            return (libd::fs::ERR_IO, 0, 0, format!("write .dos/identities.toml: {:?}", e).into_bytes());
+        }
+        if let Ok(uname) = core::str::from_utf8(user_b)
+            && !uname.is_empty()
+            && uname.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+            && let Err(e) = mkdirs(&mut home_fs, uname)
+        {
+            return (libd::fs::ERR_IO, 0, 0, format!("create home dir {}: {:?}", uname, e).into_bytes());
+        }
+        if let Err(e) = home_fs.sync() {
+            return (libd::fs::ERR_IO, 0, 0, format!("sync target home DFS: {:?}", e).into_bytes());
+        }
+        match home_fs.fsck() {
+            Ok(r) if r.errors == 0 => {}
+            Ok(r) => return (libd::fs::ERR_CORRUPT, 0, 0, format!("target home fsck found {} error(s)", r.errors).into_bytes()),
+            Err(e) => return (libd::fs::ERR_IO, 0, 0, format!("target home fsck failed: {:?}", e).into_bytes()),
+        }
+        drop(home_fs);
+
+        // Finalize DOS/BOOT.CFG on target ESP: installed = true, lock = on (login screen always shown).
+        if let Some(esp_entry) = gpt_info.parts.iter().find(|p| p.type_guid == gpt::TYPE_ESP) {
+            let esp_part = Part {
+                disk: target_shared.clone(),
+                start: esp_entry.first,
+                len: esp_entry.sectors(),
+            };
+            if let Ok(mut esp_fs) = Fat::mount(esp_part) {
+                let boot_cfg = b"# D-OS installed disk boot configuration\ninstalled = true\nlock = on\n";
+                let _ = put_file(&mut esp_fs, "DOS/BOOT.CFG", boot_cfg);
+                let _ = esp_fs.sync();
+            }
+        }
+        let _ = target_remote.borrow_mut().flush();
+        self.reset_disk_cache(di);
+        println!("storaged: install: committed OOBE & identity config to {} (home fsck OK)", disk_name);
+        (0, 0, 0, b"OOBE configuration committed to installed disk".to_vec())
     }
 }

@@ -143,6 +143,9 @@ pub const OP_TEST_ADD_OUTPUT: u32 = 944;
 pub const OP_TEST_FRAME: u32 = 945;
 /// Test mode: advance idle tracking past `idle_timeout_secs` to trigger idle auto-lock immediately.
 pub const OP_TEST_IDLE_EXPIRE: u32 = 946;
+/// `awmi.admin`: apply live locale settings (UI language, keyboard layout forwarded to `devmgr`,
+/// and desktop clock timezone). `a` = lang_id (0..=4) | (kbd_id << 8) | ((tz_offset_min as i16 as u16 as u64) << 16).
+pub const OP_SET_LOCALE: u32 = 947;
 
 // ---- flags & bits -------------------------------------------------------------------------------
 
@@ -594,7 +597,8 @@ pub enum Event {
     Close { window: u32 },
     FrameDone { window: u32, seq: u64 },
     Session { active: bool, demo: bool, desktop: bool, width: u32, height: u32 },
-    Launch { app: u8 },
+    /// `app`: entry id; `arg[..arg_len]`: optional UTF-8 argument (e.g. file or directory path).
+    Launch { app: u8, arg: [u8; LAUNCH_ARG_MAX], arg_len: u8 },
     /// `settings` as in `EVT_SETTINGS`; `theme` the encoded colours (`THEME_LEN` bytes used).
     Settings { settings: u64, theme: [u8; THEME_MAX] },
     /// `awmi.launcher`: compositor modal permission prompt answer.
@@ -605,6 +609,8 @@ pub enum Event {
 
 /// Room for an encoded theme in `Event::Settings`.
 pub const THEME_MAX: usize = 192;
+/// Room for an optional UTF-8 launch argument (e.g. path from launcher lookup) in `Event::Launch`.
+pub const LAUNCH_ARG_MAX: usize = 96;
 
 impl Event {
     pub fn decode(msg: &[u8]) -> Option<Self> {
@@ -625,7 +631,13 @@ impl Event {
             EVT_CLOSE => Self::Close { window },
             EVT_FRAME_DONE => Self::FrameDone { window, seq: h.b },
             EVT_SESSION => Self::Session { active: h.a & 1 != 0, demo: h.a & 2 != 0, desktop: h.a & 4 != 0, width: h.b as u32, height: (h.b >> 32) as u32 },
-            EVT_LAUNCH => Self::Launch { app: h.a as u8 },
+            EVT_LAUNCH => {
+                let mut arg = [0u8; LAUNCH_ARG_MAX];
+                let body = &msg[HEADER.min(msg.len())..];
+                let n = body.len().min(LAUNCH_ARG_MAX);
+                arg[..n].copy_from_slice(&body[..n]);
+                Self::Launch { app: h.a as u8, arg, arg_len: n as u8 }
+            }
             EVT_SETTINGS => {
                 let mut theme = [0u8; THEME_MAX];
                 let body = &msg[HEADER.min(msg.len())..];
@@ -718,6 +730,13 @@ impl Window {
     pub fn set_title(&self, title: &[u8]) -> Result<(), i64> {
         set_title(self.ep, self.id, title)
     }
+}
+
+/// Apply live UI language (`0..=4`), keyboard layout (`0..=4`), and timezone offset (minutes from
+/// UTC) via `awmi.admin`. Forwarded to `devmgr` immediately for all keyboard drivers.
+pub fn set_locale(ep: Handle, lang_id: u8, kbd_id: u8, tz_offset_min: i16) -> Result<(), i64> {
+    let a = u64::from(lang_id) | (u64::from(kbd_id) << 8) | (u64::from(tz_offset_min as u16) << 16);
+    simple(ep, OP_SET_LOCALE, a, 0, &[]).map(|_| ())
 }
 
 impl Drop for Window {

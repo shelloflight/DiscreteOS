@@ -16,6 +16,7 @@ mod cmds;
 mod filter;
 mod parse;
 mod show;
+mod ssh_cmd;
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -87,6 +88,7 @@ pub struct Job {
 pub struct Shell {
     term: Handle,
     pub cols: usize,
+    pub rows: usize,
     pub places: Vec<Place>,
     /// The current place: an absolute path ("/" is the list of places).
     pub place: String,
@@ -200,6 +202,16 @@ impl Shell {
             while end < b.len() && !s.is_char_boundary(end) {
                 end -= 1;
             }
+            self.send(term::WRITE, 0, &b[at..end]);
+            at = end;
+        }
+    }
+
+    /// Forward raw VT100/UTF-8 bytes directly to the terminal (for `RAW_MODE` sessions like SSH).
+    pub fn write_raw(&self, b: &[u8]) {
+        let mut at = 0;
+        while at < b.len() {
+            let end = (at + 32 * 1024).min(b.len());
             self.send(term::WRITE, 0, &b[at..end]);
             at = end;
         }
@@ -756,7 +768,10 @@ impl Shell {
             println!("shell: a key arrived; keyboard notices are no longer shown");
         }
         match h.op {
-            term::SIZE => self.cols = (h.a as usize).clamp(20, 400),
+            term::SIZE => {
+                self.cols = (h.a as usize).clamp(20, 400);
+                self.rows = (h.b as usize).clamp(5, 200);
+            }
             term::LINE => {
                 self.reading = false;
                 if h.a == 0 {
@@ -836,6 +851,73 @@ impl Shell {
 
     pub fn clear(&self) {
         self.send(term::CLEAR, 0, &[]);
+    }
+
+    /// Synchronously prompt the user for a single line (optionally masked for passwords).
+    /// Returns `None` if cancelled with Ctrl+C or the terminal disconnects.
+    pub fn read_line_sync(&mut self, prompt: &str, secret: bool) -> Option<String> {
+        if self.term == 0 {
+            return None;
+        }
+        let flags = if secret { term::READ_SECRET } else { 0 };
+        self.send(term::READ, flags, prompt.as_bytes());
+        let mut buf = alloc::vec![0u8; 4096];
+        loop {
+            match sys::channel_read(self.term, &mut buf, 0) {
+                Ok(n) => {
+                    let n = n as usize;
+                    let Some(h) = Header::get(&buf[..n]) else { continue };
+                    match h.op {
+                        term::LINE => {
+                            if h.a != 0 {
+                                return None;
+                            }
+                            return Some(String::from_utf8_lossy(&buf[HEADER..n]).into_owned());
+                        }
+                        term::SIZE => {
+                self.cols = (h.a as usize).clamp(20, 400);
+                self.rows = (h.b as usize).clamp(5, 200);
+            }
+                        _ => {}
+                    }
+                }
+                Err(sys::ERR_SHOULD_WAIT) => {
+                    if sys::object_wait(self.term, sys::READABLE | sys::PEER_CLOSED, 1_000_000_000).is_err() {
+                        continue;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Toggle raw key forwarding from the terminal (used by interactive SSH).
+    pub fn set_raw_mode(&self, on: bool) {
+        self.send(term::RAW_MODE, u64::from(on), &[]);
+    }
+
+    /// Non-blocking poll for the next raw key pressed while `RAW_MODE` is active.
+    pub fn poll_raw_key(&mut self) -> Option<u32> {
+        if self.term == 0 {
+            return None;
+        }
+        let mut buf = [0u8; HEADER + 64];
+        loop {
+            match sys::channel_read(self.term, &mut buf, 0) {
+                Ok(n) => {
+                    let Some(h) = Header::get(&buf[..n as usize]) else { continue };
+                    match h.op {
+                        term::KEY => return Some(h.a as u32),
+                        term::SIZE => {
+                self.cols = (h.a as usize).clamp(20, 400);
+                self.rows = (h.b as usize).clamp(5, 200);
+            }
+                        _ => {}
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
     }
 
     pub fn self_process() -> Handle {
@@ -982,6 +1064,7 @@ fn main(s: *const Startup) -> i32 {
     let mut sh = Shell {
         term: svc::endpoint(b"terminal.session"),
         cols: 80,
+        rows: 25,
         places,
         place: String::from("/"),
         tools,

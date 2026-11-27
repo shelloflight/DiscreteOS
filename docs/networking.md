@@ -6,7 +6,7 @@ processes (`.ddrv`) inside per-device IOMMU domains; Ethernet frames and socket 
 through zero-copy shared-memory `IoRing` VMOs (`app` ↔ `net.dsvc` ↔ NIC drivers).
 
 **Code:** `user/lib/net` (`dosnet`: `no_std`, `#![forbid(unsafe_code)]` wire parsers, ARP, IPv4,
-ICMP, UDP, DHCPv4, DNS, RFC 9293 TCP, strict TLS 1.3 client, root CA bundle loader),
+ICMP, UDP, DHCPv4, DNS, RFC 9293 TCP, strict TLS 1.3 client, SSH-2 client, root CA bundle loader),
 `user/lib/crypto` (`doscrypt`: compiler-barriered constant-time X25519, ChaCha20-Poly1305,
 zero-table algebraic AES-128-GCM and AES-256-GCM, HKDF-SHA256/SHA384, RSA-PSS SHA-256/384/512,
 ECDSA P-256 & P-384, Ed25519, FIPS 202 SHA-3/SHAKE, FIPS 203 ML-KEM-768, full X.509 v3
@@ -110,6 +110,13 @@ The shell holds `net = ["client", "icmp", "control"]` and provides:
 - `tls <host> [port]` — resolve a host, load `/sys/certs/roots.der`, perform a strict TLS 1.3
   handshake using the kernel CSPRNG and UTC clock, and report the negotiated cipher suite and key
   exchange group (e.g. `TLS_AES_256_GCM_SHA384 / X25519MLKEM768`).
+- `ssh [user@]host [-p port] [-i key] [-y] [command...]` — connect to an SSH-2 server using
+  `dosnet::ssh` (`curve25519-sha256` with strict KEX, `aes256-gcm@openssh.com` /
+  `aes128-gcm@openssh.com`, `ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-256` / `rsa-sha2-512`
+  host key verification with TOFU `/home/.ssh/known_hosts`, Ed25519 public-key and masked
+  password/keyboard-interactive authentication, remote `exec`, and interactive PTY shell with `~.`
+  disconnect). `ssh probe <host> [port]` verifies KEX and prints the server banner, cipher, and
+  SHA-256 fingerprint; `ssh keygen [path]` generates an Ed25519 keypair in `/home/.ssh/id_ed25519`.
 
 ## Tests
 

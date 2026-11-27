@@ -741,6 +741,18 @@ static int program_hw_cursor(
     return 0;
 }
 
+static void invalidate_scanout_buffers(struct dc_pipe_state *p) {
+    if (!p) return;
+    for (u32 b = 0; b < DC_MAX_SCANOUT_BUFS; b++) {
+        p->buf_valid[b] = false;
+        p->buf_dirty_any[b] = false;
+        p->buf_dirty_x0[b] = 0u;
+        p->buf_dirty_y0[b] = 0u;
+        p->buf_dirty_x1[b] = 0u;
+        p->buf_dirty_y1[b] = 0u;
+    }
+}
+
 static void write_vsync_surface_mc(struct amdgpu_device *adev, const struct dc_reg_table *r, u8 pipe, u64 mc_addr) {
     u32 hubp = (u32)pipe * r->hubp_stride;
     u32 fctl = 0;
@@ -1434,6 +1446,7 @@ static int apply_modeset(
     p->dsc_enabled = plan->requires_dsc;
     p->dsc_pps = pps;
     p->active_plan = *plan;
+    invalidate_scanout_buffers(p);
     if (p->vrr_enabled) {
         program_vrr(adev, dc, p, true);
     }
@@ -1819,6 +1832,7 @@ int dc_resume(struct amdgpu_device *adev) {
         }
         if (p->vrr_enabled) program_vrr(adev, dc, p, true);
         if (p->hdr_enabled) program_hdr10(adev, dc, p, true);
+        invalidate_scanout_buffers(p);
     }
     return 0;
 }
@@ -1851,6 +1865,7 @@ int dc_atomic_check_and_commit(
             p->current_mode.v_active = p->boot_snapshot.dst_height;
             p->current_mode.refresh_mhz = p->boot_snapshot.refresh_mhz;
             p->pending_buf = -1;
+            invalidate_scanout_buffers(p);
         }
         *out_vblank_seq = p->vblank_seq;
         *out_async = false;
@@ -1959,6 +1974,7 @@ int dc_atomic_check_and_commit(
         u32 row_bytes = req->primary_width * 4u;
         if (row_bytes > req->primary_pitch) row_bytes = req->primary_pitch;
         if (row_bytes > p->pitch_bytes) row_bytes = p->pitch_bytes;
+        u32 copy_w = row_bytes / 4u;
 
         /* Update DPP scaler if client backbuffer dimensions differ from output mode. */
         if (req->primary_width != p->src_width || req->primary_height != p->src_height) {
@@ -1987,20 +2003,112 @@ int dc_atomic_check_and_commit(
             }
             p->src_width = req->primary_width;
             p->src_height = req->primary_height;
+            invalidate_scanout_buffers(p);
         }
 
-        if (adev->io.vram_write) {
-            if (req->primary_pitch == p->pitch_bytes && row_bytes == p->pitch_bytes) {
-                (void)adev->io.vram_write(adev->io.ctx, dst_vram, req->primary_src, (size_t)p->pitch_bytes * (size_t)copy_h);
+        /* Compute incoming damage bounding box and propagate it into every scanout buffer's
+         * dirty union so triple-buffered scanout copies only changed pixels per flip. */
+        bool have_in = false;
+        u32 in_x0 = 0u, in_y0 = 0u, in_x1 = copy_w, in_y1 = copy_h;
+        if (copy_w > 0 && copy_h > 0) {
+            if (req->damage_count == 0) {
+                have_in = true;
             } else {
-                for (u32 y = 0; y < copy_h; y++) {
+                u32 cnt = req->damage_count < DC_MAX_DAMAGE_RECTS ? req->damage_count : DC_MAX_DAMAGE_RECTS;
+                in_x0 = copy_w;
+                in_y0 = copy_h;
+                in_x1 = 0u;
+                in_y1 = 0u;
+                for (u32 i = 0; i < cnt; i++) {
+                    u32 rx0 = req->damage[i].x;
+                    u32 ry0 = req->damage[i].y;
+                    u32 rw = req->damage[i].w;
+                    u32 rh = req->damage[i].h;
+                    if (rw == 0 || rh == 0 || rx0 >= copy_w || ry0 >= copy_h) continue;
+                    u32 rx1 = (rw > copy_w - rx0) ? copy_w : (rx0 + rw);
+                    u32 ry1 = (rh > copy_h - ry0) ? copy_h : (ry0 + rh);
+                    if (rx0 < in_x0) in_x0 = rx0;
+                    if (ry0 < in_y0) in_y0 = ry0;
+                    if (rx1 > in_x1) in_x1 = rx1;
+                    if (ry1 > in_y1) in_y1 = ry1;
+                    have_in = true;
+                }
+            }
+        }
+        if (have_in) {
+            for (u32 b = 0; b < p->buf_count && b < DC_MAX_SCANOUT_BUFS; b++) {
+                if (!p->buf_valid[b]) continue;
+                if (!p->buf_dirty_any[b]) {
+                    p->buf_dirty_any[b] = true;
+                    p->buf_dirty_x0[b] = in_x0;
+                    p->buf_dirty_y0[b] = in_y0;
+                    p->buf_dirty_x1[b] = in_x1;
+                    p->buf_dirty_y1[b] = in_y1;
+                } else {
+                    if (in_x0 < p->buf_dirty_x0[b]) p->buf_dirty_x0[b] = in_x0;
+                    if (in_y0 < p->buf_dirty_y0[b]) p->buf_dirty_y0[b] = in_y0;
+                    if (in_x1 > p->buf_dirty_x1[b]) p->buf_dirty_x1[b] = in_x1;
+                    if (in_y1 > p->buf_dirty_y1[b]) p->buf_dirty_y1[b] = in_y1;
+                }
+            }
+        }
+
+        if (adev->io.vram_write && copy_w > 0 && copy_h > 0) {
+            bool do_full = !p->buf_valid[next_buf];
+            u32 ux0 = 0u, uy0 = 0u, ux1 = copy_w, uy1 = copy_h;
+            if (!do_full && p->buf_dirty_any[next_buf]) {
+                ux0 = p->buf_dirty_x0[next_buf];
+                uy0 = p->buf_dirty_y0[next_buf];
+                ux1 = p->buf_dirty_x1[next_buf];
+                uy1 = p->buf_dirty_y1[next_buf];
+                if (ux1 > copy_w) ux1 = copy_w;
+                if (uy1 > copy_h) uy1 = copy_h;
+                u64 dirty_px = (ux1 > ux0 && uy1 > uy0) ? (u64)(ux1 - ux0) * (u64)(uy1 - uy0) : 0ULL;
+                u64 full_px = (u64)copy_w * (u64)copy_h;
+                if (dirty_px * 100ULL >= full_px * 65ULL) {
+                    do_full = true;
+                }
+            } else if (!do_full) {
+                ux0 = ux1 = 0u;
+                uy0 = uy1 = 0u;
+            }
+
+            if (do_full) {
+                if (req->primary_pitch == p->pitch_bytes && row_bytes == p->pitch_bytes) {
+                    (void)adev->io.vram_write(adev->io.ctx, dst_vram, req->primary_src, (size_t)p->pitch_bytes * (size_t)copy_h);
+                } else {
+                    for (u32 y = 0; y < copy_h; y++) {
+                        (void)adev->io.vram_write(
+                            adev->io.ctx,
+                            dst_vram + (u64)y * (u64)p->pitch_bytes,
+                            req->primary_src + (size_t)y * (size_t)req->primary_pitch,
+                            row_bytes
+                        );
+                    }
+                }
+                p->buf_valid[next_buf] = true;
+                p->buf_dirty_any[next_buf] = false;
+            } else if (ux1 > ux0 && uy1 > uy0) {
+                u32 span_bytes = (ux1 - ux0) * 4u;
+                if (ux0 == 0u && span_bytes == p->pitch_bytes && req->primary_pitch == p->pitch_bytes) {
                     (void)adev->io.vram_write(
                         adev->io.ctx,
-                        dst_vram + (u64)y * (u64)p->pitch_bytes,
-                        req->primary_src + (size_t)y * (size_t)req->primary_pitch,
-                        row_bytes
+                        dst_vram + (u64)uy0 * (u64)p->pitch_bytes,
+                        req->primary_src + (size_t)uy0 * (size_t)req->primary_pitch,
+                        (size_t)(uy1 - uy0) * (size_t)p->pitch_bytes
                     );
+                } else {
+                    u32 x_off = ux0 * 4u;
+                    for (u32 y = uy0; y < uy1; y++) {
+                        (void)adev->io.vram_write(
+                            adev->io.ctx,
+                            dst_vram + (u64)y * (u64)p->pitch_bytes + (u64)x_off,
+                            req->primary_src + (size_t)y * (size_t)req->primary_pitch + (size_t)x_off,
+                            span_bytes
+                        );
+                    }
                 }
+                p->buf_dirty_any[next_buf] = false;
             }
         }
         wmb();
@@ -2016,6 +2124,33 @@ int dc_atomic_check_and_commit(
 
     *out_vblank_seq = p->vblank_seq;
     return 0;
+}
+
+bool dc_has_pending_flip(const struct amdgpu_device *adev) {
+    if (!adev || !adev->dc) {
+        return false;
+    }
+    const struct dc_state *dc = adev->dc;
+    for (u32 i = 0; i < dc->active_pipe_count; i++) {
+        if (dc->pipes[i].pending_buf >= 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+u32 dc_current_refresh_mhz(const struct amdgpu_device *adev) {
+    if (!adev || !adev->dc || adev->dc->active_pipe_count == 0) {
+        return 60000u;
+    }
+    u32 max_hz = 60000u;
+    for (u32 i = 0; i < adev->dc->active_pipe_count; i++) {
+        u32 hz = adev->dc->pipes[i].current_mode.refresh_mhz;
+        if (hz > max_hz) {
+            max_hz = hz;
+        }
+    }
+    return max_hz;
 }
 
 bool dc_poll_vblank(

@@ -63,8 +63,10 @@ line editor cannot reach a file, and the shell cannot draw outside the terminal'
   running command carry over in both directions ([awmi.md](awmi.md)).
 
 Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with style bytes
-(`STYLE attr`, `PLAIN`), `READ` (show a prompt, edit a line) answered by `LINE` (or cancelled),
-`INTERRUPT`, `COMPLETE`/`COMPLETIONS`, `SIZE`, `CLEAR`.
+(`STYLE attr`, `PLAIN`), `READ` (show a prompt, edit a line; `READ_SECRET` masks characters with
+`*` and omits the line from history and log) answered by `LINE` (or cancelled), `RAW_MODE` / `KEY`
+(forward raw keys for interactive SSH sessions), `INTERRUPT`, `COMPLETE`/`COMPLETIONS`, `SIZE`,
+`CLEAR`.
 
 ## The shell
 
@@ -92,7 +94,11 @@ Session protocol (`libd::term`, endpoint `terminal.session`): `WRITE` text with 
   volume, mute/unmute, routing, test tone, mic policy; [audio.md](audio.md)), `net [check]` (`ip`,
   link and IPv4 status; `check`: which step to the internet fails), `ping <host> [count]` (DNS +
   ICMP echo, with a TCP reachability check when no reply comes), `tls <host> [port]` (TLS 1.3
-  handshake & certificate verification against `/sys/certs/roots.der`;
+  handshake & certificate verification against `/sys/certs/roots.der`), `ssh [user@]host [-p port]
+  [-i key] [-y] [command...] | ssh probe <host> [port] | ssh keygen [path]` (in-tree SSH-2 client
+  with Curve25519, AES-GCM, host-key TOFU, Ed25519/password auth, remote `exec`, and interactive
+  PTY shell backed by `terminal.dsvc`'s full VT100/xterm screen emulator with streaming UTF-8,
+  live cursor, alternate screen buffer, full clear/scrollback reset, and RFC 4254 window resize;
   [networking.md](networking.md)), `gpu [modes [id] | display [id] | mode <w> <h> <hz> [id] | confirm [id] | revert [id] | vrr on|off [id] | hdr on|off [id] | scale <pct|auto> [id]]`
   (`display`, GPU adapters, Atomic KMS topology, 12s guarded mode switching & confirm/revert, VRR,
   HDR10, per-output scale, VRAM, and IOMMU status;

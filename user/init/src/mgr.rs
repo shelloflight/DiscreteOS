@@ -121,8 +121,8 @@ pub struct Mgr {
     embedded_seen: Vec<Handle>,
     /// A manager channel asked for the power (`MGR_POWER`): a clean shutdown, then this action.
     pub power_request: Option<u64>,
-    /// Read-only manager channels handed to verified `.dapp` apps via `MGR_LINK` (`manager.services-ro`).
-    app_mgrs: Vec<Option<Owned>>,
+    /// Scoped manager channels handed to verified `.dapp` apps via `MGR_LINK` (`(channel, reboot_only)`).
+    app_mgrs: Vec<Option<(Owned, bool)>>,
 }
 
 fn startup(tag: u32) -> Handle {
@@ -858,18 +858,23 @@ impl Mgr {
             "appmgr.admin",
             "storaged.admin",
             "manager.services-ro",
+            "manager.power-reboot",
         ];
         if !dman::valid_name(app_name) || !ALLOWED.contains(&endpoint) {
             return Err(sys::ERR_ACCESS_DENIED);
         }
-        if endpoint == "manager.services-ro" {
+        if endpoint == "manager.power-reboot" && app_name != "oobe" {
+            return Err(sys::ERR_ACCESS_DENIED);
+        }
+        if endpoint == "manager.services-ro" || endpoint == "manager.power-reboot" {
+            let reboot_only = endpoint == "manager.power-reboot";
             let (client, ours) = sys::channel_pair()?;
             let slot = if let Some(pos) = self.app_mgrs.iter().position(Option::is_none) {
-                self.app_mgrs[pos] = Some(Owned::from_raw(ours));
+                self.app_mgrs[pos] = Some((Owned::from_raw(ours), reboot_only));
                 pos
             } else if self.app_mgrs.len() < MAX_APP_MGRS {
                 let pos = self.app_mgrs.len();
-                self.app_mgrs.push(Some(Owned::from_raw(ours)));
+                self.app_mgrs.push(Some((Owned::from_raw(ours), reboot_only)));
                 pos
             } else {
                 sys::handle_close(client);
@@ -908,12 +913,15 @@ impl Mgr {
         Ok(mine)
     }
 
-    /// Read-only manager requests from a verified `.dapp` (`manager.services-ro`): only `MGR_LIST`
-    /// and `MGR_OBJECTS` are permitted; stop, restart, power, and link are always refused.
+    /// Scoped manager requests from a verified `.dapp`:
+    /// - `manager.services-ro`: only `MGR_LIST` and `MGR_OBJECTS` are permitted.
+    /// - `manager.power-reboot`: only `MGR_POWER` with `POWER_REBOOT` is permitted (Setup/OOBE only).
     fn manage_app_ro(&mut self, slot: usize) {
         let mut buf = [0u8; HEADER + 64];
         loop {
-            let Some(ch) = self.app_mgrs.get(slot).and_then(|o| o.as_ref()).map(Owned::raw) else { return };
+            let Some((ch, reboot_only)) = self.app_mgrs.get(slot).and_then(|o| o.as_ref()).map(|(h, r)| (h.raw(), *r)) else {
+                return;
+            };
             let n = match sys::channel_read(ch, &mut buf, 0) {
                 Ok(n) => n as usize,
                 Err(sys::ERR_SHOULD_WAIT) => {
@@ -929,14 +937,24 @@ impl Mgr {
             };
             let Some(h) = Header::get(&buf[..n]) else { continue };
             let arg = String::from_utf8_lossy(&buf[HEADER..n]).into_owned();
-            let (status, payload) = match h.op {
-                svc::MGR_LIST => (0, self.list_records()),
-                svc::MGR_OBJECTS => match self.find(&arg) {
-                    Some(k) if self.svcs[k].proc.raw() != 0 => (0, objects_records(self.svcs[k].proc.raw())),
-                    Some(_) => (sys::ERR_BAD_STATE, b"it is not running".to_vec()),
-                    None => (fp::ERR_NOT_FOUND, b"no such service".to_vec()),
-                },
-                _ => (sys::ERR_ACCESS_DENIED, b"read-only manager channel".to_vec()),
+            let (status, payload) = if reboot_only {
+                if h.op == svc::MGR_POWER && h.a == sys::POWER_REBOOT {
+                    println!("init: setup asked to restart the machine");
+                    self.power_request = Some(sys::POWER_REBOOT);
+                    (0, Vec::new())
+                } else {
+                    (sys::ERR_ACCESS_DENIED, b"reboot-only manager channel".to_vec())
+                }
+            } else {
+                match h.op {
+                    svc::MGR_LIST => (0, self.list_records()),
+                    svc::MGR_OBJECTS => match self.find(&arg) {
+                        Some(k) if self.svcs[k].proc.raw() != 0 => (0, objects_records(self.svcs[k].proc.raw())),
+                        Some(_) => (sys::ERR_BAD_STATE, b"it is not running".to_vec()),
+                        None => (fp::ERR_NOT_FOUND, b"no such service".to_vec()),
+                    },
+                    _ => (sys::ERR_ACCESS_DENIED, b"read-only manager channel".to_vec()),
+                }
             };
             let mut out = alloc::vec![0u8; HEADER];
             Header { txid: h.txid, op: h.op, status: status as i32, a: 0, b: 0 }.put(&mut out);

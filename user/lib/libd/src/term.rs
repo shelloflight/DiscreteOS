@@ -20,12 +20,18 @@
 
 pub const WRITE: u32 = 500;
 pub const READ: u32 = 501;
+/// Flag in `READ`'s `a`: mask characters with `*`, omit from history and log (passwords).
+pub const READ_SECRET: u64 = 1 << 0;
 pub const LINE: u32 = 502;
 pub const INTERRUPT: u32 = 503;
 pub const COMPLETE: u32 = 504;
 pub const COMPLETIONS: u32 = 505;
 pub const SIZE: u32 = 506;
 pub const CLEAR: u32 = 507;
+/// Shell -> terminal: `a = 1` forwards raw key events (`KEY`) without line editing; `a = 0` restores normal mode.
+pub const RAW_MODE: u32 = 516;
+/// Terminal -> shell (while `RAW_MODE` is active): a pressed key (`a` = key value from `proto::key`).
+pub const KEY: u32 = 517;
 /// Audio service -> terminal (`terminal.indicator`): update live indicator state.
 /// `a` = flags (`IND_MIC_ACTIVE`), payload = optional short source label.
 pub const INDICATOR: u32 = 508;

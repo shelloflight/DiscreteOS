@@ -110,6 +110,30 @@ impl FilesApp {
             new_name: String::new(),
             status: String::new(),
         };
+        if let Ok(arg) = core::str::from_utf8(libd::args()) {
+            let target = arg.trim().trim_end_matches('/');
+            if !target.is_empty() {
+                // Select the longest granted place matching the requested startup path.
+                let mut best: Option<(usize, usize, &str)> = None;
+                for (i, p) in app.places.iter().enumerate() {
+                    let root = p.path.trim_end_matches('/');
+                    if target == root {
+                        if best.is_none_or(|(_, bl, _)| root.len() > bl) {
+                            best = Some((i, root.len(), ""));
+                        }
+                    } else if let Some(rest) = target.strip_prefix(root)
+                        && let Some(sub) = rest.strip_prefix('/')
+                        && best.is_none_or(|(_, bl, _)| root.len() > bl)
+                    {
+                        best = Some((i, root.len(), sub));
+                    }
+                }
+                if let Some((idx, _, sub)) = best {
+                    app.place_idx = idx;
+                    app.rel = String::from(sub);
+                }
+            }
+        }
         app.reload();
         app
     }

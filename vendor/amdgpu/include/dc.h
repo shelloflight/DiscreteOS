@@ -12,8 +12,16 @@ extern "C" {
 #define DC_MAX_CONNECTORS                  5u
 #define DC_MAX_MODES                       16u
 #define DC_MAX_SCANOUT_BUFS                3u
+#define DC_MAX_DAMAGE_RECTS                16u
 #define DC_EDID_MAX_BYTES                  512u
 #define DC_DSC_PPS_BYTES                   128u
+
+struct dc_damage_rect {
+    u32 x;
+    u32 y;
+    u32 w;
+    u32 h;
+};
 
 /* Link protocols supported by Display Core (`dc_link.c`). */
 enum dc_link_type {
@@ -383,10 +391,16 @@ struct dc_pipe_state {
     struct dc_dsc_pps dsc_pps;
     struct dc_dml2_plan active_plan;
 
-    /* Triple-buffered VRAM scanout chain + 256 KiB HW cursor buffer. */
+    /* Triple-buffered VRAM scanout chain + per-buffer dirty damage union + 256 KiB HW cursor buffer. */
     u32 buf_count;
     u64 scanout_vram[DC_MAX_SCANOUT_BUFS];
     u64 scanout_mc[DC_MAX_SCANOUT_BUFS];
+    bool buf_valid[DC_MAX_SCANOUT_BUFS];
+    bool buf_dirty_any[DC_MAX_SCANOUT_BUFS];
+    u32 buf_dirty_x0[DC_MAX_SCANOUT_BUFS];
+    u32 buf_dirty_y0[DC_MAX_SCANOUT_BUFS];
+    u32 buf_dirty_x1[DC_MAX_SCANOUT_BUFS];
+    u32 buf_dirty_y1[DC_MAX_SCANOUT_BUFS];
     u64 scanout_buf_size;
     u64 cursor_vram;
     u64 cursor_mc;
@@ -441,6 +455,8 @@ struct dc_atomic_req {
     u32 primary_height;
     u32 primary_pitch;
     u32 primary_format;
+    u32 damage_count;
+    struct dc_damage_rect damage[DC_MAX_DAMAGE_RECTS];
     bool cursor_changed;
     const u8 *cursor_src;
     u32 cursor_size;
@@ -530,6 +546,8 @@ bool dc_poll_vblank(
     u64 *out_ts_ns,
     bool *out_late
 );
+bool dc_has_pending_flip(const struct amdgpu_device *adev);
+u32 dc_current_refresh_mhz(const struct amdgpu_device *adev);
 
 #ifdef __cplusplus
 }

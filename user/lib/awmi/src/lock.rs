@@ -36,11 +36,27 @@ pub enum LockReason {
 
 impl LockReason {
     pub const fn label(self) -> &'static [u8] {
-        match self {
-            Self::Boot => b"Sign in to start your session",
-            Self::Manual => b"Session locked",
-            Self::Idle => b"Locked after inactivity",
-            Self::Sleep => b"Locked before sleep",
+        self.label_for(0)
+    }
+
+    pub const fn label_for(self, lang_id: u8) -> &'static [u8] {
+        match (lang_id, self) {
+            (2, Self::Boot) => b"Anmelden, um Sitzung zu starten",
+            (2, Self::Manual) => b"Sitzung gesperrt",
+            (2, Self::Idle) => b"Nach Inaktivitaet gesperrt",
+            (2, Self::Sleep) => b"Vor Ruhemodus gesperrt",
+            (3, Self::Boot) => b"Connectez-vous pour demarrer",
+            (3, Self::Manual) => b"Session verrouillee",
+            (3, Self::Idle) => b"Verrouillee apres inactivite",
+            (3, Self::Sleep) => b"Verrouillee avant mise en veille",
+            (4, Self::Boot) => b"Inicia sesion para comenzar",
+            (4, Self::Manual) => b"Sesion bloqueada",
+            (4, Self::Idle) => b"Bloqueada por inactividad",
+            (4, Self::Sleep) => b"Bloqueada antes de suspender",
+            (_, Self::Boot) => b"Sign in to start your session",
+            (_, Self::Manual) => b"Session locked",
+            (_, Self::Idle) => b"Locked after inactivity",
+            (_, Self::Sleep) => b"Locked before sleep",
         }
     }
 }
@@ -114,6 +130,7 @@ pub struct LockScreen {
     error: [u8; 64],
     error_len: usize,
     pub tpm_present: bool,
+    pub lang_id: u8,
 }
 
 impl Default for LockScreen {
@@ -136,7 +153,12 @@ impl LockScreen {
             error: [0; 64],
             error_len: 0,
             tpm_present: false,
+            lang_id: 0,
         }
+    }
+
+    pub fn set_language(&mut self, lang_id: u8) {
+        self.lang_id = lang_id.min(4);
     }
 
     /// Replace the identity list shown on the lock/login screen and select `active_id`.
@@ -224,8 +246,13 @@ impl LockScreen {
             0x0A | 0x0D => LockOutcome::Submit { identity_id: self.current_id() },
             0x08 => {
                 if self.pass_len > 0 {
-                    self.pass_len -= 1;
-                    self.pass[self.pass_len] = 0;
+                    // Pop one complete UTF-8 character (handles Latin-1 accented characters too).
+                    let mut new_len = self.pass_len - 1;
+                    while new_len > 0 && (self.pass[new_len] & 0xC0) == 0x80 {
+                        new_len -= 1;
+                    }
+                    self.pass[new_len..self.pass_len].fill(0);
+                    self.pass_len = new_len;
                     core::hint::black_box(&self.pass);
                     return LockOutcome::Changed;
                 }
@@ -243,11 +270,18 @@ impl LockScreen {
                 self.error_len = 0;
                 LockOutcome::Changed
             }
-            0x20..=0x7E if self.pass_len < MAX_PASS_BYTES => {
-                self.pass[self.pass_len] = base as u8;
-                self.pass_len += 1;
-                self.error_len = 0;
-                LockOutcome::Changed
+            0x20..=0x7E | 0xA0..=0xFF => {
+                if let Some(ch) = char::from_u32(base) {
+                    let mut tmp = [0u8; 4];
+                    let bytes = ch.encode_utf8(&mut tmp).as_bytes();
+                    if self.pass_len + bytes.len() <= MAX_PASS_BYTES {
+                        self.pass[self.pass_len..self.pass_len + bytes.len()].copy_from_slice(bytes);
+                        self.pass_len += bytes.len();
+                        self.error_len = 0;
+                        return LockOutcome::Changed;
+                    }
+                }
+                LockOutcome::None
             }
             _ => LockOutcome::None,
         }
@@ -399,7 +433,7 @@ impl LockScreen {
         let id = self.selected_identity();
         let name_label = id.map_or(b"Local User".as_slice(), |i| i.display_bytes());
         text.draw(canvas, clip, r.card.x + 24, r.card.y + 30, name_label, TextRole::Large, theme.text_primary, r.card.w.saturating_sub(48));
-        text.draw(canvas, clip, r.card.x + 24, r.card.y + 54, self.reason.label(), TextRole::Small, theme.text_muted, r.card.w.saturating_sub(48));
+        text.draw(canvas, clip, r.card.x + 24, r.card.y + 54, self.reason.label_for(self.lang_id), TextRole::Small, theme.text_muted, r.card.w.saturating_sub(48));
 
         // Optional identity selector pills in Login mode.
         for (i, pill) in r.id_pills.iter().enumerate().take(r.id_count) {
@@ -417,14 +451,26 @@ impl LockScreen {
         let fy = r.field.y + (r.field.h / 2) as i32;
         if self.pass_len == 0 {
             let ph = if id.is_some_and(|i| !i.enrolled) {
-                b"Press Enter to unlock (no passphrase set)".as_slice()
+                match self.lang_id {
+                    2 => b"Enter druecken zum Anmelden (kein Passwort)".as_slice(),
+                    3 => b"Appuyez sur Entree (aucun mot de passe)".as_slice(),
+                    4 => b"Pulsa Enter para entrar (sin contrasena)".as_slice(),
+                    _ => b"Press Enter to sign in (no passphrase set)".as_slice(),
+                }
             } else {
-                b"Enter passphrase".as_slice()
+                match self.lang_id {
+                    2 => b"Passphrase eingeben".as_slice(),
+                    3 => b"Entrer la phrase de passe".as_slice(),
+                    4 => b"Introduce la contrasena".as_slice(),
+                    _ => b"Enter passphrase".as_slice(),
+                }
             };
             text.draw(canvas, clip, r.field.x + 12, fy, ph, TextRole::Body, theme.text_muted, r.field.w.saturating_sub(24));
         } else {
             let dots = [b'*'; 48];
-            let shown = self.pass_len.min(dots.len());
+            let shown = core::str::from_utf8(&self.pass[..self.pass_len])
+                .map_or(self.pass_len, |s| s.chars().count())
+                .min(dots.len());
             let used = text.draw(canvas, clip, r.field.x + 12, fy, &dots[..shown], TextRole::Large, theme.text_primary, r.field.w.saturating_sub(28));
             let cx = r.field.x + 14 + used as i32;
             canvas.fill_rect(clip, Rect::new(cx, fy - (line_h as i32 / 2) + 2, 2, line_h.saturating_sub(4).max(6)), theme.accent_ring);
@@ -432,7 +478,21 @@ impl LockScreen {
 
         // Primary Unlock / Sign In button.
         canvas.fill_rounded_rect(clip, r.unlock_btn, theme.radius, theme.accent, 0);
-        let btn_lbl = if self.mode == LockMode::Login { b"Sign In".as_slice() } else { b"Unlock".as_slice() };
+        let btn_lbl = if self.mode == LockMode::Login {
+            match self.lang_id {
+                2 => b"Anmelden".as_slice(),
+                3 => b"Se connecter".as_slice(),
+                4 => b"Iniciar sesion".as_slice(),
+                _ => b"Sign In".as_slice(),
+            }
+        } else {
+            match self.lang_id {
+                2 => b"Entsperren".as_slice(),
+                3 => b"Deverrouiller".as_slice(),
+                4 => b"Desbloquear".as_slice(),
+                _ => b"Unlock".as_slice(),
+            }
+        };
         let bw = text.measure(btn_lbl, TextRole::Body);
         text.draw(
             canvas,

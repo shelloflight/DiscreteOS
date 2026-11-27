@@ -160,7 +160,7 @@ impl Xhci {
                 intr: Ring::new(PG_INTR + idx as u64),
                 buf_at: [u8::MAX; RING_TRBS as usize],
                 last: [0; 8],
-                keys: Keys::default(),
+                keys: Keys::with_layout(self.keymap_layout),
                 repeat: None,
                 leds_caps: false,
                 leds_due: false,
@@ -360,6 +360,8 @@ fn usage_code(u: u8) -> Option<u16> {
         0x28..=0x39 => Some(u16::from(OTHER[usize::from(u - 0x28)])).filter(|&c| c != 0),
         // Insert, Home, PgUp, Delete, End, PgDn, Right, Left, Down, Up: the keypad's set 1 codes.
         0x49..=0x52 => Some([82, 71, 73, 83, 79, 81, 77, 75, 80, 72][usize::from(u - 0x49)]),
+        // Non-US backslash / ISO 102nd key (`< > |` on DE/FR/ES, `\ |` on UK).
+        0x64 => Some(keymap::ISO_102),
         _ => None,
     }
 }
@@ -370,15 +372,15 @@ fn diff(keys: &mut Keys, old: &[u8; 8], new: &[u8; 8]) -> ([u32; 8], usize, Opti
     let mut out = [0u32; 8];
     let mut n = 0;
     let mut held = None;
-    // Modifiers first: left/right control, shift, alt, and Super/GUI.
+    // Modifiers first: left/right control, shift, alt/AltGr, and Super/GUI.
     let mods = [
         (0, keymap::CTRL),
         (1, keymap::LSHIFT),
         (2, keymap::ALT),
         (3, keymap::LMETA),
-        (4, keymap::CTRL),
+        (4, keymap::RCTRL),
         (5, keymap::RSHIFT),
-        (6, keymap::ALT),
+        (6, keymap::RALT),
         (7, keymap::RMETA),
     ];
     for (bit, code) in mods {

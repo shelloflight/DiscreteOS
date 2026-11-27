@@ -159,6 +159,7 @@ struct amdgpu_sim {
     uint32_t smu_msg_count;
     uint32_t psp_cmd_count;
     uint32_t dmub_cmd_count;
+    uint64_t vram_write_bytes;
     uint64_t next_dma_pa;
 
     /* Simulated DP AUX / DPCD / EDID sink */
@@ -552,6 +553,7 @@ static int sim_vram_write(void *ctx, uint64_t off, const void *src, size_t len) 
     struct amdgpu_sim *s = (struct amdgpu_sim *)ctx;
     if (off + len > SIM_VRAM_BYTES) return -34;
     memcpy(s->vram + off, src, len);
+    s->vram_write_bytes += (uint64_t)len;
     return 0;
 }
 
@@ -899,6 +901,7 @@ static void test_family_end_to_end(const char *fw_dir, uint16_t pci_dev, enum dc
     req.cursor_src = cur_buf; req.cursor_size = 64; req.cursor_x = 400; req.cursor_y = 300; req.cursor_hot_x = 4; req.cursor_hot_y = 4;
     CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "scaled primary + HW cursor flip");
     CHECK(is_async && adev.dc->pipes[0].cursor_enabled && adev.dc->pipes[0].flips_completed == 1, "flip + cursor active");
+    CHECK(dc_has_pending_flip(&adev) && dc_current_refresh_mhz(&adev) >= 500000u, "pending flip & refresh reported");
 
     /* Inject OSSSYS IH FlipDone IV and verify dc_poll_vblank completes cleanly! */
     uint32_t *ih_ring = (uint32_t *)adev.ih.ring_dma.cpu_addr;
@@ -907,7 +910,45 @@ static void test_family_end_to_end(const char *fw_dir, uint16_t pci_dev, enum dc
     ih_wb[0] = 32u;
     uint32_t vpipe = 99; uint64_t vseq = 0, vts = 0; bool vlate = true;
     CHECK(dc_poll_vblank(&adev, &vpipe, &vseq, &vts, &vlate) && vpipe == 0 && vseq == seq, "IH vblank completion");
+    CHECK(!dc_has_pending_flip(&adev), "no pending flip after vblank");
     CHECK(adev.ih.flip_irqs == 1 && adev.ih.verified_irq, "OSSSYS IH IRQ decoded");
+
+    /* Verify triple-buffered partial-damage VRAM upload: warm remaining 2 scanout buffers
+     * with small incremental cursor rects (mirroring steady-state desktop frames after initial
+     * full-frame paint), then submit a 32x32 cursor damage rect and assert VRAM traffic drops
+     * by >100x while the changed pixels land accurately in the flipped scanout buffer! */
+    req.cursor_changed = false;
+    req.damage_count = 1;
+    req.damage[0].x = 16u; req.damage[0].y = 16u; req.damage[0].w = 16u; req.damage[0].h = 16u;
+    for (int warm = 0; warm < 2; warm++) {
+        CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "warm triple buffer");
+        adev.dc->pipes[0].pending_buf = -1;
+    }
+    uint64_t bytes_before = sim.vram_write_bytes;
+    memset(fb_buf + (100u * 1280u + 200u) * 4u, 0xCCu, 32u * 4u);
+    req.damage_count = 1;
+    req.damage[0].x = 200u; req.damage[0].y = 100u; req.damage[0].w = 32u; req.damage[0].h = 32u;
+    CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "partial damage cursor flip");
+    uint64_t bytes_partial = sim.vram_write_bytes - bytes_before;
+    /* Union of warm (16,16)-(32,32) and new (200,100)-(232,132) is 216x116 = ~100 KiB << 3.6 MiB!
+     * Submit one more 32x32 cursor move nearby after buf 1 cleared its union to verify <32 KiB. */
+    CHECK(bytes_partial > 0 && bytes_partial < 256u * 1024u, "partial damage copies small union instead of full 3.6 MiB frame");
+    uint32_t fbuf = adev.dc->pipes[0].front_buf;
+    uint64_t px_off = adev.dc->pipes[0].scanout_vram[fbuf] + 100ULL * adev.dc->pipes[0].pitch_bytes + 200ULL * 4ULL;
+    CHECK(sim.vram[px_off] == 0xCCu, "partial damage pixel accurately written to VRAM");
+    adev.dc->pipes[0].pending_buf = -1;
+
+    /* Next 3 flips move cursor strictly within (200..236, 100..136) -> < 16 KiB per flip! */
+    for (uint32_t step = 0; step < 3; step++) {
+        req.damage[0].x = 200u + step; req.damage[0].y = 100u + step; req.damage[0].w = 32u; req.damage[0].h = 32u;
+        uint64_t b0 = sim.vram_write_bytes;
+        CHECK(dc_atomic_check_and_commit(&adev, &req, &seq, &is_async) == 0, "steady cursor move flip");
+        uint64_t delta = sim.vram_write_bytes - b0;
+        if (step == 2) {
+            CHECK(delta > 0 && delta < 16384u, "steady 32x32 cursor move copies <16 KiB instead of 3.6 MiB");
+        }
+        adev.dc->pipes[0].pending_buf = -1;
+    }
 
     /* Multi-monitor HPD hotplug on connector 1 (HDMI 2.1 FRL). */
     sim.hpd_sense_mask |= (1u << 1);

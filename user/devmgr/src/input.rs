@@ -80,6 +80,10 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
                         let mut out = [0u8; HEADER];
                         let (st, a) = match h.op {
                             proto::STATS => (0, q.interrupts()),
+                            proto::SET_KEYMAP => {
+                                keys.set_layout(h.a as u8);
+                                (0, 0)
+                            }
                             proto::TEST_CRASH => {
                                 // SAFETY: deliberately faults (test).
                                 unsafe { core::ptr::write_volatile(0x10 as *mut u32, 1) };
@@ -87,8 +91,10 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
                             }
                             _ => (sys::ERR_INVALID_ARGS as i32, 0),
                         };
-                        Header { txid: h.txid, op: h.op, status: st, a, b: 0 }.put(&mut out);
-                        sys::channel_write(ch, &out);
+                        if h.txid != 0 {
+                            Header { txid: h.txid, op: h.op, status: st, a, b: 0 }.put(&mut out);
+                            sys::channel_write(ch, &out);
+                        }
                     }
                 }
                 Err(sys::ERR_SHOULD_WAIT) => {}

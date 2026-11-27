@@ -63,6 +63,7 @@ pub fn canvas_of(win: &mut Window) -> Option<Canvas<'_>> {
 pub struct UiWindow<A: App> {
     pub app: A,
     pub win: Window,
+    back: Vec<u32>,
     ui: Ui<A::Msg>,
     /// The desktop's theme and settings (the app may draw with another theme, `App::theme`).
     desktop: (Theme, UiSettings),
@@ -77,12 +78,13 @@ impl<A: App> UiWindow<A> {
         let (w, h) = app.size();
         let scale = u32::from(settings.text_scale);
         let win = Window::new(ep, w * scale / 100, h * scale / 100, wire::FLAGS_DEFAULT, app.title().as_bytes())?;
+        let back = alloc::vec![theme.client_bg; (win.width as usize) * (win.height as usize)];
         let shown = app.theme(theme);
         let mut ui = Ui::new(shown, settings);
         ui.resize(win.width, win.height, text);
         ui.set_view(app.view(), text);
         ui.damage_all();
-        Ok(UiWindow { app, win, ui, desktop: (theme, settings), shown, in_flight: false, dirty: true })
+        Ok(UiWindow { app, win, back, ui, desktop: (theme, settings), shown, in_flight: false, dirty: true })
     }
 
     pub fn id(&self) -> u32 {
@@ -140,7 +142,7 @@ impl<A: App> UiWindow<A> {
             }
             Event::FrameDone { .. } => {
                 self.in_flight = false;
-                if self.ui.animating() {
+                if self.ui.animating() || self.ui.has_damage() {
                     self.dirty = true;
                 }
             }
@@ -151,16 +153,45 @@ impl<A: App> UiWindow<A> {
         true
     }
 
-    /// Paint what changed and commit it (one frame in flight at a time).
+    /// Paint what changed into a private backbuffer and blit finished regions before committing.
     pub fn draw(&mut self, text: &mut FontText<'_>) {
         if !self.dirty || self.in_flight {
             return;
         }
         self.dirty = false;
-        let Some(mut c) = canvas_of(&mut self.win) else { return };
-        let damage = self.ui.paint(&mut c, text);
+        let (ww, wh) = (self.win.width, self.win.height);
+        let need = (ww as usize) * (wh as usize);
+        if need == 0 {
+            return;
+        }
+        if self.back.len() != need {
+            self.back.resize(need, self.shown.client_bg);
+            self.ui.damage_all();
+        }
+        let damage = {
+            let Some(mut c) = Canvas::new(&mut self.back, ww, wh, ww) else { return };
+            self.ui.paint(&mut c, text)
+        };
         if damage.is_empty() {
             return; // nothing changed (an empty commit would redraw the whole window)
+        }
+        if let Some(front) = canvas_of(&mut self.win) {
+            let stride = ww as usize;
+            let iw = ww as i32;
+            let ih = wh as i32;
+            for r in damage.as_slice() {
+                let x0 = r.x.clamp(0, iw) as usize;
+                let y0 = r.y.clamp(0, ih) as usize;
+                let x1 = (r.x.saturating_add(r.w as i32)).clamp(0, iw) as usize;
+                let y1 = (r.y.saturating_add(r.h as i32)).clamp(0, ih) as usize;
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                for row in y0..y1 {
+                    let off = row * stride;
+                    front.pixels[off + x0..off + x1].copy_from_slice(&self.back[off + x0..off + x1]);
+                }
+            }
         }
         let rects: Vec<(i32, i32, u32, u32)> = damage.as_slice().iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
         if self.win.commit(&rects).is_ok() {

@@ -51,6 +51,9 @@ pub const INPUT_POINTER: u32 = 411;
 /// input routing (used by the compositor during an active GUI session; automatically released on
 /// channel close).
 pub const INPUT_GRAB: u32 = 412;
+/// Client -> device manager on `devmgr.input`: switch active keyboard layout (`a` = layout id:
+/// 0 = `us`, 1 = `uk`, 2 = `de`, 3 = `fr`, 4 = `es`). Broadcast to all keyboard drivers.
+pub const INPUT_SET_LAYOUT: u32 = 413;
 
 /// Flag bit in `POINTER` / `INPUT_POINTER` `Header::b`: `a` carries absolute `[0..=32767]` coords.
 pub const POINTER_ABS: u64 = 1 << 16;
@@ -130,6 +133,8 @@ pub const GPU_GONE: u32 = 26;
 /// Manager -> block driver (control channel, call): enable (`b = 1`) or disable (`b = 0`) writes
 /// on unit `a`. Refused (`ERR_ACCESS_DENIED`) on read-only optical media or when write-locked.
 pub const BLK_SET_RW: u32 = 27;
+/// Manager -> keyboard driver (control channel): switch active keyboard layout (`a` = layout id 0..=4).
+pub const SET_KEYMAP: u32 = 28;
 /// Manager -> driver (tests): fault on purpose (restart test).
 pub const TEST_CRASH: u32 = 20;
 /// Manager -> block driver (tests): point a request at memory the device was not given (the

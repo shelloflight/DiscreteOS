@@ -534,7 +534,11 @@ impl IdSvc {
                     (0, u64::from(uid), 0, Vec::new())
                 }
             }
-            wire::OP_AUTHENTICATE | wire::OP_ENROLL | wire::OP_CREATE | wire::OP_SET_POLICY | wire::OP_SWITCH => {
+            wire::OP_EXPORT_STORE if role == Role::Admin => {
+                let text = self.store.to_toml();
+                (0, text.len() as u64, 0, text.into_bytes())
+            }
+            wire::OP_AUTHENTICATE | wire::OP_ENROLL | wire::OP_CREATE | wire::OP_SET_POLICY | wire::OP_SWITCH | wire::OP_EXPORT_STORE => {
                 (sys::ERR_ACCESS_DENIED, 0, 0, Vec::new())
             }
             _ => (sys::ERR_NOT_SUPPORTED, 0, 0, Vec::new()),

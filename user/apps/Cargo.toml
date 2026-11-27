@@ -9,7 +9,7 @@ license = "GPL-3.0-or-later"
 publish = false
 
 [package.metadata.dos]
-dx = ["files", "editor", "settings", "sysmon", "installer", "oobe"]
+dx = ["files", "editor", "settings", "sysmon", "oobe"]
 
 [lib]
 crate-type = ["staticlib"]

@@ -419,6 +419,8 @@ struct Xhci {
     /// Completion code of the last failed command or transfer.
     last_cc: u32,
     reports: u64,
+    /// Active keyboard layout id (`keymap::LAYOUT_*`) applied to all current and future keyboards.
+    keymap_layout: u8,
 }
 
 impl Xhci {
@@ -1316,6 +1318,7 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
         next_poll: 0,
         last_cc: 0,
         reports: 0,
+        keymap_layout: 0,
     };
     if x.op_r(PAGESIZE) & 1 == 0 {
         return Err("controller does not support 4 KiB pages");
@@ -1436,6 +1439,14 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
                             }
                             let (st, a, b) = match h.op {
                                 proto::STATS => (0, sys::interrupt_ack(x.irq).unwrap_or(0), x.reports + x.requests),
+                                proto::SET_KEYMAP => {
+                                    let layout = h.a as u8;
+                                    x.keymap_layout = layout;
+                                    for k in x.kbds.iter_mut().flatten() {
+                                        k.keys.set_layout(layout);
+                                    }
+                                    (0, 0, 0)
+                                }
                                 proto::BLK_SET_RW => {
                                     let u = h.a as usize;
                                     if x.ro_locked || u >= MAX_DISKS || x.disks[u].is_none() {
@@ -1452,9 +1463,11 @@ fn run(dev: Handle, ch: Handle) -> Result<i32, &'static str> {
                                 }
                                 _ => (sys::ERR_INVALID_ARGS as i32, 0, 0),
                             };
-                            let mut out = [0u8; HEADER];
-                            Header { txid: h.txid, op: h.op, status: st, a, b }.put(&mut out);
-                            sys::channel_write(ch, &out);
+                            if h.txid != 0 {
+                                let mut out = [0u8; HEADER];
+                                Header { txid: h.txid, op: h.op, status: st, a, b }.put(&mut out);
+                                sys::channel_write(ch, &out);
+                            }
                         }
                         Err(sys::ERR_SHOULD_WAIT) => break,
                         Err(_) => return Ok(0), // the device manager is gone

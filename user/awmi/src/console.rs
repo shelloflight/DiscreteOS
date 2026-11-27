@@ -40,6 +40,7 @@ fn palette(t: &Theme, contrast: bool) -> [u32; 16] {
 
 struct Term {
     win: Window,
+    back: Vec<u32>,
     grid: Option<Mapping>,
     cols: u32,
     rows: u32,
@@ -85,7 +86,8 @@ impl Term {
         let pad = 6;
         let (w, h) = (START_COLS * cell_w + pad * 2, START_ROWS * cell_h + pad * 2);
         let win = Window::new(ep, w, h, wire::FLAGS_DEFAULT, b"Terminal").ok()?;
-        let mut t = Term { win, grid: None, cols: 0, rows: 0, cell_w, cell_h, ascent, pad, in_flight: false, dirty: None, full: true, focused: true };
+        let back = alloc::vec![0u32; (win.width as usize) * (win.height as usize)];
+        let mut t = Term { win, back, grid: None, cols: 0, rows: 0, cell_w, cell_h, ascent, pad, in_flight: false, dirty: None, full: true, focused: true };
         t.fit();
         let (hdr, vmo) = view_call(view, term::VIEW_ATTACH, u64::from(t.cols) | u64::from(t.rows) << 32)?;
         if vmo == 0 {
@@ -133,7 +135,12 @@ impl Term {
         let full = self.full;
         let (cw, ch, pad, ascent) = (self.cell_w, self.cell_h, self.pad as i32, self.ascent);
         let st = text.style(TextStyle::Mono);
-        let Some(mut c) = canvas_of(&mut self.win) else { return };
+        let (ww, wh) = (self.win.width, self.win.height);
+        let need = (ww as usize) * (wh as usize);
+        if self.back.len() != need {
+            self.back.resize(need, pal[0]);
+        }
+        let Some(mut c) = dosawmi::Canvas::new(&mut self.back, ww, wh, ww) else { return };
         let all = c.bounds();
         if full {
             c.fill_rect(all, all, pal[0]);
@@ -172,6 +179,18 @@ impl Term {
             self.dirty = None;
             return;
         };
+        if let Some(front) = canvas_of(&mut self.win) {
+            if full {
+                front.pixels[..need].copy_from_slice(&self.back[..need]);
+            } else {
+                let y0 = (pad + (rows_from * ch) as i32).max(0) as usize;
+                let y1 = (pad + (rows_to * ch) as i32).min(wh as i32).max(0) as usize;
+                let stride = ww as usize;
+                if y1 > y0 {
+                    front.pixels[y0 * stride..y1 * stride].copy_from_slice(&self.back[y0 * stride..y1 * stride]);
+                }
+            }
+        }
         self.full = false;
         self.dirty = None;
         if self.win.commit(&damage).is_ok() {

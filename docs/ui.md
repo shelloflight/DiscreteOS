@@ -76,8 +76,11 @@ column([
   coverage: the signed distance from each pixel centre to the edge, in 1/256 px, integer only.
   Straight edges stay pixel-crisp; the fill and a 1 px border get separate coverage.
 - **Rendering:** every node has a signature (a hash of what it draws), so only nodes whose
-  signature or place changed are repainted. The window gets exactly those damage rectangles.
-  Hover and press transitions take 110 ms.
+  signature or place changed are repainted. Window runners (`user/apps/src/common.rs`,
+  `user/awmi/src/app.rs`, `user/awmi/src/console.rs`) render into a private shadow backbuffer and
+  copy only finished damaged rectangles into the shared compositor buffer before committing,
+  preventing mid-paint hover flicker at high refresh rates. Hover and press transitions take 110 ms
+  using alpha-only fades over transparent surfaces.
 - **Running in a window:** `awmi::app::UiWindow` connects an `App` (`title`, `size`, `view`,
   `update`) to a D-AWMI window. It handles configure, focus, keys, pointer, frame pacing (one
   frame in flight) and settings changes.
@@ -112,7 +115,14 @@ pointer only reaches the launcher. Super+Esc and Ctrl+Alt+Esc still leave the de
   `appmgr` (`awmi.launcher`) registers up to 16 verified `.dapp` entries (24 in all). Each entry is
   shown with the program's verified name, not a name the program chose. Opening one sends that
   program `EVT_LAUNCH`.
+- **Files and directories:** opening the launcher builds a bounded, per-identity in-RAM index of
+  the active user's `/home` (plus `/data` for Operators and `/sys`, up to 256 entries). Typing
+  ranks basename prefix matches before substring/path matches; selecting a directory opens it in
+  `files.dapp` and selecting a file opens it in `editor.dapp` inside that app's granted namespace.
 - **Settings:** switch theme, larger text, smaller text, reduce motion, lock screen, leave the desktop.
+- **Power controls:** the launcher footer includes a **Power** button that expands inline **Off**,
+  **Reboot**, **Lock**, and **Rest** (sleep) controls (also searchable by typing `off`, `reboot`,
+  `lock`, or `rest`/`sleep`), backed by `awmi`'s narrow `manager = ["power"]` grant.
 
 ## Accessibility
 

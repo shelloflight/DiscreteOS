@@ -108,6 +108,15 @@ impl Default for CapiInfo {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CapiDamageRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+#[repr(C)]
 struct CapiCommit {
     pipe_slot: u32,
     test_only: u8,
@@ -134,6 +143,8 @@ struct CapiCommit {
     cursor_size: u32,
     cursor_x: i32,
     cursor_y: i32,
+    damage_count: u32,
+    damage: [CapiDamageRect; 16],
 }
 
 unsafe extern "C" {
@@ -161,6 +172,8 @@ unsafe extern "C" {
         out_late: *mut u8,
     ) -> i32;
     fn amdgpu_capi_poll_hotplug(ctx: *mut c_void) -> i32;
+    fn amdgpu_capi_has_pending_flip(ctx: *mut c_void) -> i32;
+    fn amdgpu_capi_refresh_mhz(ctx: *mut c_void) -> u32;
     fn amdgpu_capi_vm_create(ctx: *mut c_void, vm_id: u32) -> i32;
     fn amdgpu_capi_vm_destroy(ctx: *mut c_void, vm_id: u32) -> i32;
     fn amdgpu_capi_vm_map(
@@ -530,6 +543,11 @@ impl DrmDriver for AmdGpu {
             c_size = cfb.width;
         }
 
+        let mut cdamage = [CapiDamageRect::default(); 16];
+        let dcnt = usize::from(commit.damage_count).min(16);
+        for (dst, src) in cdamage.iter_mut().take(dcnt).zip(commit.damage.iter().take(dcnt)) {
+            *dst = CapiDamageRect { x: src.x, y: src.y, w: src.w, h: src.h };
+        }
         let creq = CapiCommit {
             pipe_slot: self.active_slot as u32,
             test_only: u8::from((commit.flags & kms::ATOMIC_TEST_ONLY) != 0),
@@ -556,6 +574,8 @@ impl DrmDriver for AmdGpu {
             cursor_size: c_size,
             cursor_x: commit.cursor_x,
             cursor_y: commit.cursor_y,
+            damage_count: dcnt as u32,
+            damage: cdamage,
         };
         let mut seq = 0u64;
         let mut is_async = 0u8;
@@ -714,10 +734,22 @@ impl DrmDriver for AmdGpu {
     }
 
     fn next_deadline_ns(&self) -> Option<u64> {
-        if self.native_kms {
-            Some(sys::clock_ns().saturating_add(4_000_000))
+        if !self.native_kms || self.capi.is_null() {
+            return None;
+        }
+        // SAFETY: `self.capi` is valid for the lifetime of `self`.
+        let pending = unsafe { amdgpu_capi_has_pending_flip(self.capi) != 0 };
+        if pending {
+            // SAFETY: `self.capi` is valid for the lifetime of `self`.
+            let hz = unsafe { amdgpu_capi_refresh_mhz(self.capi) }.clamp(30_000, 1_000_000);
+            let frame_ns = 1_000_000_000_000u64 / u64::from(hz);
+            // Poll at ~1/8th of a frame period (250 us .. 1.5 ms) while a flip is in flight so
+            // 240-540 Hz vblanks are delivered within sub-millisecond latency without starving idle CPU.
+            let step = (frame_ns / 8).clamp(250_000, 1_500_000);
+            Some(sys::clock_ns().saturating_add(step))
         } else {
-            None
+            // Idle: only wake periodically for connector hotplug polling.
+            Some(sys::clock_ns().saturating_add(250_000_000))
         }
     }
 

@@ -395,6 +395,10 @@ pub struct TcpStream {
     pub sock_id: u32,
     ring: IoRing,
     next_id: u32,
+    /// Active in-flight `RING_RECV` SQE id (0 if none). Reused across timed-out `read()` calls.
+    recv_id: u32,
+    /// Completed RX result received while waiting for a `RING_SEND` CQE (full-duplex safety).
+    stashed_rx: Option<Result<usize, i64>>,
 }
 
 impl TcpStream {
@@ -435,7 +439,7 @@ impl TcpStream {
         if h.status != 0 {
             return Err(i64::from(h.status));
         }
-        Ok(Self { ch, sock_id: h.a as u32, ring, next_id: 1 })
+        Ok(Self { ch, sock_id: h.a as u32, ring, next_id: 1, recv_id: 0, stashed_rx: None })
     }
 
     fn drain_events(&self) {
@@ -471,11 +475,22 @@ impl TcpStream {
         let dl = sys::clock_ns().saturating_add(5_000 * MS);
         loop {
             self.drain_events();
-            if let Some(cqe) = self.ring.pop_cq() {
-                if cqe.status != 0 {
-                    return Err(i64::from(cqe.status));
+            while let Some(cqe) = self.ring.pop_cq() {
+                if self.recv_id != 0 && cqe.id == self.recv_id {
+                    self.recv_id = 0;
+                    self.stashed_rx = Some(if cqe.status != 0 {
+                        Err(i64::from(cqe.status))
+                    } else {
+                        Ok((cqe.a as usize).min(SOCK_SLOT_BYTES as usize))
+                    });
+                    continue;
                 }
-                return Ok(cqe.a as usize);
+                if cqe.id == id {
+                    if cqe.status != 0 {
+                        return Err(i64::from(cqe.status));
+                    }
+                    return Ok(cqe.a as usize);
+                }
             }
             let now = sys::clock_ns();
             if now >= dl {
@@ -501,30 +516,45 @@ impl TcpStream {
         if dst.is_empty() {
             return Ok(0);
         }
-        let want = dst.len().min(SOCK_SLOT_BYTES as usize) as u32;
         let off = SOCK_SLOT_BYTES; // slot 1 for RX
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        let sqe = Sqe { id, op: RING_RECV, a: u64::from(self.sock_id), b: 0, buf_off: off, buf_len: want };
-        if !self.ring.push_sq(sqe) {
-            return Err(sys::ERR_SHOULD_WAIT);
+        if let Some(res) = self.stashed_rx.take() {
+            let got = res?.min(dst.len()).min(SOCK_SLOT_BYTES as usize);
+            if got > 0
+                && let Some(src) = self.ring.data(off, got as u32)
+            {
+                dst[..got].copy_from_slice(src);
+            }
+            return Ok(got);
         }
-        self.kick();
+        if self.recv_id == 0 {
+            let want = dst.len().min(SOCK_SLOT_BYTES as usize) as u32;
+            let id = self.next_id.max(1);
+            self.next_id = id.wrapping_add(1).max(1);
+            let sqe = Sqe { id, op: RING_RECV, a: u64::from(self.sock_id), b: 0, buf_off: off, buf_len: want };
+            if !self.ring.push_sq(sqe) {
+                return Err(sys::ERR_SHOULD_WAIT);
+            }
+            self.recv_id = id;
+            self.kick();
+        }
 
         let dl = sys::clock_ns().saturating_add(u64::from(timeout_ms) * MS);
         loop {
             self.drain_events();
-            if let Some(cqe) = self.ring.pop_cq() {
-                if cqe.status != 0 {
-                    return Err(i64::from(cqe.status));
+            while let Some(cqe) = self.ring.pop_cq() {
+                if cqe.id == self.recv_id {
+                    self.recv_id = 0;
+                    if cqe.status != 0 {
+                        return Err(i64::from(cqe.status));
+                    }
+                    let got = (cqe.a as usize).min(dst.len()).min(SOCK_SLOT_BYTES as usize);
+                    if got > 0
+                        && let Some(src) = self.ring.data(off, got as u32)
+                    {
+                        dst[..got].copy_from_slice(src);
+                    }
+                    return Ok(got);
                 }
-                let got = (cqe.a as usize).min(dst.len()).min(SOCK_SLOT_BYTES as usize);
-                if got > 0
-                    && let Some(src) = self.ring.data(off, got as u32)
-                {
-                    dst[..got].copy_from_slice(src);
-                }
-                return Ok(got);
             }
             let now = sys::clock_ns();
             if now >= dl {

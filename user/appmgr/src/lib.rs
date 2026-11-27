@@ -77,6 +77,7 @@ struct PendingPrompt {
     app_idx: usize,
     effective: u32,
     pending_mask: u32,
+    launch_arg: Vec<u8>,
 }
 
 struct AppMgr {
@@ -369,7 +370,7 @@ impl AppMgr {
         }
     }
 
-    fn spawn_app(&mut self, app_idx: usize, effective: u32, active: &IdentityInfo) -> Result<(), i64> {
+    fn spawn_app(&mut self, app_idx: usize, effective: u32, active: &IdentityInfo, launch_arg: &[u8]) -> Result<(), i64> {
         let Some(app) = self.apps.get(app_idx) else {
             return Err(fp::ERR_NOT_FOUND);
         };
@@ -451,6 +452,11 @@ impl AppMgr {
         }
         if has(Permission::StorageAdmin) {
             ep_specs.push("storaged.admin");
+            if app_name == "oobe"
+                && let Some(pch) = self.mgr_link("manager.power-reboot", &app_name)
+            {
+                push_h(&mut hs, pch, tool::TAG_MANAGER);
+            }
         }
 
         let mut ep_names = Vec::new();
@@ -586,7 +592,7 @@ impl AppMgr {
             }
         }
 
-        let proc = sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), prog_vmo, app_name.as_bytes(), b"", &hs, &limits)?;
+        let proc = sys::spawn(libd::startup_handle(sys::TAG_PROC_SELF), prog_vmo, app_name.as_bytes(), launch_arg, &hs, &limits)?;
         let inst_id = self.next_inst;
         self.next_inst = self.next_inst.wrapping_add(1).max(1);
         self.port.arm(proc, sys::TERMINATED, KEY_PROC_BASE + u64::from(inst_id));
@@ -606,7 +612,7 @@ impl AppMgr {
     }
 
     /// Launch `app_idx`. Returns `Ok(1)` if spawned immediately, `Ok(2)` if awaiting prompt.
-    fn launch_app(&mut self, app_idx: usize, allow_prompt: bool) -> Result<u64, i64> {
+    fn launch_app(&mut self, app_idx: usize, allow_prompt: bool, launch_arg: &[u8]) -> Result<u64, i64> {
         let active = self.active_identity();
         let Some(app) = self.apps.get(app_idx) else {
             return Err(fp::ERR_NOT_FOUND);
@@ -623,11 +629,17 @@ impl AppMgr {
             let req_id = self.next_req;
             self.next_req = self.next_req.wrapping_add(1).max(1);
             awmi::open_perm_prompt(self.awmi, req_id, pending, app.manifest.name.as_bytes(), app.manifest.title.as_bytes())?;
-            self.pending = Some(PendingPrompt { request_id: req_id, app_idx, effective, pending_mask: pending });
+            self.pending = Some(PendingPrompt {
+                request_id: req_id,
+                app_idx,
+                effective,
+                pending_mask: pending,
+                launch_arg: launch_arg.to_vec(),
+            });
             println!("appmgr: requesting permission prompt #{} for {}", req_id, app.manifest.name);
             return Ok(2);
         }
-        self.spawn_app(app_idx, effective, &active)?;
+        self.spawn_app(app_idx, effective, &active, launch_arg)?;
         Ok(1)
     }
 
@@ -732,28 +744,37 @@ impl AppMgr {
                             if self.apps[idx].manifest.autostart {
                                 let name = self.apps[idx].manifest.name.clone();
                                 if !self.running.iter().any(|r| r.app_name == name) {
-                                    let _ = self.launch_app(idx, false);
+                                    let _ = self.launch_app(idx, false, b"");
                                 }
                             }
                         }
                         match oobe_status() {
+                            None => {
+                                // Live media first boot: auto-launch unified Installer + OOBE window.
+                                if let Some(idx) = self.apps.iter().position(|a| a.manifest.name == "oobe")
+                                    && !self.running.iter().any(|r| r.app_name == "oobe")
+                                {
+                                    println!("appmgr: live boot detected, launching unified setup (oobe)");
+                                    let _ = self.launch_app(idx, false, b"");
+                                }
+                            }
                             Some(false) => {
                                 if let Some(idx) = self.apps.iter().position(|a| a.manifest.name == "oobe")
                                     && !self.running.iter().any(|r| r.app_name == "oobe")
                                 {
                                     println!("appmgr: first-boot setup pending, launching oobe");
-                                    let _ = self.launch_app(idx, false);
+                                    let _ = self.launch_app(idx, false, b"");
                                 }
                             }
                             Some(true) => {
                                 println!("appmgr: OOBE completed, bypassing first-boot setup");
                             }
-                            None => {}
                         }
                     }
-                    Event::Launch { app } => {
+                    Event::Launch { app, arg, arg_len } => {
                         if let Some(idx) = self.apps.iter().position(|a| a.entry_idx == app) {
-                            let _ = self.launch_app(idx, true);
+                            let len = usize::from(arg_len).min(arg.len());
+                            let _ = self.launch_app(idx, true, &arg[..len]);
                         }
                     }
                     Event::AppPin { app, pinned } => {
@@ -772,12 +793,12 @@ impl AppMgr {
                                     1 => {
                                         self.ledger.apply_prompt(active.name_str(), &app_name, p.pending_mask, 0);
                                         save_ledger(&self.ledger);
-                                        let _ = self.spawn_app(p.app_idx, p.effective | p.pending_mask, &active);
+                                        let _ = self.spawn_app(p.app_idx, p.effective | p.pending_mask, &active, &p.launch_arg);
                                     }
                                     2 => {
                                         self.ledger.apply_prompt(active.name_str(), &app_name, 0, p.pending_mask);
                                         save_ledger(&self.ledger);
-                                        let _ = self.spawn_app(p.app_idx, p.effective, &active);
+                                        let _ = self.spawn_app(p.app_idx, p.effective, &active, &p.launch_arg);
                                     }
                                     _ => {
                                         println!("appmgr: launch of {} cancelled at permission prompt", app_name);
@@ -901,7 +922,7 @@ impl AppMgr {
                 let Some(idx) = self.apps.iter().position(|a| a.manifest.name == name) else {
                     return (fp::ERR_NOT_FOUND, 0, 0, Vec::new());
                 };
-                match self.launch_app(idx, true) {
+                match self.launch_app(idx, true, b"") {
                     Ok(code) => (0, code, 0, Vec::new()),
                     Err(e) => (e, 0, 0, Vec::new()),
                 }
@@ -1003,13 +1024,26 @@ fn main(s: *const Startup) -> i32 {
     let awmi = awmi::launcher_endpoint();
     let identity = idwire::query_endpoint();
     let mut apps = discover_apps();
-    // On an installed system (writable /home with OOBE state), do not pin the disk installer by default.
-    if oobe_status().is_some() {
-        for app in &mut apps {
-            if app.manifest.name == "installer" {
-                app.pinned = false;
+    // On an installed system: once OOBE is completed, hide the installer/setup app completely
+    // (no Install D-OS app in dock, launcher, or app list). While OOBE is pending on a CLI-installed
+    // disk, keep `oobe` unpinned for its one-time run.
+    match oobe_status() {
+        Some(true) => {
+            apps.retain(|a| a.manifest.name != "oobe" && a.manifest.name != "installer");
+            for (idx, a) in apps.iter_mut().enumerate() {
+                a.entry_idx = idx as u8;
             }
         }
+        Some(false) => {
+            apps.retain(|a| a.manifest.name != "installer");
+            for (idx, a) in apps.iter_mut().enumerate() {
+                a.entry_idx = idx as u8;
+                if a.manifest.name == "oobe" {
+                    a.pinned = false;
+                }
+            }
+        }
+        None => {}
     }
     let ledger = load_ledger();
     let mut state = AppMgr {

@@ -19,6 +19,8 @@ pub const OP_CREATE: u32 = 1105;
 pub const OP_SET_POLICY: u32 = 1106;
 pub const OP_SWITCH: u32 = 1107;
 pub const OP_TEST_STATUS: u32 = 1108;
+/// `identity.admin`: export the sealed TOML identity store for persisting onto a newly installed disk.
+pub const OP_EXPORT_STORE: u32 = 1109;
 
 pub const ROLE_STANDARD: u8 = 1;
 pub const ROLE_OPERATOR: u8 = 2;
@@ -274,4 +276,14 @@ pub fn test_status(ep: Handle) -> Result<TestStatus, i64> {
         tpm_unseal_ops: ((h.a >> 24) & 0xFFFF) as u16,
         auth_failures: ((h.a >> 40) & 0xFFFF) as u16,
     })
+}
+
+/// Export the current sealed TOML identity store (`identity.admin` required).
+pub fn export_store(ep: Handle, out: &mut [u8]) -> Result<usize, i64> {
+    let mut rep = [0u8; HEADER + 8192];
+    let (_, n) = call(ep, OP_EXPORT_STORE, 0, 0, &[], &mut rep)?;
+    let body = &rep[HEADER..n];
+    let copy = body.len().min(out.len());
+    out[..copy].copy_from_slice(&body[..copy]);
+    Ok(copy)
 }

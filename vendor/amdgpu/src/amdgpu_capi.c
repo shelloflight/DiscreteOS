@@ -155,6 +155,13 @@ int amdgpu_capi_atomic_commit(
     dc_req.primary_height = req->primary_height;
     dc_req.primary_pitch = req->primary_pitch;
     dc_req.primary_format = req->primary_format;
+    dc_req.damage_count = req->damage_count < DC_MAX_DAMAGE_RECTS ? req->damage_count : DC_MAX_DAMAGE_RECTS;
+    for (uint32_t i = 0; i < dc_req.damage_count; i++) {
+        dc_req.damage[i].x = req->damage[i].x;
+        dc_req.damage[i].y = req->damage[i].y;
+        dc_req.damage[i].w = req->damage[i].w;
+        dc_req.damage[i].h = req->damage[i].h;
+    }
     dc_req.cursor_changed = req->cursor_changed != 0;
     dc_req.cursor_src = req->cursor_src;
     dc_req.cursor_size = req->cursor_size;
@@ -193,6 +200,16 @@ int amdgpu_capi_poll_hotplug(void *ctx) {
         return 1;
     }
     return ch ? 1 : 0;
+}
+
+int amdgpu_capi_has_pending_flip(void *ctx) {
+    if (!ctx) return 0;
+    return dc_has_pending_flip((const struct amdgpu_device *)ctx) ? 1 : 0;
+}
+
+uint32_t amdgpu_capi_refresh_mhz(void *ctx) {
+    if (!ctx) return 60000u;
+    return dc_current_refresh_mhz((const struct amdgpu_device *)ctx);
 }
 
 int amdgpu_capi_vm_create(void *ctx, uint32_t vm_id) {

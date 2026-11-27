@@ -27,6 +27,7 @@ extern crate alloc;
 
 mod font;
 mod screen;
+mod vt;
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -36,6 +37,7 @@ use libd::proto::{self, HEADER, Header, key};
 use libd::sys::{self, Handle, MsgHandle};
 use libd::{Mapping, Port, Startup, println, svc, term};
 use screen::{Cell, Screen, cell, char_of};
+use vt::VtScreen;
 
 libd::entry!(_start, main);
 
@@ -114,6 +116,9 @@ struct Term {
     scroll: usize,
     // the line editor
     reading: bool,
+    secret: bool,
+    raw_mode: bool,
+    vt: VtScreen,
     prompt: Vec<Cell>,
     edit: Vec<char>,
     at: usize,
@@ -161,6 +166,9 @@ impl Term {
         let g = self.grid();
         if g != self.told {
             self.told = g;
+            if self.raw_mode {
+                self.vt.resize(g.0, g.1);
+            }
             self.send(term::SIZE, g.0 as u64, g.1 as u64, &[]);
         }
     }
@@ -176,8 +184,21 @@ impl Term {
         self.lines.push_back(l);
     }
 
-    /// Show text with style bytes (`term::STYLE attr`, `term::PLAIN`).
+    /// Show text with style bytes (`term::STYLE attr`, `term::PLAIN`), or raw VT100/ANSI in raw mode.
     fn write(&mut self, text: &[u8]) {
+        if self.raw_mode {
+            let mut scrolled: Vec<Vec<Cell>> = Vec::new();
+            self.vt.feed(text, |line| scrolled.push(line));
+            if self.vt.take_clear_scrollback() {
+                self.lines.clear();
+                self.cur.clear();
+                self.scroll = 0;
+            }
+            for l in scrolled {
+                self.push_line(l);
+            }
+            return;
+        }
         let s = String::from_utf8_lossy(text);
         let mut style = false;
         for ch in s.chars() {
@@ -216,7 +237,7 @@ impl Term {
     fn edit_lines(&self) -> (Vec<Vec<Cell>>, (usize, usize)) {
         let cols = self.cols();
         let mut all: Vec<Cell> = self.prompt.clone();
-        all.extend(self.edit.iter().map(|&c| cell(c, term::DEFAULT_ATTR)));
+        all.extend(self.edit.iter().map(|&c| cell(if self.secret { '*' } else { c }, term::DEFAULT_ATTR)));
         let cur = self.prompt.len() + self.at;
         let n = all.len().max(cur + 1);
         let mut out = Vec::new();
@@ -240,6 +261,39 @@ impl Term {
 
     /// The rows to show (`rows` of them, `scroll` rows up from the bottom), the cursor's place.
     fn frame(&mut self, cols: usize, rows: usize) -> (Vec<Vec<Cell>>, Option<(usize, usize)>) {
+        if self.raw_mode {
+            self.vt.resize(cols, rows);
+            if self.scroll == 0 {
+                let mut out = Vec::with_capacity(rows);
+                for y in 0..rows {
+                    out.push(self.vt.row_slice(y).to_vec());
+                }
+                let cursor = self.vt.cursor_visible.then_some((self.vt.cx, self.vt.cy));
+                return (out, cursor);
+            }
+            // Scrolled back while in raw mode: combine scrollback lines + live VT screen.
+            let mut all: Vec<Vec<Cell>> = Vec::new();
+            let want = rows + self.scroll;
+            let mut back: Vec<Vec<Cell>> = Vec::new();
+            for l in self.lines.iter().rev() {
+                if back.len() + rows >= want {
+                    break;
+                }
+                let n = l.len().div_ceil(cols).max(1);
+                for k in (0..n).rev() {
+                    back.push(l[(k * cols).min(l.len())..((k + 1) * cols).min(l.len())].to_vec());
+                }
+            }
+            back.reverse();
+            all.extend(back);
+            for y in 0..rows {
+                all.push(self.vt.row_slice(y).to_vec());
+            }
+            self.scroll = self.scroll.min(all.len().saturating_sub(rows));
+            let end = all.len().saturating_sub(self.scroll);
+            let start = end.saturating_sub(rows);
+            return (all[start..end].to_vec(), None);
+        }
         // Rows of the live part below the scrollback: the current line, the prompt and edit.
         let mut tail: Vec<Vec<Cell>> = Vec::new();
         if !self.cur.is_empty() {
@@ -363,13 +417,18 @@ impl Term {
     /// the session.
     fn submit(&mut self, cancelled: bool) {
         let text: String = self.edit.iter().collect();
+        let was_secret = self.secret;
         let mut line: Vec<Cell> = self.prompt.clone();
-        line.extend(self.edit.iter().map(|&c| cell(c, term::DEFAULT_ATTR)));
+        if was_secret {
+            line.extend(self.edit.iter().map(|_| cell('*', term::DEFAULT_ATTR)));
+        } else {
+            line.extend(self.edit.iter().map(|&c| cell(c, term::DEFAULT_ATTR)));
+        }
         if cancelled {
             line.extend("^C".chars().map(|c| cell(c, term::DARK_GREY)));
         }
         self.push_line(line);
-        if !cancelled {
+        if !cancelled && !was_secret {
             let from = core::str::from_utf8(&self.from[..self.from_len]).unwrap_or("?");
             println!("terminal: line from {}: {}", from, text);
             if !text.trim().is_empty() && self.history.last() != Some(&text) {
@@ -380,6 +439,7 @@ impl Term {
             }
         }
         self.reading = false;
+        self.secret = false;
         self.edit.clear();
         self.at = 0;
         self.hist = None;
@@ -467,6 +527,10 @@ impl Term {
             return;
         }
         self.scroll = 0;
+        if self.raw_mode {
+            self.send(term::KEY, u64::from(k), 0, &[]);
+            return;
+        }
         match base {
             0x03 => {
                 self.enter_ahead = false;
@@ -514,9 +578,11 @@ impl Term {
                     self.send(term::COMPLETE, 0, 0, before.as_bytes());
                 }
             }
-            0x20..=0x7E if self.edit.len() < MAX_EDIT => {
-                self.edit.insert(self.at, char::from(base as u8));
-                self.at += 1;
+            0x20..=0x7E | 0xA0..=0xFF if self.edit.len() < MAX_EDIT => {
+                if let Some(ch) = char::from_u32(base) {
+                    self.edit.insert(self.at, ch);
+                    self.at += 1;
+                }
             }
             _ => {}
         }
@@ -550,10 +616,30 @@ impl Term {
                     }
                 }
                 self.reading = true;
+                self.secret = (h.a & term::READ_SECRET) != 0;
                 self.scroll = 0;
-                if core::mem::take(&mut self.enter_ahead) {
+                if core::mem::take(&mut self.enter_ahead) && !self.secret {
                     self.submit(false);
                 }
+            }
+            term::RAW_MODE => {
+                let on = h.a != 0;
+                if on && !self.raw_mode {
+                    if !self.cur.is_empty() {
+                        let l = core::mem::take(&mut self.cur);
+                        self.push_line(l);
+                    }
+                    let (c, r) = self.grid();
+                    self.vt.reset(c, r);
+                    self.scroll = 0;
+                    self.reading = false;
+                } else if !on && self.raw_mode {
+                    for l in self.vt.snapshot_lines() {
+                        self.push_line(l);
+                    }
+                    self.scroll = 0;
+                }
+                self.raw_mode = on;
             }
             term::COMPLETIONS => self.complete(payload),
             term::CLEAR => {
@@ -570,6 +656,8 @@ impl Term {
         }
         self.session = ch;
         self.reading = false;
+        self.secret = false;
+        self.raw_mode = false;
         self.waiting_completion = false;
         self.enter_ahead = false;
         let g = self.grid();
@@ -639,6 +727,9 @@ fn main(s: *const Startup) -> i32 {
         attr: term::DEFAULT_ATTR,
         scroll: 0,
         reading: false,
+        secret: false,
+        raw_mode: false,
+        vt: VtScreen::new(told.0, told.1),
         prompt: Vec::new(),
         edit: Vec::new(),
         at: 0,

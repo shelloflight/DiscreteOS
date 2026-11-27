@@ -40,13 +40,18 @@ protocol), `user/init/services/awmi.dman`, `awmi-demo.dman`.
 3. **Frames:** client commits, input, dock changes and animations add damage. Outputs supporting
    `CAP_ASYNC_FLIP` use event-driven vsync pacing (`OP_KMS_ATOMIC_COMMIT` -> unsolicited
    `EVT_VBLANK` from the driver's vblank interrupt, tying `EVT_FRAME_DONE` to real vertical blank
-   with zero idle CPU and stepping down cleanly on late frames); synchronous outputs use a
-   refresh-paced timer (supporting up to 540+ Hz). Bursts coalesce into one frame per refresh. The
-   compositor selects context-aware minimal cursors (`Default`, `Pointer`, `Text`, `Move`, and
-   4-axis resize arrows `ResizeEW`/`NS`/`NWSE`/`NESW`) based on what is under the pointer; a single
-   output with `CAP_HW_CURSOR` commits the active shape, hotspot, and coordinates to the Atomic KMS
-   cursor plane without recompositing, while all other outputs render the cursor into the damaged
-   backbuffer.
+   with zero idle CPU and refresh-scaled flip polling); synchronous outputs use a refresh-paced
+   timer (supporting up to 540+ Hz). Consecutive relative pointer packets coalesce per input drain
+   burst (both in the compositor and in `dosui` apps) so high-polling mice and 240+ Hz displays stay
+   responsive without IPC or redraw pileups, and native AMDGPU scanout uploads only per-buffer
+   dirty-rect rows instead of full framebuffers on small cursor/UI updates. The compositor selects
+   context-aware minimal cursors (`Default`, `Pointer`, `Text`, `Move`, and 4-axis resize arrows
+   `ResizeEW`/`NS`/`NWSE`/`NESW`) based on what is under the pointer; a single output with
+   `CAP_HW_CURSOR` commits the active shape, hotspot, and coordinates to the Atomic KMS cursor plane
+   without recompositing, while all other outputs render the cursor into the damaged backbuffer.
+   Language, keyboard layout (`OP_SET_LOCALE` -> `devmgr` `INPUT_SET_LAYOUT`), and timezone offset
+   from `/home/.dos/oobe.toml` are applied live across PS/2, USB HID, and VirtIO keyboards, the
+   dock clock, and the localized lock/login screen.
 4. **End:** `Super+Esc` (`Ctrl+Alt+Esc` inside a VM, where the host takes `Super`) or
    `OP_SESSION_STOP`: every window closes (`EVT_SESSION` 0), outputs issue `ATOMIC_RESET_BOOT` on
    `gpu.display` to restore boot scanout state, the grab is released, and the terminal redraws. If
@@ -118,10 +123,10 @@ awmi = ["indicator"]   # set the dock's security alert
 awmi = ["launcher"]    # register up to 16 .dapp launcher/dock entries and trigger permission prompts (appmgr only)
 ```
 
-`awmi.dsvc` itself holds `gpu = ["display"]`, `audio = ["control"]` (microphone and mute state),
+`awmi.dsvc` itself holds `manager = ["power"]` (strictly shutdown/reboot/suspend for the launcher power menu), `gpu = ["display"]`, `audio = ["control"]` (microphone and mute state),
 `net = ["status"]` (read-only link state), `identity = ["session"]` (exclusively for lock/login
 authentication), `devmgr.input`, `terminal.display`, `clock.time`, and `namespace = ["*"]` (read-only
-`/sys` for fonts/themes and writable `/home/.dos/settings.toml` on installed systems).
+`/sys` for fonts/themes, per-identity launcher file lookup, and writable `/home/.dos/settings.toml` on installed systems).
 
 ## Client protocol (`libd::awmi`)
 
@@ -147,7 +152,8 @@ Requests are calls on the client's channel; events arrive on the same channel (t
 
 Events: `EVT_CONFIGURE` (size and state after a snap, resize, maximize, minimize, focus change),
 `EVT_KEY`, `EVT_POINTER`, `EVT_FOCUS`, `EVT_CLOSE`, `EVT_FRAME_DONE`, `EVT_SESSION` (`a` bit 0
-active, bit 1 demo, bit 2 desktop), `EVT_LAUNCH` (`a` = the entry opened), `EVT_SETTINGS` (`a` =
+active, bit 1 demo, bit 2 desktop), `EVT_LAUNCH` (`a` = the entry opened, optional UTF-8 path
+payload forwarded as app arguments), `EVT_SETTINGS` (`a` =
 settings, payload = the theme's colours), `EVT_PERM_RESULT` (929, `awmi.launcher`: user choice for
 `OP_PERM_PROMPT`).
 `libd::awmi::Window` creates a window with its own buffer, `resize`s it on `EVT_CONFIGURE` and

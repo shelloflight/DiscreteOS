@@ -1580,16 +1580,28 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
 
         TestCase::boot("net-shell")
             .def("SHELL")
+            .net_server()
             .qemu(&[
-                "-netdev",
-                "user,id=net0",
                 "-device",
                 "virtio-net-pci,netdev=net0,disable-legacy=on,iommu_platform=on",
             ])
             .timeout(90)
             .must_exit()
             .keys_vec(
-                convert_to_qemu_keys(&["@~1500", "net", "ping 10.0.2.2 2", "net check", "power off"], 600),
+                convert_to_qemu_keys(
+                    &[
+                        "@~1500",
+                        "net",
+                        "ping 10.0.2.2 2",
+                        "net check",
+                        "ssh probe 10.0.2.100",
+                        "@~1500",
+                        "ssh -p 2222 -y 10.0.2.100 echo hello-from-ssh",
+                        "@~1500",
+                        "power off",
+                    ],
+                    800,
+                ),
                 "net: dhcp bound 10.0.2.15",
             )
             .expect(&[
@@ -1601,6 +1613,9 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "10.0.2.2 answers ping",
                 "terminal| ",
                 "net check: ",
+                "ssh: probe ok 10.0.2.100:22 banner=SSH-2.0-DiscreteOS_TestServer_1.0 alg=ssh-ed25519 cipher=aes256-gcm@openssh.com",
+                "terminal| hello-from-ssh",
+                "ssh: exec on 10.0.2.100 exited with status 0",
                 "Power: switching off",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault"]),
@@ -1803,7 +1818,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
             .timeout(150)
             .must_exit()
             .expect(&[
-                "appmgr: ready, 7 verified .dapp bundle(s)",
+                "appmgr: ready, 6 verified .dapp bundle(s)",
                 "svc-app-ungranted: PASSED (no appmgr or awmi.launcher endpoints)",
                 "svc-app-full: 5 core .dapp bundles verified",
                 "svc-app-full: .dapp signature enforcement OK",
@@ -1938,7 +1953,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "ATAPI CD-ROM, read-only",
                 "init: sys volume:",
                 "shell: ready:",
-                "appmgr: ready, 7 verified .dapp bundle(s)",
+                "appmgr: ready, 6 verified .dapp bundle(s)",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]),
 
@@ -1953,7 +1968,7 @@ fn all_test_cases(has_w2: bool) -> Vec<TestCase> {
                 "ATAPI CD-ROM, read-only",
                 "init: sys volume:",
                 "shell: ready:",
-                "appmgr: ready, 7 verified .dapp bundle(s)",
+                "appmgr: ready, 6 verified .dapp bundle(s)",
             ])
             .forbid(&["KERNEL PANIC", "FAIL", "blocked DMA", "user fault", "PANIC"]),
 
@@ -2559,9 +2574,16 @@ fn post_install_e2e(env: &Env, disk_dir: &Path) -> Result<bool, String> {
     ];
 
     // Boot #1 directly from the newly installed disk (UEFI, NO live media attached):
-    // verifies UEFI boot entry registration, automatic /home read-write unlock, OOBE auto-launch,
-    // OOBE completion persistence, and multi-user identity + /home directory creation.
-    let mut keys1 = vec!["~1500".to_string(), "ctrl-alt-esc".to_string(), "~2000".to_string()];
+    // verifies UEFI boot entry registration, automatic /home read-write unlock, always-on login
+    // screen at boot, OOBE auto-launch, OOBE completion persistence, live locale/keymap switching,
+    // and multi-user identity + /home directory creation.
+    let mut keys1 = vec![
+        "~1000".to_string(),
+        "ret".to_string(),
+        "~2500".to_string(),
+        "ctrl-alt-esc".to_string(),
+        "~2000".to_string(),
+    ];
     keys1.extend(convert_to_qemu_keys(
         &[
             "setup status",
@@ -2583,8 +2605,11 @@ fn post_install_e2e(env: &Env, disk_dir: &Path) -> Result<bool, String> {
         "D-OS: UEFI loader",
         "D-OS: registered UEFI NVRAM boot entry Boot00D0",
         "init: installed system detected: /home unlocked read-write",
+        "awmi: session locked at boot",
+        "awmi: session unlocked",
         "appmgr: first-boot setup pending, launching oobe",
         "oobe: window",
+        "devmgr: keyboard layout set to us",
         "setup: first-boot setup completed (lang=en-US, kbd=us, tz=UTC, net=skip)",
         "identity: created operator identity 'alice'",
         "identity: created standard identity 'bob'",
@@ -2612,7 +2637,7 @@ fn post_install_e2e(env: &Env, disk_dir: &Path) -> Result<bool, String> {
         extra: &gpu_extra,
         must_exit: true,
     };
-    let r1 = qemu_capture(env, &qopts1, &log1, &expect1, &forbid1, 180, &keys1, "oobe: window", &[], "")?;
+    let r1 = qemu_capture(env, &qopts1, &log1, &expect1, &forbid1, 180, &keys1, "awmi: session locked at boot", &[], "")?;
     println!("--- [install-e2e boot1] serial ({:.1}s) ---", r1.seconds);
     println!("{}", r1.log.trim_end());
     let miss1: Vec<&String> = expect1.iter().filter(|e| !r1.log.contains(e.as_str())).collect();
@@ -2623,9 +2648,16 @@ fn post_install_e2e(env: &Env, disk_dir: &Path) -> Result<bool, String> {
     }
 
     // Boot #2 directly from the SAME installed disk:
-    // verifies OOBE is bypassed once completed, identities and /home files persist across reboots,
-    // per-identity /home/<user> isolation blocks cross-user copy, and /sys stays read-only.
-    let mut keys2 = vec!["~1500".to_string(), "ctrl-alt-esc".to_string(), "~2000".to_string()];
+    // verifies always-on login screen, OOBE & installer completely hidden once completed,
+    // identities and /home files persist across reboots, per-identity /home/<user> isolation blocks
+    // cross-user copy, and /sys stays read-only.
+    let mut keys2 = vec![
+        "~1000".to_string(),
+        "ret".to_string(),
+        "~2500".to_string(),
+        "ctrl-alt-esc".to_string(),
+        "~2000".to_string(),
+    ];
     keys2.extend(convert_to_qemu_keys(
         &[
             "copy /home/alice_secret.txt /home/leaked.txt",
@@ -2641,6 +2673,8 @@ fn post_install_e2e(env: &Env, disk_dir: &Path) -> Result<bool, String> {
     let expect2: Vec<String> = [
         "init: installed system detected: /home unlocked read-write",
         "awmi: loaded saved settings (theme=High Contrast",
+        "awmi: session locked at boot",
+        "awmi: session unlocked",
         "appmgr: OOBE completed, bypassing first-boot setup",
         "identity: ready, active 'bob', 3 identity(s)",
         "identity: switched active identity to 'alice'",
@@ -2662,7 +2696,7 @@ fn post_install_e2e(env: &Env, disk_dir: &Path) -> Result<bool, String> {
     .map(|s| (*s).to_string())
     .collect();
     let log2 = disk_dir.join("serial-installed-boot2.log");
-    let r2 = qemu_capture(env, &qopts1, &log2, &expect2, &forbid2, 180, &keys2, "appmgr: OOBE completed, bypassing first-boot setup", &[], "")?;
+    let r2 = qemu_capture(env, &qopts1, &log2, &expect2, &forbid2, 180, &keys2, "awmi: session locked at boot", &[], "")?;
     println!("--- [install-e2e boot2] serial ({:.1}s) ---", r2.seconds);
     println!("{}", r2.log.trim_end());
     let miss2: Vec<&String> = expect2.iter().filter(|e| !r2.log.contains(e.as_str())).collect();
@@ -3265,7 +3299,7 @@ fn make_tampered_image(env: &Env, image: &Path) -> Result<PathBuf, String> {
 /// Typed in the boot-to-desktop tests: commands in the terminal window, Super and an app from
 /// the launcher, Ctrl+Alt+Esc out of the desktop, then a command in the text console.
 fn desktop_keys() -> Vec<String> {
-    let mut k = vec!["~1500".to_string()];
+    let mut k = vec!["~2000".to_string(), "esc".to_string(), "~600".to_string()];
     k.extend(convert_to_qemu_keys(&["gui status", "gui text 125"], 1500));
     k.extend(["meta_l".to_string(), "~800".to_string()]);
     k.extend(convert_to_qemu_keys(&["widgets"], 2500));
@@ -3274,10 +3308,12 @@ fn desktop_keys() -> Vec<String> {
     k
 }
 
-const DESKTOP_EXPECT: [&str; 14] = [
+const DESKTOP_EXPECT: [&str; 16] = [
     "init: boot: desktop",
     "awmi: fonts: 4 face(s)",
     "awmi: desktop session started at boot",
+    "appmgr: live boot detected, launching unified setup (oobe)",
+    "oobe: window",
     "console: terminal window",
     "terminal: view attached",
     "terminal: line from console: gui status",

@@ -42,13 +42,21 @@ impl EditorApp {
         } else {
             String::from("Read-only mode (files:write not granted or volume read-only)")
         };
-        Self {
+        let mut app = Self {
             path: String::from("/home/notes.txt"),
             content: String::new(),
             dirty: false,
             status,
             writable,
+        };
+        if let Ok(arg) = core::str::from_utf8(libd::args()) {
+            let target = arg.trim();
+            if !target.is_empty() {
+                app.path = String::from(target);
+                app.open_file();
+            }
         }
+        app
     }
 
     fn open_file(&mut self) {

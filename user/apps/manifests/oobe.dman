@@ -1,15 +1,17 @@
 kind = "app"
 name = "oobe"
-title = "Welcome to D-OS"
+title = "Install D-OS"
 version = "1.0.0"
 binary = "oobe.dx"
-description = "First-boot setup: language, keyboard, timezone, optional network, and local account"
-pinned = false
+description = "Unified disk installer and first-boot setup (language, keyboard, timezone, network, account)"
+pinned = true
 autostart = false
 
 [permissions]
 required = [
     "window",
+    "storage:admin",
+    "display:admin",
     "identity:query",
     "identity:admin",
     "net:status",
@@ -17,6 +19,6 @@ required = [
 ]
 
 [quota]
-memory = "48M"
+memory = "64M"
 handles = 256
 threads = 4

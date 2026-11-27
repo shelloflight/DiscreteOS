@@ -801,3 +801,110 @@ fn right_click_unpins_dock_app_and_toggles_launcher_pin() {
     let dl3 = wm.dock_layout_for(wm.layout.primary().unwrap());
     assert_eq!(dl3.pinned_count, 2);
 }
+
+#[test]
+fn launcher_file_lookup_ranks_and_opens_paths() {
+    use crate::launcher::{MAX_RESULTS, PowerAction};
+    let mut wm = launcher_wm();
+    wm.launcher.push_file(b"/home/docs", true);
+    wm.launcher.push_file(b"/home/docs/report.txt", false);
+    wm.launcher.push_file(b"/home/readme.md", false);
+    wm.launcher.push_file(b"/sys/themes/dark-slate.toml", false);
+    assert_eq!(wm.launcher.file_count(), 4);
+
+    // Empty query keeps the clean default Apps + Settings view (no file clutter).
+    wm.toggle_launcher();
+    let mut res = [LaunchTarget::Setting(Setting::ThemeToggle); MAX_RESULTS];
+    let n_empty = wm.launcher.results(&mut res);
+    assert!(res[..n_empty].iter().all(|t| !matches!(t, LaunchTarget::File { .. } | LaunchTarget::Power(_))));
+
+    // Typing "rep" ranks "/home/docs/report.txt" at top and Enter emits WmAction::OpenPath.
+    for &c in b"rep" {
+        assert_eq!(wm.handle_key(u32::from(c), true), WmAction::None);
+    }
+    let n = wm.launcher.results(&mut res);
+    assert!(n >= 1);
+    assert!(matches!(res[0], LaunchTarget::File { .. }));
+    let act = wm.handle_key(0x0A, true);
+    match act {
+        WmAction::OpenPath { path, len, is_dir } => {
+            assert_eq!(&path[..usize::from(len)], b"/home/docs/report.txt");
+            assert!(!is_dir);
+        }
+        other => panic!("expected OpenPath for report.txt, got {:?}", other),
+    }
+    assert!(!wm.launcher.open);
+
+    // Directory lookup: typing "docs" selects directory "/home/docs" before nested file.
+    wm.toggle_launcher();
+    for &c in b"docs" {
+        assert_eq!(wm.handle_key(u32::from(c), true), WmAction::None);
+    }
+    match wm.handle_key(0x0D, true) {
+        WmAction::OpenPath { path, len, is_dir } => {
+            assert_eq!(&path[..usize::from(len)], b"/home/docs");
+            assert!(is_dir);
+        }
+        other => panic!("expected OpenPath for /home/docs, got {:?}", other),
+    }
+
+    // Typing "reboot" or "rest" matches Power actions directly from keyboard.
+    wm.toggle_launcher();
+    for &c in b"reboot" {
+        let _ = wm.handle_key(u32::from(c), true);
+    }
+    assert_eq!(wm.handle_key(0x0A, true), WmAction::Power(PowerAction::Reboot));
+    wm.toggle_launcher();
+    for &c in b"rest" {
+        let _ = wm.handle_key(u32::from(c), true);
+    }
+    assert_eq!(wm.handle_key(0x0A, true), WmAction::Power(PowerAction::Sleep));
+}
+
+#[test]
+fn launcher_power_menu_toggle_and_all_four_controls() {
+    use crate::CursorKind;
+    use crate::launcher::PowerAction;
+    let mut wm = launcher_wm();
+    let expected = [PowerAction::Off, PowerAction::Reboot, PowerAction::Lock, PowerAction::Sleep];
+
+    for (idx, &want) in expected.iter().enumerate() {
+        wm.toggle_launcher();
+        assert!(wm.launcher.open);
+        assert!(!wm.launcher.power_open);
+        let prim = wm.layout.primary().unwrap();
+        let rects = wm.launcher.rects(prim.bounds.w, prim.bounds.h, wm.line_h);
+
+        // Hovering Power button shows Pointer cursor; clicking toggles the 4 power controls open.
+        let pbtn = Point::new(prim.bounds.x + rects.power_btn.x + 8, prim.bounds.y + rects.power_btn.y + 8);
+        assert_eq!(wm.handle_pointer(0, 0, Some(pbtn), 0), WmAction::None);
+        assert_eq!(wm.cursor_kind, CursorKind::Pointer);
+        assert_eq!(wm.handle_pointer(0, 0, Some(pbtn), 1), WmAction::None);
+        assert_eq!(wm.handle_pointer(0, 0, Some(pbtn), 0), WmAction::None);
+        assert!(wm.launcher.power_open);
+
+        // Click option `idx` (Off / Reboot / Lock / Rest).
+        let open_rects = wm.launcher.rects(prim.bounds.w, prim.bounds.h, wm.line_h);
+        let opt = open_rects.power_opts[idx];
+        assert!(!opt.is_empty());
+        let opt_pt = Point::new(prim.bounds.x + opt.x + 8, prim.bounds.y + opt.y + 8);
+        assert_eq!(wm.handle_pointer(0, 0, Some(opt_pt), 0), WmAction::None);
+        assert_eq!(wm.cursor_kind, CursorKind::Pointer);
+        assert_eq!(wm.handle_pointer(0, 0, Some(opt_pt), 1), WmAction::Power(want));
+        assert_eq!(wm.handle_pointer(0, 0, Some(opt_pt), 0), WmAction::None);
+        assert!(!wm.launcher.open);
+    }
+
+    // Escape closes the expanded power menu first without dismissing the launcher.
+    wm.toggle_launcher();
+    let prim = wm.layout.primary().unwrap();
+    let rects = wm.launcher.rects(prim.bounds.w, prim.bounds.h, wm.line_h);
+    let pbtn = Point::new(prim.bounds.x + rects.power_btn.x + 8, prim.bounds.y + rects.power_btn.y + 8);
+    wm.handle_pointer(0, 0, Some(pbtn), 1);
+    wm.handle_pointer(0, 0, Some(pbtn), 0);
+    assert!(wm.launcher.power_open);
+    assert_eq!(wm.handle_key(0x1B, true), WmAction::None);
+    assert!(wm.launcher.open && !wm.launcher.power_open);
+    assert_eq!(wm.handle_key(0x1B, true), WmAction::None);
+    assert!(!wm.launcher.open);
+}

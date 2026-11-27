@@ -131,6 +131,12 @@ fn mix(a: u32, b: u32, t: u32) -> u32 {
     ch(24) | ch(16) | ch(8) | ch(0)
 }
 
+/// Fade `color` in from fully transparent without darkening its RGB channels toward black.
+fn fade_alpha(color: u32, t: u32) -> u32 {
+    let a = ((color >> 24) & 0xFF) * t.min(255) / 255;
+    (color & 0x00FF_FFFF) | (a << 24)
+}
+
 fn flatten<'a, M>(n: &'a Node<M>, out: &mut Vec<&'a Node<M>>) {
     out.push(n);
     for c in &n.children {
@@ -365,6 +371,11 @@ impl<M: Clone> Ui<M> {
     /// A transition is running: the app should draw again soon (on its next frame).
     pub fn animating(&self) -> bool {
         !self.settings.reduce_motion && self.trans.iter().any(|&(_, t)| self.now.saturating_sub(t) < TRANSITION_NS)
+    }
+
+    /// True when layout or state changes queued repaint damage not yet flushed by `paint()`.
+    pub fn has_damage(&self) -> bool {
+        !self.damage.is_empty()
     }
 
     /// New window size: everything is laid out and painted again.
@@ -649,12 +660,13 @@ impl<M: Clone> Ui<M> {
                             k::HOME | 0x01 => (None, 0),
                             k::END | 0x05 => (None, value.len()),
                             0x15 => (Some(String::from(&value[caret..])), 0), // Ctrl+U: clear to the start
-                            0x20..=0x7E if mods == 0 && value.len() < 1024 => {
-                                let mut s = String::with_capacity(value.len() + 1);
+                            0x20..=0x7E | 0xA0..=0xFF if mods == 0 && value.len() < 1024 => {
+                                let ch = char::from_u32(base).unwrap_or('?');
+                                let mut s = String::with_capacity(value.len() + ch.len_utf8());
                                 s.push_str(&value[..caret]);
-                                s.push(char::from(base as u8));
+                                s.push(ch);
                                 s.push_str(&value[caret..]);
-                                (Some(s), caret + 1)
+                                (Some(s), caret + ch.len_utf8())
                             }
                             _ => (None, caret),
                         };
@@ -711,12 +723,13 @@ impl<M: Clone> Ui<M> {
                                     (None, target)
                                 }
                             }
-                            0x20..=0x7E if mods == 0 && value.len() < 65536 => {
-                                let mut s = String::with_capacity(value.len() + 1);
+                            0x20..=0x7E | 0xA0..=0xFF if mods == 0 && value.len() < 65536 => {
+                                let ch = char::from_u32(base).unwrap_or('?');
+                                let mut s = String::with_capacity(value.len() + ch.len_utf8());
                                 s.push_str(&value[..caret]);
-                                s.push(char::from(base as u8));
+                                s.push(ch);
                                 s.push_str(&value[caret..]);
-                                (Some(s), caret + 1)
+                                (Some(s), caret + ch.len_utf8())
                             }
                             _ => (None, caret),
                         };
@@ -941,8 +954,8 @@ impl<M: Clone> Ui<M> {
                         let base = if pressed { t.accent_pressed } else { mix(t.accent, t.accent_hover, hov) };
                         (base, 0, t.text_on_accent)
                     }
-                    ButtonKind::Secondary => (mix(0, t.btn_hover, hov), t.border_active, t.text_primary),
-                    ButtonKind::Danger => (mix(0, t.btn_hover, hov), t.ind_alert_red, t.ind_alert_red),
+                    ButtonKind::Secondary => (fade_alpha(t.btn_hover, hov), t.border_active, t.text_primary),
+                    ButtonKind::Danger => (fade_alpha(t.btn_hover, hov), t.ind_alert_red, t.ind_alert_red),
                 };
                 let fg = if enabled { fg } else { t.text_muted };
                 c.fill_rounded_rect(clip, r, t.radius, fill, border);
@@ -1073,7 +1086,7 @@ impl<M: Clone> Ui<M> {
                 let (fill, fg, muted) = if *selected {
                     (mix(t.accent, t.accent_hover, hov), t.text_on_accent, t.text_on_accent)
                 } else {
-                    (mix(0, t.btn_hover, hov), t.text_primary, t.text_muted)
+                    (fade_alpha(t.btn_hover, hov), t.text_primary, t.text_muted)
                 };
                 c.fill_rounded_rect(clip, r, t.radius, fill, 0);
                 let pad = s(12) as i32;

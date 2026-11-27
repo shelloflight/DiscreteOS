@@ -40,10 +40,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use dosawmi::{
-    AwmiStatus, BitmapText, Canvas, CursorKind, DamageSet, LockIdentity, LockMode, LockReason, MAX_IDENTITY_BYTES, Point, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, Theme, ThemeId, TrustTier, UiSettings,
+    AwmiStatus, BitmapText, Canvas, CursorKind, DamageSet, LockIdentity, LockMode, LockReason, MAX_IDENTITY_BYTES, Point, PowerAction, Rect, STATUS_BYTES, Setting, SurfaceView, THEME_BYTES, Theme, ThemeId, TrustTier, UiSettings,
     WINDOW_INFO_BYTES, WmAction, WmState, encode_window_info, split_connect,
 };
-use dosid::DesktopSettings;
+use dosid::{DesktopSettings, KeyboardLayout, Language, OobeConfig, timezone_offset_minutes};
 use dosui::{FontText, fonts};
 use libd::fs as fp;
 use libd::awmi as wire;
@@ -51,7 +51,7 @@ use libd::gpu::{self, AdapterInfo, ModeEntry};
 use libd::identity as idwire;
 use libd::proto::{self, HEADER, Header, key};
 use libd::sys::{self, Handle};
-use libd::{Mapping, Port, Startup, println, svc, term, time};
+use libd::{Mapping, Port, Startup, println, svc, term, time, tool};
 
 libd::entry!(dsvc_awmi, main);
 libd::entry!(dsvc_awmi_demo, demo::main);
@@ -158,6 +158,7 @@ struct RegisteredApp {
 struct Awmi {
     port: Port,
     ctl: Handle,
+    mgr: Handle,
     input: Handle,
     term: Handle,
     gpu: Handle,
@@ -190,6 +191,8 @@ struct Awmi {
     flip_pending: bool,
     /// Safety timeout for an in-flight async flip (recovers if a driver restarts mid-flip).
     flip_deadline: u64,
+    /// Timestamp when the current async flip was submitted (measures true flip latency).
+    flip_submitted_ns: u64,
     /// Timestamp of the last completed vsync flip.
     last_flip_ns: u64,
     /// When a frame missed its refresh deadline, hold the next composite until this time so we
@@ -235,6 +238,10 @@ struct Awmi {
     saved_hdr: bool,
     saved_pinned_apps: Option<Vec<String>>,
     applied_saved_display: bool,
+    /// Active UI language id (0..=4), keyboard layout id (0..=4), and timezone offset (minutes from UTC).
+    lang_id: u8,
+    kbd_id: u8,
+    tz_offset_min: i16,
     /// Launcher entries programs/appmgr registered; replayed into each session.
     apps: Vec<RegisteredApp>,
     /// What the session was started with (`SESSION_DEMO`, `SESSION_DESKTOP`).
@@ -246,6 +253,25 @@ struct Awmi {
 const HOME_CFG_DIR: &[u8] = b".dos";
 const HOME_SETTINGS_FILE: &[u8] = b".dos/settings.toml";
 const HOME_SETTINGS_TMP: &[u8] = b".dos/settings.tmp";
+const HOME_OOBE_FILE: &[u8] = b".dos/oobe.toml";
+
+fn load_oobe_locale() -> Option<OobeConfig> {
+    let ns = fp::Namespace::get();
+    let (dir, _) = ns.resolve(b"/home")?;
+    let d = fp::Node::from(dir);
+    let parsed = (|| {
+        let (f, _, size) = d.open(HOME_OOBE_FILE, 0, fp::R_READ).ok()?;
+        let size = usize::try_from(size).ok()?;
+        if size == 0 || size > 16 * 1024 {
+            return None;
+        }
+        let mut buf = alloc::vec![0u8; size];
+        let n = f.read(0, &mut buf).ok()?;
+        OobeConfig::from_toml(&buf[..n]).ok()
+    })();
+    let _ = d.into_handle();
+    parsed
+}
 
 fn load_desktop_settings() -> Option<DesktopSettings> {
     let ns = fp::Namespace::get();
@@ -290,6 +316,62 @@ fn save_desktop_settings_file(cfg: &DesktopSettings) -> bool {
     }
     let _ = d.into_handle();
     wrote
+}
+
+/// Bounded BFS walk of `root` into the launcher's in-RAM lookup table (zero symlink/dot loops).
+fn index_fs_tree(
+    launcher: &mut dosawmi::Launcher,
+    root: &fp::Node,
+    virt_prefix: &str,
+    max_depth: u8,
+    skip_root_names: &[&str],
+) {
+    let mut queue: Vec<(String, String, u8)> = Vec::new();
+    queue.push((String::new(), String::from(virt_prefix), 0));
+    let mut head = 0usize;
+    while head < queue.len() && launcher.file_count() < dosawmi::MAX_FS_ENTRIES {
+        let (rel, virt, depth) = queue[head].clone();
+        head += 1;
+        let mut items: Vec<(String, bool)> = Vec::new();
+        let ok = if rel.is_empty() {
+            root.list(|name, kind| {
+                if !name.is_empty() && name[0] != b'.' {
+                    items.push((String::from_utf8_lossy(name).into_owned(), kind == fp::KIND_DIR));
+                }
+            })
+            .is_ok()
+        } else if let Ok((sub, _, _)) = root.open(rel.as_bytes(), fp::O_DIRECTORY, fp::R_READ) {
+            sub.list(|name, kind| {
+                if !name.is_empty() && name[0] != b'.' {
+                    items.push((String::from_utf8_lossy(name).into_owned(), kind == fp::KIND_DIR));
+                }
+            })
+            .is_ok()
+        } else {
+            false
+        };
+        if !ok {
+            continue;
+        }
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        for (name, is_dir) in items {
+            if launcher.file_count() >= dosawmi::MAX_FS_ENTRIES {
+                break;
+            }
+            if depth == 0 && skip_root_names.iter().any(|&s| s == name) {
+                continue;
+            }
+            let vpath = format!("{}/{}", virt, name);
+            if vpath.len() > dosawmi::FS_PATH_BYTES {
+                continue;
+            }
+            let _ = launcher.push_file(vpath.as_bytes(), is_dir);
+            if is_dir && depth < max_depth {
+                let next_rel = if rel.is_empty() { name } else { format!("{}/{}", rel, name) };
+                queue.push((next_rel, vpath, depth + 1));
+            }
+        }
+    }
 }
 
 /// Read a whole file from the system volume (`/sys` in this service's namespace).
@@ -419,6 +501,9 @@ impl Awmi {
             b"devmgr.input" => {
                 Self::replace(&mut self.input, hnd);
                 self.port.arm(hnd, sys::READABLE | sys::PEER_CLOSED, KEY_INPUT);
+                if self.kbd_id != 0 {
+                    self.push_keyboard_layout();
+                }
                 if self.active {
                     self.grab(true);
                 }
@@ -493,6 +578,16 @@ impl Awmi {
         }
     }
 
+    fn push_keyboard_layout(&self) {
+        if self.input == 0 {
+            return;
+        }
+        let mut req = [0u8; HEADER];
+        Header { txid: 0, op: proto::INPUT_SET_LAYOUT, status: 0, a: u64::from(self.kbd_id), b: 0 }.put(&mut req);
+        let mut rep = [0u8; HEADER];
+        let _ = sys::channel_call(self.input, &req, &mut rep, 2 * SEC);
+    }
+
     fn term_call(&mut self, op: u32) {
         if self.term == 0 {
             return;
@@ -505,6 +600,24 @@ impl Awmi {
 
     fn on_input(&mut self) {
         let mut buf = [0u8; HEADER + 32];
+        let mut rel_dx: i32 = 0;
+        let mut rel_dy: i32 = 0;
+        let mut rel_buttons: u8 = self.wm.buttons;
+        let mut has_rel = false;
+        let mut hw_cursor_dirty = false;
+
+        let flush_rel = |me: &mut Self, dx: &mut i32, dy: &mut i32, btns: u8, active: &mut bool, cur_dirty: &mut bool| {
+            if *active {
+                let (mdx, mdy) = (*dx, *dy);
+                *dx = 0;
+                *dy = 0;
+                *active = false;
+                if me.pointer_inner(mdx, mdy, None, btns, 0, true) {
+                    *cur_dirty = true;
+                }
+            }
+        };
+
         loop {
             match sys::channel_read(self.input, &mut buf, 0) {
                 Ok(n) => {
@@ -514,6 +627,7 @@ impl Awmi {
                     }
                     match h.op {
                         proto::INPUT_KEY => {
+                            flush_rel(self, &mut rel_dx, &mut rel_dy, rel_buttons, &mut has_rel, &mut hw_cursor_dirty);
                             self.input_keys = self.input_keys.saturating_add(1);
                             if self.input_keys == 1 {
                                 println!("awmi: keys routed to the compositor (input grab held)");
@@ -525,16 +639,42 @@ impl Awmi {
                             if self.input_pointer == 1 {
                                 println!("awmi: pointer input routed to the compositor (grab held)");
                             }
-                            self.pointer_raw(h.a, h.b);
+                            let buttons = (h.b & 0xFF) as u8;
+                            let wheel = ((h.b >> 8) & 0xFF) as u8 as i8;
+                            let is_abs = (h.b & proto::POINTER_ABS) != 0;
+                            if !is_abs && wheel == 0 && buttons == rel_buttons {
+                                // Coalesce consecutive relative motion reports from high-polling-rate
+                                // USB mice (1000+ Hz) into one crisp motion update per drain.
+                                rel_dx = rel_dx.saturating_add(h.a as u32 as i32);
+                                rel_dy = rel_dy.saturating_add((h.a >> 32) as u32 as i32);
+                                has_rel = true;
+                            } else {
+                                flush_rel(self, &mut rel_dx, &mut rel_dy, rel_buttons, &mut has_rel, &mut hw_cursor_dirty);
+                                rel_buttons = buttons;
+                                if self.pointer_raw_inner(h.a, h.b, true) {
+                                    hw_cursor_dirty = true;
+                                }
+                            }
                         }
                         _ => {}
                     }
                 }
                 Err(sys::ERR_SHOULD_WAIT) => {
+                    flush_rel(self, &mut rel_dx, &mut rel_dy, rel_buttons, &mut has_rel, &mut hw_cursor_dirty);
+                    if hw_cursor_dirty
+                        && let Some(o) = self.outs.iter().find(|o| o.hw_cursor)
+                    {
+                        let p = self.wm.pointer;
+                        let (hx, hy) = self.wm.cursor_kind.hotspot();
+                        let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, hx as u16, hy as u16);
+                    }
                     self.port.arm(self.input, sys::READABLE | sys::PEER_CLOSED, KEY_INPUT);
                     return;
                 }
-                Err(_) => return, // the device manager is gone; the service manager links us again
+                Err(_) => {
+                    flush_rel(self, &mut rel_dx, &mut rel_dy, rel_buttons, &mut has_rel, &mut hw_cursor_dirty);
+                    return; // the device manager is gone; the service manager links us again
+                }
             }
         }
     }
@@ -544,7 +684,11 @@ impl Awmi {
         self.wm.now_ns = now;
         self.last_input_ns = now;
         let pressed = k & key::RELEASE == 0;
+        let was_open = self.wm.launcher.open;
         let action = self.wm.handle_key(k & !key::RELEASE, pressed);
+        if !was_open && self.wm.launcher.open {
+            self.refresh_launcher_files();
+        }
         match action {
             WmAction::DeliverKey { owner, window_id } => self.send_to(owner, wire::EVT_KEY, u64::from(window_id), u64::from(k)),
             other => self.act(other),
@@ -553,8 +697,9 @@ impl Awmi {
     }
 
     /// A pointer event from the device manager: relative motion, or absolute `[0, 32767]` from a
-    /// tablet (QEMU) mapped onto the whole desktop.
-    fn pointer_raw(&mut self, a: u64, b: u64) {
+    /// tablet (QEMU) mapped onto the whole desktop. Returns `true` if a deferred hardware cursor
+    /// move should be flushed once the burst finishes.
+    fn pointer_raw_inner(&mut self, a: u64, b: u64, defer_hw_cursor: bool) -> bool {
         let buttons = (b & 0xFF) as u8;
         let wheel = ((b >> 8) & 0xFF) as u8 as i8;
         if b & proto::POINTER_ABS != 0 {
@@ -563,25 +708,33 @@ impl Awmi {
             let ay = i64::from(((a >> 32) as u32).min(32767));
             let x = i64::from(d.x) + ax * i64::from(d.w) / 32768;
             let y = i64::from(d.y) + ay * i64::from(d.h) / 32768;
-            self.pointer(0, 0, Some(Point::new(x as i32, y as i32)), buttons, wheel);
+            self.pointer_inner(0, 0, Some(Point::new(x as i32, y as i32)), buttons, wheel, defer_hw_cursor)
         } else {
-            self.pointer(a as u32 as i32, (a >> 32) as u32 as i32, None, buttons, wheel);
+            self.pointer_inner(a as u32 as i32, (a >> 32) as u32 as i32, None, buttons, wheel, defer_hw_cursor)
         }
     }
 
     fn pointer(&mut self, dx: i32, dy: i32, abs: Option<Point>, buttons: u8, wheel: i8) {
+        let _ = self.pointer_inner(dx, dy, abs, buttons, wheel, false);
+    }
+
+    fn pointer_inner(&mut self, dx: i32, dy: i32, abs: Option<Point>, buttons: u8, wheel: i8, defer_hw_cursor: bool) -> bool {
         self.last_input_ns = sys::clock_ns();
         let before = (self.wm.pointer, self.wm.buttons);
         let action = self.wm.handle_pointer(dx, dy, abs, buttons);
         if self.outs.iter().any(|o| o.hw_cursor) && self.wm.cursor_kind != self.hw_cursor_kind {
             self.upload_cursor();
         }
+        let mut hw_moved = false;
         if self.wm.pointer != before.0 {
             if let Some(o) = self.outs.iter().find(|o| o.hw_cursor) {
-                // Hardware cursor plane moves atomically without triggering a full frame composite.
-                let p = self.wm.pointer;
-                let (hx, hy) = self.wm.cursor_kind.hotspot();
-                let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, hx as u16, hy as u16);
+                if defer_hw_cursor {
+                    hw_moved = true;
+                } else {
+                    let p = self.wm.pointer;
+                    let (hx, hy) = self.wm.cursor_kind.hotspot();
+                    let _ = gpu::kms_set_cursor_atomic(self.gpu, o.adapter, 0, p.x, p.y, hx as u16, hy as u16);
+                }
             } else {
                 self.cursor_moved = true;
             }
@@ -601,6 +754,7 @@ impl Awmi {
             self.act(action);
         }
         self.sync_windows();
+        hw_moved
     }
 
     fn sync_lock_identities(&mut self) -> (bool, bool) {
@@ -719,6 +873,42 @@ impl Awmi {
                 println!("awmi: launcher: opening entry {} of client {}", app, owner);
                 self.send_to(owner, wire::EVT_LAUNCH, u64::from(app), 0);
             }
+            WmAction::OpenPath { path, len, is_dir } => {
+                let target_path = &path[..usize::from(len).min(path.len())];
+                let want_app: &[u8] = if is_dir { b"files" } else { b"editor" };
+                if let Some((owner, app)) = self
+                    .apps
+                    .iter()
+                    .find(|a| a.identity.as_slice() == want_app)
+                    .map(|a| (a.owner, a.app))
+                {
+                    println!(
+                        "awmi: launcher: opening {} '{}' via {}",
+                        if is_dir { "directory" } else { "file" },
+                        core::str::from_utf8(target_path).unwrap_or("?"),
+                        if is_dir { "files" } else { "editor" }
+                    );
+                    self.send_to_payload(owner, wire::EVT_LAUNCH, u64::from(app), 0, target_path);
+                }
+            }
+            WmAction::Power(act) => match act {
+                PowerAction::Lock => {
+                    self.engage_lock_screen(LockMode::Locked, LockReason::Manual);
+                }
+                PowerAction::Off => {
+                    self.request_power(sys::POWER_OFF);
+                }
+                PowerAction::Reboot => {
+                    self.request_power(sys::POWER_REBOOT);
+                }
+                PowerAction::Sleep => {
+                    if self.lock_on_sleep && !self.wm.lock.active {
+                        self.engage_lock_screen(LockMode::Locked, LockReason::Sleep);
+                        self.flush();
+                    }
+                    self.request_power(sys::POWER_SUSPEND);
+                }
+            },
             WmAction::SetAppPinned { owner, app, pinned } => {
                 if let Some(entry) = self.apps.iter_mut().find(|a| a.owner == owner && a.app == app) {
                     entry.pinned = pinned;
@@ -835,6 +1025,78 @@ impl Awmi {
     fn send_to(&self, owner: u32, op: u32, a: u64, b: u64) {
         if let Some(c) = self.clients.iter().find(|c| c.id == owner && c.ch != 0) {
             proto::send(c.ch, op, a, b); // a full or closed client loses the event, never us
+        }
+    }
+
+    fn send_to_payload(&self, owner: u32, op: u32, a: u64, b: u64, payload: &[u8]) {
+        let Some(c) = self.clients.iter().find(|c| c.id == owner && c.ch != 0) else {
+            return;
+        };
+        let n = payload.len().min(wire::LAUNCH_ARG_MAX);
+        let mut msg = [0u8; HEADER + wire::LAUNCH_ARG_MAX];
+        Header { txid: 0, op, status: 0, a, b }.put(&mut msg);
+        msg[HEADER..HEADER + n].copy_from_slice(&payload[..n]);
+        sys::channel_write(c.ch, &msg[..HEADER + n]);
+    }
+
+    fn request_power(&self, action: u64) {
+        if self.mgr == 0 {
+            println!("awmi: power action refused (no manager.power grant)");
+            return;
+        }
+        let mut req = [0u8; HEADER];
+        Header { txid: 0, op: svc::MGR_POWER, status: 0, a: action, b: 0 }.put(&mut req);
+        let mut rep = [0u8; HEADER + 64];
+        match sys::channel_call(self.mgr, &req, &mut rep, 5 * SEC) {
+            Ok(_) => {}
+            Err(e) => println!("awmi: power action failed: {}", sys::status(e)),
+        }
+    }
+
+    /// Populate the launcher's lightweight in-RAM file/directory index for the active identity.
+    fn refresh_launcher_files(&mut self) {
+        self.wm.launcher.clear_files();
+        if self.test_mode {
+            return;
+        }
+        let (user_name, is_operator) = if self.identity != 0
+            && let Ok(info) = idwire::active(self.identity)
+        {
+            (String::from(info.name_str()), info.role == idwire::ROLE_OPERATOR)
+        } else {
+            (String::from("user"), true)
+        };
+        let ns = fp::Namespace::get();
+        let mut indexed_home = false;
+        if let Some((home_h, _)) = ns.resolve(b"/home") {
+            let d = fp::Node::from(home_h);
+            if let Ok((uh, _, _)) = d.open(user_name.as_bytes(), fp::O_DIRECTORY, fp::R_READ) {
+                let _ = self.wm.launcher.push_file(b"/home", true);
+                index_fs_tree(&mut self.wm.launcher, &uh, "/home", 3, &[]);
+                indexed_home = true;
+            }
+            let _ = d.into_handle();
+        }
+        if let Some((data_h, _)) = ns.resolve(b"/data") {
+            let d = fp::Node::from(data_h);
+            if !indexed_home {
+                let sub = format!("home/{}", user_name);
+                if let Ok((uh, _, _)) = d.open(sub.as_bytes(), fp::O_DIRECTORY, fp::R_READ) {
+                    let _ = self.wm.launcher.push_file(b"/home", true);
+                    index_fs_tree(&mut self.wm.launcher, &uh, "/home", 3, &[]);
+                }
+            }
+            if is_operator {
+                let _ = self.wm.launcher.push_file(b"/data", true);
+                index_fs_tree(&mut self.wm.launcher, &d, "/data", 2, &["home", "apps"]);
+            }
+            let _ = d.into_handle();
+        }
+        if let Some((sys_h, _)) = ns.resolve(b"/sys") {
+            let d = fp::Node::from(sys_h);
+            let _ = self.wm.launcher.push_file(b"/sys", true);
+            index_fs_tree(&mut self.wm.launcher, &d, "/sys", 2, &[]);
+            let _ = d.into_handle();
         }
     }
 
@@ -1139,6 +1401,7 @@ impl Awmi {
             self.settings.text_scale = p.scale;
         }
         self.wm.now_ns = sys::clock_ns();
+        self.wm.lock.set_language(self.lang_id);
         self.apply_settings();
         for a in &self.apps {
             if self.clients.iter().any(|c| c.id == a.owner && c.ch != 0) {
@@ -1237,17 +1500,14 @@ impl Awmi {
                     match h.op {
                         gpu::EVT_VBLANK => {
                             let now = sys::clock_ns();
-                            let late_flag = (h.a >> 32) != 0;
-                            let interval = self.frame_interval();
-                            let missed_deadline = late_flag
-                                || (self.last_flip_ns > 0 && now.saturating_sub(self.last_flip_ns) > (interval * 3) / 2);
                             self.flip_pending = false;
                             self.flip_deadline = 0;
+                            self.flip_submitted_ns = 0;
                             self.last_flip_ns = now;
-                            if missed_deadline {
-                                // Drop cleanly to every other refresh rather than tearing when a frame is late.
-                                self.pace_skip_until = now + interval;
-                            }
+                            // `EVT_VBLANK` signals the hardware flip has just latched at vblank:
+                            // the next composite can start immediately for the upcoming refresh
+                            // without inserting a full-frame skip stall.
+                            self.pace_skip_until = 0;
                             self.deliver_frame_done();
                         }
                         gpu::EVT_ADAPTERS_CHANGED => {
@@ -1310,7 +1570,8 @@ impl Awmi {
             self.clock_base = time::query(self.clock);
         }
         if let Some(b) = self.clock_base {
-            let c = b.now().to_civil();
+            let offset_ns = i64::from(self.tz_offset_min) * 60_000_000_000;
+            let c = b.now().add_ns(offset_ns).to_civil();
             self.wm.tray.hour = c.hour;
             self.wm.tray.minute = c.minute;
             self.wm.tray.clock_valid = true;
@@ -1389,10 +1650,19 @@ impl Awmi {
                     continue;
                 }
                 let mut rects = [(0u32, 0u32, 0u32, 0u32); gpu::MAX_PRESENT_RECTS];
-                let cnt = slice.len().min(gpu::MAX_PRESENT_RECTS);
-                for (slot, r) in rects.iter_mut().take(cnt).zip(slice.iter()) {
-                    *slot = (r.x as u32, r.y as u32, r.w, r.h);
-                }
+                let cnt = if slice.len() > gpu::MAX_PRESENT_RECTS {
+                    let mut u = slice[0];
+                    for &r in &slice[1..] {
+                        u = u.union(r);
+                    }
+                    rects[0] = (u.x as u32, u.y as u32, u.w, u.h);
+                    1
+                } else {
+                    for (slot, r) in rects.iter_mut().take(slice.len()).zip(slice.iter()) {
+                        *slot = (r.x as u32, r.y as u32, r.w, r.h);
+                    }
+                    slice.len()
+                };
                 match gpu::kms_present_atomic(*gpu_ep, ob.adapter, ob.fb_id, &rects[..cnt]) {
                     Ok((_, is_async)) => {
                         presented += cnt as u64;
@@ -1433,6 +1703,7 @@ impl Awmi {
         if any_async && !failed {
             let now = sys::clock_ns();
             self.flip_pending = true;
+            self.flip_submitted_ns = now;
             self.flip_deadline = now + (self.frame_interval() * 4).max(50 * MS);
         } else {
             self.deliver_frame_done();
@@ -1731,6 +2002,28 @@ impl Awmi {
                 let secs = (h.a as u32).min(86_400);
                 self.idle_timeout_ns = u64::from(secs) * SEC;
                 self.lock_on_sleep = ((h.a >> 32) & 1) != 0;
+                ok(0, 0)
+            }
+            wire::OP_SET_LOCALE if admin => {
+                let lang_id = (h.a as u8).min(4);
+                let kbd_id = ((h.a >> 8) as u8).min(4);
+                let tz_min = (((h.a >> 16) as u16) as i16).clamp(-840, 840);
+                self.lang_id = lang_id;
+                self.kbd_id = kbd_id;
+                self.tz_offset_min = tz_min;
+                self.wm.lock.set_language(lang_id);
+                self.push_keyboard_layout();
+                self.next_tray = 0;
+                self.poll_tray();
+                if self.active {
+                    self.wm.damage_all();
+                }
+                println!(
+                    "awmi: locale set (lang={}, kbd={}, tz_offset={}m)",
+                    Language::from_id(lang_id).code(),
+                    KeyboardLayout::from_id(kbd_id).code(),
+                    tz_min
+                );
                 ok(0, 0)
             }
             wire::OP_PERM_PROMPT if role == Role::Launcher => {
@@ -2036,6 +2329,10 @@ fn main(s: *const Startup) -> i32 {
     };
     let themes = [load_theme(ThemeId::DarkSlate), load_theme(ThemeId::HighContrast)];
     let persisted = if test_mode { None } else { load_desktop_settings() };
+    let oobe_loc = if test_mode { None } else { load_oobe_locale() };
+    let init_lang = oobe_loc.as_ref().map_or(0u8, |c| Language::from_code(&c.language).id());
+    let init_kbd = oobe_loc.as_ref().map_or(0u8, |c| KeyboardLayout::from_code(&c.keyboard).id());
+    let init_tz = oobe_loc.as_ref().map_or(0i16, |c| timezone_offset_minutes(&c.timezone) as i16);
     let mut init_settings = UiSettings::DEFAULT;
     let mut init_scale_set = false;
     let mut init_output_scale = 0u16;
@@ -2065,6 +2362,7 @@ fn main(s: *const Startup) -> i32 {
     let mut a = Awmi {
         port,
         ctl: libd::startup_handle(proto::TAG_CONTROL),
+        mgr: libd::startup_handle(tool::TAG_MANAGER),
         input: svc::endpoint(b"devmgr.input"),
         term: svc::endpoint(b"terminal.display"),
         gpu: gpu::display_endpoint(),
@@ -2095,6 +2393,7 @@ fn main(s: *const Startup) -> i32 {
         next_tray: 0,
         flip_pending: false,
         flip_deadline: 0,
+        flip_submitted_ns: 0,
         last_flip_ns: 0,
         pace_skip_until: 0,
         cursor_moved: false,
@@ -2125,6 +2424,9 @@ fn main(s: *const Startup) -> i32 {
         saved_hdr: init_hdr,
         saved_pinned_apps: init_pinned,
         applied_saved_display: false,
+        lang_id: init_lang,
+        kbd_id: init_kbd,
+        tz_offset_min: init_tz,
         apps: Vec::new(),
         session_flags: 0,
         autostart_until: if autostart { sys::clock_ns() + AUTOSTART_WAIT_NS } else { 0 },
@@ -2134,6 +2436,9 @@ fn main(s: *const Startup) -> i32 {
     }
     if a.input != 0 {
         a.port.arm(a.input, sys::READABLE | sys::PEER_CLOSED, KEY_INPUT);
+        if a.kbd_id != 0 {
+            a.push_keyboard_layout();
+        }
     }
     if a.gpu != 0 {
         a.port.arm(a.gpu, sys::READABLE | sys::PEER_CLOSED, KEY_GPU);
